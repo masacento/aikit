@@ -148,6 +148,30 @@ func TestKQuantUnpackMatchesEmbed(t *testing.T) {
 	}
 }
 
+// TestKQuantDotPartials_matchesScalar pins the DotProd (SDOT) partials to the scalar reference
+// bit-for-bit over full int8 range. On arm64+DotProd (every Apple-silicon Mac) this exercises the
+// asm in kquant_dp_arm64.s; elsewhere both sides are scalar. Integer arithmetic — must be exact.
+func TestKQuantDotPartials_matchesScalar(t *testing.T) {
+	rng := rand.New(rand.NewSource(6))
+	for _, nsub := range []int{1, 16, 16 * 8} { // one sub-block, one superblock, eight superblocks
+		codes := make([]int8, nsub*16)
+		qs := make([]int8, nsub*16)
+		for i := range codes {
+			codes[i] = int8(rng.Intn(256) - 128) // full [-128,127]
+			qs[i] = int8(rng.Intn(255) - 127)    // [-127,127]
+		}
+		got := make([]int32, nsub)
+		want := make([]int32, nsub)
+		dotPartials16(codes, qs, got)
+		dotPartials16Scalar(codes, qs, want)
+		for j := 0; j < nsub; j++ {
+			if got[j] != want[j] {
+				t.Fatalf("partial[%d] (nsub=%d): dotPartials16 %d != scalar %d", j, nsub, got[j], want[j])
+			}
+		}
+	}
+}
+
 // TestQuantizeActQ8K checks round-trip accuracy and exact bsums (and the all-zero block → d=0).
 func TestQuantizeActQ8K(t *testing.T) {
 	rng := rand.New(rand.NewSource(2))

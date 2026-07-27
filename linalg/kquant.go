@@ -203,22 +203,35 @@ func q4kScaleMin(j int, q []byte) (scale, min uint8) {
 func dotQ6KQ8K(w []byte, q8 *Q8K, row, nb int) float32 {
 	var out float32
 	var codes [qkK]int8
+	var partials [16]int32
 	qsBase := row * q8.K
 	dBase := row * nb
 	for sb := 0; sb < nb; sb++ {
 		scales, dw := unpackQ6K(w, sb, &codes)
-		qs := q8.Qs[qsBase+sb*qkK:]
+		qs := q8.Qs[qsBase+sb*qkK : qsBase+sb*qkK+qkK]
+		dotPartials16(codes[:], qs, partials[:]) // 16 sub-block int dots (SDOT if available)
 		var acc int32
 		for j := 0; j < 16; j++ {
-			var p int32
-			for i := 0; i < 16; i++ {
-				p += int32(codes[j*16+i]) * int32(qs[j*16+i])
-			}
-			acc += int32(scales[j]) * p
+			acc += int32(scales[j]) * partials[j]
 		}
 		out += dw * q8.D[dBase+sb] * float32(acc)
 	}
 	return out
+}
+
+// dotPartials16Scalar is the arch-neutral reference for dotPartials16: out[j] = Σ_{i<16}
+// codes[j*16+i]·qs[j*16+i]. The DotProd (SDOT) path in kquant_dp_arm64.s must match it bit-for-bit
+// (integer arithmetic — exact regardless of path).
+func dotPartials16Scalar(codes, qs []int8, out []int32) {
+	for j := range out {
+		c := codes[j*16 : j*16+16]
+		a := qs[j*16 : j*16+16]
+		var p int32
+		for i := 0; i < 16; i++ {
+			p += int32(c[i]) * int32(a[i])
+		}
+		out[j] = p
+	}
 }
 
 // dotQ4KQ8K is the integer-accumulation dot of one Q4_K weight row with one Q8_K activation row.
@@ -228,19 +241,18 @@ func dotQ6KQ8K(w []byte, q8 *Q8K, row, nb int) float32 {
 func dotQ4KQ8K(w []byte, q8 *Q8K, row, nb int) float32 {
 	var out float32
 	var codes [qkK]int8
+	var partials [16]int32
 	qsBase := row * q8.K
 	dBase := row * nb
 	bBase := row * (q8.K / 16)
 	for sb := 0; sb < nb; sb++ {
 		scales, mins, dw, dmin := unpackQ4K(w, sb, &codes)
-		qs := q8.Qs[qsBase+sb*qkK:]
+		qs := q8.Qs[qsBase+sb*qkK : qsBase+sb*qkK+qkK]
 		bsums := q8.Bsums[bBase+sb*16:]
+		dotPartials16(codes[:], qs, partials[:]) // 16 partials; a 32-wide sub-block sums an adjacent pair
 		var accScale, accMin int32
 		for s := 0; s < 8; s++ {
-			var p int32
-			for i := 0; i < 32; i++ {
-				p += int32(codes[s*32+i]) * int32(qs[s*32+i])
-			}
+			p := partials[2*s] + partials[2*s+1]
 			accScale += int32(scales[s]) * p
 			accMin += int32(mins[s]) * (int32(bsums[2*s]) + int32(bsums[2*s+1]))
 		}
