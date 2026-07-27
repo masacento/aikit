@@ -146,6 +146,26 @@ green.**
   The padded-batch and q8 kernels are SwiGLU-only: batch falls back to the per-sequence forward
   for these checkpoints, and `LoadWeightsQ8` refuses them outright rather than quantize absent
   tensors into a plausible-looking wrong model.
+- **Bucket A breadth — four more certified (2026-07-27), no new architecture.** With every
+  architecture already built, the remaining named Bucket-A models are pure config/tokenizer
+  wiring plus a gate, so they share one harness (`scripts/pin_coverage.py`,
+  `encoder/coverage_bert_test.go`): **`BAAI/bge-large-en-v1.5`** and
+  **`mixedbread-ai/mxbai-embed-large-v1`** (1024-dim CLS-BERT), **`Snowflake/snowflake-arctic-embed-m`**
+  (768-dim CLS-BERT), and **`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`** (a
+  BERT-shaped model with the XLM-R Unigram vocab + mean pooling, offset 0) — each certified at
+  **cosine 1.000000**, worst hidden maxΔ ≤ 2.6e-05, with mean↔CLS break-it-first. This takes the
+  certified set from eight to **twelve**. mxbai adds a Matryoshka-to-512 row (measured, not
+  claimed). Lesson pinned in the pin script: mxbai ships **fp16** weights, so the reference must be
+  forced to fp32 (`torch_dtype=float32`) or its fp16-rounded hidden states diverge ~1e-2 from
+  aikit's fp32 kernel (cosine stays ~1, but the hidden gate would trip on reference rounding).
+- **Two named Bucket-A models deferred — they need new primitives, not config.** The audit of the
+  remaining names found two that break the "config-driven, no new architecture" premise:
+  **`ibm-granite/granite-embedding-*-english`** is a RoBERTa with a **byte-level BPE** tokenizer,
+  which `embed` does not implement (it has WordPiece + Unigram only) — a new tokenizer backend, not
+  a config; and **`Snowflake/snowflake-arctic-embed-*-v2.0`** is `model_type=gte` with **RoPE**
+  (`position_embedding_type=rope`, 8192 positions), a different encoder than the XLM-R the plan
+  assumed for "arctic-embed2" — it needs a GTE forward. Both are real follow-ons with their own
+  gates, tracked here rather than smuggled in as coverage rows.
 
 ## Coverage claim, generated not hand-maintained
 

@@ -167,3 +167,7 @@ testdata/xlm-roberta-base
 testdata/multilingual-e5-base
 testdata/bge-m3
 testdata/nomic-moe
+testdata/bge-large
+testdata/mxbai-large
+testdata/arctic-embed-m
+testdata/paraphrase-ml

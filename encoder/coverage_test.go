@@ -101,6 +101,18 @@ var coverageRows = []covRow{
 	{"nomic-ai/nomic-embed-text-v2-moe", "../testdata/nomic-moe", loaderNomic,
 		"nomic-bert + MoE (top-2 of 8)", "mean", "Unigram", 768, 256, "TestNomicMoE_parity",
 		"mixture-of-experts FFN on odd layers"},
+	{"BAAI/bge-large-en-v1.5", "../testdata/bge-large", loaderBERT,
+		"BERT", "cls", "WordPiece", 1024, 0, "TestBGELarge_parity",
+		"the CLS-BERT path at large width (1024d, 24 layers)"},
+	{"mixedbread-ai/mxbai-embed-large-v1", "../testdata/mxbai-large", loaderBERT,
+		"BERT", "cls", "WordPiece", 1024, 512, "TestMxbaiLarge_parity",
+		"Matryoshka to 512 on CLS-BERT; fp16 checkpoint widened to fp32"},
+	{"Snowflake/snowflake-arctic-embed-m", "../testdata/arctic-embed-m", loaderBERT,
+		"BERT", "cls", "WordPiece", 768, 0, "TestArcticEmbedM_parity",
+		"arctic-embed 1.0 (BERT/CLS); the 2.0 line is a different GTE/RoPE model"},
+	{"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "../testdata/paraphrase-ml", loaderBERT,
+		"BERT (XLM-R vocab)", "mean", "Unigram", 384, 0, "TestParaphraseMultilingual_parity",
+		"Unigram tokenizer on the BERT loader path (model_type=bert, offset 0)"},
 }
 
 func buildCoverageMarkdown() []byte {

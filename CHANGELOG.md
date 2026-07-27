@@ -10,6 +10,21 @@ it.
 
 ## [Unreleased]
 
+### Added
+
+- **Four more certified embedders (`encoder`), taking the set from eight to
+  twelve** — all BERT-family coverage breadth on the existing architectures, no
+  new forward: `BAAI/bge-large-en-v1.5` and `mixedbread-ai/mxbai-embed-large-v1`
+  (1024-dim CLS-BERT), `Snowflake/snowflake-arctic-embed-m` (768-dim CLS-BERT),
+  and `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (BERT-shaped
+  with the XLM-R Unigram vocab + mean pooling). Each is certified against its
+  sentence-transformers reference at cosine 1.000000 with mean↔CLS break-it-first
+  (`encoder/coverage_bert_test.go`, `scripts/pin_coverage.py`); the checkpoints
+  are gitignored so the gates skip in CI.
+- **`encoder.MatryoshkaFloor("mixedbread-ai/mxbai-embed-large-v1")` → 512.** mxbai
+  is Matryoshka-trained; the floor is measured by `TestEmbedderCoverage_matryoshka`,
+  not asserted.
+
 ## [1.11.0] — 2026-07-22
 
 The embedder-coverage release. 1.10.x hardened what was already here; this adds
