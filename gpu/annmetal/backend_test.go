@@ -1,6 +1,6 @@
 //go:build darwin
 
-package gpu
+package annmetal
 
 import (
 	"math"

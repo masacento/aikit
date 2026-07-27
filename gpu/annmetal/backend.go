@@ -1,6 +1,6 @@
 //go:build darwin
 
-package gpu
+package annmetal
 
 import (
 	"fmt"
@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/townsendmerino/aikit/ann"
+	gpu "github.com/townsendmerino/aikit/gpu"
 )
 
 // annbackend.go registers a native-Metal implementation of ann.Backend, so an
@@ -42,20 +43,20 @@ kernel void gemv_w8a8(
 }`
 
 type metalBackend struct {
-	dev  *Device
-	q    Queue
-	pipe Pipeline
+	dev  *gpu.Device
+	q    gpu.Queue
+	pipe gpu.Pipeline
 }
 
 // init reaches Metal and registers the backend. If there is no Metal GPU (or the
 // kernel fails to compile), it registers nothing — ann.FlatI8 then stays on the
 // CPU and EnableGPU returns "no backend". Building this package is the opt-in.
 func init() {
-	dev, err := CreateSystemDefaultDevice()
+	dev, err := gpu.CreateSystemDefaultDevice()
 	if err != nil {
 		return
 	}
-	lib, err := dev.CompileLibrary(gemvW8A8Src, MSL3_1)
+	lib, err := dev.CompileLibrary(gemvW8A8Src, gpu.MSL3_1)
 	if err != nil {
 		dev.ReleaseObjects()
 		return
@@ -95,12 +96,12 @@ func (b *metalBackend) NewI8Index(bq []int8, scales []float32, n, dim int) (ann.
 type metalI8Index struct {
 	b      *metalBackend
 	n, dim int
-	codes  Buffer // [n*dim] int8 (resident)
-	scales Buffer // [n] f32
-	qi8    Buffer // [dim] int8 (reused per query)
-	qscale Buffer // [1] f32 (reused)
-	kbuf   Buffer // [1] u32
-	out    Buffer // [n] f32 (reused)
+	codes  gpu.Buffer // [n*dim] int8 (resident)
+	scales gpu.Buffer // [n] f32
+	qi8    gpu.Buffer // [dim] int8 (reused per query)
+	qscale gpu.Buffer // [1] f32 (reused)
+	kbuf   gpu.Buffer // [1] u32
+	out    gpu.Buffer // [n] f32 (reused)
 	mu     sync.Mutex
 }
 
@@ -130,7 +131,7 @@ func (x *metalI8Index) Score(q []float32, dst []float32) error {
 // Close releases this index's device buffers (the shared device stays alive for
 // other indexes; the process holds one Metal device).
 func (x *metalI8Index) Close() error {
-	for _, b := range []Buffer{x.codes, x.scales, x.qi8, x.qscale, x.kbuf, x.out} {
+	for _, b := range []gpu.Buffer{x.codes, x.scales, x.qi8, x.qscale, x.kbuf, x.out} {
 		x.b.dev.ReleaseBuf(b)
 	}
 	return nil
