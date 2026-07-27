@@ -16,9 +16,10 @@ import "strings"
 // is the lookup that lets it refuse instead. Kept in lockstep with the coverage registry (and so
 // with the published table) by TestMatryoshkaFloors_matchCoverage.
 var matryoshkaFloors = map[string]int{
-	"nomic-ai/nomic-embed-text-v1.5":     64,
-	"nomic-ai/nomic-embed-text-v2-moe":   256,
-	"mixedbread-ai/mxbai-embed-large-v1": 512,
+	"nomic-ai/nomic-embed-text-v1.5":          64,
+	"nomic-ai/nomic-embed-text-v2-moe":        256,
+	"mixedbread-ai/mxbai-embed-large-v1":      512,
+	"Snowflake/snowflake-arctic-embed-m-v2.0": 256,
 }
 
 // matryoshkaBare indexes the same rows by bare model name, since a serve layer usually knows a

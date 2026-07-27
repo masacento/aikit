@@ -171,3 +171,5 @@ testdata/bge-large
 testdata/mxbai-large
 testdata/arctic-embed-m
 testdata/paraphrase-ml
+testdata/granite-en
+testdata/arctic2-m

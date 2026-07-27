@@ -26,6 +26,8 @@ back from the loader when the weights are present). Regenerate with
 | `mixedbread-ai/mxbai-embed-large-v1` | BERT | `LoadBERT` | cls | WordPiece | 1024 | 1024→512 | `TestMxbaiLarge_parity` |
 | `Snowflake/snowflake-arctic-embed-m` | BERT | `LoadBERT` | cls | WordPiece | 768 | — | `TestArcticEmbedM_parity` |
 | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | BERT (XLM-R vocab) | `LoadBERT` | mean | Unigram | 384 | — | `TestParaphraseMultilingual_parity` |
+| `ibm-granite/granite-embedding-125m-english` | RoBERTa | `LoadBERT` | cls | ByteLevelBPE | 768 | — | `TestGranite_parity` |
+| `Snowflake/snowflake-arctic-embed-m-v2.0` | GTE (RoPE, GeGLU) | `LoadGTE` | cls | Unigram | 768 | 768→256 | `TestGTE_parity` |
 
 **Truncatable** is the Matryoshka range: only models trained with Matryoshka
 Representation Learning may have their vectors shortened. Slicing any other row
@@ -46,6 +48,8 @@ layer must not honor a `dimensions` request blindly — check this column.
 - **`mixedbread-ai/mxbai-embed-large-v1`** — Matryoshka to 512 on CLS-BERT; fp16 checkpoint widened to fp32
 - **`Snowflake/snowflake-arctic-embed-m`** — arctic-embed 1.0 (BERT/CLS); the 2.0 line is a different GTE/RoPE model
 - **`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`** — Unigram tokenizer on the BERT loader path (model_type=bert, offset 0)
+- **`ibm-granite/granite-embedding-125m-english`** — first byte-level BPE tokenizer; RoBERTa pad+1 offset on the BERT loader
+- **`Snowflake/snowflake-arctic-embed-m-v2.0`** — RoPE + packed-qkv + gated-GELU MLP; Matryoshka to 256
 
 ## Not in this table
 

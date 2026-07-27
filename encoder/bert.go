@@ -366,8 +366,14 @@ func l2norm(v []float32) []float32 { return embed.L2Normalize(v) }
 // gelu applies the exact (erf-based) GELU in place: x·Φ(x) = 0.5x(1+erf(x/√2)).
 // transformers' "gelu" activation is the erf form, not the tanh approximation.
 func gelu(x []float32) {
-	const invSqrt2 = 0.7071067811865476
 	for i, v := range x {
-		x[i] = float32(0.5 * float64(v) * (1 + math.Erf(float64(v)*invSqrt2)))
+		x[i] = geluScalar(v)
 	}
+}
+
+// geluScalar is the exact erf GELU for one element — the same computation gelu
+// applies, exposed for GeGLU where the activation is on a strided gate (gte.go).
+func geluScalar(v float32) float32 {
+	const invSqrt2 = 0.7071067811865476
+	return float32(0.5 * float64(v) * (1 + math.Erf(float64(v)*invSqrt2)))
 }

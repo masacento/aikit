@@ -158,14 +158,23 @@ green.**
   claimed). Lesson pinned in the pin script: mxbai ships **fp16** weights, so the reference must be
   forced to fp32 (`torch_dtype=float32`) or its fp16-rounded hidden states diverge ~1e-2 from
   aikit's fp32 kernel (cosine stays ~1, but the hidden gate would trip on reference rounding).
-- **Two named Bucket-A models deferred — they need new primitives, not config.** The audit of the
-  remaining names found two that break the "config-driven, no new architecture" premise:
-  **`ibm-granite/granite-embedding-*-english`** is a RoBERTa with a **byte-level BPE** tokenizer,
-  which `embed` does not implement (it has WordPiece + Unigram only) — a new tokenizer backend, not
-  a config; and **`Snowflake/snowflake-arctic-embed-*-v2.0`** is `model_type=gte` with **RoPE**
-  (`position_embedding_type=rope`, 8192 positions), a different encoder than the XLM-R the plan
-  assumed for "arctic-embed2" — it needs a GTE forward. Both are real follow-ons with their own
-  gates, tracked here rather than smuggled in as coverage rows.
+- **The two "needs a new primitive" models — both now certified (2026-07-27).** The audit found two
+  names that break the "config-driven, no new architecture" premise; each got the primitive built
+  and a gate:
+  - **`ibm-granite/granite-embedding-125m-english`** — a RoBERTa (pad+1 offset, CLS) whose tokenizer
+    is GPT-2/RoBERTa **byte-level BPE**, which `embed` lacked. Added `embed/tokenize_bpe.go` (the
+    byte→rune map, the GPT-2 pre-tokenizer with a hand-rolled `\s+(?!\S)` give-back since RE2 has no
+    lookahead, ranked-merge BPE, RobertaProcessing specials), dispatched like the Unigram backend.
+    id-exact vs HF over the golden + a 33-case multilingual/emoji/whitespace/contraction sweep; the
+    forward is the existing `LoadBERT` RoBERTa path. `TestGranite_parity` + `TestGranite_encodeEndToEnd`.
+  - **`Snowflake/snowflake-arctic-embed-m-v2.0`** — `model_type=gte` + **RoPE** (θ=160000), NOT the
+    XLM-R the plan assumed for "arctic-embed2". Added `encoder/gte.go`: a post-norm forward with a
+    packed qkv projection, RoPE (bit-identical to the existing `rope.go`), and a **gated-GELU (GeGLU)**
+    MLP (fused `up_gate_proj`, GELU on the gate) — the one genuinely new kernel. Tokenizer is XLM-R
+    Unigram (already supported). Certified at cosine 1.000000, worst hidden maxΔ 7.8e-06, Matryoshka
+    to 256. `TestGTE_parity` + `TestGTE_encodeEndToEnd`. (Pinning note: the HF reference's RoPE
+    `inv_freq` is a non-persistent buffer left uninitialized by the custom code — its own RoPE is a
+    silent no-op unless the cache is rebuilt; `scripts/pin_gte.py` reconstructs it.)
 
 ## Coverage claim, generated not hand-maintained
 

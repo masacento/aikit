@@ -38,13 +38,18 @@ type loaderKind int
 const (
 	loaderBERT  loaderKind = iota // LoadBERT: learned-absolute positions, GELU
 	loaderNomic                   // Load/LoadWeightsFromFS: nomic-bert, RoPE
+	loaderGTE                     // LoadGTE: RoPE + packed qkv + GeGLU (gte-multilingual)
 )
 
 func (k loaderKind) String() string {
-	if k == loaderBERT {
+	switch k {
+	case loaderBERT:
 		return "LoadBERT"
+	case loaderGTE:
+		return "LoadGTE"
+	default:
+		return "Load"
 	}
-	return "Load"
 }
 
 // covRow is one certified embedder. Pooling/Dims are claims verified against the
@@ -113,6 +118,12 @@ var coverageRows = []covRow{
 	{"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", "../testdata/paraphrase-ml", loaderBERT,
 		"BERT (XLM-R vocab)", "mean", "Unigram", 384, 0, "TestParaphraseMultilingual_parity",
 		"Unigram tokenizer on the BERT loader path (model_type=bert, offset 0)"},
+	{"ibm-granite/granite-embedding-125m-english", "../testdata/granite-en", loaderBERT,
+		"RoBERTa", "cls", "ByteLevelBPE", 768, 0, "TestGranite_parity",
+		"first byte-level BPE tokenizer; RoBERTa pad+1 offset on the BERT loader"},
+	{"Snowflake/snowflake-arctic-embed-m-v2.0", "../testdata/arctic2-m", loaderGTE,
+		"GTE (RoPE, GeGLU)", "cls", "Unigram", 768, 256, "TestGTE_parity",
+		"RoPE + packed-qkv + gated-GELU MLP; Matryoshka to 256"},
 }
 
 func buildCoverageMarkdown() []byte {
@@ -226,6 +237,12 @@ func TestEmbedderCoverage_propertiesMatchCheckpoints(t *testing.T) {
 					t.Fatalf("LoadBERT: %v", err)
 				}
 				gotPool, gotDims = string(b.pool), b.cfg.Hidden
+			case loaderGTE:
+				g, err := LoadGTE(r.Dir)
+				if err != nil {
+					t.Fatalf("LoadGTE: %v", err)
+				}
+				gotPool, gotDims = string(g.pool), g.cfg.Hidden
 			default:
 				m, err := Load(r.Dir)
 				if err != nil {
@@ -287,6 +304,18 @@ func TestEmbedderCoverage_matryoshka(t *testing.T) {
 			}
 			for i, s := range corpus {
 				v, err := b.Encode(s)
+				if err != nil {
+					t.Fatalf("Encode: %v", err)
+				}
+				out[i] = v
+			}
+		case loaderGTE:
+			g, err := LoadGTE(r.Dir)
+			if err != nil {
+				t.Fatalf("LoadGTE: %v", err)
+			}
+			for i, s := range corpus {
+				v, err := g.Encode(s)
 				if err != nil {
 					t.Fatalf("Encode: %v", err)
 				}

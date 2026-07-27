@@ -12,6 +12,21 @@ it.
 
 ### Added
 
+- **GTE encoder + `encoder.LoadGTE` (`encoder`).** A pure-Go forward for the GTE
+  architecture (Alibaba gte-multilingual-base): post-norm, RoPE positions, a
+  packed qkv projection, and a gated-GELU (GeGLU) MLP. Certifies
+  `Snowflake/snowflake-arctic-embed-m-v2.0` at cosine 1.000000 (worst hidden maxΔ
+  7.8e-06), Matryoshka to 256. `encoder/gte.go`, `scripts/pin_gte.py`.
+- **Byte-level BPE tokenizer (`embed`).** The GPT-2 / RoBERTa tokenizer — byte
+  map, the GPT-2 pre-tokenizer (with a hand-rolled replacement for the
+  `\s+(?!\S)` lookahead RE2 can't express), ranked-merge BPE, and
+  RobertaProcessing specials — dispatched like the Unigram backend when
+  `tokenizer.json` is `model.type: "BPE"`. Reproduces HF id-for-id; unlocks the
+  RoBERTa family end-to-end. `embed/tokenize_bpe.go`.
+- **`ibm-granite/granite-embedding-125m-english` certified (`encoder`).** RoBERTa
+  (pad+1 offset, CLS) on the existing `LoadBERT` forward, with the new byte-level
+  BPE tokenizer. `TestGranite_parity` + `TestGranite_encodeEndToEnd`.
+- **`encoder.MatryoshkaFloor("Snowflake/snowflake-arctic-embed-m-v2.0")` → 256.**
 - **Four more certified embedders (`encoder`), taking the set from eight to
   twelve** — all BERT-family coverage breadth on the existing architectures, no
   new forward: `BAAI/bge-large-en-v1.5` and `mixedbread-ai/mxbai-embed-large-v1`

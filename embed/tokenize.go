@@ -41,6 +41,10 @@ type Tokenizer struct {
 	// non-nil, the public methods dispatch to it instead of the WordPiece path.
 	// See tokenize_unigram.go.
 	uni *unigramBackend
+
+	// bpe is set for byte-level BPE tokenizers (GPT-2 / RoBERTa family); when
+	// non-nil, the public methods dispatch to it. See tokenize_bpe.go.
+	bpe *bpeBackend
 }
 
 // tokenizer.json shape — we only parse the fields we need.
@@ -110,6 +114,14 @@ func parseTokenizer(data []byte) (*Tokenizer, error) {
 			return nil, err
 		}
 		return &Tokenizer{uni: uni, unkID: uni.unkID}, nil
+	}
+	// Byte-level BPE (GPT-2 / RoBERTa family, e.g. granite-embedding-english).
+	if isBPETokenizer(probe.Model.Type) {
+		bpe, err := parseBPETokenizer(data)
+		if err != nil {
+			return nil, err
+		}
+		return &Tokenizer{bpe: bpe, unkID: bpe.unkID}, nil
 	}
 
 	var raw tokenizerJSON
@@ -202,6 +214,9 @@ func (t *Tokenizer) Encode(text string) []int32 {
 	if t.uni != nil {
 		return t.uni.encode(text)
 	}
+	if t.bpe != nil {
+		return t.bpe.encode(text)
+	}
 	if len(t.addedKeys) == 0 {
 		return t.encodeSegment(text)
 	}
@@ -262,6 +277,9 @@ func (t *Tokenizer) VocabSize() int {
 	if t.uni != nil {
 		return t.uni.vocabSize
 	}
+	if t.bpe != nil {
+		return t.bpe.vocabSize
+	}
 	return len(t.vocab)
 }
 
@@ -275,6 +293,10 @@ func (t *Tokenizer) UnkID() int32 { return t.unkID }
 func (t *Tokenizer) SpecialID(literal string) (int32, bool) {
 	if t.uni != nil {
 		id, ok := t.uni.addedTokens[literal]
+		return id, ok
+	}
+	if t.bpe != nil {
+		id, ok := t.bpe.addedTokens[literal]
 		return id, ok
 	}
 	id, ok := t.addedTokens[literal]
@@ -300,6 +322,9 @@ func (t *Tokenizer) SpecialID(literal string) (int32, bool) {
 func (t *Tokenizer) EncodeWithSpecials(text string, maxLen int) ([]int32, error) {
 	if t.uni != nil {
 		return t.uni.encodeWithSpecials(text, maxLen), nil
+	}
+	if t.bpe != nil {
+		return t.bpe.encodeWithSpecials(text, maxLen), nil
 	}
 	cls, ok := t.addedTokens["[CLS]"]
 	if !ok {

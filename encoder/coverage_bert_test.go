@@ -132,3 +132,69 @@ func TestArcticEmbedM_parity(t *testing.T) {
 func TestParaphraseMultilingual_parity(t *testing.T) {
 	assertBERTParity(t, "../testdata/paraphrase-ml", "../testdata/paraphrase_ml_golden.json", poolMean, 0)
 }
+
+// TestGranite_parity — ibm-granite/granite-embedding-125m-english: a RoBERTa
+// (pad+1 position offset = 2, CLS pooling) certified on the LoadBERT forward. Its
+// distinguishing feature is the tokenizer — GPT-2/RoBERTa byte-level BPE — which
+// TestGranite_encodeEndToEnd exercises; this gate covers the forward + pooling.
+func TestGranite_parity(t *testing.T) {
+	assertBERTParity(t, "../testdata/granite-en", "../testdata/granite_golden.json", poolCLS, 2)
+}
+
+// TestGranite_encodeEndToEnd certifies the byte-level BPE tokenizer end-to-end:
+// aikit must reproduce HF's input_ids id-for-id, and Encode(text) must match the
+// CLS-pooled golden. This is the gate for the new tokenize_bpe.go backend.
+func TestGranite_encodeEndToEnd(t *testing.T) {
+	const dir = "../testdata/granite-en"
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("no granite model at %s", dir)
+	}
+	b, err := LoadBERT(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.tok == nil {
+		t.Fatal("granite tokenizer (byte-level BPE) not loaded")
+	}
+	raw, err := os.ReadFile("../testdata/granite_golden.json")
+	if err != nil {
+		t.Skip("no golden")
+	}
+	var g struct {
+		Cases []struct {
+			Text     string    `json:"text"`
+			InputIDs []int32   `json:"input_ids"`
+			Emb      []float32 `json:"embedding"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &g); err != nil {
+		t.Fatal(err)
+	}
+	tokMismatch := 0
+	for _, c := range g.Cases {
+		ids, err := b.tok.EncodeWithSpecials(c.Text, b.maxSeq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		same := len(ids) == len(c.InputIDs)
+		for i := range ids {
+			if same && ids[i] != c.InputIDs[i] {
+				same = false
+			}
+		}
+		if !same {
+			tokMismatch++
+			t.Logf("byte-level BPE mismatch %q: got %v want %v", c.Text, ids, c.InputIDs)
+		}
+		emb, err := b.Encode(c.Text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cos := cos32(emb, c.Emb); cos < 0.9999 {
+			t.Errorf("%q: Encode cosine %.6f < 0.9999", c.Text, cos)
+		}
+	}
+	if tokMismatch > 0 {
+		t.Errorf("%d/%d cases had byte-level BPE id mismatches", tokMismatch, len(g.Cases))
+	}
+}
