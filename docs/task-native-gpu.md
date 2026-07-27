@@ -63,37 +63,56 @@ Two properties this preserves:
 
 ## Phases — each independently valuable, each gated
 
-**Phase 0 — finish the seam (prerequisite; in-flight).** Complete the `linalg.WeightMat`
-unification (roadmap §2.8 — migrate `vision.qmat` then `decoder.weightMat`; encoder is
-done) and the vision-move goinfer cleanup (§2.9). WeightMat's `Int8/Int4/F32` accessors are
-*the* GPU-dispatch seam every consumer routes through; it must be complete and validated
-(bit-identical) before anything plugs a GPU into it. No GPU code yet — just the seam.
+**Phase 0 — the seam (prerequisite) — ✅ DONE.** The `linalg.WeightMat` unification (roadmap
+§2.8) is complete: `vision.qmat` and `decoder.weightMat` are both migrated onto
+`linalg.WeightMat` — all three consumers on the one type, no local `weightMat` struct left —
+and goinfer is re-pinned to the tagged **`aikit v1.11.0`** (root + `cuda` + `gpu` modules),
+off the pseudo-version. The GPU-dispatch seam (`Int8/Int4/F32`) is in place and validated
+bit-identical. Nothing cheaper remains to do before the GPU work.
 
-**Phase 1 — extract the GPU substrate to `aikit/gpu` (the structural move).**
-- Define the `Device`/`Buffer`/`Pipeline`/`Kernel` interface (compile-a-kernel, alloc
-  buffers, dispatch with args, sync) — the near-mirror-image contract both goinfer backends
-  already satisfy.
-- **Metal impl:** lift `goinfer/metal/metal.go` verbatim (it's already zero-decoder-deps,
-  cgo-free, and proven standalone by `metal/gemv_w4a8_test.go`).
-- **CUDA impl:** thin wrapper over `gocudrv` (CUDA's device layer is already the external
-  dep — clean by construction) + the `LockOSThread` executor pattern.
-- **Generic quantized GEMV (W8A8/W4A8):** extract the standalone kernels. Honest cost — on
-  CUDA these are *braided* with LLM kernels in shared `.cu`→PTX blobs (`glue.cu`,
-  `gemv_fwd.cu`); on Metal in one concatenated MSL string. Splitting them out is a real
-  refactor, not a verbatim lift. Do it as a **blob-split**, kernel-parity-gated vs the CPU
-  reference at each step.
-- **Re-point goinfer's decode backends at `aikit/gpu`.** This is the proof the extraction is
-  clean: goinfer's Metal + CUDA decode must stay **bit-identical green** across its full
-  parity suite. If any resident model's numerics move, the extraction changed behavior —
-  stop. **This phase is triggered by Phase 2's consumer pull; don't pre-extract speculatively**
-  (aikit's own discipline — extract on a named pull, not on spec).
+**Phase 1 — scoped first cut: the device layer + one proving consumer (a *named product bet*).**
+The prerequisites (Phase 0) are cleared, so nothing cheaper remains to do first — but the
+trigger the plan specifies (a concrete ANN-GPU adopter) has **not** fired, and the tuned
+Metal/CUDA kernels are **still moving** (MoE / Gemma / prefill all landed recently). So start
+*deliberately*, as an **owner product bet** — aikit-as-public-library gains cgo-free native-GPU
+because it strengthens the product, not because a trigger fired — and scope the first cut to the
+parts that are **stable and verbatim**, never the parts that are moving or braided:
 
-**Phase 2 — ANN-GPU (the headline unlock; the pull that justifies Phase 1).** Give `ann` a
-`Backend` seam (like `encoder.Backend`); route `FlatI8.query` / `LoadFlatI8MmapPaged`'s
-per-block batch GEMV through `aikit/gpu`'s W8A8. Batch multiple queries → an int8 GEMM, the
-GPU's sweet spot, over the biggest N in the system. **Parity-gated:** GPU-ANN top-k ≡ CPU-ANN
-top-k on real indexes (argmax/rank-exact within the int8 tolerance). This is *new* coverage
-(ANN has none today) and the biggest single-workload win.
+- **`aikit/gpu` interface + Metal impl only.** Define `Device`/`Buffer`/`Pipeline`/`Encoder`
+  (compile-a-kernel, alloc buffers, dispatch, sync) and lift `goinfer/metal/metal.go`
+  **verbatim** as the Metal impl — already zero-decoder-deps, cgo-free, self-contained, proven
+  standalone by `metal/gemv_w4a8_test.go`. Design the interface to *admit* a CUDA impl later
+  (the two backends are near-mirror-images), but **do not build CUDA yet.**
+- **A minimal, correctness-only int8 GEMV — NOT the tuned decode kernels.** Write one small,
+  unoptimized W8A8 GEMV in MSL, just enough to run a real quantized matmul on the device layer.
+  This is *not* the production `gemv_w4a8_sa` / COAL kernels — those are tuned for single-stream
+  decode, braided in the shared MSL blob, and still changing. It's a fresh, gated-vs-CPU proving
+  kernel. **Tuning + the blob-split are Phase 1b**, when the decode kernels stop moving.
+- **`ann` as the one proving consumer** (so the device layer isn't dormant infra). Give `ann` a
+  `Backend` seam and route `FlatI8.query`'s batch int8 dot through the minimal GEMV;
+  **parity-gate top-k ≡ `linalg.MatmulBTW8A8` (CPU), break-it-first.** This exercises the whole
+  path end-to-end — device layer + `WeightMat` dispatch + parity discipline — on aikit's
+  highest-fit workload, with none of the moving/tuned surface.
+- **Re-point goinfer's Metal backend's *device layer* at `aikit/gpu` — device types only.**
+  `goinfer/metal` imports `Device`/`Buffer`/… from `aikit/gpu` instead of defining them locally;
+  its **tuned kernels stay in goinfer**. Pure refactor: goinfer's Metal decode stays
+  **bit-identical green** across the parity suite, or the extraction changed behavior — stop.
+  This proves the shared-substrate relationship (goinfer builds its kernels on aikit's device
+  layer — the GPU analogue of the existing `linalg` relationship) without touching a kernel.
+
+**Explicitly deferred to Phase 1b (gated on: the tuned kernels stabilizing *and* ANN-GPU being
+funded for real):** the CUDA device impl (gocudrv wrapper + `LockOSThread` executor); the
+**blob-split + lift of the tuned W4A8/W8A8 kernels**; re-pointing goinfer's CUDA backend. Those
+carry the real cost — a moving API and the blob-split — and there is no reason to pay it in the
+first cut. When ANN-GPU is funded, swap the minimal proving kernel for the tuned one and add CUDA.
+
+**Phase 2 — ANN-GPU, completed (the headline unlock).** Phase 1 lands the `ann.Backend` seam
+and a minimal single-query path; Phase 2 turns it into the real win: swap the proving kernel for
+the **tuned W8A8** (from the Phase-1b blob-split), add **CUDA**, and **batch multiple queries →
+an int8 GEMM** — the GPU's sweet spot, over the biggest N in the system (>1M vectors), including
+the paged `LoadFlatI8MmapPaged` path. **Parity-gated:** GPU-ANN top-k ≡ CPU-ANN top-k on real
+indexes (rank-exact within the int8 tolerance). This is *new* coverage (ANN has none today) and
+the biggest single-workload win — the payoff the product bet is aimed at.
 
 **Phase 3 — vision native + the Qwen ViT resident path.** `vision.ResidentEncoder` already
 exists (WebGPU SigLIP, "~9×"); add native Metal/CUDA implementations, and build the
@@ -132,16 +151,19 @@ present, WebGPU where portable, CPU always).
   part; the kernels are the work.
 - **Two of three consumers already have cgo-WebGPU** — for encoder + vision the native win is
   incremental (cgo-free + faster); the genuinely new coverage is ANN. Sequence accordingly.
-- **Phase 1 is a large structural move** — it must be a pure refactor (goinfer decode
-  bit-identical) or it stops. Land it only behind the Phase-2 pull, with goinfer's parity
-  suite as the tripwire.
+- **The device re-point must be a pure refactor** — goinfer's Metal decode bit-identical or it
+  stops (parity suite is the tripwire). The *large* structural move — the CUDA impl + the
+  tuned-kernel blob-split — is quarantined in **Phase 1b behind its trigger**, so the first cut
+  stays small and low-risk.
 - **Scope creep** — "as much as possible" is the arc, but the value is front-loaded (ANN).
   Don't let Phase 3/4 gate the ANN win.
 
 ## Recommended sequence
 
-Phase 0 (finish the WeightMat seam — already in flight) → **Phase 1 + 2 together** (extract
-`aikit/gpu` *because* ANN pulls on it, and ship native-GPU ANN — the extraction's
-justification and the headline win, in one arc) → Phase 3 (vision native + Qwen ViT) →
-Phase 4 (encoder native). Each phase gated, each independently shippable, each leaving aikit
-stronger and still cgo-free.
+**Phase 0 ✅ done** → **Phase 1 (scoped first cut)** — `aikit/gpu` + Metal device layer +
+minimal-kernel ANN proof + goinfer-Metal device re-point, as a named product bet → **Phase 1b**
+(CUDA device impl + the tuned-GEMV blob-split), *gated on the kernels settling + ANN-GPU being
+funded* → **Phase 2** (ANN-GPU completed: tuned kernel, CUDA, batch-GEMM — the headline) →
+Phase 3 (vision native + Qwen ViT) → Phase 4 (encoder native). Each gated, each independently
+shippable, each leaving aikit stronger and still cgo-free. The first cut is small and low-risk;
+the cost and the moving-API risk are quarantined into 1b, behind their trigger.
