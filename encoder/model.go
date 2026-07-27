@@ -147,6 +147,16 @@ func (m *Model) Encode(text string, isQuery bool) ([]float32, error) {
 // On error, returns the first error and a nil result slice (no
 // partial results). `concurrency` ≤ 0 means runtime.NumCPU().
 func (m *Model) EncodeBatch(texts []string, isQueries []bool, concurrency int) ([][]float32, error) {
+	return encodeBatch(m.tok, m.maxSeqLength, m.weights.forwardBatch, texts, isQueries, concurrency)
+}
+
+// encodeBatch is the shared body of Model.EncodeBatch and ModelQ8.EncodeBatch,
+// which differed only in which forwardBatch they called (audit #19: 60 duplicated
+// lines, so a fix to the tokenize-error path had to be made twice). fwd is the
+// model's batched forward. It fans out over `concurrency` workers, each tokenizing
+// its chunk (query/doc prefix per isQueries), running one batched forward, and
+// scattering the vectors back; the first tokenize error wins and is returned.
+func encodeBatch(tok *embed.Tokenizer, maxSeq int, fwd func([][]int32) [][]float32, texts []string, isQueries []bool, concurrency int) ([][]float32, error) {
 	if len(texts) != len(isQueries) {
 		return nil, fmt.Errorf("encoder: EncodeBatch len(texts)=%d != len(isQueries)=%d", len(texts), len(isQueries))
 	}
@@ -165,7 +175,6 @@ func (m *Model) EncodeBatch(texts []string, isQueries []bool, concurrency int) (
 	var errOnce sync.Once
 
 	// Static slice: worker w gets indices [w*size, min((w+1)*size, len)].
-	// chunkSize at least 1 so empty chunks don't fire.
 	chunkSize := (len(texts) + concurrency - 1) / concurrency
 	var wg sync.WaitGroup
 	for w := 0; w < concurrency; w++ {
@@ -177,7 +186,6 @@ func (m *Model) EncodeBatch(texts []string, isQueries []bool, concurrency int) (
 		wg.Add(1)
 		go func(start, end int) {
 			defer wg.Done()
-			// Tokenize the chunk's texts (with/without query prefix).
 			idsList := make([][]int32, end-start)
 			for i := start; i < end; i++ {
 				var (
@@ -185,9 +193,9 @@ func (m *Model) EncodeBatch(texts []string, isQueries []bool, concurrency int) (
 					err error
 				)
 				if isQueries[i] {
-					ids, err = EncodeQuery(m.tok, texts[i], m.maxSeqLength)
+					ids, err = EncodeQuery(tok, texts[i], maxSeq)
 				} else {
-					ids, err = EncodeDoc(m.tok, texts[i], m.maxSeqLength)
+					ids, err = EncodeDoc(tok, texts[i], maxSeq)
 				}
 				if err != nil {
 					errOnce.Do(func() { firstErr = err })
@@ -195,10 +203,7 @@ func (m *Model) EncodeBatch(texts []string, isQueries []bool, concurrency int) (
 				}
 				idsList[i-start] = ids
 			}
-			// Batched forward over the chunk (M7). On a single goroutine
-			// per worker; the 8 workers × batched-forward combination is
-			// the M3 + M7 hybrid.
-			vecs := m.weights.forwardBatch(idsList)
+			vecs := fwd(idsList)
 			for i := start; i < end; i++ {
 				out[i] = vecs[i-start]
 			}
@@ -279,58 +284,12 @@ func (m *ModelQ8) Encode(text string, isQuery bool) ([]float32, error) {
 // forward-per-worker shape as Model.EncodeBatch; routes through the
 // q8 batched forward instead.
 func (m *ModelQ8) EncodeBatch(texts []string, isQueries []bool, concurrency int) ([][]float32, error) {
-	if len(texts) != len(isQueries) {
-		return nil, fmt.Errorf("encoder: EncodeBatch len(texts)=%d != len(isQueries)=%d", len(texts), len(isQueries))
-	}
-	if len(texts) == 0 {
-		return nil, nil
-	}
-	if concurrency <= 0 {
-		concurrency = runtime.NumCPU()
-	}
-	if concurrency > len(texts) {
-		concurrency = len(texts)
-	}
-	out := make([][]float32, len(texts))
-	var firstErr error
-	var errOnce sync.Once
-	chunkSize := (len(texts) + concurrency - 1) / concurrency
-	var wg sync.WaitGroup
-	for w := 0; w < concurrency; w++ {
-		start := w * chunkSize
-		end := min(start+chunkSize, len(texts))
-		if start >= end {
-			break
-		}
-		wg.Add(1)
-		go func(start, end int) {
-			defer wg.Done()
-			idsList := make([][]int32, end-start)
-			for i := start; i < end; i++ {
-				var (
-					ids []int32
-					err error
-				)
-				if isQueries[i] {
-					ids, err = EncodeQuery(m.tok, texts[i], m.maxSeqLength)
-				} else {
-					ids, err = EncodeDoc(m.tok, texts[i], m.maxSeqLength)
-				}
-				if err != nil {
-					errOnce.Do(func() { firstErr = err })
-					return
-				}
-				idsList[i-start] = ids
-			}
-			vecs := m.weights.forwardBatch(idsList)
-			for i := start; i < end; i++ {
-				out[i] = vecs[i-start]
-			}
-		}(start, end)
-	}
-	wg.Wait()
-	if firstErr != nil {
-		return nil, firstErr
-	}
-	return out, nil
+	return encodeBatch(m.tok, m.maxSeqLength, m.weights.forwardBatch, texts, isQueries, concurrency)
 }
+
+// Close releases resources. ModelQ8 holds no mmap (LoadWeightsQ8 closes the
+// safetensors handle at load), so this is a no-op that exists for parity with
+// Model.Close — both satisfy io.Closer, so a caller holding an encoder.Encoder can
+// release it via `if c, ok := enc.(io.Closer); ok { c.Close() }` without Close
+// being on the (Hard-tier, frozen) Encoder interface (audit #19).
+func (m *ModelQ8) Close() error { return nil }
