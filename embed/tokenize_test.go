@@ -161,3 +161,26 @@ func TestNormalize_KnownStrings(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkWordPiece exercises the greedy-match probe on a word that requires many
+// shrinking probes + "##" continuation (the audit #11 case) — where the old two
+// strings-per-probe cost showed. Reports allocs/op.
+func BenchmarkWordPiece(b *testing.B) {
+	tok := &Tokenizer{
+		vocab: map[string]int32{
+			"un": 1, "##aff": 2, "##able": 3, "super": 4, "##cali": 5,
+			"##fragi": 6, "##listic": 7, "##expi": 8, "##ali": 9, "##docious": 10,
+		},
+		unkID:            99,
+		continuingPrefix: "##",
+		maxCharsPerWord:  100,
+	}
+	words := []string{"unaffable", "supercalifragilistic", "supercalifragilisticexpialidocious"}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		for _, w := range words {
+			_ = tok.wordPiece(w)
+		}
+	}
+}

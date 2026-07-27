@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -507,17 +508,30 @@ func (t *Tokenizer) wordPiece(word string) []int32 {
 		return nil
 	}
 
+	// Build each greedy-match candidate into a pooled []byte and look it up via
+	// t.vocab[string(buf)] — the compiler elides that conversion for a map lookup,
+	// so the probe is allocation-free. The old code allocated two strings per probe
+	// (string(chars[start:end]) plus the "##" concat), ~40 short-lived allocations
+	// for a 20-rune identifier, on the tokenizer that feeds every encoder entry
+	// point (audit #11). Pooled so concurrent Encode stays safe (as bm25 does).
+	bufp := wpBufPool.Get().(*[]byte)
+	defer wpBufPool.Put(bufp)
+
 	var out []int32
 	start := 0
 	for start < len(chars) {
 		end := len(chars)
 		matched := false
 		for end > start {
-			sub := string(chars[start:end])
+			b := (*bufp)[:0]
 			if start > 0 {
-				sub = t.continuingPrefix + sub
+				b = append(b, t.continuingPrefix...)
 			}
-			if id, ok := t.vocab[sub]; ok {
+			for _, r := range chars[start:end] {
+				b = utf8.AppendRune(b, r)
+			}
+			*bufp = b // retain the grown backing array for the next probe
+			if id, ok := t.vocab[string(b)]; ok {
 				out = append(out, id)
 				start = end
 				matched = true
@@ -531,3 +545,8 @@ func (t *Tokenizer) wordPiece(word string) []int32 {
 	}
 	return out
 }
+
+// wpBufPool holds reusable candidate-building buffers for wordPiece. Encode is
+// goroutine-safe, so the scratch must be per-call — a sync.Pool gives that without
+// a per-call allocation.
+var wpBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 128); return &b }}
