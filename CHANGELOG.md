@@ -12,6 +12,18 @@ it.
 
 ### Added
 
+- **Native-GPU device substrate (`gpu`, new Experimental darwin module) + GPU-scored
+  `FlatI8`.** A cgo-free Metal device layer (Device/Buffer/Queue/Pipeline/Encoder +
+  runtime MSL compiler, via `ebitengine/purego`, `CGO_ENABLED=0`) that aikit owns —
+  the GPU analogue of `linalg`. `gpu/annmetal` registers an `ann.Backend` (the same
+  inversion `encoder`/`vision` use, so core `ann` never imports it) that scores an
+  int8 `FlatI8` corpus GEMV on the GPU; `FlatI8.EnableGPU()` opts in. Verified on
+  Apple M1 Pro: GPU top-k ≡ CPU `linalg.MatmulBTW8A8` top-k, bit-identical (the int8
+  dot is exact integer arithmetic). Device tests are hand-run (no GPU CI); the
+  default build and the core dependency invariant are unchanged (separate module,
+  `purego` never enters the root). Native-GPU Phase 1; CUDA + the tuned-kernel lift
+  are Phase 1b.
+
 - **GTE encoder + `encoder.LoadGTE` (`encoder`).** A pure-Go forward for the GTE
   architecture (Alibaba gte-multilingual-base): post-norm, RoPE positions, a
   packed qkv projection, and a gated-GELU (GeGLU) MLP. Certifies

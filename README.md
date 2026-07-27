@@ -33,6 +33,7 @@ large embedded-grammar payload) — is quarantined in the separate
 | `encoder` | CodeRankEmbed (NomicBert) + MiniLM-class BERT embedder + SPLADE expansion + cross-encoder reranker — transformer inference scored by cosine / sparse dot / relevance logit; pluggable matmul `Backend` | `embed`, `linalg`, `sparse` |
 | `vision` *(Experimental)* | SigLIP / ViT image encoder — decode → preprocess → pure-Go transformer forward → image embeddings (f32 or int8 W8A8), parity-pinned to HF `SiglipVisionModel`; stdlib image codecs, no cgo | `embed`, `linalg` |
 | `chunk` | language-aware chunker registry + `regex`, `markdown`, `line` chunkers | — |
+| `gpu` *(Experimental, darwin; separate module)* | cgo-free native-GPU device substrate — `Device`/`Buffer`/`Queue`/`Pipeline`/`Encoder` + a runtime MSL compiler over Metal; the GPU analogue of `linalg`'s CPU role. `gpu/annmetal` registers an `ann.Backend` that scores `FlatI8`'s int8 corpus GEMV on the GPU (`FlatI8.EnableGPU`). Device tests are hand-run (no GPU CI); the default aikit build never imports it and stays pure-Go. | `github.com/ebitengine/purego` *(darwin)* |
 | `chunk/treesitter` *(submodule)* | tree-sitter-backed syntactic chunker | `gotreesitter`, `…/aikit` |
 
 `chunk/treesitter` is a **separate Go module** (`…/aikit/chunk/treesitter`) so the
