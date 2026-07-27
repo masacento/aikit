@@ -236,17 +236,17 @@ func (e *Encoder) Forward(pixels []float32) ([]float32, error) {
 		// attention block (pre-LN, residual)
 		layerNormInto(s.n1, h, lw.ln1w, lw.ln1b, np, hidden, c.LayerNormEps)
 		e.attentionInto(s.att, s.n1, lw, np, s)
-		lw.ow.MatmulBT(s.att, s.o, np)
+		lw.ow.MatmulBTInto(&s.ws, s.att, s.o, np)
 		addBias(s.o, lw.ob, np, hidden)
 		for i := range h {
 			h[i] += s.o[i]
 		}
 		// MLP block (pre-LN, residual): fc2(geluTanh(fc1(x)))
 		layerNormInto(s.n2, h, lw.ln2w, lw.ln2b, np, hidden, c.LayerNormEps)
-		lw.fc1w.MatmulBT(s.n2, s.mid, np)
+		lw.fc1w.MatmulBTInto(&s.ws, s.n2, s.mid, np)
 		addBias(s.mid, lw.fc1b, np, inter)
 		geluTanh(s.mid)
-		lw.fc2w.MatmulBT(s.mid, s.mlp, np)
+		lw.fc2w.MatmulBTInto(&s.ws, s.mid, s.mlp, np)
 		addBias(s.mlp, lw.fc2b, np, hidden)
 		for i := range h {
 			h[i] += s.mlp[i]
@@ -258,9 +258,10 @@ func (e *Encoder) Forward(pixels []float32) ([]float32, error) {
 // encScratch holds the SigLIP encoder's per-layer working buffers, allocated once
 // per Forward and reused across layers (audit #5). All layers share one shape.
 type encScratch struct {
-	n1, att, o, n2, mid, mlp []float32 // block buffers
-	q, k, v                  []float32 // attention projections [np,hidden]
-	qh, kh, vt, scores, oh   []float32 // per-head scratch
+	n1, att, o, n2, mid, mlp []float32        // block buffers
+	q, k, v                  []float32        // attention projections [np,hidden]
+	qh, kh, vt, scores, oh   []float32        // per-head scratch
+	ws                       linalg.Workspace // reused across the WeightMat projections (audit #12)
 }
 
 func newEncScratch(np, hidden, inter, hd int) *encScratch {
@@ -287,11 +288,11 @@ func (e *Encoder) attentionInto(att, x []float32, lw *encLayer, np int, s *encSc
 	hidden, nH := e.Cfg.HiddenSize, e.Cfg.NumAttentionHeads
 	hd := hidden / nH
 	scale := float32(1.0 / math.Sqrt(float64(hd)))
-	lw.qw.MatmulBT(x, s.q, np)
+	lw.qw.MatmulBTInto(&s.ws, x, s.q, np)
 	addBias(s.q, lw.qb, np, hidden)
-	lw.kw.MatmulBT(x, s.k, np)
+	lw.kw.MatmulBTInto(&s.ws, x, s.k, np)
 	addBias(s.k, lw.kb, np, hidden)
-	lw.vw.MatmulBT(x, s.v, np)
+	lw.vw.MatmulBTInto(&s.ws, x, s.v, np)
 	addBias(s.v, lw.vb, np, hidden)
 
 	for head := range nH {

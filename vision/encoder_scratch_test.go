@@ -4,13 +4,11 @@ import (
 	"math"
 	"math/rand"
 	"testing"
-
-	"github.com/townsendmerino/aikit/linalg"
 )
 
 // synthEncoder builds a small deterministic SigLIP encoder (random weights) so the
 // CPU forward can be exercised without a checkpoint.
-func synthEncoder(seed int64) ([]float32, *Encoder) {
+func synthEncoder(seed int64, quant bool) ([]float32, *Encoder) {
 	rng := rand.New(rand.NewSource(seed))
 	rnd := func(n int) []float32 {
 		s := make([]float32, n)
@@ -37,13 +35,13 @@ func synthEncoder(seed int64) ([]float32, *Encoder) {
 	for range nLayers {
 		e.layers = append(e.layers, encLayer{
 			ln1w: rnd(hidden), ln1b: rnd(hidden),
-			qw: linalg.WrapF32(rnd(hidden*hidden), hidden, hidden), qb: rnd(hidden),
-			kw: linalg.WrapF32(rnd(hidden*hidden), hidden, hidden), kb: rnd(hidden),
-			vw: linalg.WrapF32(rnd(hidden*hidden), hidden, hidden), vb: rnd(hidden),
-			ow: linalg.WrapF32(rnd(hidden*hidden), hidden, hidden), ob: rnd(hidden),
+			qw: newQMat(rnd(hidden*hidden), hidden, hidden, quant), qb: rnd(hidden),
+			kw: newQMat(rnd(hidden*hidden), hidden, hidden, quant), kb: rnd(hidden),
+			vw: newQMat(rnd(hidden*hidden), hidden, hidden, quant), vb: rnd(hidden),
+			ow: newQMat(rnd(hidden*hidden), hidden, hidden, quant), ob: rnd(hidden),
 			ln2w: rnd(hidden), ln2b: rnd(hidden),
-			fc1w: linalg.WrapF32(rnd(inter*hidden), inter, hidden), fc1b: rnd(inter),
-			fc2w: linalg.WrapF32(rnd(hidden*inter), hidden, inter), fc2b: rnd(hidden),
+			fc1w: newQMat(rnd(inter*hidden), inter, hidden, quant), fc1b: rnd(inter),
+			fc2w: newQMat(rnd(hidden*inter), hidden, inter, quant), fc2b: rnd(hidden),
 		})
 	}
 	return rnd(chans * imgSize * imgSize), e
@@ -55,30 +53,43 @@ func synthEncoder(seed int64) ([]float32, *Encoder) {
 // pre-#5 code; the SigLIP parity test (against a real checkpoint) skips in CI, so
 // this synthetic forward is the local guard.
 func TestEncoder_scratchBitIdentical(t *testing.T) {
-	pixels, e := synthEncoder(1234)
-	out, err := e.Forward(pixels)
-	if err != nil {
-		t.Fatal(err)
+	// Values captured from the pre-refactor implementation, per weight precision.
+	// #5 (scratch reuse) and #12 (Workspace threading) must not move any of them.
+	cases := []struct {
+		name      string
+		quant     bool
+		wantFirst []float32
+		wantSumSq float64
+	}{
+		{"f32", false, []float32{-0.12652746, -0.0008432368, -0.1994251, 0.014424909}, 1.136807045},
+		{"int8(W8A8)", true, []float32{-0.12667489, -0.00064121914, -0.19966985, 0.014695232}, 1.136773173},
 	}
-	var sum float64
-	for _, v := range out {
-		sum += float64(v) * float64(v)
-	}
-	// Exact float32 values from the pre-refactor implementation.
-	wantFirst := []float32{-0.12652746, -0.0008432368, -0.1994251, 0.014424909}
-	for i, w := range wantFirst {
-		if out[i] != w {
-			t.Errorf("out[%d] = %v, want %v (scratch reuse changed the numerics)", i, out[i], w)
-		}
-	}
-	if got := math.Sqrt(sum); math.Abs(got-1.136807045) > 1e-7 {
-		t.Errorf("checksum(sumsq) = %.10g, want 1.136807045", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pixels, e := synthEncoder(1234, tc.quant)
+			out, err := e.Forward(pixels)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var sum float64
+			for _, v := range out {
+				sum += float64(v) * float64(v)
+			}
+			for i, w := range tc.wantFirst {
+				if out[i] != w {
+					t.Errorf("out[%d] = %v, want %v (scratch/Workspace reuse changed the numerics)", i, out[i], w)
+				}
+			}
+			if got := math.Sqrt(sum); math.Abs(got-tc.wantSumSq) > 1e-7 {
+				t.Errorf("checksum(sumsq) = %.10g, want %.10g", got, tc.wantSumSq)
+			}
+		})
 	}
 }
 
 // benchEncoder builds a mid-size encoder (np=256, hidden=128, 12 layers) to show
 // the per-layer scratch reuse (#5).
-func benchEncoder(seed int64) ([]float32, *Encoder) {
+func benchEncoder(seed int64, quant bool) ([]float32, *Encoder) {
 	rng := rand.New(rand.NewSource(seed))
 	rnd := func(n int) []float32 {
 		s := make([]float32, n)
@@ -102,20 +113,20 @@ func benchEncoder(seed int64) ([]float32, *Encoder) {
 	for range nLayers {
 		e.layers = append(e.layers, encLayer{
 			ln1w: rnd(hidden), ln1b: rnd(hidden),
-			qw: linalg.WrapF32(rnd(hidden*hidden), hidden, hidden), qb: rnd(hidden),
-			kw: linalg.WrapF32(rnd(hidden*hidden), hidden, hidden), kb: rnd(hidden),
-			vw: linalg.WrapF32(rnd(hidden*hidden), hidden, hidden), vb: rnd(hidden),
-			ow: linalg.WrapF32(rnd(hidden*hidden), hidden, hidden), ob: rnd(hidden),
+			qw: newQMat(rnd(hidden*hidden), hidden, hidden, quant), qb: rnd(hidden),
+			kw: newQMat(rnd(hidden*hidden), hidden, hidden, quant), kb: rnd(hidden),
+			vw: newQMat(rnd(hidden*hidden), hidden, hidden, quant), vb: rnd(hidden),
+			ow: newQMat(rnd(hidden*hidden), hidden, hidden, quant), ob: rnd(hidden),
 			ln2w: rnd(hidden), ln2b: rnd(hidden),
-			fc1w: linalg.WrapF32(rnd(inter*hidden), inter, hidden), fc1b: rnd(inter),
-			fc2w: linalg.WrapF32(rnd(hidden*inter), hidden, inter), fc2b: rnd(hidden),
+			fc1w: newQMat(rnd(inter*hidden), inter, hidden, quant), fc1b: rnd(inter),
+			fc2w: newQMat(rnd(hidden*inter), hidden, inter, quant), fc2b: rnd(hidden),
 		})
 	}
 	return rnd(chans * imgSize * imgSize), e
 }
 
 func BenchmarkForward(b *testing.B) {
-	pixels, e := benchEncoder(9)
+	pixels, e := benchEncoder(9, false)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
