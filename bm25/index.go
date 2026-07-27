@@ -36,10 +36,17 @@ func Build(docs [][]string) *Index {
 		df:       make(map[string]int),
 	}
 	var total int
+	// One term-frequency map reused across all documents (clear per doc) instead of
+	// a fresh make per document — at ~378k chunks that churned multiple GB of
+	// short-lived map storage and 378k map-header allocations (audit #20). Output
+	// is identical: each doc appends exactly one posting per term and docs are
+	// processed in order, so postings[term] is doc-ordered regardless of the inner
+	// map-iteration order.
+	tf := make(map[string]int, 512)
 	for d, toks := range docs {
 		ix.docLen[d] = len(toks)
 		total += len(toks)
-		tf := make(map[string]int, len(toks))
+		clear(tf)
 		for _, t := range toks {
 			tf[t]++
 		}
