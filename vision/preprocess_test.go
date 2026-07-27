@@ -109,3 +109,17 @@ func TestPreprocess_guardsAndErrors(t *testing.T) {
 		}
 	}
 }
+
+// TestPreprocess_zeroStdRejected is the regression for AUDIT #23: a zero Std[c]
+// divides to +Inf (v != Mean) or NaN (v == Mean), which propagates silently
+// through softmax to an all-NaN hidden state. Config has exported fields and no
+// mandatory constructor, so Preprocess must reject it like its other bad-field
+// checks. Break-it-first: without the guard a valid image returns nil error and
+// Inf/NaN pixels.
+func TestPreprocess_zeroStdRejected(t *testing.T) {
+	img := solidPNG(t, 8, 8, 100, 150, 200)
+	c := Config{Size: 8, Mean: [3]float32{0.5, 0.5, 0.5}, Std: [3]float32{1, 0, 1}, MaxPixels: 1 << 20}
+	if _, err := Preprocess(img, c); err == nil {
+		t.Error("Preprocess with Std[1]=0 returned nil error; a zero Std produces Inf/NaN pixels")
+	}
+}

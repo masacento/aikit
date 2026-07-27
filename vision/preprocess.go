@@ -58,6 +58,15 @@ func Preprocess(data []byte, cfg Config) (*PixelValues, error) {
 	if cfg.Size <= 0 {
 		return nil, fmt.Errorf("vision: invalid target size %d", cfg.Size)
 	}
+	// A zero Std yields +Inf (v != Mean) or NaN (v == Mean) pixels that propagate
+	// silently through softmax to an all-NaN hidden state. Config is an exported
+	// struct with no mandatory constructor, so reject it like the other bad-field
+	// checks here (audit #23).
+	for c := range cfg.Std {
+		if cfg.Std[c] == 0 {
+			return nil, fmt.Errorf("vision: Std[%d] is 0 (would produce Inf/NaN pixels)", c)
+		}
+	}
 	ic, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("vision: decode header: %w", err)

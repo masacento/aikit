@@ -141,7 +141,11 @@ func chunkWith(r LanguageRules, src []byte, chunkSize int) []chunk.Chunk {
 		// Snap the boundary up over a contiguous attach block (so a
 		// function keeps its doc comment / @annotation / #[attr] / @decorator).
 		b := i
-		for b-1 >= 1 && attachMatch(r, rawLine(b-1)) {
+		// b > 0, not b-1 >= 1: the latter halts at b==1, so an attach block
+		// (license header, module doc) that starts at line 0 and runs into the
+		// first definition marked isBoundary[1] — a line INSIDE the comment —
+		// producing a single-line first chunk holding only line 0 (audit #22).
+		for b > 0 && attachMatch(r, rawLine(b-1)) {
 			b--
 		}
 		isBoundary[b] = true
