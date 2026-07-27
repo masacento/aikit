@@ -6,16 +6,20 @@ import "math"
 // convention used by sentence-transformers and a typical eps for float32.
 const l2NormEps = 1e-12
 
-// l2Normalize divides v by its L2 norm in-place, returning v. If the L2 norm
-// is below l2NormEps (degenerate / all-UNK input), v is zeroed and returned
-// as a stable, safe value rather than NaN.
+// L2Normalize divides v by its L2 norm in place and returns it. If the norm is
+// below l2NormEps (a degenerate / all-UNK input) v is zeroed and returned — a
+// stable, safe value rather than NaN (the Python reference NaNs there; we return
+// zero to keep downstream cosine well-behaved).
 //
-// The Python reference returns NaN for the all-UNK case; ken returns zero to
-// keep downstream cosine-similarity computations well-behaved.
+// This is the ONE L2-normalize the kit uses — the Model2Vec pooling path, the
+// Matryoshka Truncate, and the encoder embedders (encoder.BERT.Embed) all route
+// through it, so the degenerate-case behavior is pinned in a single place rather
+// than diverging across three copies (audit #21).
 //
-// Precision: the sum-of-squares accumulator is float64. Float32 accumulation
-// here would compound the drift from float32 accumulation in // encodeIDs's float64 pooling.
-func l2Normalize(v []float32) []float32 {
+// Precision: the sum-of-squares accumulator is float64 and each element is divided
+// by the float64 norm before the cast to float32 — float32 accumulation here would
+// compound the drift the float64 pooling path is careful to avoid.
+func L2Normalize(v []float32) []float32 {
 	var sq float64
 	for _, x := range v {
 		sq += float64(x) * float64(x)

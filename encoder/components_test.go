@@ -159,7 +159,7 @@ func TestRoPE_orthogonalityPreserved(t *testing.T) {
 // TestL2Normalize_zeroSafe: empty / zero-norm rows stay zero, never NaN.
 func TestL2Normalize_zeroSafe(t *testing.T) {
 	x := []float32{0, 0, 0, 0}
-	l2Normalize(x, 1, 4)
+	l2norm(x)
 	for i, v := range x {
 		if v != 0 {
 			t.Errorf("zero-norm row mutated: x[%d]=%v", i, v)
@@ -167,7 +167,7 @@ func TestL2Normalize_zeroSafe(t *testing.T) {
 	}
 	// Non-zero row: L2 norm of output should be 1.
 	x = []float32{3, 4, 0, 0}
-	l2Normalize(x, 1, 4)
+	l2norm(x)
 	var sum float64
 	for _, v := range x {
 		sum += float64(v) * float64(v)

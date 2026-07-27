@@ -23,5 +23,5 @@ func Truncate(v []float32, dim int) []float32 {
 	}
 	out := make([]float32, dim)
 	copy(out, v[:dim])
-	return l2Normalize(out)
+	return L2Normalize(out)
 }

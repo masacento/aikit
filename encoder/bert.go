@@ -357,6 +357,12 @@ func (b *BERT) Embed(ids []int32) []float32 {
 	return l2norm(v)
 }
 
+// l2norm is the encoder-package name for the kit's single canonical
+// L2-normalize; it forwards to embed.L2Normalize so the pooling path, the
+// Matryoshka Truncate, and every encoder embedder share one implementation and
+// one degenerate-case behavior (audit #21).
+func l2norm(v []float32) []float32 { return embed.L2Normalize(v) }
+
 // gelu applies the exact (erf-based) GELU in place: x·Φ(x) = 0.5x(1+erf(x/√2)).
 // transformers' "gelu" activation is the erf form, not the tanh approximation.
 func gelu(x []float32) {
@@ -364,19 +370,4 @@ func gelu(x []float32) {
 	for i, v := range x {
 		x[i] = float32(0.5 * float64(v) * (1 + math.Erf(float64(v)*invSqrt2)))
 	}
-}
-
-func l2norm(v []float32) []float32 {
-	var s float64
-	for _, x := range v {
-		s += float64(x) * float64(x)
-	}
-	n := float32(math.Sqrt(s))
-	if n == 0 {
-		return v
-	}
-	for i := range v {
-		v[i] /= n
-	}
-	return v
 }

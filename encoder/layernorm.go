@@ -37,23 +37,3 @@ func layerNorm(x, weight, bias []float32, L, D int, eps float64) {
 		}
 	}
 }
-
-// l2Normalize divides each row of x by its L2 norm in place. f64
-// accumulator. Zero-norm rows (degenerate inputs like empty string)
-// stay all-zero — never produce NaN.
-func l2Normalize(x []float32, L, D int) {
-	for i := range L {
-		row := x[i*D : (i+1)*D]
-		var sumSq float64
-		for _, v := range row {
-			sumSq += float64(v) * float64(v)
-		}
-		if sumSq == 0 {
-			continue
-		}
-		inv := float32(1.0 / math.Sqrt(sumSq))
-		for j := range row {
-			row[j] *= inv
-		}
-	}
-}

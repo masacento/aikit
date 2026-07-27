@@ -222,7 +222,7 @@ func (m *StaticModel) encodeIDs(ids []int32) []float32 {
 		out[j] = float32(sum[j] / wsum)
 	}
 	if m.normalize {
-		return l2Normalize(out)
+		return L2Normalize(out)
 	}
 	return out
 }
