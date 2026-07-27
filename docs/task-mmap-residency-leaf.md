@@ -1,13 +1,24 @@
 # Plan (aikit): an mmap + residency leaf — and page the FlatI8 index with it
 
-> **Status: DEFERRED — written now, executed later.** This is the aikit half of a
-> two-repo extraction (the goinfer half:
-> `goinfer/docs/task-aikit-substrate-extraction.md`). The code to be lifted is
-> goinfer's weight-memory substrate (mmap + madvise + a span-residency cache),
-> which **shipped to goinfer days ago and is still settling** as ideas #2/#4 get
-> tuned and GGUF Phase 2 lands. Promoting a moving API into aikit — where it
-> becomes a public, version-contracted surface — is the expensive thing to get
-> wrong. **Fire only when the trigger below is met.**
+> **Status: DONE (landed in `7128644` "Add mmap leaf, WeightMat.MappedSpan, and
+> paged FlatI8 index"; hardened since by audit #9/#13).** Everything below shipped:
+> the `github.com/townsendmerino/aikit/mmap` leaf (`MapReadOnly`/`Unmap`/`Advise`/
+> `SpanCache[K]`/`PageAlignedInterior`/`AutoBudget`/`AvailableRAM`, stdlib-only and
+> aikit-import-free), `linalg.WeightMat.MappedSpan`, and the §3 payoff —
+> `ann.LoadFlatI8MmapPaged(path, budget)` paging int8 codes through the SpanCache
+> under a RAM budget (`scorePaged` + `PageStats`). `ann` and `embed` both import
+> the leaf; the three duplicated `mmapReadOnly` copies are deleted. Gates green:
+> the SpanCache eviction/refault unit tests (`mmap/spancache_test.go`,
+> `TestMadvise_dontneedRefaultsIntact`) and the §6 lossless-paging gate
+> `TestLoadFlatI8MmapPaged_matchesResidentAndEvicts` (paged recall == resident,
+> eviction count > 0). Retained below as the design record.
+>
+> ---
+>
+> _Original plan (Status was: DEFERRED — written now, executed later):_ the aikit
+> half of a two-repo extraction (goinfer half:
+> `goinfer/docs/task-aikit-substrate-extraction.md`) of goinfer's weight-memory
+> substrate (mmap + madvise + a span-residency cache).
 
 ## Trigger (when to execute)
 
