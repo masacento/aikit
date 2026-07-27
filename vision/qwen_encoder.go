@@ -261,13 +261,21 @@ func (e *QwenVisionEncoder) forwardViT(pixelValues []float32, gridTHW [][3]int) 
 		// sufficient — e.g. {1,3,4} with merge 2 passes it (12%4==0) but h=3
 		// isn't divisible, so windowIndex/rotaryFreqs emit fewer than `groups`
 		// entries and winIdx[g] indexes OOB.
-		if g[0] < 0 || g[1] < 0 || g[2] < 0 {
-			return nil, fmt.Errorf("vision: negative grid dim in %v", g)
+		if g[0] <= 0 || g[1] <= 0 || g[2] <= 0 {
+			// <= 0, not < 0: a zero dim yields nPatches==0, which passes both
+			// checks below (0 != 0 is false; 0 % merge² == 0) and then divides by
+			// zero at `len(freqs)/nPatches`. Audit #4.
+			return nil, fmt.Errorf("vision: non-positive grid dim in %v", g)
 		}
 		if g[1]%merge != 0 || g[2]%merge != 0 {
 			return nil, fmt.Errorf("vision: grid %v h/w not divisible by spatial_merge_size %d", g, merge)
 		}
 		nPatches += g[0] * g[1] * g[2]
+	}
+	if nPatches == 0 {
+		// Empty gridTHW (e.g. Forward(nil, nil) — a request with zero images)
+		// reaches here with nPatches still 0; error rather than divide by zero.
+		return nil, fmt.Errorf("vision: empty gridTHW (no images/patches)")
 	}
 	if len(pixelValues) != nPatches*patchDim {
 		return nil, fmt.Errorf("vision: pixel_values len %d, want %d (%d patches × %d)", len(pixelValues), nPatches*patchDim, nPatches, patchDim)
