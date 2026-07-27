@@ -30,7 +30,7 @@ package ann
 import (
 	"math"
 	"math/rand/v2"
-	"sort"
+	"slices"
 	"sync"
 
 	"github.com/townsendmerino/aikit/linalg"
@@ -398,12 +398,7 @@ func (h *HNSW) searchLayer(qv queryVec, entryPoints []int, ef, layer int, vis *v
 
 	out := make([]cand, results.len())
 	copy(out, results.items)
-	sort.Slice(out, func(a, b int) bool {
-		if out[a].sim != out[b].sim {
-			return out[a].sim > out[b].sim
-		}
-		return out[a].id < out[b].id
-	})
+	slices.SortFunc(out, candCmp)
 	return out
 }
 
@@ -532,15 +527,29 @@ func (h *HNSW) selectHeuristic(w []cand, m int) []cand {
 
 // sortCandsDesc returns a copy of w ordered by descending sim, ties by ascending
 // id — deterministic, for the heuristic's nearest-first pass.
+// candCmp orders candidates by similarity descending, then id ascending — a total
+// order (ids are unique), so slices.SortFunc matches the previous sort.Slice output
+// exactly while avoiding its reflect-based Swapper (audit #24).
+func candCmp(a, b cand) int {
+	if a.sim != b.sim {
+		if a.sim > b.sim {
+			return -1
+		}
+		return 1
+	}
+	if a.id < b.id {
+		return -1
+	}
+	if a.id > b.id {
+		return 1
+	}
+	return 0
+}
+
 func sortCandsDesc(w []cand) []cand {
 	out := make([]cand, len(w))
 	copy(out, w)
-	sort.Slice(out, func(a, b int) bool {
-		if out[a].sim != out[b].sim {
-			return out[a].sim > out[b].sim
-		}
-		return out[a].id < out[b].id
-	})
+	slices.SortFunc(out, candCmp)
 	return out
 }
 
