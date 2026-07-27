@@ -177,6 +177,12 @@ func mapAndAliasFlatI8(path string) (f *FlatI8, at int, err error) {
 // panics — Close only once you are done querying. Not safe to call concurrently
 // with Query (coordinate the handoff, as with any teardown).
 func (f *FlatI8) Close() error {
+	// Release the device-resident index (EnableGPU) regardless of backing, before
+	// the mmap so no device work can reference unmapped codes.
+	if f.gpu != nil {
+		_ = f.gpu.Close()
+		f.gpu = nil
+	}
 	if f.mmap == nil || f.closed {
 		return nil // in-memory (nothing to release) or already closed
 	}

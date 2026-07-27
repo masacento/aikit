@@ -48,6 +48,10 @@ type FlatI8 struct {
 	pager     *mmap.SpanCache[int]
 	blockRows int
 	pagerMu   sync.Mutex
+	// gpu is non-nil after EnableGPU: a device-resident copy of the int8 codes
+	// (see backend.go). When set, query scores on the device instead of the CPU
+	// W8A8 kernel, falling back to CPU if a device Score errors.
+	gpu I8Index
 	// ws is a persistent W8A8 scratch for scorePaged, reused across the per-block
 	// matmuls instead of MatmulBTW8A8 allocating a fresh Workspace per block
 	// (~9766 blocks per query on a 10M-vector index — audit #13). Guarded by
@@ -109,9 +113,17 @@ func (f *FlatI8) query(q []float32, k int, keep func(int) bool) []Hit {
 	// W8A8 at M=1: dynamically quantize q, int8-dot it against every stored
 	// vector, rescale by the query and per-vector scales. SIMD + parallel.
 	dst := make([]float32, f.n)
-	if f.pager == nil {
+	switch {
+	case f.gpu != nil:
+		// Device-resident scoring; fall back to the CPU kernel if the device errors
+		// (the scores are identical up to the int8 tolerance, so the fallback is
+		// transparent to the ranking).
+		if err := f.gpu.Score(q, dst); err != nil {
+			linalg.MatmulBTW8A8(q, f.bq, f.scales, dst, 1, f.dim, f.n)
+		}
+	case f.pager == nil:
 		linalg.MatmulBTW8A8(q, f.bq, f.scales, dst, 1, f.dim, f.n)
-	} else {
+	default:
 		f.scorePaged(q, dst)
 	}
 
