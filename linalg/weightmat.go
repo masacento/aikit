@@ -125,9 +125,10 @@ func (w *WeightMat) MatmulBT(a, dst []float32, M int) {
 
 // MatmulBTInto is MatmulBT through a Workspace: the W8A8 and W4A8 paths quantize
 // the activation once into the Workspace's reusable scratch (zero per-call alloc
-// — the steady-state decode win), and the f32 path runs the Workspace-scoped
-// parallel matmul honoring its SetThreshold/SetWorkers. Only the weight-only Q8
-// path has no Workspace variant and ignores ws.
+// — the steady-state decode win), the weight-only Q8 path takes its widened-row
+// scratch from the Workspace too (MatmulBTQ8Into), and the f32 path runs the
+// Workspace-scoped parallel matmul honoring its SetThreshold/SetWorkers. So every
+// storage kind is now zero-alloc on the serial decode path.
 func (w *WeightMat) MatmulBTInto(ws *Workspace, a, dst []float32, M int) {
 	// Case order kept identical to MatmulBT above: with constructor-built values
 	// the storage kinds are mutually exclusive so order is inert, but a
@@ -139,7 +140,7 @@ func (w *WeightMat) MatmulBTInto(ws *Workspace, a, dst []float32, M int) {
 	case w.q8 != nil && w.w8a8:
 		MatmulBTW8A8Into(ws, a, w.q8, w.scales, dst, M, w.cols, w.rows)
 	case w.q8 != nil:
-		MatmulBTQ8(a, w.q8, w.scales, dst, M, w.cols, w.rows)
+		MatmulBTQ8Into(ws, a, w.q8, w.scales, dst, M, w.cols, w.rows)
 	default:
 		ws.MatmulBT(a, w.f32, dst, M, w.cols, w.rows)
 	}

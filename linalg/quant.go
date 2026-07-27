@@ -83,26 +83,41 @@ func DequantizeRowInt8(q []int8, scale float32, dst []float32) {
 // int8→f32 widen stays scalar; the multiply-accumulate is vectorized. The scratch
 // is one row wide and allocated once per worker. Parallelized over the N columns.
 func MatmulBTQ8(a []float32, bQ []int8, bScales []float32, dst []float32, M, K, N int) {
+	var ws Workspace
+	MatmulBTQ8Into(&ws, a, bQ, bScales, dst, M, K, N)
+}
+
+// MatmulBTQ8Into is MatmulBTQ8 through a Workspace: the SERIAL path (the decode
+// case, M=1 below the parallel threshold — ~168 such calls per token) takes its
+// widened-weight-row scratch from ws.f32Buf(K) and allocates nothing after warm-up,
+// instead of the K-wide make per call the wrapper did. The parallel path still
+// allocates one scratch per worker (noise next to the goroutines — the workers
+// can't share ws's single buffer). Output is byte-identical (audit #14).
+func MatmulBTQ8Into(ws *Workspace, a []float32, bQ []int8, bScales []float32, dst []float32, M, K, N int) {
 	checkMatmulQ8("MatmulBTQ8", len(a), len(bQ), len(bScales), len(dst), M, K, N)
-	parallelCols(M*N*K, N, func(j0, j1 int) {
-		deq := make([]float32, K) // per-worker scratch: one widened b-row
-		// Column-outer (j outer, i inner): widen each weight row to f32 ONCE and
-		// reuse it across all M activation rows. The old row-outer nest re-widened
-		// every b-row M times (the O(K) widen dominates the vectorized dot at
-		// prefill) — MatmulBTQ4/w8a8Span are column-outer for exactly this reason.
-		// Bit-identical: each dst[i,j] is the same independent dotF32(arow_i, deq_j)
-		// * scale_j, only the loop order changed.
-		for j := j0; j < j1; j++ {
-			bq := bQ[j*K : j*K+K]
-			for k := range K {
-				deq[k] = float32(bq[k])
-			}
-			s := bScales[j]
-			for i := range M {
-				dst[i*N+j] = dotF32(a[i*K:i*K+K], deq) * s
-			}
-		}
+	if M*N*K < ws.thr() || N < 2 {
+		q8Span(a, bQ, bScales, dst, M, K, N, 0, N, ws.f32Buf(K))
+		return
+	}
+	ws.parallel(N, func(j0, j1 int) {
+		q8Span(a, bQ, bScales, dst, M, K, N, j0, j1, make([]float32, K))
 	})
+}
+
+// q8Span widens each weight row [j0,j1) to f32 ONCE into deq and reuses it across
+// all M activation rows (column-outer; the O(K) widen dominates the vectorized dot
+// at prefill). Each dst[i,j] is an independent dotF32(arow_i, deq_j)·scale_j.
+func q8Span(a []float32, bQ []int8, bScales, dst []float32, M, K, N, j0, j1 int, deq []float32) {
+	for j := j0; j < j1; j++ {
+		bq := bQ[j*K : j*K+K]
+		for k := range K {
+			deq[k] = float32(bq[k])
+		}
+		s := bScales[j]
+		for i := range M {
+			dst[i*N+j] = dotF32(a[i*K:i*K+K], deq) * s
+		}
+	}
 }
 
 // dotI8Scalar returns Σ a[i]*b[i] as an int32 over two int8 vectors (the products
@@ -464,18 +479,34 @@ func w4a8Span(aq []int8, aScales []float32, w4 []byte, wScales, dst []float32, M
 // Q4 parity test references); the prior per-group-dot kernel only matched within
 // tolerance, so this is also slightly MORE faithful, not less.
 func MatmulBTQ4(a []float32, bPacked []byte, bScales []float32, dst []float32, M, K, N, group int) {
+	var ws Workspace
+	MatmulBTQ4Into(&ws, a, bPacked, bScales, dst, M, K, N, group)
+}
+
+// MatmulBTQ4Into is MatmulBTQ4 through a Workspace — same win as MatmulBTQ8Into:
+// the serial path takes its dequantized-weight-row scratch from ws.f32Buf(K)
+// (zero alloc after warm-up), the parallel path keeps a per-worker scratch. Output
+// is byte-identical (audit #14).
+func MatmulBTQ4Into(ws *Workspace, a []float32, bPacked []byte, bScales []float32, dst []float32, M, K, N, group int) {
 	// Always-on entry guard (M2); checkGroupMatmul below is a no-op without
 	// -tags aikit_checks. Same group-int4 shape contract as MatmulBTW4A8.
 	checkMatmulW4A8("MatmulBTQ4", len(a), len(bPacked), len(bScales), len(dst), M, K, N, group)
 	checkGroupMatmul("MatmulBTQ4", len(a), bPacked, bScales, len(dst), M, K, N, group)
 	nGroups, bpr := groupsFor(K, group)
-	parallelCols(M*N*K, N, func(j0, j1 int) {
-		deq := make([]float32, K) // per-worker scratch: one full dequantized weight row
-		for j := j0; j < j1; j++ {
-			DequantizeRowInt4(bPacked[j*bpr:j*bpr+bpr], bScales[j*nGroups:j*nGroups+nGroups], group, K, deq)
-			for i := range M {
-				dst[i*N+j] = dotF32(a[i*K:i*K+K], deq)
-			}
-		}
+	if M*N*K < ws.thr() || N < 2 {
+		q4Span(a, bPacked, bScales, dst, M, K, N, group, nGroups, bpr, 0, N, ws.f32Buf(K))
+		return
+	}
+	ws.parallel(N, func(j0, j1 int) {
+		q4Span(a, bPacked, bScales, dst, M, K, N, group, nGroups, bpr, j0, j1, make([]float32, K))
 	})
+}
+
+func q4Span(a []float32, bPacked []byte, bScales, dst []float32, M, K, N, group, nGroups, bpr, j0, j1 int, deq []float32) {
+	for j := j0; j < j1; j++ {
+		DequantizeRowInt4(bPacked[j*bpr:j*bpr+bpr], bScales[j*nGroups:j*nGroups+nGroups], group, K, deq)
+		for i := range M {
+			dst[i*N+j] = dotF32(a[i*K:i*K+K], deq)
+		}
+	}
 }
