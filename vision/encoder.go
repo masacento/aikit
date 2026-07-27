@@ -221,32 +221,59 @@ func (e *Encoder) Forward(pixels []float32) ([]float32, error) {
 		h[i] += e.posEmb[i]
 	}
 
+	// Allocate every per-layer scratch buffer ONCE (all layers share one shape) and
+	// reuse across the layer loop. The old code re-make'd n1/att/o/n2/mid/mlp plus
+	// attention's q/k/v/qh/kh/vt/scores/oh every layer — at SigLIP-so400m
+	// (np=4096, 27 layers) ≈290 MB allocated and discarded PER LAYER, ~7.9 GB per
+	// image, all trivially reusable (audit #5). Bit-identical: same ops, distinct
+	// buffers. One scratch per Forward preserves the documented concurrent-Forward
+	// safety (each call has its own).
+	inter := c.IntermediateSize
+	hd := hidden / c.NumAttentionHeads
+	s := newEncScratch(np, hidden, inter, hd)
 	for l := range e.layers {
 		lw := &e.layers[l]
 		// attention block (pre-LN, residual)
-		n1 := layerNorm(h, lw.ln1w, lw.ln1b, np, hidden, c.LayerNormEps)
-		att := e.attention(n1, lw, np)
-		o := make([]float32, np*hidden)
-		lw.ow.MatmulBT(att, o, np)
-		addBias(o, lw.ob, np, hidden)
+		layerNormInto(s.n1, h, lw.ln1w, lw.ln1b, np, hidden, c.LayerNormEps)
+		e.attentionInto(s.att, s.n1, lw, np, s)
+		lw.ow.MatmulBT(s.att, s.o, np)
+		addBias(s.o, lw.ob, np, hidden)
 		for i := range h {
-			h[i] += o[i]
+			h[i] += s.o[i]
 		}
 		// MLP block (pre-LN, residual): fc2(geluTanh(fc1(x)))
-		n2 := layerNorm(h, lw.ln2w, lw.ln2b, np, hidden, c.LayerNormEps)
-		inter := c.IntermediateSize
-		mid := make([]float32, np*inter)
-		lw.fc1w.MatmulBT(n2, mid, np)
-		addBias(mid, lw.fc1b, np, inter)
-		geluTanh(mid)
-		mlp := make([]float32, np*hidden)
-		lw.fc2w.MatmulBT(mid, mlp, np)
-		addBias(mlp, lw.fc2b, np, hidden)
+		layerNormInto(s.n2, h, lw.ln2w, lw.ln2b, np, hidden, c.LayerNormEps)
+		lw.fc1w.MatmulBT(s.n2, s.mid, np)
+		addBias(s.mid, lw.fc1b, np, inter)
+		geluTanh(s.mid)
+		lw.fc2w.MatmulBT(s.mid, s.mlp, np)
+		addBias(s.mlp, lw.fc2b, np, hidden)
 		for i := range h {
-			h[i] += mlp[i]
+			h[i] += s.mlp[i]
 		}
 	}
 	return layerNorm(h, e.postLNw, e.postLNb, np, hidden, c.LayerNormEps), nil
+}
+
+// encScratch holds the SigLIP encoder's per-layer working buffers, allocated once
+// per Forward and reused across layers (audit #5). All layers share one shape.
+type encScratch struct {
+	n1, att, o, n2, mid, mlp []float32 // block buffers
+	q, k, v                  []float32 // attention projections [np,hidden]
+	qh, kh, vt, scores, oh   []float32 // per-head scratch
+}
+
+func newEncScratch(np, hidden, inter, hd int) *encScratch {
+	return &encScratch{
+		n1: make([]float32, np*hidden), att: make([]float32, np*hidden),
+		o: make([]float32, np*hidden), n2: make([]float32, np*hidden),
+		mid: make([]float32, np*inter), mlp: make([]float32, np*hidden),
+		q: make([]float32, np*hidden), k: make([]float32, np*hidden),
+		v:  make([]float32, np*hidden),
+		qh: make([]float32, np*hd), kh: make([]float32, np*hd),
+		vt: make([]float32, hd*np), scores: make([]float32, np*np),
+		oh: make([]float32, np*hd),
+	}
 }
 
 // attention runs bidirectional multi-head self-attention (no causal mask) over
@@ -256,59 +283,55 @@ func (e *Encoder) Forward(pixels []float32) ([]float32, error) {
 // dead weight on a vision tower, where it dominated the CPU prefill time. At
 // SigLIP sizes (≈4096 patches) this is the difference between minutes and seconds
 // per image vs the old scalar triple-loop.
-func (e *Encoder) attention(x []float32, lw *encLayer, np int) []float32 {
+func (e *Encoder) attentionInto(att, x []float32, lw *encLayer, np int, s *encScratch) {
 	hidden, nH := e.Cfg.HiddenSize, e.Cfg.NumAttentionHeads
 	hd := hidden / nH
 	scale := float32(1.0 / math.Sqrt(float64(hd)))
-	q := make([]float32, np*hidden)
-	k := make([]float32, np*hidden)
-	v := make([]float32, np*hidden)
-	lw.qw.MatmulBT(x, q, np)
-	addBias(q, lw.qb, np, hidden)
-	lw.kw.MatmulBT(x, k, np)
-	addBias(k, lw.kb, np, hidden)
-	lw.vw.MatmulBT(x, v, np)
-	addBias(v, lw.vb, np, hidden)
+	lw.qw.MatmulBT(x, s.q, np)
+	addBias(s.q, lw.qb, np, hidden)
+	lw.kw.MatmulBT(x, s.k, np)
+	addBias(s.k, lw.kb, np, hidden)
+	lw.vw.MatmulBT(x, s.v, np)
+	addBias(s.v, lw.vb, np, hidden)
 
-	out := make([]float32, np*hidden)
-	// Per-head scratch: contiguous q/k [np,hd], vᵀ [hd,np], scores [np,np], out [np,hd].
-	qh := make([]float32, np*hd)
-	kh := make([]float32, np*hd)
-	vt := make([]float32, hd*np)
-	scores := make([]float32, np*np)
-	oh := make([]float32, np*hd)
 	for head := range nH {
 		off := head * hd
 		for i := range np {
-			copy(qh[i*hd:(i+1)*hd], q[i*hidden+off:i*hidden+off+hd])
-			copy(kh[i*hd:(i+1)*hd], k[i*hidden+off:i*hidden+off+hd])
-			vrow := v[i*hidden+off : i*hidden+off+hd]
+			copy(s.qh[i*hd:(i+1)*hd], s.q[i*hidden+off:i*hidden+off+hd])
+			copy(s.kh[i*hd:(i+1)*hd], s.k[i*hidden+off:i*hidden+off+hd])
+			vrow := s.v[i*hidden+off : i*hidden+off+hd]
 			for d := range hd {
-				vt[d*np+i] = vrow[d] // vᵀ so scores·V = MatmulBT(scores, vᵀ)
+				s.vt[d*np+i] = vrow[d] // vᵀ so scores·V = MatmulBT(scores, vᵀ)
 			}
 		}
 		// scores[np,np] = qh · khᵀ, scaled, row-softmax.
-		linalg.MatmulBT(qh, kh, scores, np, hd, np)
+		linalg.MatmulBT(s.qh, s.kh, s.scores, np, hd, np)
 		for i := range np {
-			row := scores[i*np : (i+1)*np]
+			row := s.scores[i*np : (i+1)*np]
 			for j := range row {
 				row[j] *= scale
 			}
 			softmaxRow(row)
 		}
 		// out_head[np,hd] = scores[np,np] · v_head[np,hd] = MatmulBT(scores, vᵀ).
-		linalg.MatmulBT(scores, vt, oh, np, np, hd)
+		linalg.MatmulBT(s.scores, s.vt, s.oh, np, np, hd)
 		for i := range np {
-			copy(out[i*hidden+off:i*hidden+off+hd], oh[i*hd:(i+1)*hd])
+			copy(att[i*hidden+off:i*hidden+off+hd], s.oh[i*hd:(i+1)*hd])
 		}
 	}
-	return out
 }
 
 // --- small f32 helpers (LayerNorm is standard — mean/var — not RMS) ---
 
+// layerNormInto writes the normalized rows into dst (reused across layers, audit
+// #5). layerNorm is the allocating wrapper for one-off callers (the final post-LN).
 func layerNorm(x, w, b []float32, rows, dim int, eps float64) []float32 {
 	out := make([]float32, rows*dim)
+	layerNormInto(out, x, w, b, rows, dim, eps)
+	return out
+}
+
+func layerNormInto(out, x, w, b []float32, rows, dim int, eps float64) {
 	for r := range rows {
 		xr := x[r*dim : r*dim+dim]
 		var mean float64
@@ -328,7 +351,6 @@ func layerNorm(x, w, b []float32, rows, dim int, eps float64) []float32 {
 			dst[d] = float32((float64(xr[d])-mean)*inv)*w[d] + b[d]
 		}
 	}
-	return out
 }
 
 func geluTanh(x []float32) {
