@@ -129,6 +129,12 @@ func (f *FlatI8) PageStats() (hits, misses, evictions int64, paged bool) {
 	if f.pager == nil {
 		return 0, 0, 0, false
 	}
+	// SpanCache is not goroutine-safe and Touch (under scorePaged's pagerMu)
+	// mutates the very counters Stats() reads, so a concurrent Query + a metrics
+	// scrape here is a data race. Take the same mutex; it's uncontended and O(1)
+	// (audit #9).
+	f.pagerMu.Lock()
+	defer f.pagerMu.Unlock()
 	h, m, e := f.pager.Stats()
 	return h, m, e, true
 }

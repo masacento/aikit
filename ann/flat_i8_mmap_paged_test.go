@@ -144,3 +144,57 @@ func TestFlatI8_nonPagedPageStats(t *testing.T) {
 		t.Fatalf("non-paged PageStats = (%d,%d,%d,%v), want all zero/false", h, m, e, paged)
 	}
 }
+
+// TestLoadFlatI8MmapPaged_concurrentPageStats is the -race regression for AUDIT
+// #9: PageStats read the SpanCache counters without pagerMu, so a metrics
+// goroutine scraping it while Query threads fault pages in is an unsynchronized
+// read/write on the pager's counters. The existing concurrent test calls
+// PageStats single-threaded, so the race was latent. Run under -race.
+func TestLoadFlatI8MmapPaged_concurrentPageStats(t *testing.T) {
+	rng := rand.New(rand.NewPCG(91, 92))
+	const dim = 64
+	pg := os.Getpagesize()
+	blockRows := 4 * pg / dim
+	n := 12 * blockRows
+	path := writeFlatI8Blob(t, NewFlatI8(randUnitSet(rng, n, dim)))
+	paged, err := loadFlatI8MmapPaged(path, int64(3*blockRows*dim), blockRows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer paged.Close()
+
+	const G = 8
+	queries := make([][]float32, G)
+	for g := range G {
+		queries[g] = randUnit(rng, dim)
+	}
+	done := make(chan struct{})
+	// Query goroutines fault/evict pages (mutating the pager counters).
+	for g := range G {
+		go func(g int) {
+			defer func() { done <- struct{}{} }()
+			for range 30 {
+				paged.Query(queries[g], 10)
+			}
+		}(g)
+	}
+	// A metrics goroutine scraping PageStats concurrently — the racy read.
+	stop := make(chan struct{})
+	scraped := make(chan struct{})
+	go func() {
+		defer close(scraped)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _, _, _ = paged.PageStats()
+			}
+		}
+	}()
+	for range G {
+		<-done
+	}
+	close(stop)
+	<-scraped
+}
