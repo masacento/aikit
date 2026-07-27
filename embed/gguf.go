@@ -39,6 +39,7 @@ const (
 	ggmlTypeIQ3S  uint32 = 21
 	ggmlTypeIQ2S  uint32 = 22
 	ggmlTypeIQ4XS uint32 = 23
+	ggmlTypeMXFP4 uint32 = 39 // OCP Microscaling FP4: 32-elem block, e8m0 scale + 16 e2m1 nibble-pairs (gpt-oss)
 )
 
 // kvaluesIQ4NL is the 16-entry non-linear codebook shared by IQ4_NL and IQ4_XS:
@@ -508,7 +509,7 @@ func ggmlBlockElems(typ uint32) (int, bool) {
 	switch typ {
 	case ggmlTypeF32, ggmlTypeF16:
 		return 1, true
-	case ggmlTypeQ8_0, ggmlTypeQ4_0, ggmlTypeQ5_0, ggmlTypeIQ4NL:
+	case ggmlTypeQ8_0, ggmlTypeQ4_0, ggmlTypeQ5_0, ggmlTypeIQ4NL, ggmlTypeMXFP4:
 		return 32, true
 	case ggmlTypeQ2_K, ggmlTypeQ3_K, ggmlTypeQ4_K, ggmlTypeQ5_K, ggmlTypeQ6_K, ggmlTypeIQ4XS, ggmlTypeIQ2S, ggmlTypeIQ3S:
 		return qkK, true
@@ -553,6 +554,8 @@ func dequantRange(typ uint32, raw []byte, start int, dst []float32, blockElems i
 				dequantQ6KBlock(raw, first+k, out)
 			case ggmlTypeIQ4NL:
 				dequantIQ4NLBlock(raw, first+k, out)
+			case ggmlTypeMXFP4:
+				dequantMXFP4Block(raw, first+k, out)
 			case ggmlTypeIQ4XS:
 				dequantIQ4XSBlock(raw, first+k, out)
 			case ggmlTypeIQ2S:
@@ -573,7 +576,7 @@ func (g *GGUFFile) tensorBytes(info ggufTensorInfo, n int) ([]byte, error) {
 		nbytes = n * 4
 	case ggmlTypeF16:
 		nbytes = n * 2
-	case ggmlTypeQ8_0, ggmlTypeQ4_0, ggmlTypeQ5_0, ggmlTypeIQ4NL:
+	case ggmlTypeQ8_0, ggmlTypeQ4_0, ggmlTypeQ5_0, ggmlTypeIQ4NL, ggmlTypeMXFP4:
 		if n%32 != 0 {
 			return nil, fmt.Errorf("element count %d not a multiple of 32 (block size)", n)
 		}
@@ -583,6 +586,8 @@ func (g *GGUFFile) tensorBytes(info ggufTensorInfo, n int) ([]byte, error) {
 			nbytes = blocks * 34 // 2-byte f16 scale + 32 int8
 		case ggmlTypeQ4_0, ggmlTypeIQ4NL:
 			nbytes = blocks * 18 // 2-byte f16 scale + 16 packed nibbles
+		case ggmlTypeMXFP4:
+			nbytes = blocks * 17 // 1-byte e8m0 scale + 16 packed e2m1 nibbles
 		default: // Q5_0
 			nbytes = blocks * 22 // 2-byte f16 scale + 4-byte high bits + 16 packed nibbles
 		}
@@ -704,6 +709,39 @@ func dequantIQ4NLBlock(raw []byte, blk int, out []float32) {
 	for j := range 16 {
 		out[j] = d * float32(kvaluesIQ4NL[qs[j]&0x0F])
 		out[j+16] = d * float32(kvaluesIQ4NL[qs[j]>>4])
+	}
+}
+
+// mxfp4KValues is the e2m1 dequant table (the 16 representable FP4 values, doubled
+// so the lookup stays integer — paired with the HALF-scale e8m0 below, d·half ·
+// value·2 recovers the true product). ref: gguf/quants.py MXFP4.kvalues; OCP MX v1.0.
+var mxfp4KValues = [16]int8{0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12}
+
+// e8m0ToF32Half converts an 8-bit e8m0 block scale to float32, matching ggml's
+// ggml_e8m0_to_fp32_half (gguf/quants.py MXFP4.e8m0_to_fp32_half): x<2 is a
+// subnormal bit pattern, else the exponent field is x-1. The exact bit formula
+// (not 2^(x-128)) keeps the x∈{0,1} subnormals bit-identical to the reference.
+func e8m0ToF32Half(x uint8) float32 {
+	var bits uint32
+	if x < 2 {
+		bits = uint32(0x00200000) << uint32(x)
+	} else {
+		bits = uint32(x-1) << 23
+	}
+	return math.Float32frombits(bits)
+}
+
+// dequantMXFP4Block dequantizes one 17-byte MXFP4 (OCP FP4, ggml type 39) block into
+// out[:32]: byte 0 is the e8m0 power-of-two block scale, bytes 1..16 each pack two
+// e2m1 4-bit values (element j in the low nibble, j+16 in the high nibble — matching
+// gguf/quants.py's reshape((n,2,16)) split). Used by gpt-oss's MXFP4 expert weights.
+func dequantMXFP4Block(raw []byte, blk int, out []float32) {
+	base := blk * 17
+	d := e8m0ToF32Half(raw[base])
+	qs := raw[base+1 : base+17]
+	for j := range 16 {
+		out[j] = d * float32(mxfp4KValues[qs[j]&0x0F])
+		out[j+16] = d * float32(mxfp4KValues[qs[j]>>4])
 	}
 }
 
