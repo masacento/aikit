@@ -212,6 +212,14 @@ func LoadWeights(dir string) (*Weights, error) {
 	if err := cfg.ValidateAssumptions(); err != nil {
 		return nil, err
 	}
+	// Pooling is a declared per-model property — read it here too, not only in
+	// LoadWeightsFromFS. Without this the mmap loader (and LoadQ8, which wraps it)
+	// left cfg.pooling "" and poolOne silently treats "" as CLS, so a mean-pooled
+	// checkpoint (nomic-embed-text-v1.5) returned CLS vectors with no error.
+	// poolCLS is the absent-file fallback, matching LoadWeightsFromFS.
+	if cfg.pooling, err = poolingFromConfig(dir, poolCLS); err != nil {
+		return nil, err
+	}
 	st, err := embed.OpenSafetensorsMmap(filepath.Join(dir, "model.safetensors"))
 	if err != nil {
 		return nil, fmt.Errorf("encoder: open safetensors: %w", err)
