@@ -266,6 +266,15 @@ func (d *Device) ReleaseAll() {
 	}
 }
 
+// LedgerLen reports how many MTLBuffers and non-buffer objc objects this Device still owns —
+// the observability hook for leak tests (Close/ReleaseAll must drive both to 0). Held under the
+// same mutex the ledger mutations use.
+func (d *Device) LedgerLen() (allocs, objs int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.allocs), len(d.objs)
+}
+
 // ReleaseBuf releases ONE MTLBuffer and removes it from the ledger, so a later ReleaseAll won't
 // double-free it (C5). For per-call scratch that must not accumulate on the ledger until Close —
 // the caller MUST ensure no in-flight GPU work references it (PrefillLast commits+waits before its
