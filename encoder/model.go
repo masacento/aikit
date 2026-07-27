@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"sync"
 
@@ -36,8 +37,23 @@ type Model struct {
 // Load reads a CodeRankEmbed snapshot from dir (config.json,
 // model.safetensors, tokenizer.json — the standard HF layout). Cf.
 // embed.LoadFromFS for the analogous Model2Vec loader.
+//
+// Load takes the mmap loader (LoadWeights), so the checkpoint stays in the OS
+// page cache instead of a full Go-heap copy that GC scans — the regression M8 was
+// written to fix — and Close actually releases the mapping. LoadFromFS keeps the
+// fs.FS/embed.FS route (fs.ReadFile, heap) for callers without a real directory.
+// Audit #2: previously Load delegated to LoadFromFS, so no caller used the mmap
+// path and Close on a Load-built model was a no-op.
 func Load(dir string) (*Model, error) {
-	return LoadFromFS(os.DirFS(dir), ".")
+	w, err := LoadWeights(dir)
+	if err != nil {
+		return nil, err
+	}
+	tok, err := embed.LoadTokenizer(filepath.Join(dir, "tokenizer.json"))
+	if err != nil {
+		return nil, fmt.Errorf("encoder: load tokenizer: %w", err)
+	}
+	return &Model{weights: w, tok: tok, maxSeqLength: DefaultMaxSeqLength}, nil
 }
 
 // LoadFromFS reads from fsys rooted at dir. Same file shape as Load.
