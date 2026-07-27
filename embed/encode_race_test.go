@@ -19,10 +19,9 @@ import (
 //
 //   - All StaticModel fields are initialized at Load() and never
 //     mutated after (read-only access from any goroutine is safe).
-//   - encodeIDs allocates fresh per-call slices (rows, w) and reads
-//     from m.embeddings as a slice view (shared backing, read-only).
-//   - weightedMeanPoolSafe writes only to per-call locals (sum, wsum,
-//     out); l2Normalize mutates only its caller-owned input slice.
+//   - encodeIDs writes only to per-call locals (sum, wsum, out) and reads
+//     m.embeddings as a slice view (shared backing, read-only); l2Normalize
+//     mutates only its caller-owned input slice.
 //   - Tokenizer's vocab + addedTokens are map[string]int32 built at
 //     Load and never written after — Go's memory model permits
 //     concurrent read-only map access.

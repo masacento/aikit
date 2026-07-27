@@ -173,80 +173,44 @@ func (m *StaticModel) Encode(text string) []float32 {
 }
 
 // encodeIDs is the inner path used by Encode and by tests that supply raw IDs.
+// It computes Σ embRow[id]·w[id] / Σ w[id] — the verified Model2Vec runtime mean
+// pooling — accumulating directly into one float64 sum in a single pass over ids,
+// with no per-call [][]float32 / []float64 staging (audit #18: this is the primary
+// dense-retrieval path; the old staging cost ~1.1M slice allocations over a 378k
+// chunk corpus and lost sequential access by pooling through a slice-of-slices).
+//
+// PRECISION CONTRACT (required for golden-test parity, unchanged from the previous
+// weightedMeanPoolSafe): the accumulator sum[dim], wsum, and the L2 dot are
+// float64; each embedding element (float32) is widened to float64 BEFORE the
+// multiply-accumulate; the output is cast to float32 only at the end, matching
+// numpy's astype(float64)…astype(float32) in pin_inference.py. Accumulating in
+// float32 silently drifts cosine below the 1−1e-5 parity bar on longer inputs — do
+// not "optimize" it away. Out-of-range ids contribute zero (no-op tokens); an
+// all-pad / Σw==0 input returns a zero vector.
 func (m *StaticModel) encodeIDs(ids []int32) []float32 {
+	out := make([]float32, m.dim)
 	if len(ids) == 0 {
-		return make([]float32, m.dim)
+		return out
 	}
-
-	rows := make([][]float32, len(ids))
-	w := make([]float64, len(ids))
-	for i, id := range ids {
+	sum := make([]float64, m.dim)
+	var wsum float64
+	for _, id := range ids {
 		if id < 0 || int(id) >= m.vocab {
-			// Out-of-range id — treat as a no-op token (zero contribution).
-			// Skip via zero weight; the corresponding row stays nil and is
-			// handled by the pool helper.
-			rows[i] = nil
-			w[i] = 0
-			continue
+			continue // out-of-range id → zero contribution
 		}
 		embRow := int64(id) // standard format: token id indexes embeddings directly
 		if m.mapping != nil {
 			embRow = m.mapping[id] // quantized format: indirect through mapping[]
 		}
 		if embRow < 0 || int(embRow) >= m.vocab {
-			rows[i] = nil
-			w[i] = 0
 			continue
 		}
-		start := int(embRow) * m.dim
-		rows[i] = m.embeddings[start : start+m.dim]
-		w[i] = 1.0 // uniform (plain mean) when no explicit weights
+		row := m.embeddings[int(embRow)*m.dim : int(embRow)*m.dim+m.dim]
+		ww := 1.0 // uniform (plain mean) when no explicit weights
 		if m.weights != nil {
-			w[i] = m.weights[id]
+			ww = m.weights[id]
 		}
-	}
-
-	pooled := weightedMeanPoolSafe(rows, w, m.dim)
-	if m.normalize {
-		pooled = l2Normalize(pooled)
-	}
-	return pooled
-}
-
-// weightedMeanPoolSafe computes Σ rows[i]·weights[i] / Σ weights[i], the
-// verified Model2Vec runtime pooling algorithm. Tolerates nil rows
-// (treated as zero contribution; used when ids contain out-of-range values).
-//
-// `rows` is a logical [N, dim] view: rows[i] is a slice of length dim into
-// the embeddings tensor (F32). `weights` is length N (F64 from the model).
-//
-// PRECISION CONTRACT (required for golden-test parity):
-//   - All accumulators (sum[dim], wsum, the dot product inside L2 norm) are
-//     float64. Each `rows[i][j]` (float32) is widened to float64 BEFORE
-//     multiplying by w[i] and accumulating.
-//   - Output is float32 (cast at the end), matching numpy's
-//     `embeddings[...].astype(np.float64) ... .astype(np.float32)` shape
-//     in pin_inference.py.
-//
-// Doing the accumulation in float32 will silently drift cosine below the
-// 1 − 1e-5 parity bar on longer inputs. This is the single most likely
-// silent failure mode for a re-implementer; do not "optimize" it away.
-//
-// Returns a zero vector if N==0 or Σweights == 0 (an all-pad / all-zero-weight
-// degenerate case).
-func weightedMeanPoolSafe(rows [][]float32, weights []float64, dim int) []float32 {
-	out := make([]float32, dim)
-	if len(rows) == 0 {
-		return out
-	}
-	sum := make([]float64, dim)
-	var wsum float64
-	for i, row := range rows {
-		if row == nil {
-			continue
-		}
-		ww := weights[i]
-		for j := range dim {
+		for j := range m.dim {
 			sum[j] += float64(row[j]) * ww
 		}
 		wsum += ww
@@ -254,8 +218,11 @@ func weightedMeanPoolSafe(rows [][]float32, weights []float64, dim int) []float3
 	if wsum == 0 {
 		return out
 	}
-	for j := range dim {
+	for j := range m.dim {
 		out[j] = float32(sum[j] / wsum)
+	}
+	if m.normalize {
+		return l2Normalize(out)
 	}
 	return out
 }

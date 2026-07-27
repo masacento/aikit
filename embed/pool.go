@@ -14,8 +14,7 @@ const l2NormEps = 1e-12
 // keep downstream cosine-similarity computations well-behaved.
 //
 // Precision: the sum-of-squares accumulator is float64. Float32 accumulation
-// here would compound the drift introduced by float32 accumulation in
-// weightedMeanPoolSafe.
+// here would compound the drift from float32 accumulation in // encodeIDs's float64 pooling.
 func l2Normalize(v []float32) []float32 {
 	var sq float64
 	for _, x := range v {
