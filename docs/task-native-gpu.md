@@ -100,11 +100,39 @@ parts that are **stable and verbatim**, never the parts that are moving or braid
   This proves the shared-substrate relationship (goinfer builds its kernels on aikit's device
   layer — the GPU analogue of the existing `linalg` relationship) without touching a kernel.
 
-**Explicitly deferred to Phase 1b (gated on: the tuned kernels stabilizing *and* ANN-GPU being
-funded for real):** the CUDA device impl (gocudrv wrapper + `LockOSThread` executor); the
-**blob-split + lift of the tuned W4A8/W8A8 kernels**; re-pointing goinfer's CUDA backend. Those
-carry the real cost — a moving API and the blob-split — and there is no reason to pay it in the
-first cut. When ANN-GPU is funded, swap the minimal proving kernel for the tuned one and add CUDA.
+**Phase 1b — the CUDA device impl — ✅ DONE (device layer + proving kernels).** The Linux mirror
+of Phase 1, verified on an RTX 2070 SUPER:
+
+- **`gpu/cuda.go` (`//go:build linux`)** — the same `Device`/`Buffer`/`Queue`/`Pipeline`/`Encoder`
+  vocabulary as `metal.go`, over `gocudrv` (cgo-free by construction: dlopen'd libcuda, no
+  toolkit at runtime). Build-tag mutually exclusive with the Metal impl, so the shared type
+  names never collide and consumers read the same on both platforms. Ann-free, like `metal.go`.
+  Three documented divergences, all forced by the hardware rather than chosen: transfers are
+  explicit (a discrete GPU has no UMA mapping, so Metal's zero-copy `Floats()`/`SetU32` writes
+  cannot be honored — faking them would silently drop writes); kernels must bounds-check (a CUDA
+  launch rounds up to whole blocks where `dispatchThreads` launches exactly n); and dispatch
+  returns `error` (a failed `cuLaunchKernel` must not read back as a buffer of zeros).
+- **Thread affinity — structural, not hand-rolled.** The crash class that hit Metal via
+  `NSAutoreleasePool` applies to CUDA's thread-bound contexts too, but no `runtime.LockOSThread`
+  appears in this layer: `gocudrv`'s `Context` owns a dedicated `LockOSThread`'d executor
+  goroutine and funnels every driver call through it. `TestCUDA_concurrentScore` holds that
+  claim honest.
+- **`gpu/anncuda`** (nested module, mirroring `gpu/annmetal`) — the CUDA `ann.Backend` with
+  minimal, correctness-only `gemv_w8a8` / `gemm_w8a8` kernels, shipped as PTX built by
+  `gpu/build_ptx.sh` (NVRTC, reproducible from the committed `.cu` — never hand-edited).
+- **Parity-gated, break-it-first.** GPU top-k ≡ CPU `linalg.MatmulBTW8A8` top-k for both the
+  single-query GEMV and the batched GEMM, worst score Δ `0.000e+00` — bit-identical, as the
+  exact-integer-arithmetic argument predicts. Mutation-tested: dropping the row rescale and
+  transposing the GEMM's index decode each fail the gate. One honest limit found that way — the
+  off-block-boundary shape test does *not* catch a deleted bounds guard (the overhang lands in
+  allocation slack); the device layer's sentinel-canary `TestCUDA_tailBlockGuard` is what does,
+  and the tests say so.
+
+**Still deferred (gated on the tuned kernels stabilizing):** the **blob-split + lift of the tuned
+W4A8/W8A8 kernels**, and re-pointing goinfer's CUDA backend at this device layer (the CUDA analog
+of the Metal device re-point, tag-gated, after a `gpu/v0.2.0` cutting the new CUDA surface). Those
+carry the real cost — a moving API and the blob-split — and there is no reason to pay it here.
+When ANN-GPU is funded, swap the minimal proving kernels for the tuned ones.
 
 **Phase 2 — ANN-GPU, completed (the headline unlock).** Phase 1 lands the `ann.Backend` seam
 and a minimal single-query path; Phase 2 turns it into the real win: swap the proving kernel for
@@ -160,10 +188,11 @@ present, WebGPU where portable, CPU always).
 
 ## Recommended sequence
 
-**Phase 0 ✅ done** → **Phase 1 (scoped first cut)** — `aikit/gpu` + Metal device layer +
-minimal-kernel ANN proof + goinfer-Metal device re-point, as a named product bet → **Phase 1b**
-(CUDA device impl + the tuned-GEMV blob-split), *gated on the kernels settling + ANN-GPU being
-funded* → **Phase 2** (ANN-GPU completed: tuned kernel, CUDA, batch-GEMM — the headline) →
-Phase 3 (vision native + Qwen ViT) → Phase 4 (encoder native). Each gated, each independently
-shippable, each leaving aikit stronger and still cgo-free. The first cut is small and low-risk;
-the cost and the moving-API risk are quarantined into 1b, behind their trigger.
+**Phase 0 ✅ done** → **Phase 1 ✅ done (scoped first cut)** — `aikit/gpu` + Metal device layer +
+minimal-kernel ANN proof + goinfer-Metal device re-point, as a named product bet → **Phase 2
+✅ done** (ANN-GPU batch-GEMM — the headline) → **Phase 1b ✅ done** (CUDA device impl + the CUDA
+ANN backend, parity-gated on an RTX 2070 SUPER) → **next: the tuned-GEMV blob-split + the goinfer
+CUDA device re-point**, *gated on the decode kernels settling* → Phase 3 (vision native + Qwen
+ViT) → Phase 4 (encoder native). Each gated, each independently shippable, each leaving aikit
+stronger and still cgo-free. The device substrate is now two-platform; the remaining cost and
+moving-API risk are quarantined into the blob-split, behind its trigger.

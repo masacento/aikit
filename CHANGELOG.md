@@ -12,6 +12,17 @@ it.
 
 ### Added
 
+- **CUDA device layer + GPU-scored ANN on NVIDIA (native-GPU Phase 1b).** The Linux
+  mirror of the shipped Metal work, so the substrate is now two-platform. `gpu/cuda.go`
+  (`//go:build linux`) presents the same `Device`/`Buffer`/`Queue`/`Pipeline`/`Encoder`
+  vocabulary as `gpu/metal.go` over `gocudrv` (cgo-free, dlopen'd libcuda); the new
+  `gpu/anncuda` nested module registers the CUDA `ann.Backend` with `gemv_w8a8` /
+  `gemm_w8a8` kernels (PTX, built by `gpu/build_ptx.sh` via NVRTC, so the runtime needs
+  no CUDA toolkit). Verified on an RTX 2070 SUPER: GPU top-k ≡ CPU `linalg.MatmulBTW8A8`
+  top-k for both the single-query GEMV and the batched GEMM, worst score Δ `0.000e+00`
+  (the int8 dot is exact integer arithmetic). Device-only and hand-run; `gocudrv` is
+  confined to the `gpu` module under `//go:build linux`, so the root module's
+  one-dependency-tier invariant and the darwin/default builds are untouched.
 - **`ann.FlatI8.QueryBatch(queries, k)` + GPU batched int8 GEMM (native-GPU Phase 2).**
   Scores a whole batch of queries against the corpus in one dispatch when the index
   is GPU-enabled (`ann.I8BatchIndex`, implemented by the Metal backend) — the batched

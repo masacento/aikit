@@ -1,0 +1,586 @@
+//go:build linux
+
+// cuda.go is the CUDA half of aikit's cgo-free GPU device substrate — the Linux
+// mirror of metal.go (docs/task-native-gpu.md, Phase 1b). It presents the SAME
+// vocabulary as the Metal impl — Device / Buffer / Queue / Pipeline / Encoder,
+// CreateSystemDefaultDevice, NewBuffer*, Run1D, Begin/Dispatch/End, and the
+// allocation ledger (ReleaseAll / ReleaseBuf / ReleaseObjects / LedgerLen) — so a
+// consumer reads the same on both platforms. The two files are build-tag mutually
+// exclusive (darwin vs linux), so the shared type names never collide.
+//
+// It is a thin wrapper over github.com/eitamring/gocudrv, which dlopens libcuda
+// and is cgo-free by construction (CGO_ENABLED=0 throughout). No aikit imports —
+// the device layer stays ann-free, exactly like metal.go.
+//
+// # Three places the CUDA surface deliberately diverges from Metal
+//
+//  1. **Host memory is not device memory.** Apple's UMA lets an MTLBuffer's
+//     contents be a zero-copy Go slice, so metal.go's Floats/Int8s/SetU32 both
+//     read AND write device memory in place. A discrete NVIDIA GPU has no such
+//     mapping, so faking those views would silently drop writes. Transfers are
+//     therefore EXPLICIT here: WriteFloats/WriteInt8s/SetU32 upload,
+//     ReadFloats/ReadInt8s/ReadU32 download. Same buffer constructors, explicit
+//     traffic.
+//
+//  2. **Dispatch launches whole blocks.** Metal's dispatchThreads launches
+//     EXACTLY n threads, so its kernels need no bounds check. CUDA launches
+//     ceil(n/tg) blocks of tg threads, so the tail block overruns n. Every kernel
+//     run through this layer MUST guard its global index against its own count
+//     parameter — see gpu/anncuda's kernels for the shape.
+//
+//  3. **Failures are returned, not swallowed.** Metal's Run1D/Dispatch/End are
+//     infallible (objc msgSend has nothing to report); cuLaunchKernel does. These
+//     return error rather than let a failed launch read back as a buffer of zeros
+//     — an OOM or a bad grid wearing a parity bug's clothes.
+//
+// # Thread affinity
+//
+// A CUDA context is bound to an OS thread, so a per-call dispatch from a
+// migrating goroutine is an intermittent-crash generator — the same class of bug
+// NSAutoreleasePool caused on the Metal side (see gpu/annmetal's runLocked).
+// Nothing here needs runtime.LockOSThread: gocudrv's Context OWNS a dedicated
+// runtime.LockOSThread'd executor goroutine and funnels every driver call
+// (alloc, memcpy, launch, sync) through it. The affinity guarantee is structural,
+// which is why this file has no pinning of its own.
+package gpu
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"sync"
+	"unsafe"
+
+	gc "github.com/eitamring/gocudrv/cuda"
+	"github.com/eitamring/gocudrv/cudasys"
+)
+
+// bg is the context.Context every gocudrv call takes. The driver calls this layer
+// makes are short and already serialized on the context's pinned executor, so
+// there is nothing to cancel; a real deadline belongs to the caller's request, not
+// to a memcpy.
+var bg = context.Background()
+
+// Device wraps a CUDA primary context and OWNS every allocation made through it.
+//
+// The ledger mirrors metal.go's: gocudrv requires every Buffer be closed before
+// its Context (a buffer outliving the context cannot reach the executor to free
+// itself), so tracking allocations centrally is what makes "release a resident
+// model" a single call. Modules and streams are tracked alongside as objs.
+type Device struct {
+	cx  *gc.Context
+	dev *gc.Device
+
+	mu     sync.Mutex
+	allocs []*gc.Buffer[uint8] // every device allocation handed out, for ReleaseAll
+	objs   []closer            // modules + streams, for ReleaseObjects
+}
+
+// closer is the shared shape of the non-buffer resources the Device tracks
+// (gc.Module, gc.Stream): both free driver-owned handles at Close.
+type closer interface{ Close() error }
+
+// CreateSystemDefaultDevice initializes the driver and retains device 0's primary
+// context — the CUDA analogue of MTLCreateSystemDefaultDevice, and named the same
+// so consumer code is platform-agnostic. Returns an error (not a panic) when there
+// is no libcuda, no device, or no context: callers degrade to the CPU path.
+func CreateSystemDefaultDevice() (*Device, error) {
+	if err := gc.Init(); err != nil {
+		return nil, fmt.Errorf("cuda: driver init: %w", err)
+	}
+	dev, err := gc.GetDevice(0)
+	if err != nil {
+		return nil, fmt.Errorf("cuda: GetDevice(0): %w", err)
+	}
+	cx, err := dev.Primary()
+	if err != nil {
+		return nil, fmt.Errorf("cuda: retain primary context: %w", err)
+	}
+	return &Device{cx: cx, dev: dev}, nil
+}
+
+// Name is the device's product name (e.g. "NVIDIA GeForce RTX 2070 SUPER"), or ""
+// if the driver cannot report it. Mirrors metal.go's Name — diagnostics only, so a
+// query failure degrades to the empty string rather than complicating the signature.
+func (d *Device) Name() string {
+	n, err := d.dev.Name()
+	if err != nil {
+		return ""
+	}
+	return n
+}
+
+// Context exposes the underlying gocudrv context, for consumers that need driver
+// surface this layer does not wrap (events, graphs, cooperative launch). goinfer's
+// tuned decode kernels are the intended caller when they re-point onto this layer.
+func (d *Device) Context() *gc.Context { return d.cx }
+
+// TrackObj records a driver-owned handle (module, stream) so ReleaseObjects frees
+// it at Close. Mirrors metal.go's TrackObj.
+func (d *Device) TrackObj(c closer) {
+	if c == nil {
+		return
+	}
+	d.mu.Lock()
+	d.objs = append(d.objs, c)
+	d.mu.Unlock()
+}
+
+// ReleaseAll frees every device allocation this Device handed out and empties the
+// ledger. Callers MUST ensure no launch is still in flight against them (releasing
+// memory a running kernel reads is a use-after-free). Idempotent.
+func (d *Device) ReleaseAll() {
+	d.mu.Lock()
+	bufs := d.allocs
+	d.allocs = nil
+	d.mu.Unlock()
+	for _, b := range bufs {
+		_ = b.Close()
+	}
+}
+
+// ReleaseObjects frees the modules and streams this Device tracked, then releases
+// the primary context — the CUDA counterpart of metal.go's ReleaseObjects.
+//
+// It drains the buffer ledger FIRST (via ReleaseAll) because gocudrv cannot free a
+// Buffer once its Context is closed: the free has to reach the context's executor.
+// Metal has no such ordering constraint, so the two-defer idiom that is merely
+// tidy there (`defer d.ReleaseObjects(); defer d.ReleaseAll()`) is load-bearing
+// here — calling ReleaseAll internally makes the correct order unconditional
+// rather than something every caller has to remember. Idempotent: it nils the
+// context, so a second call (or a double Close) is a no-op.
+func (d *Device) ReleaseObjects() {
+	d.ReleaseAll()
+	d.mu.Lock()
+	objs := d.objs
+	d.objs = nil
+	cx := d.cx
+	d.cx = nil
+	d.mu.Unlock()
+	for _, o := range objs {
+		_ = o.Close()
+	}
+	if cx != nil {
+		_ = cx.Close()
+	}
+}
+
+// ReleaseBuf frees ONE allocation and removes it from the ledger, so a later
+// ReleaseAll won't double-free it. For per-call scratch that must not accumulate
+// until Close — the caller MUST ensure no in-flight launch references it. O(n)
+// swap-remove scan: fine for coarse per-request scratch, never a per-token path.
+// A zero Buffer is a no-op. Mirrors metal.go's ReleaseBuf.
+func (d *Device) ReleaseBuf(b Buffer) {
+	if b.b == nil {
+		return
+	}
+	d.mu.Lock()
+	for i, x := range d.allocs {
+		if x == b.b {
+			d.allocs[i] = d.allocs[len(d.allocs)-1]
+			d.allocs = d.allocs[:len(d.allocs)-1]
+			break
+		}
+	}
+	d.mu.Unlock()
+	_ = b.b.Close()
+}
+
+// LedgerLen reports how many allocations and non-buffer objects this Device still
+// owns — the observability hook for leak tests (ReleaseObjects must drive both to
+// 0). Mirrors metal.go's LedgerLen.
+func (d *Device) LedgerLen() (allocs, objs int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.allocs), len(d.objs)
+}
+
+// ---- modules + pipelines ----
+
+// Library is a loaded PTX module — the CUDA counterpart of an MTLLibrary.
+type Library struct{ m *gc.Module }
+
+// CompileLibrary hands `ptx` to the driver's JIT (cuModuleLoadData) and returns the
+// module. It is the CUDA counterpart of metal.go's CompileLibrary, with the one
+// unavoidable signature change: Metal compiles MSL *source* at run time, whereas
+// the cgo-free CUDA path ships PTX built ahead of time (build_ptx.sh → NVRTC →
+// go:embed) so the runtime needs no CUDA toolkit — only libcuda. That also means
+// there is no languageVersion landmine to defuse on this side.
+func (d *Device) CompileLibrary(ptx []byte) (Library, error) {
+	if d.cx == nil {
+		return Library{}, fmt.Errorf("cuda: CompileLibrary on a released device")
+	}
+	m, err := d.cx.LoadModule(ptx)
+	if err != nil {
+		return Library{}, fmt.Errorf("cuda: LoadModule: %w", err)
+	}
+	d.TrackObj(m)
+	return Library{m: m}, nil
+}
+
+// Pipeline is a kernel entry point — the CUDA counterpart of an
+// MTLComputePipelineState. Value type, like Metal's.
+type Pipeline struct{ f *gc.Function }
+
+// NewComputePipeline looks a kernel up in a loaded module. The kernel must be
+// declared `extern "C"` so its name is unmangled.
+func (d *Device) NewComputePipeline(lib Library, fn string) (Pipeline, error) {
+	if lib.m == nil {
+		return Pipeline{}, fmt.Errorf("cuda: pipeline %q: nil library", fn)
+	}
+	f, err := lib.m.Function(fn)
+	if err != nil {
+		return Pipeline{}, fmt.Errorf("cuda: no kernel %q in module: %w", fn, err)
+	}
+	return Pipeline{f: f}, nil
+}
+
+// ---- buffers ----
+
+// Buffer is a device allocation, addressed as raw bytes exactly like an MTLBuffer.
+// A single untyped Buffer (rather than gocudrv's generic Buffer[T]) is what lets
+// the variadic `bufs ...Buffer` dispatch signature mirror Metal's; the element type
+// lives in the kernel signature, where it already had to agree.
+type Buffer struct {
+	b   *gc.Buffer[uint8]
+	n   int     // element count in the constructor's unit (floats, int8s, u32s, …)
+	off uintptr // byte offset for binding (a sub-view into a larger buffer; 0 = whole)
+}
+
+// At returns a view of the buffer bound at byteOff — for reading a slice of a
+// combined buffer. Zero-copy; only the bind offset changes. Mirrors metal.go's At.
+func (b Buffer) At(byteOff int) Buffer { b.off = uintptr(byteOff); return b }
+
+// Len is the buffer's element count in its constructor's unit.
+func (b Buffer) Len() int { return b.n }
+
+// MustBuf turns a FAILED allocation into a loud panic instead of a silently unusable
+// Buffer, and records it so ReleaseAll can free it — metal.go's discipline, kept
+// verbatim: an OOM must not surface downstream as garbage numerics. Consumers that
+// can degrade (a backend's init, an EnableGPU) recover the panic and fall back to CPU.
+func (d *Device) MustBuf(nBytes, n int, what string) Buffer {
+	if d.cx == nil {
+		panic(fmt.Sprintf("cuda: allocation on a released device (%s, %d bytes)", what, nBytes))
+	}
+	buf, err := gc.Alloc[uint8](d.cx, nBytes)
+	if err != nil {
+		panic(fmt.Sprintf("cuda: device allocation failed (%s, %d bytes): %v", what, nBytes, err))
+	}
+	d.mu.Lock()
+	d.allocs = append(d.allocs, buf)
+	d.mu.Unlock()
+	return Buffer{b: buf, n: n}
+}
+
+// asBytes reinterprets a slice of fixed-size scalars as the []byte gocudrv copies.
+// The caller must runtime.KeepAlive the source across the copy.
+func asBytes[T any](s []T) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	var z T
+	return unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), len(s)*int(unsafe.Sizeof(z)))
+}
+
+// upload copies src into the buffer at its bind offset.
+func (b Buffer) upload(src []byte) error {
+	if b.b == nil {
+		return fmt.Errorf("cuda: upload to a nil buffer")
+	}
+	if len(src) == 0 {
+		return nil
+	}
+	if got, want := b.b.Bytes(), uint64(b.off)+uint64(len(src)); got < want {
+		return fmt.Errorf("cuda: upload of %d bytes at offset %d overruns a %d-byte buffer", len(src), b.off, got)
+	}
+	return b.b.CopyFromAt(bg, int(b.off), src)
+}
+
+// download copies the buffer's contents at its bind offset into dst.
+func (b Buffer) download(dst []byte) error {
+	if b.b == nil {
+		return fmt.Errorf("cuda: download from a nil buffer")
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	if got, want := b.b.Bytes(), uint64(b.off)+uint64(len(dst)); got < want {
+		return fmt.Errorf("cuda: download of %d bytes at offset %d overruns a %d-byte buffer", len(dst), b.off, got)
+	}
+	return b.b.CopyToAt(bg, dst, int(b.off))
+}
+
+// NewBufferFloats allocates a device buffer and uploads data into it.
+func (d *Device) NewBufferFloats(data []float32) Buffer {
+	b := d.MustBuf(len(data)*4, len(data), "floats")
+	if err := b.upload(asBytes(data)); err != nil {
+		panic(fmt.Sprintf("cuda: NewBufferFloats upload: %v", err))
+	}
+	runtime.KeepAlive(data)
+	return b
+}
+
+// NewBufferLen allocates an uninitialized device buffer of nFloats float32s.
+func (d *Device) NewBufferLen(nFloats int) Buffer { return d.MustBuf(nFloats*4, nFloats, "len") }
+
+// NewBufferBytes allocates an uninitialized device buffer of n BYTES (n is also
+// the element count for the returned Buffer) — the primitive for consumers that
+// size in raw bytes rather than float32s.
+func (d *Device) NewBufferBytes(n int) Buffer { return d.MustBuf(n, n, "bytes") }
+
+// NewBufferInt8 uploads int8 data (n counts bytes for this buffer).
+func (d *Device) NewBufferInt8(data []int8) Buffer {
+	b := d.MustBuf(len(data), len(data), "int8")
+	if err := b.upload(asBytes(data)); err != nil {
+		panic(fmt.Sprintf("cuda: NewBufferInt8 upload: %v", err))
+	}
+	runtime.KeepAlive(data)
+	return b
+}
+
+// NewBufferU32 uploads a single uint32 (a kernel scalar passed by reference, the
+// shape metal.go uses for `constant uint&` args).
+func (d *Device) NewBufferU32(v uint32) Buffer {
+	b := d.MustBuf(4, 1, "u32")
+	if err := b.upload(asBytes([]uint32{v})); err != nil {
+		panic(fmt.Sprintf("cuda: NewBufferU32 upload: %v", err))
+	}
+	return b
+}
+
+// NewBufferUint32s uploads packed u32 data (n counts u32 words).
+func (d *Device) NewBufferUint32s(data []uint32) Buffer {
+	b := d.MustBuf(len(data)*4, len(data), "uint32s")
+	if err := b.upload(asBytes(data)); err != nil {
+		panic(fmt.Sprintf("cuda: NewBufferUint32s upload: %v", err))
+	}
+	runtime.KeepAlive(data)
+	return b
+}
+
+// NewBufferU16s uploads u16 data (e.g. f16 group scales; n counts u16s). An empty
+// input still yields a live 1-element buffer, so a kernel arg is never a null
+// pointer — metal.go does the same.
+func (d *Device) NewBufferU16s(data []uint16) Buffer {
+	if len(data) == 0 {
+		return d.MustBuf(2, 1, "u16s")
+	}
+	b := d.MustBuf(len(data)*2, len(data), "u16s")
+	if err := b.upload(asBytes(data)); err != nil {
+		panic(fmt.Sprintf("cuda: NewBufferU16s upload: %v", err))
+	}
+	runtime.KeepAlive(data)
+	return b
+}
+
+// WriteFloats / WriteInt8s / WriteUint32s / SetU32 upload into an existing buffer.
+// On Metal these are slice writes through the UMA mapping; here they are explicit
+// H2D copies (divergence 1 in the file header).
+func (b Buffer) WriteFloats(src []float32) error {
+	err := b.upload(asBytes(src))
+	runtime.KeepAlive(src)
+	return err
+}
+
+func (b Buffer) WriteInt8s(src []int8) error {
+	err := b.upload(asBytes(src))
+	runtime.KeepAlive(src)
+	return err
+}
+
+func (b Buffer) WriteUint32s(src []uint32) error {
+	err := b.upload(asBytes(src))
+	runtime.KeepAlive(src)
+	return err
+}
+
+// SetU32 overwrites a 1-word uniform buffer (per-call: rope pos, nKeys, a row count).
+func (b Buffer) SetU32(v uint32) error { return b.upload(asBytes([]uint32{v})) }
+
+// ReadFloats / ReadInt8s / ReadUint32s download into caller-owned storage; the
+// slice's length is the transfer size. ReadU32 reads a 1-word buffer.
+func (b Buffer) ReadFloats(dst []float32) error {
+	err := b.download(asBytes(dst))
+	runtime.KeepAlive(dst)
+	return err
+}
+
+func (b Buffer) ReadInt8s(dst []int8) error {
+	err := b.download(asBytes(dst))
+	runtime.KeepAlive(dst)
+	return err
+}
+
+func (b Buffer) ReadUint32s(dst []uint32) error {
+	err := b.download(asBytes(dst))
+	runtime.KeepAlive(dst)
+	return err
+}
+
+func (b Buffer) ReadU32() (uint32, error) {
+	var v [1]uint32
+	if err := b.download(asBytes(v[:])); err != nil {
+		return 0, err
+	}
+	return v[0], nil
+}
+
+// arg builds the kernel argument for this buffer. At offset 0 it goes through
+// gocudrv's Arg, which holds the buffer's lock for the launch (so a concurrent
+// Close cannot free memory out from under a running kernel); an offset view has to
+// pass a raw device pointer and forgoes that guard, which is why At is documented
+// as a sub-view of a buffer the caller keeps alive.
+func (b Buffer) arg() gc.KernelArg {
+	if b.off == 0 {
+		return gc.Arg(b.b)
+	}
+	return gc.ArgDevicePtr(b.b.DevicePtr() + cudasys.CUdeviceptr(b.off))
+}
+
+// ---- queue + dispatch ----
+
+// Queue is a CUDA stream — the counterpart of an MTLCommandQueue. Value type.
+type Queue struct {
+	d *Device
+	s *gc.Stream // nil ⇒ the default (null) stream
+}
+
+// NewCommandQueue creates the stream work is submitted on (built once, reused).
+// Total, like Metal's: if the driver declines a new stream, the Queue falls back to
+// the default (null) stream, which is a valid submission target — a degraded
+// stream is not worth failing a whole backend over.
+func (d *Device) NewCommandQueue() Queue {
+	s, err := d.cx.NewStream()
+	if err != nil {
+		return Queue{d: d}
+	}
+	d.TrackObj(s)
+	return Queue{d: d, s: s}
+}
+
+// grid computes the launch geometry for n threads at threadgroup width tg. CUDA
+// launches WHOLE blocks, so the tail block overruns n — every kernel dispatched
+// here must bounds-check its global index (divergence 2 in the file header).
+func grid(n, tg int) (gc.LaunchConfig, error) {
+	if n <= 0 {
+		return gc.LaunchConfig{}, fmt.Errorf("cuda: dispatch of %d threads", n)
+	}
+	if tg <= 0 {
+		tg = 256
+	}
+	if tg > n {
+		tg = n
+	}
+	if tg > 1024 {
+		tg = 1024 // CUDA's hard max threads-per-block
+	}
+	cfg := gc.LaunchConfig1D(n, tg)
+	if cfg.GridX == 0 {
+		return cfg, fmt.Errorf("cuda: invalid launch geometry (n=%d tg=%d)", n, tg)
+	}
+	return cfg, nil
+}
+
+// launch enqueues one kernel on this queue's stream.
+func (q Queue) launch(p Pipeline, n, tg int, bufs []Buffer) error {
+	if p.f == nil {
+		return fmt.Errorf("cuda: dispatch of a nil pipeline")
+	}
+	cfg, err := grid(n, tg)
+	if err != nil {
+		return err
+	}
+	args := make([]gc.KernelArg, len(bufs))
+	for i, b := range bufs {
+		if b.b == nil {
+			return fmt.Errorf("cuda: kernel arg %d is a nil buffer", i)
+		}
+		args[i] = b.arg()
+	}
+	if q.s == nil {
+		return p.f.Launch(bg, cfg, args...)
+	}
+	return p.f.LaunchOn(bg, q.s, cfg, args...)
+}
+
+// sync blocks until this queue's stream drains.
+func (q Queue) sync() error {
+	if q.s == nil {
+		return q.d.cx.Synchronize(bg)
+	}
+	return q.s.Synchronize(bg)
+}
+
+// Run1D runs a 1-D kernel over n threads (threadgroup width tg), binding bufs as
+// the kernel's positional parameters, and blocks until the GPU finishes.
+// Mirrors metal.go's Run1D, plus an error return (divergence 3).
+func (q Queue) Run1D(p Pipeline, n, tg int, bufs ...Buffer) error {
+	if err := q.launch(p, n, tg, bufs); err != nil {
+		return fmt.Errorf("cuda: launch: %w", err)
+	}
+	if err := q.sync(); err != nil {
+		return fmt.Errorf("cuda: synchronize: %w", err)
+	}
+	return nil
+}
+
+// Run1DBatch enqueues `reps` dispatches of the same kernel and synchronizes once —
+// the shape that isolates the per-submit round trip from the marginal per-launch
+// cost. Mirrors metal.go's Run1DBatch.
+func (q Queue) Run1DBatch(p Pipeline, n, tg, reps int, bufs ...Buffer) error {
+	for range reps {
+		if err := q.launch(p, n, tg, bufs); err != nil {
+			return fmt.Errorf("cuda: launch: %w", err)
+		}
+	}
+	if err := q.sync(); err != nil {
+		return fmt.Errorf("cuda: synchronize: %w", err)
+	}
+	return nil
+}
+
+// Encoder batches many DIFFERENT kernel dispatches before one synchronize — the
+// per-token shape the decode loop needs (a whole layer stack → one round trip),
+// and the counterpart of metal.go's one-command-buffer Encoder. Launches on a
+// single CUDA stream run in issue order and each sees the prior one's writes, so
+// chained kernels need no explicit barrier, exactly as Metal's serial compute
+// encoder provides.
+//
+// The first error is latched and short-circuits the rest; End returns it. That
+// keeps the call sites free of per-Dispatch error checks (matching Metal's
+// signature) without ever losing a failure.
+type Encoder struct {
+	q   Queue
+	err error
+	n   int
+}
+
+// Begin starts a batch of dispatches on this queue.
+func (q Queue) Begin() *Encoder { return &Encoder{q: q} }
+
+// Dispatch encodes one kernel over n threads (threadgroup width tg, clamped ≤ n),
+// binding bufs as the kernel's positional parameters.
+func (e *Encoder) Dispatch(p Pipeline, n, tg int, bufs ...Buffer) {
+	if e.err != nil {
+		return
+	}
+	if err := e.q.launch(p, n, tg, bufs); err != nil {
+		e.err = fmt.Errorf("cuda: dispatch %d: %w", e.n, err)
+		return
+	}
+	e.n++
+}
+
+// End waits for every dispatch in the batch and reports the first failure.
+func (e *Encoder) End() error {
+	if e.err != nil {
+		return e.err
+	}
+	if err := e.q.sync(); err != nil {
+		return fmt.Errorf("cuda: synchronize: %w", err)
+	}
+	return nil
+}
+
+// Err reports the first dispatch failure so far, without waiting.
+func (e *Encoder) Err() error { return e.err }
