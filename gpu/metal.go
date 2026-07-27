@@ -298,6 +298,14 @@ func (d *Device) NewBufferLen(nFloats int) Buffer {
 	return d.MustBuf(d.id.Send(selNewBufferLen, uintptr(nFloats*4), uintptr(0)), nFloats, "len")
 }
 
+// NewBufferBytes allocates an uninitialized shared MTLBuffer of n BYTES (n is the
+// element count for the returned Buffer). For consumers that size a buffer in raw
+// bytes rather than float32s — the device-layer primitive goinfer's kernels reach
+// for when re-pointed onto this substrate.
+func (d *Device) NewBufferBytes(n int) Buffer {
+	return d.MustBuf(d.id.Send(selNewBufferLen, uintptr(n), uintptr(0)), n, "bytes")
+}
+
 // NewBufferInt8 uploads int8 data (n counts BYTES for this buffer). NewBufferU32
 // uploads a single uint32 (kernel scalar arg). Both are shared/UMA.
 func (d *Device) NewBufferInt8(data []int8) Buffer {
@@ -405,15 +413,15 @@ func (q Queue) Begin() *Encoder {
 	return &Encoder{pool: pool, cb: cb, enc: cb.Send(selComputeEncoder)}
 }
 
-// arPool is an NSAutoreleasePool handle — the pipelined executor owns one long-lived pool
+// ARPool is an NSAutoreleasePool handle — the pipelined executor owns one long-lived pool
 // (drained periodically) so encode-ahead can hold an un-committed command buffer across the
 // loop without per-call pool nesting.
-type arPool struct{ id objc.ID }
+type ARPool struct{ id objc.ID }
 
-func newARPool() arPool {
-	return arPool{id: objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc).Send(selInit)}
+func NewARPool() ARPool {
+	return ARPool{id: objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc).Send(selInit)}
 }
-func (p arPool) drain() { p.id.Send(selDrain) }
+func (p ARPool) Drain() { p.id.Send(selDrain) }
 
 // BeginNP creates a command buffer + encoder with NO per-call pool — the cb/encoder autorelease
 // into whatever pool is active on the calling thread. Used by the pipelined executor, which
