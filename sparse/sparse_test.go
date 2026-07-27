@@ -148,3 +148,20 @@ func TestNew_dupQuerySumsAndLenMismatchSafe(t *testing.T) {
 		t.Fatalf("dup/len-mismatch: got %+v, want doc 0 score ~1.0", got)
 	}
 }
+
+// TestScores_deterministic is the regression for AUDIT #16: Scores summed each
+// document's contributions in Go map-iteration order (randomized per call), and
+// float64 addition isn't associative, so identical queries returned different
+// scores across calls and ties flipped. The weights here are chosen so the sum is
+// strongly order-dependent (1 + 1e16 - 1e16 is 0 or 1 depending on order), making
+// the old map-range path visibly non-deterministic; the fix sums in a fixed order.
+func TestScores_deterministic(t *testing.T) {
+	ix := New([]SparseVec{{Terms: []uint32{1, 2, 3}, Weights: []float32{1, 1, 1}}}) // doc 0 in all three terms
+	q := SparseVec{Terms: []uint32{1, 2, 3}, Weights: []float32{1, 1e16, -1e16}}
+	first := ix.Scores(q)[0]
+	for i := 0; i < 500; i++ {
+		if got := ix.Scores(q)[0]; got != first {
+			t.Fatalf("Scores non-deterministic: call %d = %v, first = %v (float64 sum order varied)", i, got, first)
+		}
+	}
+}

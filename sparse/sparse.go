@@ -98,16 +98,34 @@ func (ix *Index) Len() int { return ix.ndocs }
 func (ix *Index) Scores(q SparseVec) []float64 {
 	scores := make([]float64, ix.ndocs)
 	n := min(len(q.Terms), len(q.Weights))
-	qw := make(map[uint32]float64, n)
-	for i := range n {
-		qw[q.Terms[i]] += float64(q.Weights[i])
+	// Accumulate duplicate query terms, but keep a STABLE order (first appearance
+	// in q.Terms) so each document's score below is summed in a fixed order.
+	// Ranging a map here made the float64 accumulation order random per call (Go
+	// randomizes map iteration), so identical queries produced scores like
+	// 0.6 vs 0.6000000000000001 across runs and ties flipped, against the
+	// ascending-doc-id determinism the package promises (audit #16). bm25.Scores
+	// already walks the query slice in order — this makes the two consistent.
+	type termWeight struct {
+		term uint32
+		w    float64
 	}
-	for t, w := range qw {
-		if w == 0 {
+	order := make([]termWeight, 0, n)
+	seen := make(map[uint32]int, n)
+	for i := range n {
+		t := q.Terms[i]
+		if j, ok := seen[t]; ok {
+			order[j].w += float64(q.Weights[i])
 			continue
 		}
-		for _, p := range ix.postings[t] {
-			scores[p.doc] += w * float64(p.w)
+		seen[t] = len(order)
+		order = append(order, termWeight{t, float64(q.Weights[i])})
+	}
+	for _, tw := range order {
+		if tw.w == 0 {
+			continue
+		}
+		for _, p := range ix.postings[tw.term] {
+			scores[p.doc] += tw.w * float64(p.w)
 		}
 	}
 	return scores
