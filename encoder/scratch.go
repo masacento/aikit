@@ -60,6 +60,13 @@ type scratch struct {
 	ctxHead []float32
 	// Attention scores [L, L].
 	scores []float32
+	// MoE scratch (moeMLP only): moeScores holds the per-token router logits
+	// [numExperts]; moeOut is the per-token expert-combination accumulator [D].
+	// x1 (the W1 output) and contrib (the per-expert W2 output) reuse val/mid,
+	// exactly as gelu/swigluMLP reuse them. All are pooled so the MoE layers of a
+	// forward allocate nothing after warmup (audit #10).
+	moeScores []float32
+	moeOut    []float32
 	// deqW holds one int8 weight matrix dequantized to f32 for the q8 linear path:
 	// matmulBTQ8Into widens the int8 weights here ONCE per matmul (N*K) and then runs
 	// the SIMD f32 matmulBTInto, instead of the scalar inline-widen (which redid the

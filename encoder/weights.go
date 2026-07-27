@@ -167,7 +167,10 @@ type LayerWeights struct {
 	Fc2B []float32 // [HiddenDim]
 
 	// Mixture-of-experts FFN (set when IsMoE). Router is [NumExperts, HiddenDim];
-	// ExpW1/ExpW2 are the experts stacked as [NumExperts*IntermediateDim, HiddenDim];
+	// ExpW1 is the experts stacked as [NumExperts*IntermediateDim, HiddenDim].
+	// ExpW2 is stored TRANSPOSED per-expert — [NumExperts*HiddenDim, IntermediateDim],
+	// each expert's [I,D] weight held as [D,I] — so the FFN's second projection uses
+	// the SIMD A·Bᵀ matmul (audit #10); the on-disk tensor is [E*I, D].
 	// ExpBias is a single shared [HiddenDim] row added after combining experts.
 	IsMoE   bool
 	Router  []float32
@@ -319,6 +322,10 @@ func buildWeightsFromSafetensors(cfg *Config, st *embed.SafetensorsFile) (*Weigh
 			if l.ExpW2, err = loadF32(st, pfx+"mlp.experts.mlp.w2", []int{E * I, D}); err != nil {
 				return nil, err
 			}
+			// Store each expert's W2 transposed [I,D] → [D,I] so the FFN's second
+			// projection can run through the SIMD A·Bᵀ matmul instead of a scalar
+			// triple-loop (audit #10). One transpose per expert, once at load.
+			l.ExpW2 = transposeExpertsW2(l.ExpW2, E, I, D)
 			if l.ExpBias, err = loadF32(st, pfx+"mlp.experts.bias", []int{D}); err != nil {
 				return nil, err
 			}
@@ -401,4 +408,30 @@ func loadConfig(fsys fs.FS, p string) (*Config, error) {
 // don't churn.
 func loadF32(st *embed.SafetensorsFile, name string, want []int) ([]float32, error) {
 	return st.TensorF32(name, want...)
+}
+
+// transposeExpertsW2 returns the stacked expert W2 tensor rewritten from
+// [E*I, D] (each expert [I,D], row-major) to [E*D, I] (each expert [D,I]).
+// This lets moeMLP apply W2 with the SIMD A·Bᵀ matmul — out_j = Σ_i x1_i·W2[i,j]
+// becomes a matmul of x1 against W2ᵀ, where W2ᵀ[j,i] = W2[i,j] — instead of a
+// scalar triple-loop (audit #10). Run once per load; the per-expert block size is
+// unchanged (I·D), so moeMLP's offset arithmetic is identical.
+//
+// It allocates a fresh owned buffer rather than transposing in place: the loaded
+// tensor is a zero-copy view aliasing the read-only mmap (LayerWeights: "Do not
+// mutate"), so an in-place write would fault. The MoE experts are a small slice
+// of the model, so owning this one transposed copy is a negligible memory cost.
+func transposeExpertsW2(w2 []float32, E, I, D int) []float32 {
+	out := make([]float32, len(w2))
+	for e := range E {
+		src := w2[e*I*D : (e+1)*I*D]  // expert e, [I, D] row-major
+		dst := out[e*I*D : (e+1)*I*D] // expert e, [D, I] row-major
+		for i := range I {
+			row := src[i*D : (i+1)*D]
+			for j := range D {
+				dst[j*I+i] = row[j]
+			}
+		}
+	}
+	return out
 }

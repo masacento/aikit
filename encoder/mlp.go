@@ -90,17 +90,27 @@ func geluMLP(h, fc1, fc1b, fc2, fc2b []float32, D, intermediate, L int, s *scrat
 //	y_token = Σ_k w_k · ( GELU(h · W1_{e_k}ᵀ) · W2_{e_k} ) + bias
 //
 // Two details are easy to get subtly wrong and are load-bearing:
-//   - W2 is applied WITHOUT transpose (the reference does act_out.matmul(expert_w2)
-//     where expert_w2 is [intermediate, D]), unlike every other projection here.
+//   - W2 is [intermediate, D] in the reference (act_out.matmul(expert_w2)); the
+//     loader stores it TRANSPOSED per-expert to [D, intermediate] (weights.go,
+//     audit #10) so the projection runs through the SIMD A·Bᵀ matmul instead of a
+//     scalar triple-loop. The per-expert block size is unchanged, so the offset
+//     arithmetic below is the same.
 //   - `bias` is a single shared [D] row added once after combining the experts —
 //     it is not per-expert.
 //
 // The softmax runs over all experts (not just the top-k) and the top-k weights are
 // taken from it as-is, so they do not sum to 1.
-func moeMLP(h, router, w1, w2, bias []float32, numExperts, topK, D, intermediate, L int, s *scratch) {
-	scores := make([]float32, numExperts)
-	x1 := make([]float32, intermediate)
-	out := make([]float32, D)
+//
+// All working buffers come from the scratch arena: moeScores/moeOut are dedicated,
+// x1 and contrib reuse val/mid (as gelu/swigluMLP do), so the MoE layers allocate
+// nothing after warmup.
+func moeMLP(h, router, w1, w2t, bias []float32, numExperts, topK, D, intermediate, L int, s *scratch) {
+	s.moeScores = ensureF32(s.moeScores, numExperts)
+	s.moeOut = ensureF32(s.moeOut, D)
+	scores := s.moeScores
+	out := s.moeOut
+	x1 := s.val[:intermediate]  // W1 output (reuses the SwiGLU value buffer)
+	contrib := s.mid[:D]        // per-expert W2 output (reuses the fc2-output buffer)
 
 	for t := range L {
 		row := h[t*D : (t+1)*D]
@@ -126,20 +136,20 @@ func moeMLP(h, router, w1, w2, bias []float32, numExperts, topK, D, intermediate
 
 			off := bestIdx * intermediate
 			expW1 := w1[off*D : (off+intermediate)*D]
-			expW2 := w2[off*D : (off+intermediate)*D]
+			// w2t holds this expert's W2 transposed to [D, intermediate].
+			expW2t := w2t[off*D : (off+intermediate)*D]
 
-			matmulBTInto(row, expW1, x1, 1, D, intermediate)
+			// Both projections are M=1 (one token) with K·N ≈ 2.36M FLOPs, which is
+			// UNDER matmulBTInto's 4M blocking threshold — so matmulBTInto would run
+			// the naive dot-product, measurably slower than even the old scalar AXPY.
+			// Call the register-blocked kernel directly: at this shape it is ~3.5×
+			// faster than the AXPY and ~10× the naive path (BenchmarkMoEW2_*). W2 is
+			// pre-transposed at load so contrib_j = Σ_i x1_i·W2[i,j] = x1·W2ᵀ.
+			matmulBTBlockedInto(row, expW1, x1, 1, D, intermediate)
 			gelu(x1)
-			// W2 is [intermediate, D] applied untransposed: out_j = Σ_i x1_i·W2[i,j].
-			for i := range intermediate {
-				wRow := expW2[i*D : (i+1)*D]
-				xi := x1[i]
-				if xi == 0 {
-					continue
-				}
-				for j := range D {
-					out[j] += best * xi * wRow[j]
-				}
+			matmulBTBlockedInto(x1, expW2t, contrib, 1, intermediate, D)
+			for j := range D {
+				out[j] += best * contrib[j]
 			}
 		}
 		for j := range D {
