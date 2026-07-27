@@ -24,6 +24,55 @@ type I8Index interface {
 	Close() error
 }
 
+// I8BatchIndex is an optional extension of I8Index: a device index that scores
+// MANY queries against the whole corpus in a single dispatch — the batched int8
+// GEMM that is the GPU's sweet spot (M queries × N rows). A backend whose I8Index
+// also implements this is used by FlatI8.QueryBatch; one that doesn't falls back
+// to per-query scoring.
+type I8BatchIndex interface {
+	// ScoreBatch scores M = len(queries) queries against all N rows into dst
+	// (length M*N, row-major): dst[m*N+j] is the W8A8 score of queries[m] against
+	// row j — the same values Score would produce per query, laid out as a matrix.
+	ScoreBatch(queries [][]float32, dst []float32) error
+}
+
+// QueryBatch runs a batch of queries, returning each one's k highest hits (the
+// same per-query contract as Query). When the index is GPU-enabled and the backend
+// supports batched scoring, the whole batch is scored in one int8 GEMM on the
+// device — the throughput win over Query-in-a-loop; otherwise it degrades to
+// per-query scoring. A query of the wrong dimension yields nil for that row.
+func (f *FlatI8) QueryBatch(queries [][]float32, k int) [][]Hit {
+	if f.closed {
+		panic("ann: QueryBatch on a closed FlatI8 (mmap released by Close)")
+	}
+	out := make([][]Hit, len(queries))
+	// Device batched path: one GEMM for the whole batch, when every query is the
+	// right dimension and the backend scores batches.
+	if bi, ok := f.gpu.(I8BatchIndex); ok && f.n > 0 && len(queries) > 0 {
+		allDim := true
+		for _, q := range queries {
+			if len(q) != f.dim {
+				allDim = false
+				break
+			}
+		}
+		if allDim {
+			dst := make([]float32, len(queries)*f.n)
+			if err := bi.ScoreBatch(queries, dst); err == nil {
+				for m := range queries {
+					out[m] = f.topHits(dst[m*f.n:(m+1)*f.n], k, nil)
+				}
+				return out
+			}
+		}
+	}
+	// Fallback: per query (CPU, or single-query GPU if enabled).
+	for m, q := range queries {
+		out[m] = f.Query(q, k)
+	}
+	return out
+}
+
 var backend Backend
 
 // RegisterBackend installs the process-wide device backend for FlatI8 scoring.

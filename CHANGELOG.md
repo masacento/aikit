@@ -10,6 +10,16 @@ it.
 
 ## [Unreleased]
 
+### Added
+
+- **`ann.FlatI8.QueryBatch(queries, k)` + GPU batched int8 GEMM (native-GPU Phase 2).**
+  Scores a whole batch of queries against the corpus in one dispatch when the index
+  is GPU-enabled (`ann.I8BatchIndex`, implemented by the Metal backend) — the batched
+  GEMM that is the GPU's sweet spot — and degrades to per-query scoring otherwise.
+  Verified on M1 Pro: batch GPU top-k ≡ CPU per-query top-k, bit-identical. Also fixes
+  an intermittent `NSAutoreleasePool`-drain-on-the-wrong-thread SIGSEGV in the Metal
+  backend by pinning the OS thread across each dispatch.
+
 ## [1.12.0] — 2026-07-27
 
 The native-GPU + coverage-completion release. On top of 1.11.0's embedder coverage,

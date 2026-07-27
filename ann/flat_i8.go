@@ -127,6 +127,13 @@ func (f *FlatI8) query(q []float32, k int, keep func(int) bool) []Hit {
 		f.scorePaged(q, dst)
 	}
 
+	return f.topHits(dst, k, keep)
+}
+
+// topHits selects the k highest scores from dst (one score per indexed vector),
+// descending, ties broken by ascending index, honoring an optional keep filter.
+// k <= 0 or k >= Len returns all, sorted. Shared by Query and QueryBatch.
+func (f *FlatI8) topHits(dst []float32, k int, keep func(int) bool) []Hit {
 	if k <= 0 || k >= f.n {
 		hits := make([]Hit, 0, f.n)
 		for i, s := range dst {
