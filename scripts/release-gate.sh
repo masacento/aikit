@@ -9,7 +9,8 @@
 #   2. apidiff shows NO incompatible change in any Hard-tier package vs the previous
 #      tag — the stated release bar.
 #   3. The core module pulls in no external dependency beyond golang.org/x/text
-#      (the cgo-free, dependency-light invariant the README promises).
+#      and golang.org/x/sys (darwin-only madvise) — the cgo-free, dependency-light
+#      invariant the README promises.
 #
 # Used by .github/workflows/release.yml (tag-triggered) and runnable locally:
 #   scripts/release-gate.sh 1.4.0
@@ -92,9 +93,13 @@ else
 	git worktree prune
 fi
 
-# (3) Core dependency invariant: nothing external beyond golang.org/x/text.
+# (3) Core dependency invariant: nothing external beyond golang.org/x/text and
+# golang.org/x/sys. The latter is a darwin-only edge: mmap/madvise_darwin.go calls
+# madvise through golang.org/x/sys/unix because the stdlib lacks it on darwin (the
+# linux build uses syscall directly and pulls neither), so `go list ./...` surfaces
+# it only when the gate runs on a Mac. Both are pinned, vetted x/ repos.
 ext="$(go list -deps -f '{{if not .Standard}}{{.ImportPath}}{{end}}' ./... 2>/dev/null \
-	| grep -v "^${MOD}" | grep -v '^golang.org/x/text' | grep -v '^$' || true)"
+	| grep -v "^${MOD}" | grep -Ev '^golang.org/x/(text|sys)(/|$)' | grep -v '^$' || true)"
 if [ -n "$ext" ]; then
 	err "core module pulls unexpected external dependency(ies): $(echo "$ext" | tr '\n' ' ')"
 fi
