@@ -350,3 +350,36 @@ func debugChunks(chunks []chunk.Chunk) string {
 	}
 	return b.String()
 }
+
+// TestMarkdown_FrontmatterTrailingSpace is the regression for AUDIT #8: an opening
+// frontmatter delimiter with a trailing space ("--- ", which editors and
+// copy-paste produce constantly) was stored untrimmed but the close is compared
+// trimmed, so it never matched and the whole document collapsed into a single
+// chunk with all heading sections lost. Break-it-first: store body untrimmed and
+// this returns 1 chunk.
+func TestMarkdown_FrontmatterTrailingSpace(t *testing.T) {
+	src := []byte("--- \ntitle: T\nauthor: A\n---\n\n# Heading One\n\nSome content here.\n\n## Heading Two\n\nMore content in the second section.\n\n## Heading Three\n\nAnd a third.\n")
+	chunks := chunkMD(t, src, 64)
+	if len(chunks) < 2 {
+		t.Errorf("frontmatter with a trailing space collapsed the doc into %d chunk(s); want the heading sections preserved (>1)", len(chunks))
+	}
+	assertByteFidelity(t, src, chunks)
+}
+
+// TestMarkdown_FourSpaceIndentedFence is the regression for AUDIT #15: a fence line
+// indented with 4 spaces is an indented code block, not a fence, but detectCodeFence
+// consumed 4 leading spaces so it toggled `inFence`; with an odd count the fence
+// never closed and every later line (including the next heading) became code,
+// collapsing the document. Break-it-first: i<4 collapses this to 1 chunk.
+func TestMarkdown_FourSpaceIndentedFence(t *testing.T) {
+	src := []byte("Intro paragraph.\n\n    ```\n\nThen some text, not code.\n\n## Next Section\n\nContent that must remain its own section.\n")
+	// Large chunkSize so NO size-splitting happens — the only source of >1 chunk is
+	// the '## Next Section' heading boundary. With the bug the 4-space fence opens an
+	// unclosed fence, that heading becomes code, the boundary vanishes, and the whole
+	// doc is one chunk.
+	chunks := chunkMD(t, src, 100_000)
+	if len(chunks) < 2 {
+		t.Errorf("4-space-indented fence collapsed the doc into %d chunk(s); '## Next Section' should stay a heading boundary (>1)", len(chunks))
+	}
+	assertByteFidelity(t, src, chunks)
+}

@@ -169,20 +169,29 @@ func subdivideSection(source []byte, lines []scannedLine, chunkSize int, baseLin
 	// runs into adjacent chunks).
 	splittable := splittablePositions(lines)
 
+	// prevSplit[i] = the greatest index s ≤ i with splittable[s], else -1. This
+	// O(L) prefix pass replaces the per-i backward rescan below: when a window had
+	// no splittable line (a section whose blank lines are all inside one big fenced
+	// block — a generated artifact in a docs corpus), chunkStartIdx didn't advance
+	// and the next i rescanned the whole range, making it Σi ≈ L²/2 (audit #7).
+	// prevSplit[i] > chunkStartIdx is exactly the old loop's "greatest splittable in
+	// (chunkStartIdx, i]" result.
+	prevSplit := make([]int, len(lines))
+	last := -1
+	for i := range lines {
+		if splittable[i] {
+			last = i
+		}
+		prevSplit[i] = last
+	}
+
 	var out []chunk.Chunk
 	chunkStartIdx := 0
 	for i := 1; i < len(lines); i++ {
 		// Bytes accumulated from lines[chunkStartIdx..i] inclusive.
 		accumBytes := lines[i].end - lines[chunkStartIdx].start
 		if accumBytes >= chunkSize && i > chunkStartIdx {
-			// Try to find the most recent splittable position <= i.
-			splitIdx := -1
-			for s := i; s > chunkStartIdx; s-- {
-				if splittable[s] {
-					splitIdx = s
-					break
-				}
-			}
+			splitIdx := prevSplit[i]
 			if splitIdx > chunkStartIdx {
 				// Emit [chunkStartIdx, splitIdx) — splitIdx is a blank
 				// line; we attach blanks to the chunk that came before

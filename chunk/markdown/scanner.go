@@ -118,7 +118,11 @@ func scanLines(source []byte) []scannedLine {
 			// exactly `---` or `+++` (with optional CRLF).
 			if i == 0 && isFrontmatterOpen(body) {
 				inFrontmatter = true
-				frontmatterDelim = append([]byte(nil), body...)
+				// Store the TRIMMED delimiter: isFrontmatterClose compares the
+				// closing line trimmed, so a raw "--- " (one trailing space, which
+				// editors produce constantly) would never match its own close and
+				// the whole document collapsed into one chunk (audit #8).
+				frontmatterDelim = append([]byte(nil), bytes.TrimRight(body, " \t")...)
 				out[i] = scannedLine{lineFrontmatterDelim, r.start, r.end}
 				break
 			}
@@ -199,9 +203,12 @@ func classifyContentLine(body []byte) lineKind {
 // line (3+ consecutive ` or ~ with optional info string after). Returns
 // (0, 0) otherwise. Leading whitespace up to 3 spaces is allowed.
 func detectCodeFence(body []byte) (byte, int) {
-	// CommonMark allows 0-3 spaces of indent before a fence.
+	// CommonMark allows 0-3 spaces of indent before a fence; 4+ spaces is an
+	// indented code block, not a fence. i<3 consumes at most 3 spaces (audit #15:
+	// i<4 consumed 4, so "    ```" was wrongly treated as a fence toggle and the
+	// rest of the document collapsed into one chunk).
 	i := 0
-	for i < len(body) && i < 4 && body[i] == ' ' {
+	for i < len(body) && i < 3 && body[i] == ' ' {
 		i++
 	}
 	if i >= len(body) {
