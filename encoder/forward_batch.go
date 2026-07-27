@@ -48,10 +48,14 @@ func (w *Weights) forwardBatch(idsList [][]int32) [][]float32 {
 		return nil
 	}
 	// The padded-batch kernel below is SwiGLU-only (it calls swigluMLP directly on
-	// the [B*Lmax] block). Mixture-of-experts routes per token and the dense GELU
-	// MLP has bias terms, so for those checkpoints fall back to the per-sequence
-	// forward — correct, just without the batch kernel's packing win.
-	if w.hasMoE() || !w.Cfg.gatedMLP() {
+	// the [B*Lmax] block) AND has no attention-bias path (selfAttentionBatched takes
+	// no bias). Mixture-of-experts routes per token, the dense GELU MLP has bias
+	// terms, and a qkv_proj_bias checkpoint needs the bias the single path applies —
+	// so for any of those, fall back to the per-sequence forward. Correct (it is
+	// exactly what Encode runs), just without the batch kernel's packing win. Audit
+	// #3: without the QKVProjBias clause a SwiGLU+bias checkpoint's EncodeBatch
+	// dropped the biases that Encode applied, so the two disagreed silently.
+	if w.hasMoE() || !w.Cfg.gatedMLP() || w.Cfg.QKVProjBias {
 		out := make([][]float32, B)
 		for i, ids := range idsList {
 			out[i] = w.forward(ids)

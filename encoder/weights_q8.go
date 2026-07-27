@@ -74,6 +74,13 @@ func LoadWeightsQ8(dir string) (*WeightsQ8, error) {
 	if w.hasMoE() || !w.Cfg.gatedMLP() {
 		return nil, fmt.Errorf("encoder: q8 unsupported for this checkpoint (mixture-of-experts / non-gated MLP); use the f32 path")
 	}
+	// The Q8 attention path (selfAttentionQ8/…Batched) has no bias term and
+	// LayerWeightsQ8 carries no bias fields, so a qkv_proj_bias checkpoint would
+	// silently drop its attention biases on every Q8 path. Refuse rather than
+	// mis-score (audit #3); the f32 path applies them correctly.
+	if w.Cfg.QKVProjBias {
+		return nil, fmt.Errorf("encoder: q8 unsupported for a checkpoint with qkv_proj_bias (the Q8 attention path has no bias term); use the f32 path")
+	}
 	// Build the q8 bundle by quantizing each big projection.
 	q := &WeightsQ8{
 		Cfg:          w.Cfg,
