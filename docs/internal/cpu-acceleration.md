@@ -182,6 +182,54 @@ see `goinfer/gpu` and goinfer's perf docs.
 
 ---
 
+## Native K-quant matmul (Q4_K/Q6_K × Q8_K) — evaluated, NOT shipped
+
+**Result: negative for the stated gate.** `task-q8k-integer-accum.md` asked whether a
+native integer-accumulation K-quant kernel (the cpubrrr / llama.cpp `ggml_vec_dot_q6_K_q8_K`
+algorithm — quantize activations to Q8_K, accumulate sub-block int dot products weighted by
+the integer sub-scales, convert to float once per 256-superblock) beats the current decode
+path (dequant→int8-requant→`MatmulBTW8A8`, which at decode is just W8A8 over the resident
+int8 weight) by **≥1.3× at M=1**. It cannot, for Q6_K — provably.
+
+**What was built and validated** (kept in `linalg/kquant*.go`, Experimental tier, tested and
+correct, but deliberately **not wired into `WeightMat`**): `QuantizeActQ8K` (per-256-block
+int8 + f32 scale + exact per-16 bsums); `unpackQ6K`/`unpackQ4K`, bit-identical to
+`embed/gguf.go`'s dequant (drift-guarded, `TestKQuantUnpackMatchesEmbed`); scalar
+integer-accum dots; and an SDOT path (`dotPartials16SDOT`, one Go→asm crossing per superblock)
+bit-exact against the scalar reference. So the arithmetic half works and is fast.
+
+**Measured (Apple M-series, this box, `BenchmarkGEMV_*`, M=1):**
+
+| shape | Q6_K native | W8A8 baseline | ratio |
+|---|---|---|---|
+| K2048 × N2048 | 2.21 ms | 0.111 ms | **20× slower** |
+| K4096 × N4096 | 8.79 ms | 0.196 ms | **45× slower** |
+
+The SDOT does the same MAC count as W8A8 (~0.2 ms); ~98% of the native time is the weight
+unpack. A SIMD bit-unpack would cut that — but it cannot cross the gate, because there is a
+hard ceiling above any unpack:
+
+**The byte-ratio ceiling.** A native K-quant kernel's only advantage is reading fewer weight
+bytes. So the speedup cannot exceed the byte-count ratio:
+- If W8A8 is **bandwidth-bound**, Q6_K reads 210 B/superblock vs int8's 256 → at best
+  256/210 = **1.22×**, and it still adds unpack+SDOT compute → ≤ 1.22×.
+- If W8A8 is **compute-bound**, Q6_K does the *same* SDOT MACs *plus* the unpack → strictly
+  more work → ≤ 1.0× (loses).
+
+Either way **Q6_K ≤ 1.22× < 1.3×**: the gate is unreachable regardless of kernel quality, so
+the SIMD-unpack asm was not written. Q4_K's ratio is 256/144 = **1.78×** (headroom exists),
+but cpubrrr's *own* optimized Q4_K/Q6_K kernel landed **~1.12×** over llama.cpp in practice —
+below 1.3× — so Q4_K was not pursued either. This confirms `task-native-q6k-kernel.md`'s
+original caution on the last axis it had set aside (compute/throughput): the win is real but
+thin, and below this project's bar for adding a native-GGUF weight path.
+
+Where the cpubrrr win actually lives is **MXFP4 MoE (~5×)**, which is a different format and a
+missing model family — tracked as goinfer's A2 (`task-mxfp4-gptoss.md`), not here.
+
+Reproduce: `go test -bench GEMV -benchmem ./linalg`.
+
+---
+
 ## File reference
 
 ```
