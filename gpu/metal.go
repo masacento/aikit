@@ -435,10 +435,10 @@ func (q Queue) BeginNP() *Encoder {
 // FinishEncoding closes the encoder (ready to commit) without committing — the split that lets
 // the executor encode token t+1 while token t's command buffer runs.
 func (e *Encoder) FinishEncoding() { e.enc.Send(selEndEncoding) }
-func (e *Encoder) commit()         { e.cb.Send(selCommit) }
+func (e *Encoder) Commit()         { e.cb.Send(selCommit) }
 
 // waitDone blocks until the committed command buffer completes, then reads its GPU timestamps.
-func (e *Encoder) waitDone() {
+func (e *Encoder) WaitDone() {
 	e.cb.Send(selWaitCompleted)
 	e.ReadTimes()
 }
@@ -506,7 +506,7 @@ func (e *Encoder) DispatchTG(p Pipeline, n, tg, tgBytes int, bufs ...Buffer) {
 	runtime.KeepAlive(&perTG)
 }
 
-func (e *Encoder) end() {
+func (e *Encoder) End() {
 	e.enc.Send(selEndEncoding)
 	e.cb.Send(selCommit)
 	e.cb.Send(selWaitCompleted)
