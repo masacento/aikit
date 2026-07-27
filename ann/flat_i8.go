@@ -48,6 +48,11 @@ type FlatI8 struct {
 	pager     *mmap.SpanCache[int]
 	blockRows int
 	pagerMu   sync.Mutex
+	// ws is a persistent W8A8 scratch for scorePaged, reused across the per-block
+	// matmuls instead of MatmulBTW8A8 allocating a fresh Workspace per block
+	// (~9766 blocks per query on a 10M-vector index — audit #13). Guarded by
+	// pagerMu, which scorePaged already holds for the whole scan.
+	ws linalg.Workspace
 }
 
 // NewFlatI8 builds an int8 index by quantizing vecs (each assumed L2-normalized,

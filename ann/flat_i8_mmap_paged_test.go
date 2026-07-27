@@ -198,3 +198,28 @@ func TestLoadFlatI8MmapPaged_concurrentPageStats(t *testing.T) {
 	close(stop)
 	<-scraped
 }
+
+// BenchmarkPagedQuery measures per-query allocations on a paged index — where
+// scorePaged's per-block Workspace allocation (#13) showed.
+func BenchmarkPagedQuery(b *testing.B) {
+	rng := rand.New(rand.NewPCG(3, 4))
+	const dim = 128
+	pg := b1pagesize()
+	blockRows := 2 * pg / dim
+	n := 40 * blockRows
+	tb := &testing.T{}
+	path := writeFlatI8Blob(tb, NewFlatI8(randUnitSet(rng, n, dim)))
+	paged, err := loadFlatI8MmapPaged(path, int64(4*blockRows*dim), blockRows)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer paged.Close()
+	q := randUnit(rng, dim)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = paged.Query(q, 10)
+	}
+}
+
+func b1pagesize() int { return os.Getpagesize() }

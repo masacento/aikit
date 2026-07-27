@@ -116,7 +116,10 @@ func (f *FlatI8) scorePaged(q []float32, dst []float32) {
 	for b, r0 := 0, 0; r0 < f.n; b, r0 = b+1, r0+f.blockRows {
 		r1 := min(r0+f.blockRows, f.n)
 		f.pager.Touch(b)
-		linalg.MatmulBTW8A8(q, f.bq[r0*f.dim:r1*f.dim], f.scales[r0:r1], dst[r0:r1], 1, f.dim, r1-r0)
+		// MatmulBTW8A8Into with the persistent f.ws instead of MatmulBTW8A8 (which
+		// allocates a fresh Workspace per call). Bit-identical — the wrapper is
+		// exactly this with a zero Workspace. pagerMu (held) guards f.ws.
+		linalg.MatmulBTW8A8Into(&f.ws, q, f.bq[r0*f.dim:r1*f.dim], f.scales[r0:r1], dst[r0:r1], 1, f.dim, r1-r0)
 	}
 }
 
