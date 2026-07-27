@@ -10,6 +10,23 @@ it.
 
 ## [Unreleased]
 
+## [1.12.0] — 2026-07-27
+
+The native-GPU + coverage-completion release. On top of 1.11.0's embedder coverage,
+this cycle adds a **cgo-free native-GPU compute substrate aikit owns** (Metal today,
+the GPU analogue of `linalg`) with GPU-scored ANN as its first consumer; takes the
+certified embedder set from **eight to fourteen** — including two that needed new
+primitives (a byte-level BPE tokenizer and a GTE RoPE/GeGLU forward); adds **MXFP4**
+GGUF dequant (gpt-oss); and folds in a full engineering-audit remediation — 13
+correctness fixes (silent-wrong pooling, dropped attention biases, three data races,
+determinism, div-by-zero guards) and a broad allocation/kernel performance pass, each
+bit-identical or parity-gated.
+
+Minor, not patch: new exported API (`encoder.LoadGTE`/`GTE`, `ann.Backend` + friends,
+the `gpu` module, `MatryoshkaFloor` rows), no breaking changes. The behavior changes
+either fix latent bugs or **widen** acceptance, so they are additive from a caller's
+perspective. The default build stays pure-Go CPU with the same one dependency-tier.
+
 ### Added
 
 - **Native-GPU device substrate (`gpu`, new Experimental darwin module) + GPU-scored
@@ -23,6 +40,10 @@ it.
   default build and the core dependency invariant are unchanged (separate module,
   `purego` never enters the root). Native-GPU Phase 1; CUDA + the tuned-kernel lift
   are Phase 1b.
+- **MXFP4 (ggml type 39) GGUF dequant (`embed`).** OCP Microscaling FP4 — the
+  32-element block (e8m0 scale + 16 e2m1 nibble-pairs) — unlocking gpt-oss weights.
+  Hand-derived against `gguf/quants.py` and pinned (`embed/gguf.go`,
+  `embed/gguf_mxfp4_test.go`).
 
 - **GTE encoder + `encoder.LoadGTE` (`encoder`).** A pure-Go forward for the GTE
   architecture (Alibaba gte-multilingual-base): post-norm, RoPE positions, a
@@ -51,6 +72,55 @@ it.
 - **`encoder.MatryoshkaFloor("mixedbread-ai/mxbai-embed-large-v1")` → 512.** mxbai
   is Matryoshka-trained; the floor is measured by `TestEmbedderCoverage_matryoshka`,
   not asserted.
+
+### Fixed
+
+Remediation of the 2026-07-25 engineering audit (`docs/AUDIT-2026-07-25.md`, 24
+findings). Each fix ships with a regression test and a break-it-first check.
+
+- **`encoder`: silent-wrong pooling and dropped biases.** `LoadWeights` now reads
+  the declared pooling mode instead of always assuming CLS (#1); the batch and Q8
+  attention paths no longer drop the qkv/out_proj biases a bias-carrying checkpoint
+  needs (#3); `Load` takes the mmap loader rather than a full heap read (#2).
+- **Data races.** `chunk.Register` guards the chunker registry against a concurrent
+  map write (#17); `FlatI8.PageStats` locks the pager it shares with `Query` (#9).
+  Both are `-race` clean.
+- **Determinism.** `sparse` sums scores in a fixed order (was map-iteration-order
+  dependent) (#16); `topk` evicts the latest tied minimum rather than an arbitrary
+  one, so ties break by index (#6).
+- **Robustness / crashes.** `vision` rejects zero-patch grids instead of dividing by
+  zero and guards a zero pixel-std (#4, #23); the `markdown` chunker collapses
+  frontmatter/fence blocks correctly and drops the quadratic they triggered (#7, #8,
+  #15); the `regex` chunker attaches a block at line 0 correctly (#22).
+
+### Performance
+
+Allocation and kernel wins across the decode/index hot paths, each proven
+bit-identical or parity-gated (float32-bits / checksum pins, or the certified cosine
+suites).
+
+- **`vision`** scratch allocated once per `Forward` (23.2 → 2.3 MB/op) and a
+  `linalg.Workspace` threaded through the SigLIP projections (int8 5.87 → 2.42 MB/op)
+  (#5, #12).
+- **`encoder`** MoE `W2` projection SIMD-ified via a load-time transpose + the
+  register-blocked kernel (~3.5× the scalar loop) and `moeMLP` arena-allocated (0
+  allocs/op) (#10).
+- **`embed`** allocation-free `wordPiece` probe via a pooled buffer (3.5×) and a
+  fused `StaticModel.encodeIDs` pooling pass (#11, #18).
+- **`ann`/`linalg`/`bm25`** — paged-`FlatI8` reuses one `Workspace` across blocks,
+  weight-only Q8/Q4 matmuls gained `*Into` `Workspace` variants, `hnsw` candidate
+  sorts moved to `slices.SortFunc`, and `bm25.Build` reuses one tf map across
+  documents (#13, #14, #24, #20).
+
+### Changed
+
+- **`embed.L2Normalize` is the single canonical L2-normalize.** The three divergent
+  copies (with different degenerate-vector behavior) are unified onto it; the encoder
+  embedders route through it. Scale-invariant, so certified cosines are unaffected
+  (#21).
+- **`encoder.EncodeBatch` deduplicated**, and `ModelQ8` gained `Close()` so both
+  `Model` and `ModelQ8` satisfy `io.Closer` (not added to the Hard-tier `Encoder`
+  interface, which would break it) (#19).
 
 ## [1.11.0] — 2026-07-22
 
@@ -1491,6 +1561,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.11.0...HEAD
+[1.12.0]: https://github.com/townsendmerino/aikit/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/townsendmerino/aikit/compare/v1.10.1...v1.11.0
 [1.10.1]: https://github.com/townsendmerino/aikit/compare/v1.10.0...v1.10.1
 [1.10.0]: https://github.com/townsendmerino/aikit/compare/v1.9.0...v1.10.0
