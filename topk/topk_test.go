@@ -197,3 +197,41 @@ func TestPush_LargeStream(t *testing.T) {
 		}
 	}
 }
+
+// TestSelector_tieBreakFirstSeen is the regression for AUDIT #6: when a later,
+// strictly-higher score forces an eviction among tied minimums, the FIRST-seen
+// tied item must survive (the "ties broken by ascending id / first-seen wins"
+// contract bm25.TopK and sparse.Query document). The traced failure: Push(0,5),
+// Push(1,5), Push(2,10) at k=2 wrongly kept item 1 and dropped item 0.
+func TestSelector_tieBreakFirstSeen(t *testing.T) {
+	s := New[int](2)
+	s.Push(0, 5) // first-seen tied minimum — must survive
+	s.Push(1, 5) // later tied minimum — must be evicted first
+	s.Push(2, 10)
+	got := s.Result()
+	if len(got) != 2 {
+		t.Fatalf("got %d results, want 2", len(got))
+	}
+	if got[0].Item != 2 || got[0].Score != 10 {
+		t.Errorf("top result = {%d,%v}, want {2,10}", got[0].Item, got[0].Score)
+	}
+	if got[1].Item != 0 {
+		t.Errorf("tie survivor = item %d, want item 0 (first-seen); item 1 was wrongly kept", got[1].Item)
+	}
+
+	// Symmetric check with more ties: offer 0..4 all at score 1, then a 9. k=3.
+	// The three survivors must be the first-seen tied items {0,1} plus the 9.
+	s2 := New[int](3)
+	for i := 0; i < 5; i++ {
+		s2.Push(i, 1)
+	}
+	s2.Push(9, 100)
+	res := s2.Result()
+	survivors := map[int]bool{}
+	for _, r := range res {
+		survivors[r.Item] = true
+	}
+	if !survivors[9] || !survivors[0] || !survivors[1] {
+		t.Errorf("survivors = %v, want {9,0,1} (first-seen ties kept)", survivors)
+	}
+}

@@ -30,6 +30,20 @@ package topk
 type scored[T any] struct {
 	item  T
 	score float64
+	seq   uint64 // insertion order, for the tie-break (audit #6)
+}
+
+// heapLess orders the min-heap on (score asc, seq desc): among equal scores the
+// LATER-inserted item is "smaller" and sits at the root, so an eviction removes
+// the newest tied item and the first-seen ones survive — the "ties broken by
+// ascending document id / first-seen wins" contract bm25.TopK and sparse.Query
+// document. Ordering only on score left heap[0] as an arbitrary tied minimum, so a
+// higher score arriving later could evict an OLDER tied item and keep a newer one.
+func heapLess[T any](a, b scored[T]) bool {
+	if a.score != b.score {
+		return a.score < b.score
+	}
+	return a.seq > b.seq
 }
 
 // Selector is a min-heap of fixed capacity. Push items as you score
@@ -44,6 +58,7 @@ type scored[T any] struct {
 // sort cost.
 type Selector[T any] struct {
 	k    int
+	seq  uint64 // monotonic offer counter feeding the tie-break
 	heap []scored[T]
 }
 
@@ -78,18 +93,21 @@ func (s *Selector[T]) Push(item T, score float64) bool {
 	if score != score {
 		return false
 	}
+	seq := s.seq
+	s.seq++
 	if len(s.heap) < s.k {
-		s.heap = append(s.heap, scored[T]{item: item, score: score})
+		s.heap = append(s.heap, scored[T]{item: item, score: score, seq: seq})
 		s.siftUp(len(s.heap) - 1)
 		return true
 	}
 	// At capacity: only retain if strictly greater than current minimum.
-	// Strict > preserves "older wins on tie" for callers that iterate
-	// input in their natural order — see the doc comment on Selector.
+	// Strict > still rejects a tied newcomer (score == min); the heap's
+	// (score asc, seq desc) ordering makes heap[0] the latest-inserted tied
+	// minimum, so evicting it keeps the first-seen tied items (audit #6).
 	if score <= s.heap[0].score {
 		return false
 	}
-	s.heap[0] = scored[T]{item: item, score: score}
+	s.heap[0] = scored[T]{item: item, score: score, seq: seq}
 	s.siftDown(0)
 	return true
 }
@@ -140,7 +158,7 @@ func (s *Selector[T]) Len() int { return len(s.heap) }
 func (s *Selector[T]) siftUp(i int) {
 	for i > 0 {
 		parent := (i - 1) / 2
-		if s.heap[i].score >= s.heap[parent].score {
+		if !heapLess(s.heap[i], s.heap[parent]) {
 			return
 		}
 		s.heap[i], s.heap[parent] = s.heap[parent], s.heap[i]
@@ -157,10 +175,10 @@ func siftDownSlice[T any](heap []scored[T], i int) {
 	for {
 		l, r := 2*i+1, 2*i+2
 		smallest := i
-		if l < n && heap[l].score < heap[smallest].score {
+		if l < n && heapLess(heap[l], heap[smallest]) {
 			smallest = l
 		}
-		if r < n && heap[r].score < heap[smallest].score {
+		if r < n && heapLess(heap[r], heap[smallest]) {
 			smallest = r
 		}
 		if smallest == i {
