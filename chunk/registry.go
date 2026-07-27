@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"sync"
 )
 
 // DefaultChunkSize is the target chunk size in bytes (≈characters for the
@@ -49,7 +50,15 @@ type Chunker interface {
 	Name() string // "line" | "regex" | (future) "chroma" | "treesitter"
 }
 
-var registry = map[string]Chunker{}
+// registryMu guards registry. Register is documented as runtime-callable
+// (external mcp.Run authors, config-reload handlers), and Get runs on every
+// ChunkFile, so an unguarded map is a `concurrent map read and map write` fatal
+// (audit #17). Like database/sql.Register, take a lock — RWMutex so the hot Get
+// path stays parallel.
+var (
+	registryMu sync.RWMutex
+	registry   = map[string]Chunker{}
+)
 
 // Register adds a chunker under name. Called from init() — the "line"
 // chunker registers itself in this package; "regex" registers from
@@ -57,19 +66,37 @@ var registry = map[string]Chunker{}
 // cycle: chunk must not import its own sub-chunkers). External mcp.Run
 // authors call this directly to register a custom or ken-provided
 // chunker before invoking mcp.Run (ADR-032).
-func Register(name string, c Chunker) { registry[name] = c }
+func Register(name string, c Chunker) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	registry[name] = c
+}
 
 // Get returns the registered chunker, or an error listing what is available.
 func Get(name string) (Chunker, error) {
+	registryMu.RLock()
 	c, ok := registry[name]
-	if !ok {
-		return nil, fmt.Errorf("chunk: unknown chunker %q (have %v)", name, Names())
+	if ok {
+		registryMu.RUnlock()
+		return c, nil
 	}
-	return c, nil
+	// Build the error's name list while still holding the read lock — RWMutex is
+	// not reentrant, so calling the public Names() (which RLocks again) here could
+	// deadlock against a waiting Register.
+	names := namesLocked()
+	registryMu.RUnlock()
+	return nil, fmt.Errorf("chunk: unknown chunker %q (have %v)", name, names)
 }
 
 // Names lists registered chunker names, sorted.
 func Names() []string {
+	registryMu.RLock()
+	defer registryMu.RUnlock()
+	return namesLocked()
+}
+
+// namesLocked returns the sorted names; the caller must hold registryMu (R or W).
+func namesLocked() []string {
 	out := make([]string, 0, len(registry))
 	for n := range registry {
 		out = append(out, n)
