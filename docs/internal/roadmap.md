@@ -32,9 +32,10 @@ knobs, pool deleted, surface audit (deliberate keep), format policy
 
 In order. Items 1–3 are a sequence, not a menu; each feeds the next.
 
-1. **Post the announcement** — [high / trivial; asset exists]. The r/golang
-   draft is written (`r-golang-post.md`, repo root — strip the posting-notes
-   footer). Post it; optionally follow with Show HN a few days later (HN
+1. **Post the announcement** — [high / trivial]. The r/golang draft was written
+   as `r-golang-post.md` (repo root — strip the posting-notes footer), but that
+   file is **not in the repo** as of 2026-07-27 (never committed; regenerate or
+   locate before posting). Post it; optionally follow with Show HN a few days later (HN
    wants a different lead: the war story or the `//go:embed` demo, not the
    feature list). Submit to awesome-go the same week (its bar: API docs,
    coverage, CI — all already met).
@@ -176,14 +177,14 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
    SPLADE / CrossEncoder / int8 indexes / persistence graduate to the
    semver tier once they survive two quiet consecutive minors under an
    external consumer (the same bar the original Hard tier met). Trigger:
-   §1.3's adopter + that stability window. Re-run the surface audit's
-   "re-evaluate" notes (unconsumed Workspace methods) at that moment.
-   *Note (§2.8):* `WeightMat.MatmulBTInto`'s f32/W8A8 paths now route
-   through the `Workspace`-scoped matmul (honoring `SetThreshold`/
-   `SetWorkers`), but no in-repo consumer exercises them yet — the encoder
-   Q8 migration uses its own baked-scale kernel. The "unconsumed" status
-   flips only when the goinfer `decoder.weightMat` f32 path migrates onto
-   `MatmulBTInto`; re-evaluate then.
+   §1.3's adopter + that stability window.
+   *Note (§2.8), updated 2026-07-27:* `WeightMat.MatmulBTInto`'s f32/W8A8
+   paths route through the `Workspace`-scoped matmul (honoring
+   `SetThreshold`/`SetWorkers`), and are now **consumed in-repo** — the
+   `aikit/vision` tower threads a `Workspace` through all six per-layer
+   projections via `lw.MatmulBTInto(&s.ws, …)` (`vision/encoder.go`, the
+   audit-#12 Workspace threading). So the "unconsumed" caveat is resolved;
+   the method has real coverage for the graduation audit.
 8. **`linalg.WeightMat` — unify the quantized-weight abstraction** —
    ✅ **DONE (type + 3 of 3 consumers).** The precision-hiding
    weight-matrix wrapper was implemented **three times** — aikit
@@ -211,11 +212,11 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
    reconstructs the old kernel calls and asserts exact float-bit equality
    against the WeightMat path (plus the no-alias and int8-export contracts).
    Break-it-first: flipping the `w8a8` flag moves the result and turns it red.
-   *Still unconsumed (cf. §2.7):* nothing routes through
-   `WeightMat.MatmulBTInto` yet — the decoder migration landed on
-   `MatmulBT`, so the `Workspace`-scoped f32/W8A8 paths remain without an
-   in-repo consumer. That re-evaluation is still pending, contrary to what
-   §2.7's note anticipated.
+   *Now consumed (cf. §2.7), updated 2026-07-27:* `aikit/vision` exercises
+   `WeightMat.MatmulBTInto` — the audit-#12 Workspace threading routes all six
+   per-layer projections through `lw.MatmulBTInto(&s.ws, …)` (`vision/encoder.go`),
+   so the `Workspace`-scoped f32/W8A8 paths have an in-repo consumer. The decoder
+   migration landing on `MatmulBT` is no longer what the re-evaluation waits on.
 9. **`vision` (SigLIP/ViT encoder) → aikit** — ✅ **DONE (aikit side).**
    The vision tower moved into `aikit/vision` (Experimental), verbatim and
    parity-preserving — decode/preprocess/forward/qmat/resident + the

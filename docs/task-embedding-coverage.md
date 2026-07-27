@@ -85,7 +85,8 @@ That's the silent-wrong class, and only a reference comparison catches it:
 ## Phasing
 
 - **Phase 1 —** the `encoder` API work (loader variants, declared pooling, WordPiece), landing
-  3 representatives with gates: `all-minilm`, `bge-large`, `nomic-embed-text`.
+  3 representatives with gates: `all-minilm`, a CLS-BERT (`bge-large` was the planned rep;
+  `bge-small-en-v1.5` was the one actually certified — same architecture), `nomic-embed-text`.
 - **Phase 2 —** the XLM-R trio (`bge-m3`, `paraphrase-multilingual`, `arctic-embed2`) —
   multilingual tokenizer + the position offset.
 - **Phase 3 —** decoder-as-embedder, goinfer side (`qwen3-embedding`, `embeddinggemma`).
