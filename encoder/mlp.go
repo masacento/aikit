@@ -109,8 +109,8 @@ func moeMLP(h, router, w1, w2t, bias []float32, numExperts, topK, D, intermediat
 	s.moeOut = ensureF32(s.moeOut, D)
 	scores := s.moeScores
 	out := s.moeOut
-	x1 := s.val[:intermediate]  // W1 output (reuses the SwiGLU value buffer)
-	contrib := s.mid[:D]        // per-expert W2 output (reuses the fc2-output buffer)
+	x1 := s.val[:intermediate] // W1 output (reuses the SwiGLU value buffer)
+	contrib := s.mid[:D]       // per-expert W2 output (reuses the fc2-output buffer)
 
 	for t := range L {
 		row := h[t*D : (t+1)*D]
