@@ -93,8 +93,11 @@ incomplete for a cross-backend claim, it's impossible. Consequences:
 - The doc states plainly *what was measured where*; no silent cross-machine
   extrapolation.
 - This is goinfer's "second-machine-confirmation debt" (DECISIONS.md) becoming
-  **structural**. Decide the policy once: which numbers are gated, which are
-  documented periodic runs.
+  **structural**, and the policy is settled (see *Where the benchmarks live*): no
+  GPU number is CI-gated — cross-machine numbers *cannot* be, since Metal and CUDA
+  never co-reside — so **all** GPU rows are a **documented periodic pass** on
+  self-hosted M-series + NVIDIA runners. Only the pure-Go `CGO_ENABLED=0` no-regression
+  guard (§5) stays in default CI.
 
 ### 5. Re-run CPU as a contemporaneous baseline + a no-regression gate
 Collect the CPU SIMD numbers on the *same boxes and harness build* the GPU runs
@@ -199,5 +202,5 @@ ANN is "the one workload with no GPU path at all." Start there: **`FlatI8` CPU
 SIMD vs `anncuda` (and `annmetal`) `QueryBatch`, as an (N × batch) crossover on
 real Model2Vec embeddings**, measured against the exact-CPU top-k for recall +
 parity, with the four cost components broken out. That single sweep validates the
-whole methodology and produces the first real dispatch threshold. See the
-companion kickoff prompt.
+whole methodology and produces the first real dispatch threshold. The kickoff
+prompt is [`prompts/bench-ann-first-slice.md`](prompts/bench-ann-first-slice.md).
