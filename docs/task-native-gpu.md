@@ -212,12 +212,17 @@ kernel) and reuses `vision.BuildWindowPlan` rather than reimplementing the index
 the **patch merger** stays on the CPU, being three small ops over n_patches/merge² groups against
 32 blocks of tower.
 
-**Still to do in Phase 3:** just **tiling** the correctness-first GEMMs. Note the parity fixtures
-are *tiny* towers: they gate correctness sharply and say nothing about throughput, so tiling must
-be driven by a real SigLIP-so400m / dynamic-res Qwen measurement, not by assumption
-(`docs/BENCH-gpu.md` is that methodology).
+**Phase 3 is complete.** The correctness-first GEMMs have since been **tiled** and then
+superseded by a **simdgroup_matrix** kernel on Metal (see Phase 4's GEMM section — the kernels
+are shared, `gpu/`-level, not vision-specific). Note the parity fixtures are *tiny* towers: they
+gate correctness sharply and say nothing about throughput, so all GEMM tuning was driven by the
+`BenchmarkMetalGEMMF32` sweep, not by the fixtures (`docs/BENCH-gpu.md` is that methodology).
 
-**Phase 4 — encoder native — 🟡 THE SEAM IS NOW WIRED; backends remain.**
+**Phase 4 — encoder native — ✅ DONE (f32); one int8 decision remains.** The seam is wired and
+both native backends (`gpu/enccuda`, `gpu/encmetal`) ship, parity-gated, with the production
+GEMMs and an end-to-end figure. The single open item is the **int8 (`LoadQ8`) encoder path**, and
+it is a *decision*, not unbuilt work — it routes through the existing `WeightMat` W8A8 GEMV, NOT
+by widening `Backend` (see the scope note below).
 
 The plan said "`encoder.Backend` already has `webgpu`; add native Metal/CUDA", which read as
 *plug a backend into a working seam*. It wasn't: the interface existed, `NewBackend` resolved
@@ -338,13 +343,29 @@ single short-sequence forward (small L, hidden 384) has no matmul above it, so t
 correctly stays entirely on the CPU and the numerics are identical — the device pays for batched
 or larger-model encode. (`BENCH-gpu.md`: microbenchmarks tune, end-to-end publishes.)
 
-**Still to do in Phase 4:** widening `Backend` for the int8 (`LoadQ8`) path — a Hard-tier
-decision, see the scope note above. Optional throughput follow-ons, both measurement-gated: a
-CUDA `wmma` (Tensor-Core) mirror of `gemm_f32_sg_big`, and — to close the remaining gap to the
-~4.7 TFLOP/s M1-Pro peak from today's ~1.08 TFLOP/s — **double-buffered / async-copy staging** in
-the general kernel (the one lever not yet pulled: the aligned kernel already dropped the barriers,
-but prefetching the next K-tile while the ALU computes is what production GEMMs do next). Wider
-register blocking is NOT the lever — it was tried and lost to register spilling.
+**Still to do in Phase 4:** the int8 (`LoadQ8`) encoder path — the one open *decision* (route via
+the `WeightMat` W8A8 GEMV, per the scope note; don't widen `Backend`). One optional throughput
+follow-on remains, a **CUDA `wmma` (Tensor-Core) GEMM** on the Linux box — but note it is NOT a
+straight mirror of `gemm_f32_sg_big`: Tensor Cores have no true fp32 path, so an f32-accumulate
+`wmma` needs **tf32** inputs (~10-bit mantissa, ~1e-3 relative), which fails the encoder's 2e-4
+f32 parity bound. It is therefore a precision decision (relax the bound and document it, or use a
+non-Tensor-Core shared-memory GEMM), not a copy of the Metal kernel.
+
+**Metal f32 GEMM — the peak-push levers were explored and the ~1.08 TFLOP/s kernel is the
+practical ceiling for the simple approach.** `gemm_f32_sg_big` (direct device loads, no barriers)
+sits at ~23% of the M1-Pro's ~4.7 TFLOP/s f32 peak. Three standard levers were implemented and
+benchmarked (1s runs, `BenchmarkMetalGEMMF32`); none beat it, so none shipped:
+- **Wider register blocking** (64×64 tile, 16 fragments/simdgroup) — ~150 GFLOP/s: 24 live
+  simdgroup matrices spill registers and occupancy collapses.
+- **Double-buffered staging** (ping-pong threadgroup buffers, one barrier/K-step, prefetch under
+  compute) — *worse* at the shapes that matter (737 vs 968 GFLOP/s at 2416 MFLOP): the staged
+  path's extra device→threadgroup hop and output staging outweigh the barrier it saves.
+- **Register-level software prefetch** on the direct-load kernel (load next K-tile's fragments
+  under the current MACs) — marginal and shape-dependent (+14% at large-K 604 MFLOP, +2% at 8590,
+  but −24% at short-K 151 where the extra registers hurt); not a reliable win.
+Closing the remaining gap to peak needs a genuinely sophisticated kernel (large-tile blocking
+with co-tuned register/occupancy budgets, or Apple's newer tensor APIs) — a separate project with
+uncertain payoff, well beyond tuning. The direct-load kernel is where the simple approach lands.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
 waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a
@@ -393,13 +414,13 @@ portable, CPU always).
 goinfer-Metal device re-point) → **Phase 2 ✅** (ANN-GPU batch-GEMM — the headline) → **Phase 1b
 ✅** (CUDA device impl + CUDA ANN backend + the tuned-GEMV blob-split + the goinfer CUDA device
 re-point, all parity-gated on an RTX 2070 SUPER) → **Phase 3 ✅** (SigLIP and Qwen2.5-VL both done
-on BOTH CUDA and Metal; only GEMM tiling remains, and it is throughput work driven by a real
-measurement) → **Phase 4** (encoder native — but see the
-dangling-seam finding above: it starts with wiring, not with a backend).
+on BOTH CUDA and Metal, tiled and then simdgroup-GEMM'd) → **Phase 4 ✅ (f32)** (encoder native:
+seam wired, `enccuda` + `encmetal` shipped with production GEMMs and an end-to-end figure; the
+int8 path is a remaining `WeightMat`-dispatch decision, not unbuilt work).
 
 **Nothing is gated behind an unfired trigger any more.** Every "wait for X to settle" in this
 plan has been discharged: the tuned kernels stabilized, the blob-split turned out to be a clean
 entry-point cut rather than a disentangling, and both device re-points landed bit-identical.
-What remains — encoder-native (wiring first), and tiling the correctness-first
-GEMMs — is simply unbuilt work, sequenced by value rather than by risk. `embed` is ruled out on the
-merits (above), not deferred.
+What remains is a single int8-encoder dispatch decision (route via `WeightMat`, not by widening
+`Backend`) and optional CUDA-side GEMM throughput work; `embed` is ruled out on the merits
+(above), not deferred.
