@@ -186,12 +186,24 @@ the biggest single-workload win — the payoff the product bet is aimed at.
   `dispatchThreads` (no bounds checks), UMA (`Floats()` is a live view, no upload/download),
   scalars as 1-element buffers, and one `LockOSThread` per forward for the autorelease pool.
 
-**Still to do in Phase 3:** the **Qwen2.5-VL** resident path
-(`goinfer/docs/prompts/aikit-qwen25vl-vit.md`), whose dynamic resolution means thousands of
-patches — the fat GEMM the MMA path was built for. Note the current parity fixture is a *tiny*
-tower (16 patches × 32 hidden): it gates correctness sharply and says **nothing** about
-throughput. The correctness-first GEMM here is one thread per output element; tiling it is the
-throughput work, and it should be driven by a real SigLIP-so400m measurement, not by assumption.
+**Qwen2.5-VL — ✅ DONE on CUDA.** `vision.QwenResidentEncoder` (the seam `qwen_encoder.go`
+flagged as a follow-on) plus `gpu/qwencuda`. Five kernels beyond the SigLIP set — weight-only
+RMSNorm, NeoX 2D rotary on a fused QKV, **segmented** attention (windowed vs full per block),
+gated SiLU, and an **erf**-GELU distinct from SigLIP's tanh one. Parity on the pinned tiny
+tower: ViT **cosine 1.000000000** (Δ 1.13e-06) and merged features **1.000000000** (Δ 6.71e-08),
+with both attention kinds exercised.
+
+Two deliberate host/device splits, documented in the package: the **window permutation** is done
+by permuting pixel ROWS before upload (the patch embed is row-wise, so this needs no gather
+kernel) and reuses `vision.BuildWindowPlan` rather than reimplementing the index arithmetic; and
+the **patch merger** stays on the CPU, being three small ops over n_patches/merge² groups against
+32 blocks of tower.
+
+**Still to do in Phase 3:** the **Metal** mirror of the five Qwen kernels (`metal_vit.go`'s ViT
+does not carry them yet, so a Qwen resident encoder is CUDA-only), and **tiling** the
+correctness-first GEMMs. Note the parity fixtures are *tiny* towers: they gate correctness
+sharply and say nothing about throughput, so tiling must be driven by a real SigLIP-so400m /
+dynamic-res Qwen measurement, not by assumption.
 
 **Phase 4 — encoder native. ⚠️ Bigger than this plan assumed: `encoder.Backend` is a DANGLING
 SEAM.** The plan says "`encoder.Backend` already has `webgpu`; add native Metal/CUDA", which

@@ -115,6 +115,8 @@ type QwenVisionEncoder struct {
 	merger2w   linalg.WeightMat // merger.mlp.2 [out_hidden, hidden*merge²]
 	merger2b   []float32
 	rotInvFreq []float32 // head_dim/4 rotary frequencies
+
+	resident QwenResidentEncoder // device-resident ViT (EnableResident); nil = CPU path
 }
 
 const qwenRotaryTheta = 10000.0 // Qwen2_5_VisionRotaryEmbedding default theta
@@ -235,7 +237,7 @@ func qwenTensorPrefix(st *embed.SafetensorsFile) string {
 // embeddings [n_merged, out_hidden_size] in ORIGINAL patch order — the embeddings
 // that replace the decoder's <image> placeholders. n_merged = Σ t*h*w / merge².
 func (e *QwenVisionEncoder) Forward(pixelValues []float32, gridTHW [][3]int) ([]float32, error) {
-	hid, err := e.forwardViT(pixelValues, gridTHW)
+	hid, err := e.ForwardViT(pixelValues, gridTHW)
 	if err != nil {
 		return nil, err
 	}
@@ -359,6 +361,12 @@ func (e *QwenVisionEncoder) forwardViT(pixelValues []float32, gridTHW [][3]int) 
 
 // ForwardViT exposes the pre-merge hidden state for stage-isolated parity tests.
 func (e *QwenVisionEncoder) ForwardViT(pixelValues []float32, gridTHW [][3]int) ([]float32, error) {
+	// Device-resident path (EnableResident): the whole ViT runs on the GPU and
+	// returns the same de-windowed, original-order hidden state. The merger stays on
+	// the CPU (see QwenResidentEncoder's doc for why).
+	if e.resident != nil {
+		return e.resident.ForwardViT(pixelValues, gridTHW)
+	}
 	return e.forwardViT(pixelValues, gridTHW)
 }
 
