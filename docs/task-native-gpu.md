@@ -128,11 +128,22 @@ of Phase 1, verified on an RTX 2070 SUPER:
   allocation slack); the device layer's sentinel-canary `TestCUDA_tailBlockGuard` is what does,
   and the tests say so.
 
+**goinfer's CUDA device re-point — ✅ DONE.** goinfer `25a4711` deletes its raw-gocudrv device
+layer and builds its tuned decode kernels on `aikit/gpu` instead — the CUDA analog of the Metal
+re-point, and the second proof of the shared-substrate relationship. It is what drove the CUDA
+surface past the ANN proving path's needs: `gpu/v0.2.0` dispatched buffers-only on derived 1-D
+geometry, which a tuned kernel set cannot express, so **`v0.3.0`** added scalar kernel args passed
+by value, explicit grid/block geometry with dynamic shared memory, async `Launch` + explicit
+`Sync`, pinned host memory, and generic typed-buffer verbs; **`v0.3.1`** added `ArgNull` for
+optional-buffer binds. A consumer can now express a whole decode loop importing **only**
+`aikit/gpu`, with no gocudrv type in any signature.
+
 **Still deferred (gated on the tuned kernels stabilizing):** the **blob-split + lift of the tuned
-W4A8/W8A8 kernels**, and re-pointing goinfer's CUDA backend at this device layer (the CUDA analog
-of the Metal device re-point, tag-gated, after a `gpu/v0.2.0` cutting the new CUDA surface). Those
-carry the real cost — a moving API and the blob-split — and there is no reason to pay it here.
-When ANN-GPU is funded, swap the minimal proving kernels for the tuned ones.
+W4A8/W8A8 kernels** into aikit — the one genuinely expensive piece left, because the generic
+quantized GEMV is physically fused with the LLM-specific kernels in goinfer's shared PTX blobs
+(the risk this plan has flagged from the start: the device substrate is the clean part, the
+kernels are the work). `gpu/anncuda`'s minimal, correctness-only kernels are the documented
+swap-in point when that trigger fires.
 
 **Phase 2 — ANN-GPU, completed (the headline unlock).** Phase 1 lands the `ann.Backend` seam
 and a minimal single-query path; Phase 2 turns it into the real win: swap the proving kernel for
