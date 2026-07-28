@@ -138,7 +138,7 @@ func TestBackend_nilIsUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBackend(cpu): %v", err)
 	}
-	defer cpu.Close()
+	defer func() { _ = cpu.Close() }()
 	viaRegistered := f.run(cpu)
 	for i := range base {
 		if base[i] != viaRegistered[i] {
