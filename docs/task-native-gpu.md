@@ -153,15 +153,41 @@ the paged `LoadFlatI8MmapPaged` path. **Parity-gated:** GPU-ANN top-k ≡ CPU-AN
 indexes (rank-exact within the int8 tolerance). This is *new* coverage (ANN has none today) and
 the biggest single-workload win — the payoff the product bet is aimed at.
 
-**Phase 3 — vision native + the Qwen ViT resident path.** `vision.ResidentEncoder` already
-exists (WebGPU SigLIP, "~9×"); add native Metal/CUDA implementations, and build the
-**Qwen2.5-VL** resident path (currently a documented follow-on, `goinfer/docs/prompts/
-aikit-qwen25vl-vit.md`). Batch patches (M = np, thousands for dynamic-res Qwen) → the fat
-GEMM the MMA path was built for. Parity-gated vs the CPU tower (HF-parity already exists).
+**Phase 3 — vision native + the Qwen ViT resident path — 🟡 CUDA SigLIP DONE, rest active.**
+`vision.ResidentEncoder` already existed (WebGPU SigLIP, "~9×"); the native CUDA
+implementation now exists too:
+
+- **`gpu/vit.cu` + `cuda_vit.go`** — the transformer-encoder kernel set on top of the device
+  layer: quantized GEMM, f32 GEMM, LayerNorm, tanh-GELU, bidirectional multi-head attention,
+  per-row int8 quantize, and the two broadcast adds. These live in `gpu/` rather than beside
+  the vision backend because **none of them is vision-specific** — they are the same ops a
+  text encoder needs, so Phase 4 builds on them rather than duplicating them.
+- **`gpu/visioncuda`** (nested module, mirroring `gpu/anncuda`) — the `vision.ResidentEncoder`
+  itself. The tower uploads once and the `[np, hidden]` residual stream never leaves the
+  device between the patch embed and the post-LayerNorm; only patches go up and the last
+  hidden state comes back. One `Sync` per forward, not per op.
+- **Parity-gated vs the CPU tower**, which is what forced every kernel to mirror
+  `vision/encoder.go`'s *exact* formulation rather than a standard one — double-accumulated
+  LayerNorm/softmax, tanh-GELU (not erf), eps on the variance. Result on the pinned
+  siglip-tiny checkpoint: **cosine 1.000000000, worst abs Δ 7.15e-07**, with break-it-first
+  (a negated input scores −0.49). Each kernel is *also* gated individually against a CPU
+  reference — a whole-tower cosine can stay high while one op is subtly wrong.
+
+**Still to do in Phase 3:** the **Metal** implementation of the same kernel set (it needs the
+Apple box — this work was done on the NVIDIA box and only the CUDA half is testable here), and
+the **Qwen2.5-VL** resident path (`goinfer/docs/prompts/aikit-qwen25vl-vit.md`), whose dynamic
+resolution means thousands of patches — the fat GEMM the MMA path was built for. Note the
+current parity fixture is a *tiny* tower (16 patches × 32 hidden): it gates correctness
+sharply and says **nothing** about throughput. The correctness-first GEMM here is one thread
+per output element; tiling it is the throughput work, and it should be driven by a real
+SigLIP-so400m measurement, not by assumption.
 
 **Phase 4 — encoder native.** `encoder.Backend` already has `webgpu`; add native Metal/CUDA.
 Batch text embedding (M = L tokens / B·Lmax). Incremental over the existing cgo-WebGPU path —
-the win here is *cgo-free + native-class*, not GPU-where-there-was-none.
+the win here is *cgo-free + native-class*, not GPU-where-there-was-none. **Not gated behind a
+trigger** — it is simply unbuilt, and Phase 3's kernel set (`gpu/vit.cu`) is most of the
+compute it needs, so the remaining work is the `encoder.Backend` wiring plus its own parity
+gate.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
 waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a
@@ -206,11 +232,15 @@ portable, CPU always).
 
 ## Recommended sequence
 
-**Phase 0 ✅ done** → **Phase 1 ✅ done (scoped first cut)** — `aikit/gpu` + Metal device layer +
-minimal-kernel ANN proof + goinfer-Metal device re-point, as a named product bet → **Phase 2
-✅ done** (ANN-GPU batch-GEMM — the headline) → **Phase 1b ✅ done** (CUDA device impl + the CUDA
-ANN backend, parity-gated on an RTX 2070 SUPER) → **next: the tuned-GEMV blob-split + the goinfer
-CUDA device re-point**, *gated on the decode kernels settling* → Phase 3 (vision native + Qwen
-ViT) → Phase 4 (encoder native). Each gated, each independently shippable, each leaving aikit
-stronger and still cgo-free. The device substrate is now two-platform; the remaining cost and
-moving-API risk are quarantined into the blob-split, behind its trigger.
+**Phase 0 ✅** → **Phase 1 ✅** (`aikit/gpu` + Metal device layer + minimal-kernel ANN proof +
+goinfer-Metal device re-point) → **Phase 2 ✅** (ANN-GPU batch-GEMM — the headline) → **Phase 1b
+✅** (CUDA device impl + CUDA ANN backend + the tuned-GEMV blob-split + the goinfer CUDA device
+re-point, all parity-gated on an RTX 2070 SUPER) → **Phase 3 🟡** (CUDA SigLIP resident encoder
+done; Metal impl + Qwen2.5-VL path remain) → **Phase 4** (encoder native).
+
+**Nothing is gated behind an unfired trigger any more.** Every "wait for X to settle" in this
+plan has been discharged: the tuned kernels stabilized, the blob-split turned out to be a clean
+entry-point cut rather than a disentangling, and both device re-points landed bit-identical.
+What remains — Metal ViT, Qwen2.5-VL, encoder-native, and tiling the correctness-first GEMMs —
+is simply unbuilt work, sequenced by value rather than by risk. `embed` is ruled out on the
+merits (above), not deferred.
