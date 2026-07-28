@@ -48,6 +48,9 @@ type bertLayer struct {
 // BERT is a loaded MiniLM-class encoder. Immutable after load; the forward is
 // read-only-safe for concurrent use (no shared mutable state).
 type BERT struct {
+	// be is the compute backend for f32 matmuls; nil = the pure-Go path (default).
+	be Backend
+
 	cfg     bertConfig
 	wordEmb []float32 // [vocab, hidden]
 	posEmb  []float32 // [maxPos, hidden] — learned absolute positions
@@ -247,6 +250,7 @@ func (b *BERT) hiddenStates(ids, segs []int32) []float32 {
 	// (unlike the allocating matmulBT) parallelizes a lone forward — so a bare
 	// SPLADE.Expand / CrossEncoder.Score no longer runs single-threaded.
 	s := getScratch()
+	s.be = b.be
 	defer putScratch(s)
 	s.ensureLayer(L, D, c.Intermediate, c.Heads, headDim, L)
 
@@ -289,9 +293,9 @@ func (b *BERT) hiddenStates(ids, segs []int32) []float32 {
 
 		// Self-attention (no RoPE): Q,K,V = hWᵀ + b, into scratch.
 		Q, K, V := s.Q[:L*D], s.K[:L*D], s.V[:L*D]
-		matmulBTInto(h, l.Wq, Q, L, D, D)
-		matmulBTInto(h, l.Wk, K, L, D, D)
-		matmulBTInto(h, l.Wv, V, L, D, D)
+		s.mm(h, l.Wq, Q, L, D, D)
+		s.mm(h, l.Wk, K, L, D, D)
+		s.mm(h, l.Wv, V, L, D, D)
 		addBias(Q, l.Bq, L, D)
 		addBias(K, l.Bk, L, D)
 		addBias(V, l.Bv, L, D)
@@ -310,20 +314,20 @@ func (b *BERT) hiddenStates(ids, segs []int32) []float32 {
 					vHT[d*L+i] = V[src+d]
 				}
 			}
-			matmulBTInto(qH, kH, scores, L, headDim, L)
+			s.mm(qH, kH, scores, L, headDim, L)
 			for i := range scores {
 				scores[i] *= scale
 			}
 			for i := range L {
 				softmaxRow(scores[i*L : (i+1)*L])
 			}
-			matmulBTInto(scores, vHT, ctxHead, L, L, headDim)
+			s.mm(scores, vHT, ctxHead, L, L, headDim)
 			for i := range L {
 				copy(ctx[i*D+headIdx*headDim:i*D+headIdx*headDim+headDim], ctxHead[i*headDim:(i+1)*headDim])
 			}
 		}
 		attnOut := s.out[:L*D]
-		matmulBTInto(ctx, l.Wo, attnOut, L, D, D)
+		s.mm(ctx, l.Wo, attnOut, L, D, D)
 		addBias(attnOut, l.Bo, L, D)
 		for i := range h {
 			h[i] += attnOut[i] // residual
@@ -332,11 +336,11 @@ func (b *BERT) hiddenStates(ids, segs []int32) []float32 {
 
 		// GELU FFN: intermediate → gelu → output, residual, LayerNorm.
 		inter := s.val[:L*c.Intermediate]
-		matmulBTInto(h, l.Wi, inter, L, D, c.Intermediate)
+		s.mm(h, l.Wi, inter, L, D, c.Intermediate)
 		addBias(inter, l.Bi, L, c.Intermediate)
 		gelu(inter)
 		ffn := s.mid[:L*D]
-		matmulBTInto(inter, l.Wd, ffn, L, c.Intermediate, D)
+		s.mm(inter, l.Wd, ffn, L, c.Intermediate, D)
 		addBias(ffn, l.Bd, L, D)
 		for i := range h {
 			h[i] += ffn[i] // residual

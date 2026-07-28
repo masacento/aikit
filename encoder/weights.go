@@ -187,6 +187,9 @@ type LayerWeights struct {
 // not a fused mlp.fc1 [6144,768]. There is also no out_proj bias and no
 // final encoder LayerNorm beyond the last block's norm2.
 type Weights struct {
+	// be is the compute backend for f32 matmuls; nil = the pure-Go path (default).
+	be Backend
+
 	Cfg          Config
 	WordEmb      []float32 // [VocabSize, HiddenDim]
 	TokenTypeEmb []float32 // [TypeVocabSize, HiddenDim] — only row 0 used (single segment)

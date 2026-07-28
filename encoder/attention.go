@@ -31,7 +31,7 @@ func selfAttention(h []float32, Wqkv, WqkvB, OutProj, OutProjB []float32, heads,
 	}
 	// 1) Project: QKV = h · Wqkvᵀ (+ bias) -> [L, 3D] into scratch.
 	qkv := s.qkv[:L*3*D]
-	matmulBTInto(h, Wqkv, qkv, L, D, 3*D)
+	s.mm(h, Wqkv, qkv, L, D, 3*D)
 	addRowBias(qkv, WqkvB, L, 3*D)
 
 	// 2) Split QKV into Q, K, V — each [L, D]. Reuse scratch buffers.
@@ -72,7 +72,7 @@ func selfAttention(h []float32, Wqkv, WqkvB, OutProj, OutProjB []float32, heads,
 				vHT[d*L+i] = V[src+d]
 			}
 		}
-		matmulBTInto(qH, kH, scores, L, headDim, L)
+		s.mm(qH, kH, scores, L, headDim, L)
 		for i := range scores {
 			scores[i] *= scale
 		}
@@ -80,7 +80,7 @@ func selfAttention(h []float32, Wqkv, WqkvB, OutProj, OutProjB []float32, heads,
 			softmaxRow(scores[i*L : (i+1)*L])
 		}
 		// ctxHead[L, headDim] = scores[L, L] · V[L, headDim], as scores · (vHT)ᵀ.
-		matmulBTInto(scores, vHT, ctxHead, L, L, headDim)
+		s.mm(scores, vHT, ctxHead, L, L, headDim)
 		// Scatter this head's context into the interleaved ctx[L, D].
 		for i := range L {
 			dst := i*D + headIdx*headDim
@@ -90,7 +90,7 @@ func selfAttention(h []float32, Wqkv, WqkvB, OutProj, OutProjB []float32, heads,
 
 	// 5) Output projection into scratch (+ bias).
 	out := s.out[:L*D]
-	matmulBTInto(ctx, OutProj, out, L, D, D)
+	s.mm(ctx, OutProj, out, L, D, D)
 	addRowBias(out, OutProjB, L, D)
 
 	// 6) Residual: h += out (in place).

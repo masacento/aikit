@@ -29,14 +29,14 @@ package encoder
 func swigluMLP(h []float32, Fc11, Fc12, Fc2 []float32, D, intermediate, L int, s *scratch) {
 	val := s.val[:L*intermediate]
 	gate := s.gate[:L*intermediate]
-	matmulBTInto(h, Fc11, val, L, D, intermediate)
-	matmulBTInto(h, Fc12, gate, L, D, intermediate)
+	s.mm(h, Fc11, val, L, D, intermediate)
+	s.mm(h, Fc12, gate, L, D, intermediate)
 	// mid = val ⊙ SiLU(gate), reuse val's storage
 	for i, v := range val {
 		val[i] = v * silu(gate[i])
 	}
 	mid := s.mid[:L*D]
-	matmulBTInto(val, Fc2, mid, L, intermediate, D)
+	s.mm(val, Fc2, mid, L, intermediate, D)
 	for i := range h {
 		h[i] += mid[i]
 	}
@@ -68,12 +68,12 @@ func addRowBias(dst, bias []float32, M, N int) {
 // activation_function == "gelu".
 func geluMLP(h, fc1, fc1b, fc2, fc2b []float32, D, intermediate, L int, s *scratch) {
 	inner := s.val[:L*intermediate] // reuse the SwiGLU value buffer
-	matmulBTInto(h, fc1, inner, L, D, intermediate)
+	s.mm(h, fc1, inner, L, D, intermediate)
 	addRowBias(inner, fc1b, L, intermediate)
 	gelu(inner)
 
 	out := s.mid[:L*D] // reuse the SwiGLU fc2-output buffer
-	matmulBTInto(inner, fc2, out, L, intermediate, D)
+	s.mm(inner, fc2, out, L, intermediate, D)
 	addRowBias(out, fc2b, L, D)
 	for i := range h {
 		h[i] += out[i]
@@ -116,7 +116,7 @@ func moeMLP(h, router, w1, w2t, bias []float32, numExperts, topK, D, intermediat
 		row := h[t*D : (t+1)*D]
 
 		// Router: scores over all experts, softmaxed in float32.
-		matmulBTInto(row, router, scores, 1, D, numExperts)
+		s.mm(row, router, scores, 1, D, numExperts)
 		softmaxRow(scores)
 
 		clear(out)

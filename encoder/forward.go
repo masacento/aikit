@@ -56,6 +56,7 @@ func (w *Weights) forward(ids []int32) []float32 {
 	// forward reuses them (typical rerank loop). ensureLayer grows
 	// the per-buffer caps to fit this forward's L if needed.
 	s := getScratch()
+	s.be = w.be
 	defer putScratch(s)
 	s.ensureLayer(L, D, intermediate, heads, headDim, L)
 

@@ -14,8 +14,15 @@ var scratchPool = sync.Pool{
 	New: func() any { return &scratch{} },
 }
 
-func getScratch() *scratch  { return scratchPool.Get().(*scratch) }
-func putScratch(s *scratch) { scratchPool.Put(s) }
+func getScratch() *scratch { return scratchPool.Get().(*scratch) }
+
+// putScratch returns a scratch to the pool. It CLEARS the backend first: scratches are
+// pooled and shared across models, so a backend left on one would silently leak into the
+// next forward — including a forward on a model that never opted in.
+func putScratch(s *scratch) {
+	s.be = nil
+	scratchPool.Put(s)
+}
 
 // scratch is a per-forward scratchpad of reusable float32 buffers. The
 // alternative (allocating inside every selfAttention call) burns ~432
@@ -36,6 +43,12 @@ func putScratch(s *scratch) { scratchPool.Put(s) }
 // For single-sequence: cap=L; for batched: cap=B*Lmax. Caller passes
 // the right cap via ensure*.
 type scratch struct {
+	// be is the compute backend for this forward's f32 matmuls — nil means the
+	// pure-Go path, which is the default and is BIT-IDENTICAL to not having this
+	// field at all (mm dispatches to exactly the function the call sites used to
+	// call). Set from the model at each getScratch site; cleared by putScratch.
+	be Backend
+
 	// Linear-layer scratch (sized to L*3*D = QKV output, or L*D for
 	// projections). qkv is reused across the 12 selfAttention calls;
 	// Q/K/V/ctx are split-out per-call buffers.
@@ -120,4 +133,27 @@ func (s *scratch) ensureLayer(L, D, intermediate, heads, headDim, perHeadLen int
 	s.vH = ensureF32(s.vH, perHeadLen*headDim)
 	s.ctxHead = ensureF32(s.ctxHead, perHeadLen*headDim)
 	s.scores = ensureF32(s.scores, perHeadLen*perHeadLen)
+}
+
+// mm is the encoder's f32 matmul dispatch point: dst[M,N] = a[M,K] · b[N,K]ᵀ.
+//
+// This is the seam Phase 4 needed. Before it, encoder.Backend existed, NewBackend
+// resolved it and goinfer/gpu registered "webgpu", but nothing ever CALLED
+// Backend.MatmulBT — the hot path went straight to matmulBTInto, so every registered
+// backend was inert. Routing through here is what makes a backend do anything.
+//
+// With no backend (the default) this is a direct call to matmulBTInto, so the pure-Go
+// numerics are unchanged — not "equivalent", the same function.
+//
+// A backend sees EVERY f32 matmul in the forward, including the small per-head QKᵀ and
+// scores·V. Deciding which shapes are worth a device round-trip is the BACKEND's job,
+// not this layer's: matmulBT's own 4-MFLOP naive/blocked split is the precedent for
+// where that policy belongs. A backend that offloads unconditionally will be slower on
+// short sequences.
+func (s *scratch) mm(a, b, dst []float32, M, K, N int) {
+	if s.be != nil {
+		s.be.MatmulBT(a, b, dst, M, K, N)
+		return
+	}
+	matmulBTInto(a, b, dst, M, K, N)
 }

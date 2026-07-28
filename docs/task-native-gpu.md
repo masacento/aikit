@@ -217,28 +217,40 @@ are *tiny* towers: they gate correctness sharply and say nothing about throughpu
 be driven by a real SigLIP-so400m / dynamic-res Qwen measurement, not by assumption
 (`docs/BENCH-gpu.md` is that methodology).
 
-**Phase 4 — encoder native. ⚠️ Bigger than this plan assumed: `encoder.Backend` is a DANGLING
-SEAM.** The plan says "`encoder.Backend` already has `webgpu`; add native Metal/CUDA", which
-reads as *plug a new backend into a working seam*. It isn't. The interface exists
-(`encoder/backend.go`), `NewBackend` resolves it, and `goinfer/gpu` registers `"webgpu"` — but
-**nothing in aikit's encoder forward ever calls `Backend.MatmulBT`**. `encoder/linalg.go`'s
-`matmulBT` dispatches straight to the pure-Go paths, and there is no caller of `NewBackend`
-anywhere in either repo. Registering a CUDA backend today would install a factory nobody
-invokes.
+**Phase 4 — encoder native — 🟡 THE SEAM IS NOW WIRED; backends remain.**
 
-So Phase 4 is two pieces of work, and the first is the real one:
+The plan said "`encoder.Backend` already has `webgpu`; add native Metal/CUDA", which read as
+*plug a backend into a working seam*. It wasn't: the interface existed, `NewBackend` resolved
+it and `goinfer/gpu` registered `"webgpu"`, but **nothing in the forward ever called
+`Backend.MatmulBT`**. A caller could ask for a backend, receive one, and have it do nothing —
+silently, and with every test still green, because the pure-Go path produced correct numbers
+either way. That is now fixed:
 
-1. **Wire the seam into the forward** — thread a `Backend` through the encoder so the hot
-   matmuls dispatch through it, defaulting to the existing CPU path. This touches `encoder`,
-   a **Hard-tier** package (README stability tiers), so it needs an additive-only API and the
-   release-gate apidiff check. This is also what would make the *existing* WebGPU backend do
-   anything, so it is not native-GPU-specific work.
-2. **Then** the native backends, which are comparatively cheap: the seam is a single f32
-   `MatmulBT(a, b, dst, M, K, N)`, and `gpu/vit.cu`'s `gemm_f32` already is that kernel.
+- **`scratch.mm` is the dispatch point.** A `*scratch` was already threaded through every hot
+  function (`selfAttention`, `selfAttentionBatched`, `geluMLP`, `swigluMLP`, the BERT/GTE/q8
+  forwards), so the seam needed no signature churn — 32 call sites now route through it.
+- **`UseBackend` on `Model` / `ModelQ8` / `BERT` / `GTE`** is the opt-in. apidiff vs `v1.12.0`:
+  **4 compatible additions, 0 incompatible** — the Hard-tier guarantee holds.
+- **Not setting a backend calls exactly the function the call sites called before**, so the
+  pure-Go numerics are unchanged by construction rather than by argument.
+- **Gated on dispatch, not just numerics** (`encoder/backend_wiring_test.go`): a spy backend
+  must *observe* the matmuls (it observed none before), nil ≡ delegating ≡ `NewBackend("cpu")`
+  bit-identical, a deliberately-wrong backend must *change* the output (or the seam is
+  decorative), the MLP projections must be routed, and a pooled scratch must not leak a backend
+  into the next forward. These use synthetic weights, not a checkpoint — a seam test that skips
+  in CI is what let the dangling seam survive.
 
-Batch text embedding (M = L tokens / B·Lmax); the win is *cgo-free + native-class*, not
-GPU-where-there-was-none. Sequence it after Qwen2.5-VL: that finishes a phase, whereas this
-starts by reopening a Hard-tier package.
+**Scope limit, deliberate:** this routes the **f32** path, which is all `Backend`'s single
+`MatmulBT(a, b, dst, M, K, N)` can express. The int8 (`LoadQ8`) projections go through
+`matmulBTQ8Into`, whose int8 weights and per-row scales do not fit that signature, and stay on
+the CPU. Widening `Backend` is a separate, deliberate decision — it is Hard-tier surface.
+
+**Still to do in Phase 4:** the native backends themselves, now genuinely cheap — the seam is
+one f32 `MatmulBT` and `gpu/vit.cu`'s `gemm_f32` already *is* that kernel. Note a backend sees
+EVERY f32 matmul including the small per-head QKᵀ; deciding which shapes are worth a device
+round-trip belongs to the backend (the pure-Go path's own ~4 MFLOP naive/blocked split is the
+precedent). A backend that offloads unconditionally will lose on short sequences — which is
+exactly what `docs/BENCH-gpu.md` exists to measure.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
 waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a

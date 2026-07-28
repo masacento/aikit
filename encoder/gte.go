@@ -55,6 +55,9 @@ type gteLayer struct {
 // GTE is a loaded gte-multilingual-class encoder. Immutable after load; the
 // forward is read-only-safe for concurrent use.
 type GTE struct {
+	// be is the compute backend for f32 matmuls; nil = the pure-Go path (default).
+	be Backend
+
 	cfg     gteConfig
 	wordEmb []float32 // [vocab, hidden]
 	typeEmb []float32 // [typeVocab, hidden] — row 0 added to every token
@@ -200,6 +203,7 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 
 	s := getScratch()
+	s.be = g.be
 	defer putScratch(s)
 	s.ensureLayer(L, D, I, c.Heads, headDim, L)
 	rope := newRopeTable(L, headDim, c.RopeTheta)
@@ -228,7 +232,7 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 		l := &g.layers[li]
 
 		// Packed qkv = h·Wqkvᵀ + b, then split into Q,K,V [L,D] each.
-		matmulBTInto(h, l.Wqkv, qkv, L, D, 3*D)
+		s.mm(h, l.Wqkv, qkv, L, D, 3*D)
 		addBias(qkv, l.WqkvB, L, 3*D)
 		Q, K, V := s.Q[:L*D], s.K[:L*D], s.V[:L*D]
 		for i := range L {
@@ -255,20 +259,20 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 					vHT[d*L+i] = V[src+d]
 				}
 			}
-			matmulBTInto(qH, kH, scores, L, headDim, L)
+			s.mm(qH, kH, scores, L, headDim, L)
 			for i := range scores {
 				scores[i] *= scale
 			}
 			for i := range L {
 				softmaxRow(scores[i*L : (i+1)*L])
 			}
-			matmulBTInto(scores, vHT, ctxHead, L, L, headDim)
+			s.mm(scores, vHT, ctxHead, L, L, headDim)
 			for i := range L {
 				copy(ctx[i*D+headIdx*headDim:i*D+headIdx*headDim+headDim], ctxHead[i*headDim:(i+1)*headDim])
 			}
 		}
 		attnOut := s.out[:L*D]
-		matmulBTInto(ctx, l.Wo, attnOut, L, D, D)
+		s.mm(ctx, l.Wo, attnOut, L, D, D)
 		addBias(attnOut, l.WoB, L, D)
 		for i := range h {
 			h[i] += attnOut[i] // residual
@@ -277,7 +281,7 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 
 		// GeGLU MLP: up_gate = h·UpGateᵀ [L,2I]; split up=[:I], gate=[I:2I];
 		// mid = gelu(gate) ⊙ up; ffn = mid·Downᵀ + b; residual; post-norm.
-		matmulBTInto(h, l.UpGate, upGate, L, D, 2*I)
+		s.mm(h, l.UpGate, upGate, L, D, 2*I)
 		mid := s.val[:L*I]
 		for i := range L {
 			up := upGate[i*2*I : i*2*I+I]
@@ -288,7 +292,7 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 			}
 		}
 		ffn := s.mid[:L*D]
-		matmulBTInto(mid, l.Down, ffn, L, I, D)
+		s.mm(mid, l.Down, ffn, L, I, D)
 		addBias(ffn, l.DownB, L, D)
 		for i := range h {
 			h[i] += ffn[i] // residual

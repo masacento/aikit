@@ -37,6 +37,7 @@ func (w *WeightsQ8) forward(ids []int32) []float32 {
 	eps := w.Cfg.LayerNormEpsilon
 
 	s := getScratch()
+	s.be = w.be
 	defer putScratch(s)
 	s.ensureLayer(L, D, intermediate, heads, headDim, L)
 	s.ensureDeqW(D, intermediate)
@@ -100,6 +101,7 @@ func (w *WeightsQ8) forwardBatch(idsList [][]int32) [][]float32 {
 	BL := B * Lmax
 
 	s := getScratch()
+	s.be = w.be
 	defer putScratch(s)
 	s.ensureLayer(BL, D, intermediate, heads, headDim, Lmax)
 	s.ensureDeqW(D, intermediate)
@@ -168,14 +170,14 @@ func selfAttentionQ8(h []float32, wqkv, outProj *linalg.WeightMat,
 				vHT[d*L+i] = V[src+d]
 			}
 		}
-		matmulBTInto(qH, kH, scores, L, headDim, L)
+		s.mm(qH, kH, scores, L, headDim, L)
 		for i := range scores {
 			scores[i] *= scale
 		}
 		for i := range L {
 			softmaxRow(scores[i*L : (i+1)*L])
 		}
-		matmulBTInto(scores, vHT, ctxHead, L, L, headDim)
+		s.mm(scores, vHT, ctxHead, L, L, headDim)
 		for i := range L {
 			dst := i*D + headIdx*headDim
 			copy(ctx[dst:dst+headDim], ctxHead[i*headDim:(i+1)*headDim])
@@ -237,7 +239,7 @@ func selfAttentionQ8Batched(h []float32, wqkv, outProj *linalg.WeightMat,
 				}
 			}
 			scoresL := scores[:L*L]
-			matmulBTInto(qHl, kHl, scoresL, L, headDim, L)
+			s.mm(qHl, kHl, scoresL, L, headDim, L)
 			for i := range scoresL {
 				scoresL[i] *= scale
 			}
@@ -245,7 +247,7 @@ func selfAttentionQ8Batched(h []float32, wqkv, outProj *linalg.WeightMat,
 				softmaxRow(scoresL[i*L : (i+1)*L])
 			}
 			ctxHeadL := ctxHead[:L*headDim]
-			matmulBTInto(scoresL, vHTl, ctxHeadL, L, L, headDim)
+			s.mm(scoresL, vHTl, ctxHeadL, L, L, headDim)
 			for i := range L {
 				dst := seqOff + i*D + headIdx*headDim
 				copy(ctx[dst:dst+headDim], ctxHeadL[i*headDim:(i+1)*headDim])

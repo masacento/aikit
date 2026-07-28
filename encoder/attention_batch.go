@@ -28,7 +28,7 @@ func selfAttentionBatched(h []float32, Wqkv, OutProj []float32, heads, headDim, 
 
 	// 1) Project: QKV = h · Wqkvᵀ → [BL, 3D] into scratch.
 	qkv := s.qkv[:BL*3*D]
-	matmulBTInto(h, Wqkv, qkv, BL, D, 3*D)
+	s.mm(h, Wqkv, qkv, BL, D, 3*D)
 
 	// 2) Split into Q, K, V — each [BL, D] in scratch.
 	Q := s.Q[:BL*D]
@@ -85,7 +85,7 @@ func selfAttentionBatched(h []float32, Wqkv, OutProj []float32, heads, headDim, 
 			}
 
 			scores = scores[:L*L]
-			matmulBTInto(qH, kH, scores, L, headDim, L)
+			s.mm(qH, kH, scores, L, headDim, L)
 			for i := range scores {
 				scores[i] *= scale
 			}
@@ -95,7 +95,7 @@ func selfAttentionBatched(h []float32, Wqkv, OutProj []float32, heads, headDim, 
 			// ctxHead[L, headDim] = scores[L, L] · V[L, headDim] — was the scalar
 			// triple-loop hotspot; now the SIMD A·Bᵀ matmul.
 			ctxHeadL := ctxHead[:L*headDim]
-			matmulBTInto(scores, vHTl, ctxHeadL, L, L, headDim)
+			s.mm(scores, vHTl, ctxHeadL, L, L, headDim)
 			for i := range L {
 				dst := seqOff + i*D + headIdx*headDim
 				copy(ctx[dst:dst+headDim], ctxHeadL[i*headDim:(i+1)*headDim])
@@ -105,7 +105,7 @@ func selfAttentionBatched(h []float32, Wqkv, OutProj []float32, heads, headDim, 
 
 	// 5) Output projection into scratch.
 	out := s.out[:BL*D]
-	matmulBTInto(ctx, OutProj, out, BL, D, D)
+	s.mm(ctx, OutProj, out, BL, D, D)
 	// 6) Residual.
 	for i := range h {
 		h[i] += out[i]

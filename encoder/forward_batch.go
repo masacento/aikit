@@ -93,6 +93,7 @@ func (w *Weights) forwardBatch(idsList [][]int32) [][]float32 {
 	// M8c: scratch arena sized to B*Lmax (the row count the batched
 	// forward sees through every linear layer + LayerNorm).
 	s := getScratch()
+	s.be = w.be
 	defer putScratch(s)
 	s.ensureLayer(B*Lmax, D, intermediate, heads, headDim, Lmax)
 

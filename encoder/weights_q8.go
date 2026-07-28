@@ -42,6 +42,9 @@ type LayerWeightsQ8 struct {
 // Memory footprint: ~140 MB total vs Weights' ~547 MB (4× reduction
 // for the linear-projection bulk; embeddings still cost ~92 MB).
 type WeightsQ8 struct {
+	// be is the compute backend for f32 matmuls; nil = the pure-Go path (default).
+	be Backend
+
 	Cfg          Config
 	WordEmb      []float32 // [VocabSize, HiddenDim] — stays f32 (embedding lookup, not matmul)
 	TokenTypeEmb []float32 // [TypeVocabSize, HiddenDim] — stays f32

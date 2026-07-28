@@ -29,6 +29,7 @@ func (w *Weights) forwardTokens(ids []int32) []float32 {
 	eps := w.Cfg.LayerNormEpsilon
 
 	s := getScratch()
+	s.be = w.be
 	defer putScratch(s)
 	s.ensureLayer(L, D, intermediate, heads, headDim, L)
 
