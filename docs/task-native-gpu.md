@@ -392,13 +392,21 @@ int8 speedup exceeds f32 here too — vs the CPU widen-every-call path, **1.8× 
 151 / 604 / 2416 MFLOP (lower ratios than CUDA only because the M1-Pro CPU is strong; the
 *pattern* — int8 beats CPU by more than f32 does — holds).
 
-**Still to do in Phase 4:** an **int8 end-to-end** encode measurement (the f32 end-to-end already
-ran on Metal — `testdata/minilm-model` present, CPU≡Metal cosine 1.0; the int8 one needs a
-`ModelQ8` checkpoint on a box); and a faster CUDA f32 GEMM. On that last one: Metal's
-`gemm_f32_sg_big` does **not** port as `wmma` — NVIDIA Tensor Cores have no fp32×fp32 path, and a
-tf32-input wmma (~10-bit mantissa, ~1e-3 relative) cannot meet the encoder's 2e-4 bound. The CUDA
-analogue is a **non-Tensor-Core register-blocked f32 kernel**; tf32 would need its own
-deliberately-relaxed, separately documented gate and must stay off the parity-exact path.
+**Still to do in Phase 4:** an **int8 end-to-end** encode measurement and a faster CUDA f32 GEMM.
+
+- The int8 GPU path is fully **unit-parity-gated** on both platforms (MatmulBTQ8 vs the
+  weight-only float64 reference, weight-residency, and the negative control). What is missing is
+  the *published wall-time* end-to-end number, and it is **blocked on a checkpoint**: `LoadQ8`
+  requires a **SwiGLU/GELU `ModelQ8`** config, whereas the only local checkpoint
+  (`testdata/minilm-model`) is BERT-family — `LoadQ8` rejects it (`activation_function=""
+  unsupported`), and BERT has no int8 forward. So it needs a GTE/SwiGLU sentence-model Q8
+  checkpoint on a GPU box; the f32 end-to-end already ran on Metal (CPU≡Metal cosine 1.0) as the
+  methodological proof.
+- The CUDA f32 GEMM: Metal's `gemm_f32_sg_big` does **not** port as `wmma` — NVIDIA Tensor Cores
+  have no fp32×fp32 path, and a tf32-input wmma (~10-bit mantissa, ~1e-3 relative) cannot meet the
+  encoder's 2e-4 bound. The CUDA analogue is a **non-Tensor-Core register-blocked f32 kernel**; the
+  kickoff prompt is [`prompts/cuda-f32-gemm.md`](prompts/cuda-f32-gemm.md). tf32 would need its own
+  deliberately-relaxed, separately documented gate and must stay off the parity-exact path.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
 waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a
