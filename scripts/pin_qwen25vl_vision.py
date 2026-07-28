@@ -55,6 +55,25 @@ def main():
         image_token_id=299, vision_start_token_id=298,
     )
     model = Qwen2_5_VLForConditionalGeneration(cfg).eval().to(torch.float32)
+
+    # Strengthen the vision-tower RMSNorm weights. HF leaves every Qwen2_5_VLRMSNorm at
+    # its default (weight = ones) — an IDENTITY scale. With that, this golden would pass
+    # even if the Go tower mis-applied an RMSNorm weight (the ×weight path is a no-op on
+    # ones), so it under-exercises the block norms (norm1/norm2) and the merger's ln_q.
+    # Give them seeded, non-trivial values (~ N(1, 0.1)) so the golden pins the RMSNorm
+    # scale. RMSNorm has no bias. A SEPARATE RNG (seed 1234) leaves the input (gen seed 1)
+    # and every OTHER weight (init seed 0) bit-identical — only the vision RMSNorm weights
+    # and the recomputed vit_hidden / image_features change. HF's get_image_features stays
+    # the independent reference oracle. Text-tower norms are untouched (this golden runs
+    # only the vision path).
+    import torch.nn as nn  # noqa: F401  (Qwen2_5_VLRMSNorm matched by class name)
+
+    wgen = torch.Generator().manual_seed(1234)
+    with torch.no_grad():
+        for name, mod in model.named_modules():
+            if name.startswith("model.visual") and "RMSNorm" in mod.__class__.__name__:
+                mod.weight.copy_(1.0 + 0.1 * torch.randn(mod.weight.shape, generator=wgen))
+
     vcfg = model.config.vision_config
     merge = vcfg.spatial_merge_size
 

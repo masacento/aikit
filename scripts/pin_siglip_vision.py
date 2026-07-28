@@ -47,6 +47,24 @@ def main():
     model.eval()
     model.to(torch.float32)
 
+    # Strengthen the LayerNorm params. HF's _init_weights leaves every nn.LayerNorm at
+    # the PyTorch default (weight=1, bias=0) — an IDENTITY scale/shift. With that, this
+    # golden would pass even if the Go tower mis-applied a LayerNorm weight or bias
+    # (the ×w and +b paths are no-ops on identity), so it under-exercises the tower's
+    # pre-LN blocks and the final post-LayerNorm. Give them seeded, non-trivial values
+    # (weight ~ N(1, 0.1), bias ~ N(0, 0.05)) so the golden actually pins the scale+shift.
+    # A SEPARATE RNG (seed 1234) leaves the input (gen seed 1) and every OTHER weight
+    # (init seed 0) bit-identical — only the LayerNorm params and the recomputed
+    # last_hidden_state change. HF's forward remains the independent reference oracle.
+    import torch.nn as nn
+
+    wgen = torch.Generator().manual_seed(1234)
+    with torch.no_grad():
+        for mod in model.modules():
+            if isinstance(mod, nn.LayerNorm):
+                mod.weight.copy_(1.0 + 0.1 * torch.randn(mod.weight.shape, generator=wgen))
+                mod.bias.copy_(0.05 * torch.randn(mod.bias.shape, generator=wgen))
+
     # Fixed synthetic image batch [1, 3, image_size, image_size], deterministic.
     gen = torch.Generator().manual_seed(1)
     pixel_values = torch.randn(1, CFG["num_channels"], CFG["image_size"], CFG["image_size"],
