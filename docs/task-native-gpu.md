@@ -163,10 +163,17 @@ GEMM the MMA path was built for. Parity-gated vs the CPU tower (HF-parity alread
 Batch text embedding (M = L tokens / B·Lmax). Incremental over the existing cgo-WebGPU path —
 the win here is *cgo-free + native-class*, not GPU-where-there-was-none.
 
-**Not in scope:** `embed` (Model2Vec) — a token→row gather + mean-pool, no GEMM; GPU is the
-wrong tool. **WebGPU stays** — it's the portable "any GPU (Vulkan/DX12/Metal)" fallback;
-native is the cgo-free-fast path on NVIDIA/Apple. They coexist (native preferred where
-present, WebGPU where portable, CPU always).
+**Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
+waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a
+token→row gather + mean-pool with **no GEMM anywhere**. The work is memory-bound lookup, so there
+is nothing for the MMA path to accelerate, and moving it to a device would *add* host↔device
+round-trips to a workload that is already a cache-friendly scan — slower, not faster. It stays on
+the CPU by design. Revisit only if `embed` itself grows a dense matmul (it has none today), never
+merely for coverage's sake.
+
+**WebGPU stays** — it's the portable "any GPU (Vulkan/DX12/Metal)" fallback; native is the
+cgo-free-fast path on NVIDIA/Apple. They coexist (native preferred where present, WebGPU where
+portable, CPU always).
 
 ## Cross-cutting discipline (non-negotiable)
 
