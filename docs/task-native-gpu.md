@@ -153,9 +153,9 @@ the paged `LoadFlatI8MmapPaged` path. **Parity-gated:** GPU-ANN top-k ≡ CPU-AN
 indexes (rank-exact within the int8 tolerance). This is *new* coverage (ANN has none today) and
 the biggest single-workload win — the payoff the product bet is aimed at.
 
-**Phase 3 — vision native + the Qwen ViT resident path — 🟡 CUDA SigLIP DONE, rest active.**
+**Phase 3 — vision native + the Qwen ViT resident path — 🟡 CUDA + Metal SigLIP DONE, Qwen2.5-VL remains.**
 `vision.ResidentEncoder` already existed (WebGPU SigLIP, "~9×"); the native CUDA
-implementation now exists too:
+*and* Metal implementations now exist too:
 
 - **`gpu/vit.cu` + `cuda_vit.go`** — the transformer-encoder kernel set on top of the device
   layer: quantized GEMM, f32 GEMM, LayerNorm, tanh-GELU, bidirectional multi-head attention,
@@ -173,14 +173,25 @@ implementation now exists too:
   (a negated input scores −0.49). Each kernel is *also* gated individually against a CPU
   reference — a whole-tower cosine can stay high while one op is subtly wrong.
 
-**Still to do in Phase 3:** the **Metal** implementation of the same kernel set (it needs the
-Apple box — this work was done on the NVIDIA box and only the CUDA half is testable here), and
-the **Qwen2.5-VL** resident path (`goinfer/docs/prompts/aikit-qwen25vl-vit.md`), whose dynamic
-resolution means thousands of patches — the fat GEMM the MMA path was built for. Note the
-current parity fixture is a *tiny* tower (16 patches × 32 hidden): it gates correctness
-sharply and says **nothing** about throughput. The correctness-first GEMM here is one thread
-per output element; tiling it is the throughput work, and it should be driven by a real
-SigLIP-so400m measurement, not by assumption.
+- **`gpu/metal_vit.go` + `gpu/visionmetal`** (Apple box) — the Metal mirror: the same 8 kernels
+  in MSL and the same `vision.ResidentEncoder`, exported-name-identical to the CUDA side so a
+  consumer stays platform-agnostic. The one thing that did **not** port is `double` — MSL has
+  none — so LayerNorm mean/variance and the softmax sum accumulate in f32 with a pairwise
+  (tree) reduction, and GELU uses `precise::tanh`; the ViT library is compiled fast-math-OFF
+  (`CompileLibraryPrecise`) so the per-row quant scale (`maxAbs/127`) is an exact divide, not a
+  reciprocal approximation. That was enough to reach the **same** result as the double CUDA
+  kernels: **cosine 1.000000000, worst abs Δ 6.71e-07** on siglip-tiny, break-it-first −0.49,
+  each kernel individually gated (all beat the CUDA per-kernel bars: layernorm 9.5e-07, gelu
+  4.8e-07, attention 2.4e-07, quant byte-exact). Metal-specific dispatch inversions: exact
+  `dispatchThreads` (no bounds checks), UMA (`Floats()` is a live view, no upload/download),
+  scalars as 1-element buffers, and one `LockOSThread` per forward for the autorelease pool.
+
+**Still to do in Phase 3:** the **Qwen2.5-VL** resident path
+(`goinfer/docs/prompts/aikit-qwen25vl-vit.md`), whose dynamic resolution means thousands of
+patches — the fat GEMM the MMA path was built for. Note the current parity fixture is a *tiny*
+tower (16 patches × 32 hidden): it gates correctness sharply and says **nothing** about
+throughput. The correctness-first GEMM here is one thread per output element; tiling it is the
+throughput work, and it should be driven by a real SigLIP-so400m measurement, not by assumption.
 
 **Phase 4 — encoder native.** `encoder.Backend` already has `webgpu`; add native Metal/CUDA.
 Batch text embedding (M = L tokens / B·Lmax). Incremental over the existing cgo-WebGPU path —

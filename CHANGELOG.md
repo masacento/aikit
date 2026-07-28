@@ -12,6 +12,19 @@ it.
 
 ### Added
 
+- **Native-Metal SigLIP resident encoder (`gpu` + `gpu/visionmetal`, native-GPU
+  Phase 3, Apple).** The Metal mirror of the CUDA ViT: the 8-kernel encoder set in
+  MSL (`gpu/metal_vit.go` — quantized/f32 GEMM, LayerNorm, tanh-GELU, bidirectional
+  MHA, per-row int8 quant, the two adds) plus `gpu/visionmetal`, a
+  `vision.ResidentEncoder` registered via `vision.RegisterResident`
+  (`Encoder.EnableResident()` routes Forward to the GPU). Verified on Apple M1 Pro:
+  cosine **1.000000000** vs the CPU tower, worst abs Δ 6.71e-07, each kernel also
+  gated individually. MSL has no `double`, so the reductions use f32 pairwise
+  (tree) sums and the ViT library is compiled fast-math-off (new
+  `Device.CompileLibraryPrecise`) for exact divides — enough to match the double
+  CUDA result. Adds `Device.NewViT`/`ViT` and `Queue.Run1DTG` to the Metal device
+  layer. Device tests are hand-run; the default build stays pure-Go.
+
 - **`aikit/gpu` CUDA API extended to fit a tuned kernel set (`gpu/v0.3.0`).** `v0.2.0`'s
   dispatch was buffers-only on derived 1-D geometry, which the ANN proving kernels need and
   a tuned decode path cannot express. Adds, all in `cuda.go` (`//go:build linux`):

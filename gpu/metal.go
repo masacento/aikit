@@ -169,6 +169,31 @@ func (d *Device) CompileLibrary(src string, ver uint) (objc.ID, error) {
 	return lib, nil
 }
 
+var selSetFastMath = objc.RegisterName("setFastMathEnabled:")
+
+// CompileLibraryPrecise compiles MSL with fast-math DISABLED: divides are true
+// divides (not reciprocal approximations) and the compiler won't reassociate or
+// contract f32 — so a computation matches the CPU/CUDA reference where f32 can. The
+// ViT kernels use this because their parity gate needs an exact per-row quant scale
+// (maxAbs/127, which fast-math turns into maxAbs*rcp(127), off by a ULP). CompileLibrary
+// keeps the default (fast-math on), which is what goinfer's tuned decode kernels want.
+func (d *Device) CompileLibraryPrecise(src string, ver uint) (objc.ID, error) {
+	opts := objc.ID(objc.GetClass("MTLCompileOptions")).Send(selAlloc).Send(selInit)
+	defer opts.Send(selRelease)
+	opts.Send(selSetLanguageVersion, ver)
+	opts.Send(selSetFastMath, uintptr(0)) // fastMathEnabled = NO
+	if got := uint(objc.Send[uintptr](opts, selLanguageVersion)); got != ver {
+		return 0, fmt.Errorf("metal: languageVersion set to %#x but reads %#x — the LC_BUILD_VERSION landmine (golang/go#77917)", ver, got)
+	}
+	var nsErr objc.ID
+	lib := d.id.Send(selNewLibrarySource, nsString(src), opts, unsafe.Pointer(&nsErr))
+	if lib == 0 {
+		return 0, fmt.Errorf("metal: newLibraryWithSource (precise) failed: %s", goString(nsErr.Send(selLocalizedDesc)))
+	}
+	d.TrackObj(lib)
+	return lib, nil
+}
+
 // ---- compute Dispatch (Layer A phase-1 completion: queue → buffers → encode → run) ----
 
 var (
@@ -572,6 +597,14 @@ func (q Queue) Run1DBatchTG(p Pipeline, n, tg, reps, tgBytes int, bufs ...Buffer
 	enc.Send(selEndEncoding)
 	cb.Send(selCommit)
 	cb.Send(selWaitCompleted)
+}
+
+// Run1DTG runs ONE 1-D dispatch over n threads (threadgroup width tg) with tgBytes of
+// dynamic threadgroup memory bound at index 0 — Run1D plus a `threadgroup T*
+// [[threadgroup(0)]]` param (the ViT attention kernel stages its per-query score row
+// there). It is Run1DBatchTG with reps=1, the shape the encoder kernels want.
+func (q Queue) Run1DTG(p Pipeline, n, tg, tgBytes int, bufs ...Buffer) {
+	q.Run1DBatchTG(p, n, tg, 1, tgBytes, bufs...)
 }
 
 // GPUStart/GPUEnd/KernStart/KernEnd expose the last committed command buffer's GPU/kernel
