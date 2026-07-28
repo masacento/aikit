@@ -21,14 +21,24 @@ import (
 // and correctness-only; the tuned decode kernel is Phase 1b/2.
 //
 // Two kernels: gemv_w8a8 scores ONE query against the whole index (FlatI8.Query),
-// gemm_w8a8 scores M queries in one dispatch (FlatI8.QueryBatch) — the batched
-// int8 GEMM that is the GPU's sweet spot (Phase 2). Both compute the exact int32
-// dot of the host-quantized int8 query against each row, then the query/row
-// rescale — the same value w8a8Span produces on the CPU, so GPU and CPU rank
-// identically.
+// gemm_w8a8_tiled scores M queries in one dispatch (FlatI8.QueryBatch) — the batched
+// int8 GEMM that is the GPU's sweet spot (Phase 2). Both compute the exact int32 dot
+// of the host-quantized int8 query against each row, then the query/row rescale — the
+// same value w8a8Span produces on the CPU, so GPU and CPU rank identically.
+//
+// gemm_w8a8_tiled stages a TILE×TILE block of the query tile (A) and the corpus tile (B)
+// through threadgroup memory per K-chunk, so each int8 code is read from global memory
+// ONCE per tile rather than once per output — the same tiling that took the f32 GEMM from
+// ~350 to ~1080 GFLOP/s. It stays BIT-IDENTICAL to the naive one-thread-per-output kernel
+// it replaced: the accumulator is int32 and integer addition is associative, so chunking
+// K cannot change the sum (a much sharper property than a tolerance, and the batch parity
+// test asserts it). Launch with dispatchThreadgroups over a 2-D (ceil(N/TILE), ceil(M/TILE))
+// grid of TILE×TILE threads. The first Apple ANN slice showed the naive kernel (~8 GOP/s)
+// LOSING ~5× to the SIMD CPU (docs/BENCH-gpu-results.md); this is the Phase-2 fix.
 const w8a8Src = `
 #include <metal_stdlib>
 using namespace metal;
+#define TILE 16
 kernel void gemv_w8a8(
     device const char*  codes  [[buffer(0)]],   // [N*K] int8, row-major
     device const char*  qi8    [[buffer(1)]],   // [K]   int8 query (host-quantized)
@@ -44,23 +54,32 @@ kernel void gemv_w8a8(
     }
     out[j] = float(acc) * qscale * scales[j];
 }
-kernel void gemm_w8a8(
-    device const char*  codes  [[buffer(0)]],   // [N*K] int8
-    device const char*  qi8    [[buffer(1)]],   // [M*K] int8 queries (host-quantized)
+kernel void gemm_w8a8_tiled(
+    device const char*  codes  [[buffer(0)]],   // [N*K] int8 (corpus rows = B)
+    device const char*  qi8    [[buffer(1)]],   // [M*K] int8 queries (= A)
     device const float* scales [[buffer(2)]],   // [N]
     constant uint&      K      [[buffer(3)]],
     constant uint&      N      [[buffer(4)]],
     device const float* qscale [[buffer(5)]],   // [M] per-query scale
     device float*       out    [[buffer(6)]],   // [M*N] scores, row-major
-    uint g [[thread_position_in_grid]]) {       // g = m*N + j
-    uint m = g / N, j = g % N;
-    device const char* qrow = qi8   + m * K;
-    device const char* crow = codes + j * K;
+    constant uint&      M      [[buffer(7)]],
+    uint2 tgpos [[threadgroup_position_in_grid]], uint2 tid [[thread_position_in_threadgroup]]) {
+    threadgroup char As[TILE][TILE]; // query tile  [m-local][k]
+    threadgroup char Bs[TILE][TILE]; // corpus tile [n-local][k]
+    int tx = (int)tid.x, ty = (int)tid.y;
+    int m = (int)tgpos.y * TILE + ty;    // query row
+    int n = (int)tgpos.x * TILE + tx;    // corpus row (output column)
+    int bRow = (int)tgpos.x * TILE + ty; // the corpus row this thread STAGES (not the one it uses)
     int acc = 0;
-    for (uint k = 0; k < K; k++) {
-        acc += int(qrow[k]) * int(crow[k]);
+    for (uint k0 = 0; k0 < K; k0 += TILE) {
+        uint k = k0 + (uint)tx;
+        As[ty][tx] = (m < (int)M && k < K) ? qi8[(uint)m * K + k] : (char)0;
+        Bs[ty][tx] = (bRow < (int)N && k < K) ? codes[(uint)bRow * K + k] : (char)0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < TILE; kk++) acc += int(As[ty][kk]) * int(Bs[tx][kk]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    out[g] = float(acc) * qscale[m] * scales[j];
+    if (m < (int)M && n < (int)N) out[(uint)m * (uint)N + (uint)n] = float(acc) * qscale[m] * scales[n];
 }`
 
 type metalBackend struct {
@@ -88,7 +107,7 @@ func init() {
 		dev.ReleaseObjects()
 		return
 	}
-	gemm, err := dev.NewComputePipeline(lib, "gemm_w8a8")
+	gemm, err := dev.NewComputePipeline(lib, "gemm_w8a8_tiled")
 	if err != nil {
 		dev.ReleaseObjects()
 		return
@@ -108,6 +127,15 @@ func (b *metalBackend) runLocked(p gpu.Pipeline, n, tg int, bufs ...gpu.Buffer) 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	b.q.Run1D(p, n, tg, bufs...)
+}
+
+// runLocked2D is runLocked for a 2-D dispatchThreadgroups grid — the tiled GEMM's shape
+// (gx×gy whole threadgroups of tgx×tgy threads), same OS-thread pinning for the autorelease
+// pool.
+func (b *metalBackend) runLocked2D(p gpu.Pipeline, gx, gy, tgx, tgy int, bufs ...gpu.Buffer) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	b.q.Run2D(p, gx, gy, tgx, tgy, bufs...)
 }
 
 // NewI8Index uploads the int8 codes + scales resident on the device and allocates
@@ -194,18 +222,18 @@ func (x *metalI8Index) ScoreBatch(queries [][]float32, dst []float32) error {
 	qi8Buf := x.b.dev.NewBufferInt8(qi8)
 	qscaleBuf := x.b.dev.NewBufferFloats(qscale)
 	nBuf := x.b.dev.NewBufferU32(uint32(N))
+	mBuf := x.b.dev.NewBufferU32(uint32(M))
 	outBuf := x.b.dev.NewBufferLen(M * N)
 	defer func() {
-		for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, nBuf, outBuf} {
+		for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, nBuf, mBuf, outBuf} {
 			x.b.dev.ReleaseBuf(b)
 		}
 	}()
-	total := M * N
-	tg := 256
-	if tg > total {
-		tg = total
-	}
-	x.b.runLocked(x.b.gemm, total, tg, x.codes, qi8Buf, x.scales, x.kbuf, nBuf, qscaleBuf, outBuf)
+	// Tiled GEMM: one TILE×TILE output block per threadgroup (dispatchThreadgroups →
+	// uniform whole groups, so the edge tiles are full and the kernel bounds-checks).
+	const tile = 16
+	gx, gy := (N+tile-1)/tile, (M+tile-1)/tile
+	x.b.runLocked2D(x.b.gemm, gx, gy, tile, tile, x.codes, qi8Buf, x.scales, x.kbuf, nBuf, qscaleBuf, outBuf, mBuf)
 	copy(dst, outBuf.Floats())
 	return nil
 }

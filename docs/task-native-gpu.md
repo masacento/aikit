@@ -160,18 +160,26 @@ a normalized cross-platform summary + derived crossover thresholds), and the dev
 crossover harnesses (`gpu/annmetal`, `gpu/anncuda`, run on real Model2Vec embeddings under
 `AIKIT_GPU_BENCH=1`). Generated output: `docs/BENCH-gpu-results.md` from `docs/bench-records/`.
 
-The first Apple run (M1 Pro, `FlatI8.QueryBatch`, N=1e4–1e5 × batch 1–256, int8) is a **negative
-result that the methodology exists to catch**: Metal **loses ~5×** to the CPU across the whole
-sweep (0.10–0.59×), and throughput is **flat across batch** (no amortization). Parity is perfect —
-Metal top-k ≡ CPU int8 top-k, recall identical — so this is not a bug, it is a **kernel-maturity**
-finding: `gpu/annmetal`'s `gemm_w8a8` is still the Phase-1 *correctness-only* one-thread-per-output
-GEMV (~8 GOP/s), and it re-copies the full M×N score matrix to host every call, so the strong
-M1-Pro SIMD CPU (~39 GOP/s) wins and the crossover is never reached. So **Phase 2's "headline
-unlock" is NOT yet realized on Apple** — it needs the deferred **tuned W8A8 GEMM** (the same
-`simdgroup_matrix`/tiling treatment `gemm_f32_sg_big` got) and ideally **on-device top-k** (to
-avoid the full-score D2H). The CUDA crossover is the NVIDIA box's to run with the same harness;
-its tuned kernel + a weaker CPU baseline may cross over where Metal does not — the normalized
-summary will show it once that file lands in `docs/bench-records/`.
+The first Apple run caught a **negative result the methodology exists to surface**, and the fix
+then landed — the full arc:
+
+1. **The catch.** The initial slice showed Metal **losing ~5×** across the whole sweep
+   (0.10–0.59×), throughput **flat across batch**. Parity was perfect (Metal top-k ≡ CPU int8
+   top-k), so it was not a bug but **kernel maturity**: `gpu/annmetal`'s batched kernel was still
+   the Phase-1 *correctness-only* one-thread-per-output GEMV (~8 GOP/s), losing to the strong
+   M1-Pro SIMD CPU (~39 GOP/s). A "3–9× ANN win" published on faith would have been wrong.
+2. **The fix — Phase 2 realized on Apple.** Tiling the batched kernel (`gemm_w8a8_tiled`: 16×16
+   threadgroup staging, coalesced global reads — the same tiling that took the f32 GEMM from ~350
+   to ~1080 GFLOP/s) flipped it. It stays **BIT-IDENTICAL** to the naive kernel (int32 sums are
+   order-independent; the batch-parity test asserts it), so recall is unchanged. Metal now **wins
+   from batch≥8** (N=1e4) and **batch≥64** (N=1e5), up to **2.9×** — vs the 0.54× it managed
+   before (a ~5.5× kernel improvement). Single-query (batch=1) still favors the CPU, which is
+   correct: that is the `gemv` path, and the batch regime is where the GPU is meant to pay.
+
+The dispatch threshold (GPU overtakes CPU at batch≥8/≥64) is exactly the value the `ann.Backend`
+should key off. Still open, a further lever: **on-device top-k** to avoid the full M×N score D2H —
+a follow-on, not needed to realize the win. The CUDA crossover is the NVIDIA box's to run with the
+same harness; the normalized summary will show both once its file lands in `docs/bench-records/`.
 
 **Phase 3 — vision native + the Qwen ViT resident path — ✅ DONE on CUDA + Metal (SigLIP and Qwen2.5-VL on both).**
 `vision.ResidentEncoder` already existed (WebGPU SigLIP, "~9×"); the native CUDA
