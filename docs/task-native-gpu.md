@@ -177,9 +177,22 @@ then landed — the full arc:
    correct: that is the `gemv` path, and the batch regime is where the GPU is meant to pay.
 
 The dispatch threshold (GPU overtakes CPU at batch≥8/≥64) is exactly the value the `ann.Backend`
-should key off. Still open, a further lever: **on-device top-k** to avoid the full M×N score D2H —
-a follow-on, not needed to realize the win. The CUDA crossover is the NVIDIA box's to run with the
-same harness; the normalized summary will show both once its file lands in `docs/bench-records/`.
+should key off.
+
+3. **On-device top-k — ✅ DONE, a gated large-N win, and another "measure, don't assume".** The
+   obvious next lever was selecting each query's top-k *on the device* (`ann.I8TopKIndex` →
+   `annmetal.TopKBatch`, apidiff: compatible addition), so the full M×N score matrix is never
+   copied to — or **allocated on** — the host (~1 GB at N=1e6, batch=256). The selection kernel
+   matches `topHits`'s exact (score-desc, index-asc) tie-break, so it is the SAME top-k set
+   (bit-exact scores, verified incl. an all-ties fixture). But measured, it does **not** win
+   everywhere: the second dispatch + the reduction pass cost more than the small-N readback they
+   save, so it *lost* at N=1e4 and won at N≥1e5 (N=1e5 batch 64/256: **1.29→1.73× / 1.25→1.98×**).
+   So it is **gated on N** (`topkMinN`): device top-k for N≥1e5, host top-k below — the best of
+   both, and the memory win grows with N. It did **not** help the batch-1/small end (that is the
+   GEMM-tile-utilisation limit, a separate lever), correcting the earlier guess.
+
+The CUDA crossover is the NVIDIA box's to run with the same harness; the normalized summary will
+show both once its file lands in `docs/bench-records/`.
 
 **Phase 3 — vision native + the Qwen ViT resident path — ✅ DONE on CUDA + Metal (SigLIP and Qwen2.5-VL on both).**
 `vision.ResidentEncoder` already existed (WebGPU SigLIP, "~9×"); the native CUDA

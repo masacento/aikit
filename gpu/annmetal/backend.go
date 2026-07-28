@@ -80,14 +80,83 @@ kernel void gemm_w8a8_tiled(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (m < (int)M && n < (int)N) out[(uint)m * (uint)N + (uint)n] = float(acc) * qscale[m] * scales[n];
+}
+// topk_rows selects each query's top-k directly on the device, so QueryBatch never copies
+// (or allocates on the host) the full M*N score matrix — only M*k hits cross back. One
+// threadgroup per query, TOPK_TG threads: each thread scans a strip of the row keeping a
+// local top-k, then thread 0 merges the TOPK_TG partial lists. The order is
+// (score DESC, index ASC) — byte-for-byte the tie-break FlatI8.topHits uses, so the device
+// top-k is the SAME set the CPU picks. k is capped at TOPK_MAXK (else QueryBatch falls back).
+#define TOPK_TG   128
+#define TOPK_MAXK 16
+kernel void topk_rows(
+    device const float* scores   [[buffer(0)]], // [M*N]
+    constant uint&      N        [[buffer(1)]],
+    constant uint&      k        [[buffer(2)]],
+    device int*         outIdx   [[buffer(3)]], // [M*k]
+    device float*       outScore [[buffer(4)]], // [M*k]
+    uint m [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint tgsz [[threads_per_threadgroup]]) {
+    threadgroup float mScore[TOPK_TG * TOPK_MAXK];
+    threadgroup int   mIdx  [TOPK_TG * TOPK_MAXK];
+    device const float* row = scores + (uint)m * N;
+    float ls[TOPK_MAXK];
+    int   li[TOPK_MAXK];
+    int cnt = 0, worst = 0;
+    for (uint j = tid; j < N; j += tgsz) {
+        float s = row[j]; int idx = (int)j;
+        if (cnt < (int)k) {
+            ls[cnt] = s; li[cnt] = idx; cnt++;
+            if (cnt == (int)k) { worst = 0;
+                for (int t = 1; t < (int)k; t++)
+                    if (ls[t] < ls[worst] || (ls[t] == ls[worst] && li[t] > li[worst])) worst = t;
+            }
+        } else if (s > ls[worst] || (s == ls[worst] && idx < li[worst])) {
+            ls[worst] = s; li[worst] = idx; worst = 0;
+            for (int t = 1; t < (int)k; t++)
+                if (ls[t] < ls[worst] || (ls[t] == ls[worst] && li[t] > li[worst])) worst = t;
+        }
+    }
+    for (int t = cnt; t < (int)k; t++) { ls[t] = -INFINITY; li[t] = -1; }
+    for (int t = 0; t < (int)k; t++) { mScore[tid * k + t] = ls[t]; mIdx[tid * k + t] = li[t]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        int total = (int)tgsz * (int)k;
+        for (int r = 0; r < (int)k; r++) {
+            int best = -1;
+            for (int c = 0; c < total; c++) {
+                if (mIdx[c] < 0) continue;
+                if (best < 0 || mScore[c] > mScore[best] || (mScore[c] == mScore[best] && mIdx[c] < mIdx[best])) best = c;
+            }
+            outScore[(uint)m * k + (uint)r] = (best < 0) ? -INFINITY : mScore[best];
+            outIdx[(uint)m * k + (uint)r]   = (best < 0) ? -1 : mIdx[best];
+            if (best >= 0) mIdx[best] = -2; // consume
+        }
+    }
 }`
 
 type metalBackend struct {
 	dev  *gpu.Device
 	q    gpu.Queue
 	gemv gpu.Pipeline // one query  × N rows (FlatI8.Query)
-	gemm gpu.Pipeline // M queries × N rows (FlatI8.QueryBatch)
+	gemm gpu.Pipeline // M queries × N rows (FlatI8.QueryBatch), tiled
+	topk gpu.Pipeline // per-query top-k over the device score matrix
 }
+
+// topkTG / topkMaxK mirror the topk_rows kernel's TOPK_TG / TOPK_MAXK; k above topkMaxK
+// falls back to the ScoreBatch (full-matrix) path.
+//
+// topkMinN is the corpus size below which on-device top-k is DECLINED (→ ScoreBatch + host
+// top-k). Measured on M1 Pro (docs/BENCH-gpu-results.md): the second dispatch + the top-k
+// reduction pass cost more than the M*N readback they save at small N (device top-k *lost* at
+// N=1e4), but win at N≥1e5 — 1.29→1.73× / 1.25→1.98× at batch 64/256 — and win larger still as
+// the M*N host allocation the ScoreBatch path makes (~1 GB at N=1e6, batch=256) becomes
+// prohibitive. So it is a LARGE-N optimization, gated here rather than applied blindly.
+const (
+	topkTG   = 128
+	topkMaxK = 16
+	topkMinN = 100_000
+)
 
 // init reaches Metal and registers the backend. If there is no Metal GPU (or the
 // kernel fails to compile), it registers nothing — ann.FlatI8 then stays on the
@@ -112,7 +181,12 @@ func init() {
 		dev.ReleaseObjects()
 		return
 	}
-	ann.RegisterBackend(&metalBackend{dev: dev, q: dev.NewCommandQueue(), gemv: gemv, gemm: gemm})
+	topk, err := dev.NewComputePipeline(lib, "topk_rows")
+	if err != nil {
+		dev.ReleaseObjects()
+		return
+	}
+	ann.RegisterBackend(&metalBackend{dev: dev, q: dev.NewCommandQueue(), gemv: gemv, gemm: gemm, topk: topk})
 }
 
 func (b *metalBackend) Name() string { return "metal" }
@@ -236,6 +310,64 @@ func (x *metalI8Index) ScoreBatch(queries [][]float32, dst []float32) error {
 	x.b.runLocked2D(x.b.gemm, gx, gy, tile, tile, x.codes, qi8Buf, x.scales, x.kbuf, nBuf, qscaleBuf, outBuf, mBuf)
 	copy(dst, outBuf.Floats())
 	return nil
+}
+
+// TopKBatch scores the batch with the same tiled GEMM, then selects each query's top-k ON
+// THE DEVICE (topk_rows), so only M*k hits are read back — not the full M*N score matrix,
+// which is neither copied to nor allocated on the host (at N=1e6, batch=256 that matrix is
+// ~1 GB). The scores are the same int32 dot ScoreBatch produces, and the device selection
+// uses topHits's exact (score-desc, index-asc) order, so the result is the SAME top-k set.
+// k above topkMaxK returns an error and QueryBatch falls back to the ScoreBatch path.
+func (x *metalI8Index) TopKBatch(queries [][]float32, k int) ([][]ann.Hit, error) {
+	M := len(queries)
+	if M == 0 {
+		return [][]ann.Hit{}, nil
+	}
+	N, K := x.n, x.dim
+	if k <= 0 || k > topkMaxK || k >= N || N < topkMinN {
+		return nil, fmt.Errorf("gpu: topk declined (k=%d max %d, n=%d min %d) — fall back", k, topkMaxK, N, topkMinN)
+	}
+	qi8 := make([]int8, M*K)
+	qscale := make([]float32, M)
+	for m, q := range queries {
+		if len(q) != K {
+			return nil, fmt.Errorf("gpu: batch query %d dim %d != index dim %d", m, len(q), K)
+		}
+		qscale[m] = quantizeRowInt8(q, qi8[m*K:(m+1)*K])
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	dev := x.b.dev
+	qi8Buf := dev.NewBufferInt8(qi8)
+	qscaleBuf := dev.NewBufferFloats(qscale)
+	nBuf := dev.NewBufferU32(uint32(N))
+	mBuf := dev.NewBufferU32(uint32(M))
+	kBuf := dev.NewBufferU32(uint32(k))
+	scoreBuf := dev.NewBufferLen(M * N)                 // device-only; never crosses to the host
+	idxOut := dev.NewBufferUint32s(make([]uint32, M*k)) // device int* (u32 storage, same bytes)
+	scoreOut := dev.NewBufferLen(M * k)                 // only M*k floats come back
+	defer func() {
+		for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, nBuf, mBuf, kBuf, scoreBuf, idxOut, scoreOut} {
+			dev.ReleaseBuf(b)
+		}
+	}()
+	const tile = 16
+	gx, gy := (N+tile-1)/tile, (M+tile-1)/tile
+	x.b.runLocked2D(x.b.gemm, gx, gy, tile, tile, x.codes, qi8Buf, x.scales, x.kbuf, nBuf, qscaleBuf, scoreBuf, mBuf)
+	// one threadgroup per query (M groups of topkTG threads), reducing scoreBuf → M*k.
+	x.b.runLocked(x.b.topk, M*topkTG, topkTG, scoreBuf, nBuf, kBuf, idxOut, scoreOut)
+
+	idxs := idxOut.U32s()
+	scs := scoreOut.Floats()
+	hits := make([][]ann.Hit, M)
+	for m := range M {
+		h := make([]ann.Hit, k)
+		for r := range k {
+			h[r] = ann.Hit{Index: int(int32(idxs[m*k+r])), Score: float64(scs[m*k+r])}
+		}
+		hits[m] = h
+	}
+	return hits, nil
 }
 
 // Close releases this index's device buffers (the shared device stays alive for

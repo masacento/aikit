@@ -36,6 +36,17 @@ type I8BatchIndex interface {
 	ScoreBatch(queries [][]float32, dst []float32) error
 }
 
+// I8TopKIndex is an optional extension of I8BatchIndex: a device index that returns
+// each query's top-k DIRECTLY, doing the selection on the device. That avoids the
+// full M*N score matrix entirely on the host side — neither the M*N readback nor the
+// M*N host allocation ScoreBatch requires (at N=1e6, batch=256 that matrix is ~1 GB) —
+// so only M*k hits cross back. FlatI8.QueryBatch prefers it when the backend
+// implements it. The returned hits are rank-identical to ScoreBatch + topHits within
+// the int8 quantization (score descending, ties broken by lower index).
+type I8TopKIndex interface {
+	TopKBatch(queries [][]float32, k int) ([][]Hit, error)
+}
+
 // QueryBatch runs a batch of queries, returning each one's k highest hits (the
 // same per-query contract as Query). When the index is GPU-enabled and the backend
 // supports batched scoring, the whole batch is scored in one int8 GEMM on the
@@ -46,24 +57,28 @@ func (f *FlatI8) QueryBatch(queries [][]float32, k int) [][]Hit {
 		panic("ann: QueryBatch on a closed FlatI8 (mmap released by Close)")
 	}
 	out := make([][]Hit, len(queries))
-	// Device batched path: one GEMM for the whole batch, when every query is the
-	// right dimension and the backend scores batches.
-	if bi, ok := f.gpu.(I8BatchIndex); ok && f.n > 0 && len(queries) > 0 {
-		allDim := true
-		for _, q := range queries {
-			if len(q) != f.dim {
-				allDim = false
-				break
-			}
+	allDim := f.n > 0 && len(queries) > 0
+	for _, q := range queries {
+		if len(q) != f.dim {
+			allDim = false
+			break
 		}
-		if allDim {
-			dst := make([]float32, len(queries)*f.n)
-			if err := bi.ScoreBatch(queries, dst); err == nil {
-				for m := range queries {
-					out[m] = f.topHits(dst[m*f.n:(m+1)*f.n], k, nil)
-				}
-				return out
+	}
+	// Device top-k path (preferred): the backend selects each query's top-k on the
+	// device, so the M*N score matrix is never copied to — or allocated on — the host.
+	if ti, ok := f.gpu.(I8TopKIndex); ok && allDim && k > 0 && k < f.n {
+		if hits, err := ti.TopKBatch(queries, k); err == nil && len(hits) == len(queries) {
+			return hits
+		}
+	}
+	// Device batched path: one GEMM for the whole batch, then top-k on the host.
+	if bi, ok := f.gpu.(I8BatchIndex); ok && allDim {
+		dst := make([]float32, len(queries)*f.n)
+		if err := bi.ScoreBatch(queries, dst); err == nil {
+			for m := range queries {
+				out[m] = f.topHits(dst[m*f.n:(m+1)*f.n], k, nil)
 			}
+			return out
 		}
 	}
 	// Fallback: per query (CPU, or single-query GPU if enabled).

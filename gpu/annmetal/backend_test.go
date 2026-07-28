@@ -158,3 +158,42 @@ func TestMetalGEMM_batchParityWithCPU(t *testing.T) {
 		t.Error("break-it-first vacuous: every batch row shared the same top hit")
 	}
 }
+
+// TestMetalTopK_tieBreakAndFallback gates the on-device top-k selection (TopKBatch, reached
+// via QueryBatch): its (score-desc, index-asc) order must match topHits EXACTLY, including on
+// ties, and k above the kernel cap must fall back to the full-matrix path and still be correct.
+func TestMetalTopK_tieBreakAndFallback(t *testing.T) {
+	if !ann.HasBackend() {
+		t.Skip("no Metal backend registered (no GPU?)")
+	}
+	const n, dim = 100_000, 64 // ≥ topkMinN so k=10 takes the DEVICE top-k path
+	// All rows identical → every score ties → the top-k is decided PURELY by the index-asc
+	// tie-break, so it must be exactly [0,1,...,k-1]. This is the case a wrong tie-break fails.
+	one := make([]float32, dim)
+	for i := range one {
+		one[i] = 1
+	}
+	vecs := make([][]float32, n)
+	for i := range vecs {
+		vecs[i] = append([]float32(nil), one...)
+	}
+	g := ann.NewFlatI8(vecs)
+	if err := g.EnableGPU(); err != nil {
+		t.Fatalf("EnableGPU: %v", err)
+	}
+	defer g.Close()
+
+	q := [][]float32{append([]float32(nil), one...)}
+	for _, k := range []int{10, 20} { // 10 ≤ topkMaxK (device path); 20 > cap (fallback path)
+		got := g.QueryBatch(q, k)[0]
+		if len(got) != k {
+			t.Fatalf("k=%d: got %d hits", k, len(got))
+		}
+		for i := range k {
+			if got[i].Index != i {
+				t.Fatalf("k=%d rank %d: index %d, want %d — tie-break (or fallback) diverges from topHits index-asc", k, i, got[i].Index, i)
+			}
+		}
+		t.Logf("k=%d: all-tie top-k == [0..k-1] (index-asc tie-break holds%s)", k, map[bool]string{true: ", via device", false: ", via fallback"}[k <= 16])
+	}
+}
