@@ -486,6 +486,45 @@ kernel void gemm_f32_sg(
         int r = idx / SGBN, c = idx % SGBN;
         if (m0 + r < M && n0 + c < N) C[(uint)(m0 + r) * (uint)N + (uint)(n0 + c)] = Cs[r][c];
     }
+}
+
+// gemm_f32_sg_big — the ALIGNED fast path of gemm_f32_sg, same 32×32 tile / 4 simdgroups /
+// 2×2 fragments (so the same low register footprint the general kernel already tunes well),
+// but for shapes with M%32==0, N%32==0, K%8==0 (GEMMF32Plan enforces it, else falls back to
+// gemm_f32_sg). The alignment buys the removal of the general kernel's per-K-step cost:
+//   - A and B fragments load DIRECTLY from device (B with the transpose flag, since it is
+//     stored [N,K]) — NO threadgroup staging and, crucially, NO two barriers per K-step;
+//   - NO edge bounds checks and NO output staging through Cs — every access is in range.
+// Wider register blocking was tried (64×64, 16 fragments/simdgroup) and lost badly to register
+// spilling and low occupancy, so the win here is dropping the barriers, not enlarging the tile.
+kernel void gemm_f32_sg_big(
+    device const float* A [[buffer(0)]], device const float* B [[buffer(1)]], device float* C [[buffer(2)]],
+    constant int& M [[buffer(3)]], constant int& N [[buffer(4)]], constant int& K [[buffer(5)]],
+    uint2 tgpos [[threadgroup_position_in_grid]], uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    int sgr = (int)sgid / 2, sgc = (int)sgid % 2; // 2×2 simdgroups, each 16×16
+    int rm = (int)tgpos.y * 32 + sgr * 16;
+    int cn = (int)tgpos.x * 32 + sgc * 16;
+
+    simdgroup_float8x8 acc[2][2];
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += 8) {
+        simdgroup_float8x8 a[2], b[2];
+        for (int i = 0; i < 2; i++)
+            simdgroup_load(a[i], A + (uint)(rm + i * 8) * (uint)K + (uint)k0, K);
+        for (int j = 0; j < 2; j++)
+            simdgroup_load(b[j], B + (uint)(cn + j * 8) * (uint)K + (uint)k0, K, ulong2(0, 0), true);
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 2; j++)
+            simdgroup_store(acc[i][j], C + (uint)(rm + i * 8) * (uint)N + (uint)(cn + j * 8), N);
 }`
 
 // Kernel entry points in vitMSL (identical names to the CUDA side).
@@ -513,6 +552,10 @@ const (
 	// KernelGEMMF32SG is the production f32 GEMM on simdgroup_matrix (Metal-only; CUDA has
 	// no analogue in this kernel set). Same signature as gemm_f32_tiled. Launch with SGDims.
 	KernelGEMMF32SG = "gemm_f32_sg"
+
+	// KernelGEMMF32SGBig is the aligned (M%64==0, N%64==0, K%8==0) fast path: 64×64 tile,
+	// direct device loads, no staging/barriers/bounds. Pick it via GEMMF32Plan.
+	KernelGEMMF32SGBig = "gemm_f32_sg_big"
 )
 
 // SGBlock is gemm_f32_sg's threadgroup output-tile width (must match vitMSL's SGBM/SGBN);
@@ -526,6 +569,22 @@ const (
 // output tile per threadgroup, SGThreads threads each.
 func SGDims(M, N int) (gx, gy, tgx, tgy int) {
 	return (N + SGBlock - 1) / SGBlock, (M + SGBlock - 1) / SGBlock, SGThreads, 1
+}
+
+// SGBigBlock is gemm_f32_sg_big's threadgroup output-tile width (must match the kernel's 32).
+const SGBigBlock = 32
+
+// GEMMF32Plan picks the f32 GEMM kernel and its Run2D geometry for a shape M×N×K. The aligned
+// no-barrier kernel (gemm_f32_sg_big — same 32×32 tile, but direct device loads and no bounds
+// checks) is chosen when M and N are multiples of 32 and K of 8 — which every large encoder /
+// ViT GEMM satisfies — and the general gemm_f32_sg (any shape) otherwise. Both bind at buffers
+// 0..5 (A, B, C, M, N, K), so the caller just sets its scalar buffers and calls Run2D.
+func (v ViT) GEMMF32Plan(M, N, K int) (p Pipeline, gx, gy, tgx, tgy int) {
+	if M%SGBigBlock == 0 && N%SGBigBlock == 0 && K%8 == 0 {
+		return v.GEMMF32SGBig, N / SGBigBlock, M / SGBigBlock, SGThreads, 1
+	}
+	gx, gy, tgx, tgy = SGDims(M, N)
+	return v.GEMMF32SG, gx, gy, tgx, tgy
 }
 
 // GEMMTile is the tiled GEMMs' tile width; it must match vitMSL's TILE, which sizes the
@@ -566,8 +625,9 @@ type ViT struct {
 	GEMMW8A8Tiled Pipeline
 	GEMMF32Tiled  Pipeline
 
-	// Production f32 GEMM on simdgroup_matrix (Metal-only).
-	GEMMF32SG Pipeline
+	// Production f32 GEMM on simdgroup_matrix (Metal-only); SGBig is the aligned fast path.
+	GEMMF32SG    Pipeline
+	GEMMF32SGBig Pipeline
 }
 
 // NewViT compiles vitMSL on this device and builds every encoder pipeline. The library
@@ -598,6 +658,7 @@ func (d *Device) NewViT() (ViT, error) {
 		{KernelGEMMW8A8Tiled, &v.GEMMW8A8Tiled},
 		{KernelGEMMF32Tiled, &v.GEMMF32Tiled},
 		{KernelGEMMF32SG, &v.GEMMF32SG},
+		{KernelGEMMF32SGBig, &v.GEMMF32SGBig},
 	} {
 		p, err := d.NewComputePipeline(lib, bind.name)
 		if err != nil {

@@ -269,10 +269,11 @@ parity and the same pooled-scratch regression test (`TestEncMetal_noStaleOperand
 difference is the point — the "upload" is a `copy()` into the buffer's `Floats()` view and the
 download a `copy()` back, no PCIe transfer and none of the CUDA upload race (so the
 `Buffer.upload` sync `25d6de3` added on CUDA is deliberately NOT mirrored — there is no DMA to
-order against). Its `minGPUFlops` is **derived independently** from an M1-Pro sweep: `1<<29` ≈
-537 MFLOP (crossover between 151 MFLOP where the GPU loses 0.78× and 604 MFLOP where it wins
-1.80×). This is ~4× lower than the tiled kernel's crossover would have been, because the backend
-runs the simdgroup GEMM (see below), not the tiled one.
+order against). Its `minGPUFlops` is **derived independently** from an M1-Pro sweep: `1<<27` ≈
+134 MFLOP (crossover between 24 MFLOP where the GPU loses 0.83× and 151 MFLOP where it wins
+1.33×; 8590 MFLOP hits 4.25×). Successive GEMM kernels dropped this crossover ~16× from where
+the tiled kernel would have put it — tiled ~2.1 GFLOP → `gemm_f32_sg` ~0.5 GFLOP →
+`gemm_f32_sg_big` ~0.13 GFLOP (see below). The backend routes via `ViT.GEMMF32Plan`.
 
 **Tiled GEMMs — ✅ DONE on both platforms.** `gemm_w8a8_tiled` + `gemm_f32_tiled` stage a
 TILE×TILE block through shared/threadgroup memory. On Metal they launch via `Run2D`
@@ -282,19 +283,29 @@ asymmetric gate ports intact: W8A8 tiled is **BIT-IDENTICAL** to untiled (int32 
 order-independent), f32 tiled is gated against a **float64** reference (√K·ε, not against the
 untiled kernel).
 
-**Production simdgroup GEMM — ✅ DONE on Metal (`gemm_f32_sg`).** The correctness-first
-`gemm_f32_tiled` accumulates scalar; `gemm_f32_sg` uses the Apple GPU's `simdgroup_matrix` 8×8
-cooperative matrix ALU. Each threadgroup computes a 32×32 tile with 4 simdgroups (2×2), each
-owning 2×2 accumulator fragments; per K-chunk the 128 threads stage A and Bᵀ into threadgroup
-memory ZERO-PADDED on the M/N/K edges (so `simdgroup_load` is never out of bounds and any shape
-works), then issue four `simdgroup_multiply_accumulate`. Gated against a float64 reference across
-7 shapes incl. tile/K overhang. Measured **2.3–2.8× the tiled kernel** (778 vs 339 GFLOP/s at
-2416 MFLOP, **967 vs 346 at 8590**) — MPS was avoided deliberately: it is an Obj-C framework
-dependency, whereas `simdgroup_matrix` is pure MSL and keeps the substrate cgo-free/self-contained.
-Both `gpu/encmetal` and the ViT f32 paths (`visionmetal`/`qwenmetal` patch embed + Qwen fp32
-projections) route through it; W8A8 stays on the tiled kernel (`simdgroup_matrix` has no int8
-form). All parity unchanged (SigLIP/Qwen cosine 1.000000000). CUDA has no analogue in this set
-yet — a future `gemm_f32_wmma` (Tensor-Core `wmma`) would be the Linux-side mirror.
+**Production simdgroup GEMM — ✅ DONE on Metal (two kernels, `ViT.GEMMF32Plan` routes).** The
+correctness-first `gemm_f32_tiled` accumulates scalar; these use the Apple GPU's
+`simdgroup_matrix` 8×8 cooperative matrix ALU. MPS was avoided deliberately — it is an Obj-C
+framework dependency, whereas `simdgroup_matrix` is pure MSL and keeps the substrate
+cgo-free/self-contained. Both bind buffers 0..5 (A,B,C,M,N,K), gated against a float64 reference.
+
+- **`gemm_f32_sg`** (any shape) — a 32×32 tile, 4 simdgroups (2×2) each owning 2×2 accumulator
+  fragments; per K-chunk the 128 threads stage A and Bᵀ into threadgroup memory ZERO-PADDED on
+  the M/N/K edges (so `simdgroup_load` never goes out of bounds), then four
+  `simdgroup_multiply_accumulate`. ~2.3–2.8× the tiled kernel (778 vs 339 GFLOP/s at 2416 MFLOP).
+- **`gemm_f32_sg_big`** (aligned: M,N%32==0, K%8==0 — every large encoder/ViT GEMM) — the SAME
+  32×32 tile and register footprint, but A/B fragments load DIRECTLY from device (no staging, and
+  crucially **no two barriers per K-step**) and there are no bounds checks. That is the whole win:
+  **~1080 GFLOP/s (≈23% of the M1-Pro f32 peak), up to 4.25× the CPU** and +4–21% over
+  `gemm_f32_sg` across shapes. Two things that did NOT help and were dropped: wider register
+  blocking (a 64×64 tile / 16 fragments per simdgroup spilled registers and tanked occupancy,
+  ~150 GFLOP/s), and a threadgroup-count/M threshold (a stable 1s sweep showed the direct-load
+  kernel wins at every aligned shape, so `GEMMF32Plan` routes purely on alignment).
+
+`gpu/encmetal` and the ViT f32 paths (`visionmetal`/`qwenmetal` patch embed + Qwen fp32
+projections) route through `GEMMF32Plan`; W8A8 stays on the tiled kernel (`simdgroup_matrix` has
+no int8 form). All parity unchanged (SigLIP/Qwen cosine 1.000000000). CUDA has no analogue in
+this set yet — a future `gemm_f32_wmma` (Tensor-Core `wmma`) would be the Linux-side mirror.
 
 Two findings the interface forced, both worth acting on:
 
@@ -310,13 +321,14 @@ Two findings the interface forced, both worth acting on:
   CUDA the GPU wins at every shape but by the *largest* margin on the *smallest* work (7.7× at
   1 MFLOP, 1.09× at 2416 MFLOP): the pure-Go path switches scalar→blocked-parallel at ~4 MFLOP,
   so it is weakest where the device looks strongest, and hits 329 GFLOP/s where the device is
-  transfer-bound. On **Metal the crossover is much higher** — with the production simdgroup GEMM
-  the device wins from ~604 MFLOP (1.80×) up (1.83× at 2416, 3.47× at 8590) and loses below ~151
-  MFLOP, because the M1-Pro CPU is strong (~300 GFLOP/s) and even `gemm_f32_sg`'s ~872 GFLOP/s
-  needs the size to amortize a ~250us dispatch+sync floor. (The earlier tiled kernel put this
-  crossover ~4× higher, near 2.4 GFLOP.) Same interface, different thresholds per platform *and*
-  per kernel: the sweep *is* the deliverable, exactly as `BENCH-gpu.md` argues, and copying one
-  platform's constant to the other would have been wrong.
+  transfer-bound. On **Metal the crossover is higher but has moved down with each kernel** — with
+  `gemm_f32_sg_big` the device wins from ~151 MFLOP (1.33×) up (1.28× at 604, 2.22× at 2416,
+  **4.25× at 8590**) and loses below ~24 MFLOP, because the M1-Pro CPU is strong (~300 GFLOP/s)
+  and even ~978 GFLOP/s (incl. copies) needs the size to amortize a ~250us dispatch+sync floor.
+  (Tiled put this crossover near 2.4 GFLOP; `gemm_f32_sg` at ~0.5 GFLOP; `gemm_f32_sg_big` at
+  ~0.13 GFLOP.) Same interface, different thresholds per platform *and* per kernel: the sweep *is*
+  the deliverable, exactly as `BENCH-gpu.md` argues, and copying one constant to another box or
+  kernel would have been wrong.
 
 **End-to-end measurement — ✅ DONE on Metal (first Phase-4 end-to-end figure either box has).**
 `testdata/minilm-model` is present on the Apple box, so `TestEncMetal_endToEnd` times a real
@@ -328,9 +340,11 @@ or larger-model encode. (`BENCH-gpu.md`: microbenchmarks tune, end-to-end publis
 
 **Still to do in Phase 4:** widening `Backend` for the int8 (`LoadQ8`) path — a Hard-tier
 decision, see the scope note above. Optional throughput follow-ons, both measurement-gated: a
-CUDA `wmma` (Tensor-Core) mirror of `gemm_f32_sg`, and further tuning of `gemm_f32_sg` itself
-(double-buffered staging, wider register blocking) toward the M1-Pro f32 peak (~5 TFLOP/s) —
-the current kernel reaches ~872 GFLOP/s, already ~2.8× the tiled one.
+CUDA `wmma` (Tensor-Core) mirror of `gemm_f32_sg_big`, and — to close the remaining gap to the
+~4.7 TFLOP/s M1-Pro peak from today's ~1.08 TFLOP/s — **double-buffered / async-copy staging** in
+the general kernel (the one lever not yet pulled: the aligned kernel already dropped the barriers,
+but prefetching the next K-tile while the ALU computes is what production GEMMs do next). Wider
+register blocking is NOT the lever — it was tried and lost to register spilling.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
 waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a

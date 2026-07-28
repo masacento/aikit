@@ -201,11 +201,11 @@ func (e *encoder) proj(src gpu.Buffer, m mat, bias, dst gpu.Buffer, M int) {
 		e.setI(e.s2, K)
 		e.q.Run2D(e.k.GEMMW8A8Tiled, tgxg, tgyg, ttx, tty, e.qi8, e.qs, m.a, m.b, dst, e.s0, e.s1, e.s2)
 	} else {
-		gx, gy, tgx, tgy := gpu.SGDims(M, N) // production simdgroup_matrix GEMM
+		p, gx, gy, tgx, tgy := e.k.GEMMF32Plan(M, N, K) // aligned → sg_big, else sg
 		e.setI(e.s0, M)
 		e.setI(e.s1, N)
 		e.setI(e.s2, K)
-		e.q.Run2D(e.k.GEMMF32SG, gx, gy, tgx, tgy, src, m.a, dst, e.s0, e.s1, e.s2)
+		e.q.Run2D(p, gx, gy, tgx, tgy, src, m.a, dst, e.s0, e.s1, e.s2)
 	}
 	if bias.Len() == 0 {
 		return
@@ -265,8 +265,8 @@ func (e *encoder) ForwardViT(pixelValues []float32, gridTHW [][3]int) ([]float32
 	e.setI(e.s0, n)
 	e.setI(e.s1, H)
 	e.setI(e.s2, pd)
-	pgx, pgy, ptgx, ptgy := gpu.SGDims(n, H) // production simdgroup_matrix GEMM
-	e.q.Run2D(e.k.GEMMF32SG, pgx, pgy, ptgx, ptgy, e.pix, e.patchW, e.h, e.s0, e.s1, e.s2)
+	pp, pgx, pgy, ptgx, ptgy := e.k.GEMMF32Plan(n, H, pd) // aligned → sg_big, else sg
+	e.q.Run2D(pp, pgx, pgy, ptgx, ptgy, e.pix, e.patchW, e.h, e.s0, e.s1, e.s2)
 
 	scale := float32(1.0 / math.Sqrt(float64(hd)))
 	curFull := -1 // which segment bounds are currently uploaded: 1 full, 0 windowed

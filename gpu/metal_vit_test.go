@@ -674,9 +674,11 @@ func TestMetal_gemmF32SG(t *testing.T) {
 		{512, 768, 3072}, // encoder batch shape
 	} {
 		Af, Bf := randF32M(rng, sh.M*sh.K, 1), randF32M(rng, sh.N*sh.K, 1)
+		// GEMMF32Plan routes aligned shapes to gemm_f32_sg_big and the rest to gemm_f32_sg,
+		// so gating through it covers BOTH kernels on the shapes each actually serves.
+		p, gx, gy, tgx, tgy := v.GEMMF32Plan(sh.M, sh.N, sh.K)
 		out := d.NewBufferLen(sh.M * sh.N)
-		gx, gy, tgx, tgy := SGDims(sh.M, sh.N)
-		run2d(q, v.GEMMF32SG, gx, gy, tgx, tgy, d.NewBufferFloats(Af), d.NewBufferFloats(Bf), out,
+		run2d(q, p, gx, gy, tgx, tgy, d.NewBufferFloats(Af), d.NewBufferFloats(Bf), out,
 			i32b(d, sh.M), i32b(d, sh.N), i32b(d, sh.K))
 		h := out.Floats()
 		worst := 0.0
@@ -697,10 +699,10 @@ func TestMetal_gemmF32SG(t *testing.T) {
 		}
 		// Same analytic f32 bound as the tiled f32 gate (~sqrt(K)*eps, ~5e-5 at K=1152).
 		if worst > 2e-4 {
-			t.Fatalf("gemm_f32_sg M=%d N=%d K=%d: worst relative Δ %.3g vs float64 CPU", sh.M, sh.N, sh.K, worst)
+			t.Fatalf("gemm_f32 M=%d N=%d K=%d: worst relative Δ %.3g vs float64 CPU", sh.M, sh.N, sh.K, worst)
 		}
 	}
-	t.Log("gemm_f32_sg ≡ float64 CPU reference across 7 shapes (incl. tile/K overhang)")
+	t.Log("gemm_f32_sg + gemm_f32_sg_big (via GEMMF32Plan) ≡ float64 CPU across 7 shapes (incl. overhang + aligned 512×768×3072)")
 }
 
 // BenchmarkMetalGEMMF32 compares the scalar-tiled GEMM to the simdgroup_matrix one at ViT /
@@ -744,6 +746,15 @@ func BenchmarkMetalGEMMF32(b *testing.B) {
 			defer runtime.UnlockOSThread()
 			for range b.N {
 				q.Run2D(v.GEMMF32SG, gx, gy, tgx, tgy, dA, dB, dC, i32b(d, s.M), i32b(d, s.N), i32b(d, s.K))
+			}
+			b.ReportMetric(mf/1e3/(b.Elapsed().Seconds()/float64(b.N)), "GFLOP/s")
+		})
+		b.Run(name+"/simdgroup_big", func(b *testing.B) {
+			p, gx, gy, tgx, tgy := v.GEMMF32Plan(s.M, s.N, s.K)
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			for range b.N {
+				q.Run2D(p, gx, gy, tgx, tgy, dA, dB, dC, i32b(d, s.M), i32b(d, s.N), i32b(d, s.K))
 			}
 			b.ReportMetric(mf/1e3/(b.Elapsed().Seconds()/float64(b.N)), "GFLOP/s")
 		})
