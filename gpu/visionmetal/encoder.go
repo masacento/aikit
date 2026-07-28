@@ -158,8 +158,8 @@ func (e *encoder) gemmF32(a, b, c gpu.Buffer, M, N, K int) {
 	e.setI(e.s0, M)
 	e.setI(e.s1, N)
 	e.setI(e.s2, K)
-	gx, gy, tgx, tgy := gpu.TileDims(M, N)
-	e.q.Run2D(e.k.GEMMF32Tiled, gx, gy, tgx, tgy, a, b, c, e.s0, e.s1, e.s2)
+	gx, gy, tgx, tgy := gpu.SGDims(M, N) // production simdgroup_matrix GEMM
+	e.q.Run2D(e.k.GEMMF32SG, gx, gy, tgx, tgy, a, b, c, e.s0, e.s1, e.s2)
 }
 
 func (e *encoder) addBias(x, bias gpu.Buffer, rows, dim int) {

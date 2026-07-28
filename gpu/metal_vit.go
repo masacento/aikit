@@ -30,6 +30,7 @@ import "fmt"
 // runtime, so unlike the CUDA side there is no embedded PTX). LNBLOCK matches ViTBlock.
 const vitMSL = `
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 #define LNBLOCK 256
 
@@ -419,6 +420,72 @@ kernel void gemm_f32_tiled(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (m < M && n < N) C[(uint)m * (uint)N + (uint)n] = acc;
+}
+
+// gemm_f32_sg — the PRODUCTION f32 GEMM, on simdgroup_matrix (the Apple GPU's cooperative
+// 8×8 matrix ALU), vs gemm_f32_tiled's scalar accumulation. Same C[m,n]=dot(A[m,:],B[n,:])
+// with B row-major [N,K].
+//
+// Layout: each threadgroup computes a BM×BN = 32×32 output tile with 4 simdgroups (2×2),
+// each owning a 16×16 sub-tile = 2×2 accumulator fragments. Per K-chunk (BK=8) the 128
+// threads cooperatively stage A[32×8] and Bᵀ[8×32] into threadgroup memory, ZERO-PADDED on
+// the M/N/K edges, so simdgroup_load never reads out of bounds and ANY shape is handled;
+// each simdgroup then loads its A/B fragments from that staged tile and issues four
+// simdgroup_multiply_accumulate. Results stage back through Cs and are written bounds-checked.
+//
+// B is loaded pre-transposed into Bs[k][n] (a plain scatter during staging, not a device
+// transpose), so the multiply consumes an [m,k]·[k,n] pair directly. Launch via Run2D with
+// grid = (ceil(N/32), ceil(M/32)) threadgroups of 128 threads (SGDims).
+#define SGBM 32
+#define SGBN 32
+#define SGBK 8
+
+kernel void gemm_f32_sg(
+    device const float* A [[buffer(0)]], device const float* B [[buffer(1)]], device float* C [[buffer(2)]],
+    constant int& M [[buffer(3)]], constant int& N [[buffer(4)]], constant int& K [[buffer(5)]],
+    uint2 tgpos [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup float As[SGBM][SGBK];
+    threadgroup float Bs[SGBK][SGBN];
+    threadgroup float Cs[SGBM][SGBN];
+    int m0 = (int)tgpos.y * SGBM;
+    int n0 = (int)tgpos.x * SGBN;
+    int sg = (int)tid / 32;      // 0..3
+    int sgr = sg / 2, sgc = sg % 2; // 2×2 simdgroup grid → each covers 16×16
+
+    simdgroup_float8x8 acc[2][2];
+    for (int f = 0; f < 2; f++)
+        for (int g = 0; g < 2; g++)
+            acc[f][g] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += SGBK) {
+        for (int idx = (int)tid; idx < SGBM * SGBK; idx += 128) {
+            int r = idx / SGBK, c = idx % SGBK;
+            As[r][c] = (m0 + r < M && k0 + c < K) ? A[(uint)(m0 + r) * (uint)K + (uint)(k0 + c)] : 0.0f;
+        }
+        for (int idx = (int)tid; idx < SGBK * SGBN; idx += 128) {
+            int k = idx / SGBN, n = idx % SGBN;
+            Bs[k][n] = (n0 + n < N && k0 + k < K) ? B[(uint)(n0 + n) * (uint)K + (uint)(k0 + k)] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 a[2], b[2];
+        for (int f = 0; f < 2; f++) simdgroup_load(a[f], &As[sgr * 16 + f * 8][0], SGBK);
+        for (int g = 0; g < 2; g++) simdgroup_load(b[g], &Bs[0][sgc * 16 + g * 8], SGBN);
+        for (int f = 0; f < 2; f++)
+            for (int g = 0; g < 2; g++)
+                simdgroup_multiply_accumulate(acc[f][g], a[f], b[g], acc[f][g]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (int f = 0; f < 2; f++)
+        for (int g = 0; g < 2; g++)
+            simdgroup_store(acc[f][g], &Cs[sgr * 16 + f * 8][sgc * 16 + g * 8], SGBN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int idx = (int)tid; idx < SGBM * SGBN; idx += 128) {
+        int r = idx / SGBN, c = idx % SGBN;
+        if (m0 + r < M && n0 + c < N) C[(uint)(m0 + r) * (uint)N + (uint)(n0 + c)] = Cs[r][c];
+    }
 }`
 
 // Kernel entry points in vitMSL (identical names to the CUDA side).
@@ -442,7 +509,24 @@ const (
 	// --- tiled GEMMs (throughput; identical names to the CUDA side) ---
 	KernelGEMMW8A8Tiled = "gemm_w8a8_tiled"
 	KernelGEMMF32Tiled  = "gemm_f32_tiled"
+
+	// KernelGEMMF32SG is the production f32 GEMM on simdgroup_matrix (Metal-only; CUDA has
+	// no analogue in this kernel set). Same signature as gemm_f32_tiled. Launch with SGDims.
+	KernelGEMMF32SG = "gemm_f32_sg"
 )
+
+// SGBlock is gemm_f32_sg's threadgroup output-tile width (must match vitMSL's SGBM/SGBN);
+// SGThreads is its threadgroup size (4 simdgroups × 32).
+const (
+	SGBlock   = 32
+	SGThreads = 128
+)
+
+// SGDims is gemm_f32_sg's uniform-threadgroup 2-D geometry for Run2D: one SGBlock×SGBlock
+// output tile per threadgroup, SGThreads threads each.
+func SGDims(M, N int) (gx, gy, tgx, tgy int) {
+	return (N + SGBlock - 1) / SGBlock, (M + SGBlock - 1) / SGBlock, SGThreads, 1
+}
 
 // GEMMTile is the tiled GEMMs' tile width; it must match vitMSL's TILE, which sizes the
 // threadgroup As/Bs staging arrays. Mirrors cuda_vit.go's GEMMTile.
@@ -481,6 +565,9 @@ type ViT struct {
 	// Tiled GEMMs — same math, staged through threadgroup memory.
 	GEMMW8A8Tiled Pipeline
 	GEMMF32Tiled  Pipeline
+
+	// Production f32 GEMM on simdgroup_matrix (Metal-only).
+	GEMMF32SG Pipeline
 }
 
 // NewViT compiles vitMSL on this device and builds every encoder pipeline. The library
@@ -510,6 +597,7 @@ func (d *Device) NewViT() (ViT, error) {
 		{KernelGELUErf, &v.GELUErf},
 		{KernelGEMMW8A8Tiled, &v.GEMMW8A8Tiled},
 		{KernelGEMMF32Tiled, &v.GEMMF32Tiled},
+		{KernelGEMMF32SG, &v.GEMMF32SG},
 	} {
 		p, err := d.NewComputePipeline(lib, bind.name)
 		if err != nil {

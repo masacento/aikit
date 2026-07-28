@@ -54,41 +54,40 @@ func init() {
 // the CPU path instead of the device. Per docs/BENCH-gpu.md the crossover IS the
 // deliverable of BenchmarkEncoderMatmulBT, so this is DERIVED from the sweep, not picked —
 // and deliberately NOT copied from enccuda's 1 MFLOP: the CPU, the transfer cost (UMA vs
-// PCIe) and the crossover are all different here, and the answer is ~2000× larger.
+// PCIe) and the crossover are all different here.
+//
+// This backend runs the PRODUCTION gemm_f32_sg (simdgroup_matrix), NOT the correctness-first
+// gemm_f32_tiled — the kernel is ~2.3–2.8× faster at these shapes (778 vs 339 GFLOP/s at
+// 2416 MFLOP, 967 vs 346 at 8590; see BenchmarkMetalGEMMF32), which moved the crossover
+// DOWN ~4× from where the tiled kernel put it (~2.1 GFLOP → ~0.5 GFLOP).
 //
 // Measurement (Apple M1 Pro, GPU vs 10-core pure-Go CPU, same box, best-of ns/op, both
 // operands copied into UMA buffers and the result copied back every call — the honest cost
 // of this interface). GFLOP/s in parentheses:
 //
-//	   1 MFLOP  M=80   K=64   N=80    cpu 223us(3.7)   gpu 241us(3.4)   0.92x   CPU
-//	   2 MFLOP  M=128  K=64   N=128   cpu 577us(3.6)   gpu 244us(8.6)   2.36x   (CPU-artifact)
-//	  19 MFLOP  M=64   K=384  N=384   cpu 264us(71)    gpu 311us(61)    0.85x   CPU
-//	  24 MFLOP  M=80   K=384  N=384   cpu 331us(71)    gpu 402us(59)    0.82x   CPU
-//	 151 MFLOP  M=128  K=768  N=768   cpu 580us(260)   gpu 731us(207)   0.79x   CPU
-//	 604 MFLOP  M=128  K=768  N=3072  cpu 2.18ms(277)  gpu 2.49ms(242)  0.87x   CPU
-//	2416 MFLOP  M=512  K=768  N=3072  cpu 7.94ms(304)  gpu 7.55ms(320)  1.05x   GPU
-//	8590 MFLOP  M=1024 K=1024 N=4096  cpu 32.2ms(267)  gpu 25.1ms(343)  1.29x   GPU
+//	   1 MFLOP  M=80   K=64   N=80    cpu 227us(3.6)   gpu 255us(3.2)   0.89x   CPU
+//	   2 MFLOP  M=128  K=64   N=128   cpu 579us(3.6)   gpu 267us(7.9)   2.17x   (CPU-artifact)
+//	  19 MFLOP  M=64   K=384  N=384   cpu 269us(70)    gpu 427us(44)    0.63x   CPU
+//	  24 MFLOP  M=80   K=384  N=384   cpu 335us(70)    gpu 343us(69)    0.98x   ~tie
+//	 151 MFLOP  M=128  K=768  N=768   cpu 599us(252)   gpu 771us(196)   0.78x   CPU
+//	 604 MFLOP  M=128  K=768  N=3072  cpu 2.34ms(258)  gpu 1.31ms(463)  1.80x   GPU
+//	2416 MFLOP  M=512  K=768  N=3072  cpu 7.96ms(303)  gpu 4.35ms(556)  1.83x   GPU
+//	8590 MFLOP  M=1024 K=1024 N=4096  cpu 34.2ms(251)  gpu 9.85ms(872)  3.47x   GPU
 //
-// The device wins ONLY at the large end (≥ ~2.4 GFLOP). That is not the CUDA story
-// inverted, it is an M1-Pro story: the pure-Go CPU is strong (~300 GFLOP/s in its blocked
-// path) and this tiled kernel is correctness-first (a 16×16 threadgroup tile, not
-// simdgroup_matrix / MPS), so it tops out near ~340 GFLOP/s — only a ~1.15× throughput
-// edge, which pays only once the size amortizes the ~240us fixed dispatch+sync floor. The
-// lone small-shape "win" (2 MFLOP, 2.36x) is a CPU artifact — the pure-Go path switches
-// scalar→blocked at ~4 MFLOP, so the CPU is briefly awful there — and it is 244us of pure
-// GPU floor; routing a forward's ~72 small matmuls each to that floor would be far slower
-// in aggregate than the CPU doing them together. So the threshold keeps small matmuls on
-// the CPU and sends only large batched GEMMs to the device.
-//
-// A production Metal GEMM (simdgroup_matrix, multi-TFLOP/s) would move this crossover down
-// substantially; that is the tiling work BENCH-gpu.md scopes, and it is separate.
+// The crossover is now between 151 MFLOP (GPU loses, 0.78×) and 604 MFLOP (GPU wins, 1.80×),
+// so the threshold sits just below the proven win at 604. The M1-Pro CPU is still strong
+// (~300 GFLOP/s in its blocked path), but gemm_f32_sg reaches ~872 GFLOP/s — enough of an
+// edge to pay once the size amortizes the ~250us fixed dispatch+sync floor. The lone
+// small-shape "win" (2 MFLOP, 2.17×) is a CPU artifact — the pure-Go path switches
+// scalar→blocked at ~4 MFLOP — and is pure GPU floor; routing a forward's many small matmuls
+// each to that floor would be slower in aggregate, so the threshold keeps them on the CPU.
 //
 // HONESTY NOTE (BENCH-gpu.md: microbenchmarks tune, end-to-end publishes):
-// TestEncMetal_endToEnd times a REAL MiniLM Encode — the first Phase-4 end-to-end figure
-// either box has produced. Its finding corroborates this threshold: a single short-sequence
-// forward has NO matmul above the crossover, so the backend correctly stays entirely on the
-// CPU; the device pays only at large batch.
-const minGPUFlops = 1 << 31 // ~2.1 GFLOP — derived from the sweep above (M1 Pro crossover)
+// TestEncMetal_endToEnd times a REAL MiniLM Encode. Even at this lower crossover a single
+// short-sequence forward (small L, hidden 384) has no matmul above the threshold, so the
+// backend correctly stays entirely on the CPU and the numerics are identical; the device
+// pays for batched or larger-model encode.
+const minGPUFlops = 1 << 29 // ~537 MFLOP — derived from the sweep above (simdgroup crossover)
 
 // Backend is the Metal encoder backend.
 type Backend struct {
@@ -173,8 +172,8 @@ func (b *Backend) gpuMatmul(a, w, dst []float32, M, K, N int) (err error) {
 	b.mS.SetU32(uint32(int32(M)))
 	b.nS.SetU32(uint32(int32(N)))
 	b.kS.SetU32(uint32(int32(K)))
-	gx, gy, tgx, tgy := gpu.TileDims(M, N)
-	b.q.Run2D(b.k.GEMMF32Tiled, gx, gy, tgx, tgy, b.aBuf, b.bBuf, b.cBuf, b.mS, b.nS, b.kS)
+	gx, gy, tgx, tgy := gpu.SGDims(M, N)
+	b.q.Run2D(b.k.GEMMF32SG, gx, gy, tgx, tgy, b.aBuf, b.bBuf, b.cBuf, b.mS, b.nS, b.kS)
 	copy(dst[:M*N], b.cBuf.Floats()[:M*N]) // UMA "download" (Run2D already waited)
 	return nil
 }

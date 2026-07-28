@@ -190,20 +190,22 @@ func uploadSeg(b gpu.Buffer, s []int32) {
 // activation first when the weight is int8 — the same op sequence as gpu/qwencuda's.
 func (e *encoder) proj(src gpu.Buffer, m mat, bias, dst gpu.Buffer, M int) {
 	K, N := m.cols, m.rows
-	gx, gy, tgx, tgy := gpu.TileDims(M, N)
 	if m.quant {
+		// W8A8 stays on the tiled kernel — simdgroup_matrix has no int8 form.
+		tgxg, tgyg, ttx, tty := gpu.TileDims(M, N)
 		e.setI(e.s0, M)
 		e.setI(e.s1, K)
 		e.q.Run1D(e.k.QuantRows, M*gpu.ViTBlock, gpu.ViTBlock, src, e.qi8, e.qs, e.s0, e.s1)
 		e.setI(e.s0, M)
 		e.setI(e.s1, N)
 		e.setI(e.s2, K)
-		e.q.Run2D(e.k.GEMMW8A8Tiled, gx, gy, tgx, tgy, e.qi8, e.qs, m.a, m.b, dst, e.s0, e.s1, e.s2)
+		e.q.Run2D(e.k.GEMMW8A8Tiled, tgxg, tgyg, ttx, tty, e.qi8, e.qs, m.a, m.b, dst, e.s0, e.s1, e.s2)
 	} else {
+		gx, gy, tgx, tgy := gpu.SGDims(M, N) // production simdgroup_matrix GEMM
 		e.setI(e.s0, M)
 		e.setI(e.s1, N)
 		e.setI(e.s2, K)
-		e.q.Run2D(e.k.GEMMF32Tiled, gx, gy, tgx, tgy, src, m.a, dst, e.s0, e.s1, e.s2)
+		e.q.Run2D(e.k.GEMMF32SG, gx, gy, tgx, tgy, src, m.a, dst, e.s0, e.s1, e.s2)
 	}
 	if bias.Len() == 0 {
 		return
@@ -263,8 +265,8 @@ func (e *encoder) ForwardViT(pixelValues []float32, gridTHW [][3]int) ([]float32
 	e.setI(e.s0, n)
 	e.setI(e.s1, H)
 	e.setI(e.s2, pd)
-	pgx, pgy, ptgx, ptgy := gpu.TileDims(n, H)
-	e.q.Run2D(e.k.GEMMF32Tiled, pgx, pgy, ptgx, ptgy, e.pix, e.patchW, e.h, e.s0, e.s1, e.s2)
+	pgx, pgy, ptgx, ptgy := gpu.SGDims(n, H) // production simdgroup_matrix GEMM
+	e.q.Run2D(e.k.GEMMF32SG, pgx, pgy, ptgx, ptgy, e.pix, e.patchW, e.h, e.s0, e.s1, e.s2)
 
 	scale := float32(1.0 / math.Sqrt(float64(hd)))
 	curFull := -1 // which segment bounds are currently uploaded: 1 full, 0 windowed

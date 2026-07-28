@@ -3,6 +3,7 @@
 package gpu
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"runtime"
@@ -653,4 +654,98 @@ func TestMetal_gemmTiledMatchesUntiled(t *testing.T) {
 		}
 	}
 	t.Log("gemm_w8a8_tiled BIT-IDENTICAL to untiled across 5 shapes; gemm_f32_tiled ≡ float64 CPU reference")
+}
+
+// TestMetal_gemmF32SG gates the production simdgroup_matrix GEMM against a FLOAT64
+// reference (not against gemm_f32_tiled — comparing two f32 kernels pins whichever way they
+// agree). The odd shapes are the point: {17,33,47} overhangs the 32×32 tile in M and N and
+// the 8-wide K chunk, so the zero-padded edge staging that keeps simdgroup_load in bounds is
+// actually exercised — a mis-set pad would corrupt exactly those tiles.
+func TestMetal_gemmF32SG(t *testing.T) {
+	d, q, v := vitSetupM(t)
+	rng := rand.New(rand.NewSource(41))
+	for _, sh := range []struct{ M, N, K int }{
+		{1, 1, 1},        // degenerate
+		{8, 8, 8},        // one simdgroup fragment
+		{32, 32, 32},     // exactly one threadgroup tile
+		{17, 33, 47},     // overhang in all three dims + K tail
+		{64, 96, 129},    // K tail
+		{129, 65, 1152},  // realistic ViT projection
+		{512, 768, 3072}, // encoder batch shape
+	} {
+		Af, Bf := randF32M(rng, sh.M*sh.K, 1), randF32M(rng, sh.N*sh.K, 1)
+		out := d.NewBufferLen(sh.M * sh.N)
+		gx, gy, tgx, tgy := SGDims(sh.M, sh.N)
+		run2d(q, v.GEMMF32SG, gx, gy, tgx, tgy, d.NewBufferFloats(Af), d.NewBufferFloats(Bf), out,
+			i32b(d, sh.M), i32b(d, sh.N), i32b(d, sh.K))
+		h := out.Floats()
+		worst := 0.0
+		for m := range sh.M {
+			for n := range sh.N {
+				var acc float64
+				for k := range sh.K {
+					acc += float64(Af[m*sh.K+k]) * float64(Bf[n*sh.K+k])
+				}
+				den := math.Abs(acc)
+				if den < 1 {
+					den = 1
+				}
+				if r := math.Abs(float64(h[m*sh.N+n])-acc) / den; r > worst {
+					worst = r
+				}
+			}
+		}
+		// Same analytic f32 bound as the tiled f32 gate (~sqrt(K)*eps, ~5e-5 at K=1152).
+		if worst > 2e-4 {
+			t.Fatalf("gemm_f32_sg M=%d N=%d K=%d: worst relative Δ %.3g vs float64 CPU", sh.M, sh.N, sh.K, worst)
+		}
+	}
+	t.Log("gemm_f32_sg ≡ float64 CPU reference across 7 shapes (incl. tile/K overhang)")
+}
+
+// BenchmarkMetalGEMMF32 compares the scalar-tiled GEMM to the simdgroup_matrix one at ViT /
+// encoder shapes, resident and warm (no host transfer) — the isolated kernel speedup that
+// motivates shipping gemm_f32_sg. GFLOP/s in the metric.
+func BenchmarkMetalGEMMF32(b *testing.B) {
+	d, err := CreateSystemDefaultDevice()
+	if err != nil {
+		b.Skipf("no Metal device: %v", err)
+	}
+	b.Cleanup(func() { d.ReleaseObjects(); d.ReleaseAll() })
+	v, err := d.NewViT()
+	if err != nil {
+		b.Fatalf("NewViT: %v", err)
+	}
+	q := d.NewCommandQueue()
+	rng := rand.New(rand.NewSource(42))
+	for _, s := range []struct{ M, N, K int }{
+		{128, 768, 768},
+		{128, 768, 3072},
+		{512, 768, 3072},
+		{1024, 1024, 4096},
+	} {
+		dA := d.NewBufferFloats(randF32M(rng, s.M*s.K, 1))
+		dB := d.NewBufferFloats(randF32M(rng, s.N*s.K, 1))
+		dC := d.NewBufferLen(s.M * s.N)
+		mf := 2.0 * float64(s.M) * float64(s.K) * float64(s.N) / 1e6
+		name := fmt.Sprintf("M%d_K%d_N%d_%.0fMFLOP", s.M, s.K, s.N, mf)
+		b.Run(name+"/tiled", func(b *testing.B) {
+			gx, gy, tgx, tgy := TileDims(s.M, s.N)
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			for range b.N {
+				q.Run2D(v.GEMMF32Tiled, gx, gy, tgx, tgy, dA, dB, dC, i32b(d, s.M), i32b(d, s.N), i32b(d, s.K))
+			}
+			b.ReportMetric(mf/1e3/(b.Elapsed().Seconds()/float64(b.N)), "GFLOP/s")
+		})
+		b.Run(name+"/simdgroup", func(b *testing.B) {
+			gx, gy, tgx, tgy := SGDims(s.M, s.N)
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			for range b.N {
+				q.Run2D(v.GEMMF32SG, gx, gy, tgx, tgy, dA, dB, dC, i32b(d, s.M), i32b(d, s.N), i32b(d, s.K))
+			}
+			b.ReportMetric(mf/1e3/(b.Elapsed().Seconds()/float64(b.N)), "GFLOP/s")
+		})
+	}
 }
