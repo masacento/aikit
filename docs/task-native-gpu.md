@@ -245,12 +245,32 @@ either way. That is now fixed:
 `matmulBTQ8Into`, whose int8 weights and per-row scales do not fit that signature, and stay on
 the CPU. Widening `Backend` is a separate, deliberate decision — it is Hard-tier surface.
 
-**Still to do in Phase 4:** the native backends themselves, now genuinely cheap — the seam is
-one f32 `MatmulBT` and `gpu/vit.cu`'s `gemm_f32` already *is* that kernel. Note a backend sees
-EVERY f32 matmul including the small per-head QKᵀ; deciding which shapes are worth a device
-round-trip belongs to the backend (the pure-Go path's own ~4 MFLOP naive/blocked split is the
-precedent). A backend that offloads unconditionally will lose on short sequences — which is
-exactly what `docs/BENCH-gpu.md` exists to measure.
+**CUDA backend — ✅ DONE (`gpu/enccuda`).** Registers `"cuda"`, uses `gemm_f32_tiled`, and
+declines small shapes to the CPU path. Parity vs a float64 reference on both sides of the
+threshold; measured crossover in `minGPUFlops`'s doc comment.
+
+Two findings the interface forced, both worth acting on:
+
+- **`encoder.Backend` has no residency hook.** It takes host slices, so both operands upload
+  and the result downloads on *every* call — a 12-layer forward re-uploads the same weights
+  ~72 times. The obvious fix, a pointer-keyed weight cache, is **unsound here**: in attention
+  the `b` operand is a *pooled scratch* slice whose backing array is stable while its contents
+  change every call, so a pointer key serves stale data silently. A size threshold does not
+  rescue it — at long sequences the per-head QKᵀ outgrows any threshold. `gpu/enccuda` therefore
+  does not cache, and carries a regression test for exactly that trap. **Widening `Backend`
+  with a resident-weight concept is the real fix**, and is a Hard-tier decision.
+- **The measured curve is not the expected one.** The GPU wins at every shape, but by the
+  *largest* margin on the *smallest* work (7.7× at 1 MFLOP, 1.09× at 2416 MFLOP). That is a CPU
+  result, not a GPU one: the pure-Go path switches from a scalar to a blocked-parallel kernel at
+  ~4 MFLOP, so it is weakest exactly where the device looks strongest, and hits 329 GFLOP/s
+  where the device is transfer-bound.
+
+**Still to do in Phase 4:** an **end-to-end encode measurement** — `BENCH-gpu.md` is explicit
+that microbenchmarks tune and end-to-end publishes, and `minGPUFlops` is currently
+microbenchmark-derived only (`testdata/minilm-model` is absent on the CUDA box). A forward makes
+~72 sequential backend calls each paying a device synchronize; that serial cost cannot appear in
+a per-call benchmark. Also: the **Metal** encoder backend, and widening `Backend` for the int8
+(`LoadQ8`) path.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
 waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a
