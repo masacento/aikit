@@ -697,3 +697,117 @@ func TestCUDA_vitAttentionSeg(t *testing.T) {
 	}
 	t.Log("attention_seg ≡ CPU per-segment MHA; full-attention differs (bounds enforced)")
 }
+
+// --- tiled GEMMs ---
+
+// TestCUDA_gemmTiledMatchesUntiled gates the tiled GEMMs, asymmetrically, because the
+// two admit different claims.
+//
+// W8A8 must be BIT-IDENTICAL to the untiled kernel. Its accumulator is int32 and
+// integer addition is associative, so staging K through shared memory in TILE-sized
+// chunks cannot change the sum. Asserting equality rather than a tolerance is what
+// makes this able to catch a real tiling bug — a mis-indexed shared tile typically
+// shifts a handful of outputs, which a loose bound would wave through.
+//
+// The f32 kernel is gated against a float64 CPU reference, NOT against its untiled
+// counterpart. Comparing the two GPU kernels to each other is the obvious thing and it
+// was wrong: it made this test flaky at 3-8 failures per 25 runs, and in EVERY failure
+// the tiled result matched CPU while the untiled one drifted (see the note on
+// gemm_f32 in vit.cu). Encoding "these two agree" would have pinned a defect as the
+// expectation. The tiled kernel is what the consumers run; the reference is what it
+// has to equal.
+func TestCUDA_gemmTiledMatchesUntiled(t *testing.T) {
+	d, q, v := vitSetup(t)
+	rng := rand.New(rand.NewSource(21))
+	for _, sh := range []struct{ M, N, K int }{
+		{1, 1, 1},       // degenerate
+		{16, 16, 16},    // exactly one tile
+		{17, 33, 47},    // overhang in all three dims + K tail
+		{64, 96, 129},   // K tail
+		{129, 65, 1152}, // realistic ViT projection
+	} {
+		A := make([]int8, sh.M*sh.K)
+		B := make([]int8, sh.N*sh.K)
+		for i := range A {
+			A[i] = int8(rng.Intn(255) - 127)
+		}
+		for i := range B {
+			B[i] = int8(rng.Intn(255) - 127)
+		}
+		as, bs := randF32(rng, sh.M, 0.01), randF32(rng, sh.N, 0.01)
+		dA, dB := NewBufferOf(d, A), NewBufferOf(d, B)
+		dAs, dBs := NewBufferOf(d, as), NewBufferOf(d, bs)
+		c1 := NewBufferLenOf[float32](d, sh.M*sh.N)
+		c2 := NewBufferLenOf[float32](d, sh.M*sh.N)
+		if err := q.Launch(v.GEMMW8A8, Grid1D(sh.M*sh.N, 256),
+			Arg(dA), Arg(dAs), Arg(dB), Arg(dBs), Arg(c1),
+			ArgValue(int32(sh.M)), ArgValue(int32(sh.N)), ArgValue(int32(sh.K))); err != nil {
+			t.Fatalf("untiled: %v", err)
+		}
+		if err := q.Launch(v.GEMMW8A8Tiled, TileGrid(sh.M, sh.N),
+			Arg(dA), Arg(dAs), Arg(dB), Arg(dBs), Arg(c2),
+			ArgValue(int32(sh.M)), ArgValue(int32(sh.N)), ArgValue(int32(sh.K))); err != nil {
+			t.Fatalf("tiled: %v", err)
+		}
+		if err := q.Sync(); err != nil {
+			t.Fatalf("Sync: %v", err)
+		}
+		g1, g2 := make([]float32, sh.M*sh.N), make([]float32, sh.M*sh.N)
+		if err := Download(c1, g1); err != nil {
+			t.Fatalf("Download: %v", err)
+		}
+		if err := Download(c2, g2); err != nil {
+			t.Fatalf("Download: %v", err)
+		}
+		for i := range g1 {
+			if g1[i] != g2[i] {
+				t.Fatalf("W8A8 M=%d N=%d K=%d: tiled[%d]=%v != untiled %v — int32 accumulation is order-independent, so this is a real tiling bug",
+					sh.M, sh.N, sh.K, i, g2[i], g1[i])
+			}
+		}
+
+		Af, Bf := randF32(rng, sh.M*sh.K, 1), randF32(rng, sh.N*sh.K, 1)
+		dAf, dBf := NewBufferOf(d, Af), NewBufferOf(d, Bf)
+		f2 := NewBufferLenOf[float32](d, sh.M*sh.N)
+		if err := q.Launch(v.GEMMF32Tiled, TileGrid(sh.M, sh.N), Arg(dAf), Arg(dBf), Arg(f2),
+			ArgValue(int32(sh.M)), ArgValue(int32(sh.N)), ArgValue(int32(sh.K))); err != nil {
+			t.Fatalf("f32 tiled: %v", err)
+		}
+		if err := q.Sync(); err != nil {
+			t.Fatalf("Sync: %v", err)
+		}
+		h2 := make([]float32, sh.M*sh.N)
+		if err := Download(f2, h2); err != nil {
+			t.Fatalf("Download: %v", err)
+		}
+		worst := 0.0
+		for m := range sh.M {
+			for n := range sh.N {
+				var acc float64
+				for k := range sh.K {
+					acc += float64(Af[m*sh.K+k]) * float64(Bf[n*sh.K+k])
+				}
+				den := math.Abs(acc)
+				if den < 1 {
+					den = 1
+				}
+				if r := math.Abs(float64(h2[m*sh.N+n])-acc) / den; r > worst {
+					worst = r
+				}
+			}
+		}
+		// Bound set from the analytic f32 error, not picked to fit: a K-term f32 dot
+		// accumulates roughly sqrt(K)*eps*sum|terms| against a float64 reference, which
+		// at K=1152 with unit-normal operands is ~5e-5 relative. 2e-4 sits just above
+		// that and still rejects anything structural — the earlier upload race showed
+		// up here as 6.6, five orders of magnitude clear of this line. The SHARP gate
+		// is the W8A8 bit-identity check above; f32 cannot offer one.
+		if worst > 2e-4 {
+			t.Fatalf("f32 tiled M=%d N=%d K=%d: worst relative Δ %.3g vs float64 CPU", sh.M, sh.N, sh.K, worst)
+		}
+		for _, b := range []Buffer{dA, dB, dAs, dBs, c1, c2, dAf, dBf, f2} {
+			d.ReleaseBuf(b)
+		}
+	}
+	t.Log("gemm_w8a8_tiled BIT-IDENTICAL to untiled across 5 shapes; gemm_f32_tiled ≡ float64 CPU reference")
+}

@@ -95,7 +95,24 @@ const (
 	// ~5e-4, far above any parity bar. Pick deliberately.
 	//   (x f32*, n i32)
 	KernelGELUErf = "gelu_erf"
+
+	// --- tiled GEMMs (throughput) ---
+
+	// KernelGEMMW8A8Tiled is gemm_w8a8 staged through shared memory. Same signature,
+	// and BIT-IDENTICAL output: the accumulator is int32 and integer addition is
+	// associative, so re-chunking the K loop cannot change the result.
+	// Launch with TileGrid(M, N).
+	KernelGEMMW8A8Tiled = "gemm_w8a8_tiled"
+
+	// KernelGEMMF32Tiled is gemm_f32 staged through shared memory. Same signature.
+	// NOT bit-identical to the untiled kernel — f32 addition reassociates — so it is
+	// gated on a tight relative bound instead. Launch with TileGrid(M, N).
+	KernelGEMMF32Tiled = "gemm_f32_tiled"
 )
+
+// GEMMTile is the tiled GEMMs' tile width; it must match vit.cu's TILE, which sizes
+// their shared-memory staging arrays statically.
+const GEMMTile = 16
 
 // ViTBlock is the block width the per-row kernels reduce at. It must match vit.cu's
 // LNBLOCK, since those kernels size their shared-memory reduction arrays statically.
@@ -118,6 +135,10 @@ type ViT struct {
 	AttentionSeg Pipeline
 	SiLUMul      Pipeline
 	GELUErf      Pipeline
+
+	// Tiled GEMMs — same math, staged through shared memory.
+	GEMMW8A8Tiled Pipeline
+	GEMMF32Tiled  Pipeline
 }
 
 // NewViT loads ViTPTX on this device and builds every encoder pipeline. The module is
@@ -145,6 +166,8 @@ func (d *Device) NewViT() (ViT, error) {
 		{KernelAttentionSeg, &v.AttentionSeg},
 		{KernelSiLUMul, &v.SiLUMul},
 		{KernelGELUErf, &v.GELUErf},
+		{KernelGEMMW8A8Tiled, &v.GEMMW8A8Tiled},
+		{KernelGEMMF32Tiled, &v.GEMMF32Tiled},
 	} {
 		p, err := d.NewComputePipeline(lib, bind.name)
 		if err != nil {
@@ -192,5 +215,19 @@ func AttentionGrid(np, heads int) LaunchConfig {
 		GridX: uint32(np * heads), GridY: 1, GridZ: 1,
 		BlockX: ViTBlock, BlockY: 1, BlockZ: 1,
 		SharedMemBytes: uint32(np * 4),
+	}
+}
+
+// TileGrid is the tiled GEMMs' 2-D geometry: one GEMMTile×GEMMTile output tile per
+// block. Both kernels bounds-check, so a grid that overhangs M or N is safe.
+func TileGrid(M, N int) LaunchConfig {
+	if M <= 0 || N <= 0 {
+		return LaunchConfig{}
+	}
+	return LaunchConfig{
+		GridX:  uint32((N + GEMMTile - 1) / GEMMTile),
+		GridY:  uint32((M + GEMMTile - 1) / GEMMTile),
+		GridZ:  1,
+		BlockX: GEMMTile, BlockY: GEMMTile, BlockZ: 1,
 	}
 }

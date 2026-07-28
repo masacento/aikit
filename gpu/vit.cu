@@ -403,3 +403,73 @@ extern "C" __global__ void gelu_erf(float* __restrict__ x, int n)
     double v = (double)x[g];
     x[g] = (float)(0.5 * v * (1.0 + erf(v / 1.4142135623730951)));
 }
+
+// ---------------------------------------------------------------------------
+// TILED GEMMs (throughput). The gemm_w8a8 / gemm_f32 above are correctness-first:
+// one thread per output element, each re-reading a whole row of A and of B from
+// global memory. At ViT shapes that is the dominant cost — every A row is re-read N
+// times and every B row M times.
+//
+// These tile through shared memory instead: a TILE×TILE block cooperatively stages
+// one A-tile and one B-tile per K-chunk, so each element is read from global memory
+// once per tile rather than once per output. Same arithmetic, same operand order
+// within a thread's accumulation.
+//
+// The W8A8 variant is expected to be BIT-IDENTICAL to the untiled one, and its test
+// asserts exactly that: the accumulator is int32 and integer addition is associative,
+// so re-chunking the K loop cannot change the result. That is a much sharper gate than
+// a tolerance, and it is available here precisely because the dot is integer.
+// gemm_f32_tiled cannot make that claim — f32 addition reassociates — so its gate is a
+// tight relative bound instead.
+//
+// Launch with a 2-D grid: grid = (ceil(N/TILE), ceil(M/TILE)), block = (TILE, TILE).
+// ---------------------------------------------------------------------------
+
+#define TILE 16
+
+extern "C" __global__ void gemm_w8a8_tiled(
+    const signed char* __restrict__ A, const float* __restrict__ aScale,
+    const signed char* __restrict__ B, const float* __restrict__ bScale,
+    float* __restrict__ C, int M, int N, int K)
+{
+    __shared__ signed char As[TILE][TILE];
+    __shared__ signed char Bs[TILE][TILE];
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int m = blockIdx.y * TILE + ty;
+    int n = blockIdx.x * TILE + tx;
+    int bRow = blockIdx.x * TILE + ty; // the B row this thread STAGES (not the one it uses)
+    int acc = 0;
+    for (int k0 = 0; k0 < K; k0 += TILE) {
+        int k = k0 + tx;
+        As[ty][tx] = (m < M && k < K) ? A[(long)m * K + k] : (signed char)0;
+        Bs[ty][tx] = (bRow < N && k < K) ? B[(long)bRow * K + k] : (signed char)0;
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < TILE; kk++) acc += (int)As[ty][kk] * (int)Bs[tx][kk];
+        __syncthreads();
+    }
+    if (m < M && n < N) C[(long)m * N + n] = (float)acc * aScale[m] * bScale[n];
+}
+
+extern "C" __global__ void gemm_f32_tiled(
+    const float* __restrict__ A, const float* __restrict__ B,
+    float* __restrict__ C, int M, int N, int K)
+{
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int m = blockIdx.y * TILE + ty;
+    int n = blockIdx.x * TILE + tx;
+    int bRow = blockIdx.x * TILE + ty;
+    float acc = 0.f;
+    for (int k0 = 0; k0 < K; k0 += TILE) {
+        int k = k0 + tx;
+        As[ty][tx] = (m < M && k < K) ? A[(long)m * K + k] : 0.f;
+        Bs[ty][tx] = (bRow < N && k < K) ? B[(long)bRow * K + k] : 0.f;
+        __syncthreads();
+        #pragma unroll
+        for (int kk = 0; kk < TILE; kk++) acc += As[ty][kk] * Bs[tx][kk];
+        __syncthreads();
+    }
+    if (m < M && n < N) C[(long)m * N + n] = acc;
+}

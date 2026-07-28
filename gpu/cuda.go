@@ -258,8 +258,9 @@ func (d *Device) NewComputePipeline(lib Library, fn string) (Pipeline, error) {
 // lives in the kernel signature, where it already had to agree.
 type Buffer struct {
 	b   *gc.Buffer[uint8]
-	n   int     // element count in the constructor's unit (floats, int8s, u32s, …)
-	off uintptr // byte offset for binding (a sub-view into a larger buffer; 0 = whole)
+	cx  *gc.Context // owning context, so upload can order its copy against launches
+	n   int         // element count in the constructor's unit (floats, int8s, u32s, …)
+	off uintptr     // byte offset for binding (a sub-view into a larger buffer; 0 = whole)
 }
 
 // At returns a view of the buffer bound at byteOff — for reading a slice of a
@@ -284,7 +285,7 @@ func (d *Device) MustBuf(nBytes, n int, what string) Buffer {
 	d.mu.Lock()
 	d.allocs = append(d.allocs, buf)
 	d.mu.Unlock()
-	return Buffer{b: buf, n: n}
+	return Buffer{b: buf, cx: d.cx, n: n}
 }
 
 // asBytes reinterprets a slice of fixed-size scalars as the []byte gocudrv copies.
@@ -297,7 +298,28 @@ func asBytes[T any](s []T) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), len(s)*int(unsafe.Sizeof(z)))
 }
 
-// upload copies src into the buffer at its bind offset.
+// upload copies src into the buffer at its bind offset, and does NOT return until the
+// bytes are actually visible to a kernel.
+//
+// That last part is load-bearing and was a real data race. gocudrv creates every
+// stream with CU_STREAM_NON_BLOCKING, which by definition does not order against the
+// legacy null stream — and the copy below runs on the context, i.e. the null stream,
+// while Queue.Launch runs on our own stream. Worse, cuMemcpyHtoD from PAGEABLE host
+// memory (a Go slice) is documented to return once the source has been staged for DMA,
+// with the transfer to the device still in flight. So "upload then launch" had no
+// ordering guarantee at all.
+//
+// It surfaced as an intermittently wrong GEMM: whichever kernel launched FIRST after a
+// large upload read a partially-landed buffer, with the errors clustered in the tail of
+// the last bytes copied. It reproduced 15/15 at a 129x65x1152 f32 GEMM and vanished
+// when a second kernel was launched ahead of it — which is exactly why it hid for so
+// long behind small fixtures.
+//
+// The synchronize makes the copy complete before we return. It is a full device sync,
+// which is heavier than ideal, but uploads are per-request (a corpus, a tower, a batch
+// of patches) rather than per-op, and a correct upload is not negotiable. A cheaper
+// fix — an async copy on the queue's own stream — needs pinned host memory and a
+// queue-aware Buffer; worth doing if profiling ever shows this on a hot path.
 func (b Buffer) upload(src []byte) error {
 	if b.b == nil {
 		return fmt.Errorf("cuda: upload to a nil buffer")
@@ -308,7 +330,13 @@ func (b Buffer) upload(src []byte) error {
 	if got, want := b.b.Bytes(), uint64(b.off)+uint64(len(src)); got < want {
 		return fmt.Errorf("cuda: upload of %d bytes at offset %d overruns a %d-byte buffer", len(src), b.off, got)
 	}
-	return b.b.CopyFromAt(bg, int(b.off), src)
+	if err := b.b.CopyFromAt(bg, int(b.off), src); err != nil {
+		return err
+	}
+	if b.cx == nil {
+		return nil
+	}
+	return b.cx.Synchronize(bg)
 }
 
 // download copies the buffer's contents at its bind offset into dst.

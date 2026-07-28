@@ -166,12 +166,12 @@ func (e *encoder) proj(src gpu.Buffer, m mat, bias, dst gpu.Buffer, M int) error
 			gpu.ArgValue(int32(M)), gpu.ArgValue(int32(K))); err != nil {
 			return err
 		}
-		if err := e.q.Launch(e.k.GEMMW8A8, gpu.Grid1D(M*N, 256),
+		if err := e.q.Launch(e.k.GEMMW8A8Tiled, gpu.TileGrid(M, N),
 			gpu.Arg(e.qi8), gpu.Arg(e.qs), gpu.Arg(m.a), gpu.Arg(m.b), gpu.Arg(dst),
 			gpu.ArgValue(int32(M)), gpu.ArgValue(int32(N)), gpu.ArgValue(int32(K))); err != nil {
 			return err
 		}
-	} else if err := e.q.Launch(e.k.GEMMF32, gpu.Grid1D(M*N, 256),
+	} else if err := e.q.Launch(e.k.GEMMF32Tiled, gpu.TileGrid(M, N),
 		gpu.Arg(src), gpu.Arg(m.a), gpu.Arg(dst),
 		gpu.ArgValue(int32(M)), gpu.ArgValue(int32(N)), gpu.ArgValue(int32(K))); err != nil {
 		return err
@@ -231,7 +231,7 @@ func (e *encoder) ForwardViT(pixelValues []float32, gridTHW [][3]int) ([]float32
 	}
 
 	// patch embed: h = pixels[n,pd] · patchW[H,pd]ᵀ (no bias).
-	if err := e.q.Launch(e.k.GEMMF32, gpu.Grid1D(n*H, 256),
+	if err := e.q.Launch(e.k.GEMMF32Tiled, gpu.TileGrid(n, H),
 		gpu.Arg(e.pix), gpu.Arg(e.patchW), gpu.Arg(e.h),
 		gpu.ArgValue(int32(n)), gpu.ArgValue(int32(H)), gpu.ArgValue(int32(pd))); err != nil {
 		return nil, err

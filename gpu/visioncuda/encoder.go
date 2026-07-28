@@ -149,7 +149,7 @@ func (e *encoder) proj(src gpu.Buffer, m mat, bias, dst gpu.Buffer, M int) error
 		gpu.ArgValue(int32(M)), gpu.ArgValue(int32(K))); err != nil {
 		return err
 	}
-	if err := e.launch(e.k.GEMMW8A8, gpu.Grid1D(M*N, 256),
+	if err := e.launch(e.k.GEMMW8A8Tiled, gpu.TileGrid(M, N),
 		gpu.Arg(e.qi8), gpu.Arg(e.qs), gpu.Arg(m.q), gpu.Arg(m.s), gpu.Arg(dst),
 		gpu.ArgValue(int32(M)), gpu.ArgValue(int32(N)), gpu.ArgValue(int32(K))); err != nil {
 		return err
@@ -184,7 +184,7 @@ func (e *encoder) ForwardPatches(patches []float32) ([]float32, error) {
 		return nil, err
 	}
 	// patch embed: h = patches[np,cpp] · patchW[hidden,cpp]ᵀ + patchB + posEmb
-	if err := e.launch(e.k.GEMMF32, gpu.Grid1D(np*hidden, 256),
+	if err := e.launch(e.k.GEMMF32Tiled, gpu.TileGrid(np, hidden),
 		gpu.Arg(e.patches), gpu.Arg(e.patchW), gpu.Arg(e.h),
 		gpu.ArgValue(int32(np)), gpu.ArgValue(int32(hidden)), gpu.ArgValue(int32(e.cpp))); err != nil {
 		return nil, err
