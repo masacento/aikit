@@ -4,6 +4,8 @@ import (
 	"math"
 	"math/rand"
 	"testing"
+
+	"github.com/townsendmerino/aikit/linalg"
 )
 
 // backend_wiring_test.go gates the Phase-4 seam wiring: that Backend.MatmulBT is
@@ -211,4 +213,120 @@ func TestBackend_scratchDoesNotLeakBackend(t *testing.T) {
 		putScratch(got)
 	}
 	t.Log("putScratch clears the backend; no cross-forward leak")
+}
+
+// --- int8 (Q8Backend) dispatch ---
+
+// spyQ8 is a Backend that ALSO implements Q8Backend, recording the int8 matmuls and
+// delegating to the CPU path so numerics are unchanged.
+type spyQ8 struct {
+	spyBackend
+	q8calls  int
+	q8shapes [][3]int
+	handle   bool // whether to claim the call
+	deq      []float32
+}
+
+func (s *spyQ8) MatmulBTQ8(dst, a []float32, wq []int8, wscales []float32, M, K, N int) bool {
+	s.q8calls++
+	s.q8shapes = append(s.q8shapes, [3]int{M, K, N})
+	if !s.handle {
+		return false
+	}
+	if cap(s.deq) < N*K {
+		s.deq = make([]float32, N*K)
+	}
+	matmulBTQ8Into(dst, a, wq, wscales, M, K, N, s.deq[:N*K])
+	return true
+}
+
+type wrongQ8 struct{ spyBackend }
+
+func (wrongQ8) MatmulBTQ8(dst, a []float32, wq []int8, wscales []float32, M, K, N int) bool {
+	for i := range dst[:M*N] {
+		dst[i] = 1
+	}
+	return true
+}
+
+// runQ8MLP drives swigluMLPQ8 — the int8 MLP — with synthetic weight-only Q8 weights.
+// linalg.QuantizeInt8(..., w8a8=false) is what the encoder's loader uses: weight-only,
+// NOT full W8A8. That flag is the same distinction Q8Backend's contract turns on.
+func runQ8MLP(be Backend) []float32 {
+	const D, inter, L = 16, 64, 5
+	rng := rand.New(rand.NewSource(21))
+	rf := func(n int) []float32 {
+		out := make([]float32, n)
+		for i := range out {
+			out[i] = float32(rng.NormFloat64()) * 0.1
+		}
+		return out
+	}
+	qm := func(rows, cols int) *linalg.WeightMat {
+		m := linalg.QuantizeInt8(rf(rows*cols), rows, cols, false)
+		return &m
+	}
+	h := rf(L * D)
+	fc11, fc12, fc2 := qm(inter, D), qm(inter, D), qm(D, inter)
+	s := getScratch()
+	defer putScratch(s)
+	s.be = be
+	s.ensureLayer(L, D, inter, 2, D/2, L)
+	s.ensureDeqW(D, inter)
+	swigluMLPQ8(h, fc11, fc12, fc2, D, inter, L, s)
+	return h
+}
+
+// TestQ8Backend_isActuallyCalled is the int8 twin of TestBackend_isActuallyCalled. The
+// int8 forward called matmulBTQ8Into DIRECTLY before this seam existed, so an attached
+// backend accelerated the f32 path and silently did nothing for int8 models.
+func TestQ8Backend_isActuallyCalled(t *testing.T) {
+	spy := &spyQ8{handle: true}
+	runQ8MLP(spy)
+	if spy.q8calls == 0 {
+		t.Fatal("Q8Backend saw ZERO int8 matmuls — the int8 seam is dangling")
+	}
+	if spy.q8calls != 3 { // fc11, fc12, fc2
+		t.Errorf("Q8Backend saw %d int8 matmuls, want 3 (shapes %v)", spy.q8calls, spy.q8shapes)
+	}
+	t.Logf("Q8Backend observed %d int8 matmuls: %v", spy.q8calls, spy.q8shapes)
+}
+
+// TestQ8Backend_declineFallsBackExactly pins the decline contract: a backend returning
+// false must leave the result BIT-IDENTICAL to having no backend at all. That is what
+// makes "decline on anything unusual" a safe default for implementations.
+func TestQ8Backend_declineFallsBackExactly(t *testing.T) {
+	base := runQ8MLP(nil)
+	declined := runQ8MLP(&spyQ8{handle: false})
+	for i := range base {
+		if base[i] != declined[i] {
+			t.Fatalf("declining backend changed the result at %d: %v != %v", i, declined[i], base[i])
+		}
+	}
+	// A backend with NO Q8 capability must behave the same — this is the WebGPU case.
+	plain := runQ8MLP(&spyBackend{})
+	for i := range base {
+		if base[i] != plain[i] {
+			t.Fatalf("f32-only backend changed the int8 result at %d", i)
+		}
+	}
+	t.Log("decline ≡ no backend ≡ f32-only backend, bit-identical")
+}
+
+// TestQ8Backend_isLoadBearing: a Q8 backend computing something different must change
+// the output, or the int8 seam is decorative.
+func TestQ8Backend_isLoadBearing(t *testing.T) {
+	base := runQ8MLP(nil)
+	bad := runQ8MLP(&wrongQ8{})
+	diff := false
+	for i := range base {
+		if base[i] != bad[i] {
+			diff = true
+			break
+		}
+	}
+	if !diff {
+		t.Fatal("a deliberately-wrong Q8 backend changed nothing — the int8 seam is decorative")
+	}
+	t.Log("wrong Q8 backend moves the output — the int8 seam is load-bearing")
 }

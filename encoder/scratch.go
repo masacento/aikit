@@ -157,3 +157,29 @@ func (s *scratch) mm(a, b, dst []float32, M, K, N int) {
 	}
 	matmulBTInto(a, b, dst, M, K, N)
 }
+
+// mmq8 is the encoder's INT8 matmul dispatch point: dst[M,N] = a[M,K] · dequant(wq)[N,K]ᵀ.
+//
+// It is the int8 twin of mm, and it exists because forward_q8.go called matmulBTQ8Into
+// directly, so int8 encoders got no GPU acceleration at all even with a backend
+// attached — the f32 seam simply did not reach them.
+//
+// WHAT THIS PATH IS, AND WHAT IT IS NOT. The encoder's int8 is WEIGHT-ONLY: the
+// weights are stored int8 and widened to f32, then multiplied against f32 activations
+// (matmulBTQ8Into). It is NOT W8A8 — the activations are never quantized. That is a
+// deliberate, measured choice: full W8A8 was tried and fell below the 0.97 reranker
+// bar that TestModelQ8_cosineMatchesF32 still enforces, while weight-only holds cosine
+// 0.997 vs f32. A backend that "accelerates int8" by quantizing activations would
+// silently reintroduce that regression, so the Q8Backend contract below is explicitly
+// weight-only.
+//
+// A backend that declines (false) — too small, no device, an error — leaves the CPU
+// path to run exactly as before.
+func (s *scratch) mmq8(dst, a []float32, wq []int8, wscales []float32, M, K, N int) {
+	if q8, ok := s.be.(Q8Backend); ok && q8 != nil {
+		if q8.MatmulBTQ8(dst, a, wq, wscales, M, K, N) {
+			return
+		}
+	}
+	matmulBTQ8Into(dst, a, wq, wscales, M, K, N, s.deqW)
+}

@@ -142,7 +142,7 @@ func selfAttentionQ8(h []float32, wqkv, outProj *linalg.WeightMat,
 	heads, headDim, D, L int, rope *ropeTable, s *scratch) {
 	qkv := s.qkv[:L*3*D]
 	WqkvQ, WqkvScales, _, _ := wqkv.Int8()
-	matmulBTQ8Into(qkv, h, WqkvQ, WqkvScales, L, D, 3*D, s.deqW)
+	s.mmq8(qkv, h, WqkvQ, WqkvScales, L, D, 3*D)
 	Q := s.Q[:L*D]
 	K := s.K[:L*D]
 	V := s.V[:L*D]
@@ -185,7 +185,7 @@ func selfAttentionQ8(h []float32, wqkv, outProj *linalg.WeightMat,
 	}
 	out := s.out[:L*D]
 	OutProjQ, OutProjScales, _, _ := outProj.Int8()
-	matmulBTQ8Into(out, ctx, OutProjQ, OutProjScales, L, D, D, s.deqW)
+	s.mmq8(out, ctx, OutProjQ, OutProjScales, L, D, D)
 	for i := range h {
 		h[i] += out[i]
 	}
@@ -198,7 +198,7 @@ func selfAttentionQ8Batched(h []float32, wqkv, outProj *linalg.WeightMat,
 	BL := B * Lmax
 	qkv := s.qkv[:BL*3*D]
 	WqkvQ, WqkvScales, _, _ := wqkv.Int8()
-	matmulBTQ8Into(qkv, h, WqkvQ, WqkvScales, BL, D, 3*D, s.deqW)
+	s.mmq8(qkv, h, WqkvQ, WqkvScales, BL, D, 3*D)
 	Q := s.Q[:BL*D]
 	K := s.K[:BL*D]
 	V := s.V[:BL*D]
@@ -256,7 +256,7 @@ func selfAttentionQ8Batched(h []float32, wqkv, outProj *linalg.WeightMat,
 	}
 	out := s.out[:BL*D]
 	OutProjQ, OutProjScales, _, _ := outProj.Int8()
-	matmulBTQ8Into(out, ctx, OutProjQ, OutProjScales, BL, D, D, s.deqW)
+	s.mmq8(out, ctx, OutProjQ, OutProjScales, BL, D, D)
 	for i := range h {
 		h[i] += out[i]
 	}
@@ -270,14 +270,14 @@ func swigluMLPQ8(h []float32, fc11, fc12, fc2 *linalg.WeightMat,
 	gate := s.gate[:L*intermediate]
 	Fc11Q, Fc11Scales, _, _ := fc11.Int8()
 	Fc12Q, Fc12Scales, _, _ := fc12.Int8()
-	matmulBTQ8Into(val, h, Fc11Q, Fc11Scales, L, D, intermediate, s.deqW)
-	matmulBTQ8Into(gate, h, Fc12Q, Fc12Scales, L, D, intermediate, s.deqW)
+	s.mmq8(val, h, Fc11Q, Fc11Scales, L, D, intermediate)
+	s.mmq8(gate, h, Fc12Q, Fc12Scales, L, D, intermediate)
 	for i, v := range val {
 		val[i] = v * silu(gate[i])
 	}
 	mid := s.mid[:L*D]
 	Fc2Q, Fc2Scales, _, _ := fc2.Int8()
-	matmulBTQ8Into(mid, val, Fc2Q, Fc2Scales, L, intermediate, D, s.deqW)
+	s.mmq8(mid, val, Fc2Q, Fc2Scales, L, intermediate, D)
 	for i := range h {
 		h[i] += mid[i]
 	}

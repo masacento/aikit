@@ -55,3 +55,29 @@ func (g *GTE) UseBackend(be Backend) {
 		g.be = be
 	}
 }
+
+// Q8Backend is an OPTIONAL capability a Backend may also implement, to accelerate the
+// int8 (LoadQ8 / WeightsQ8) projections. It is discovered by type assertion in
+// scratch.mmq8; encoder.Backend itself is unchanged, so a backend that only does f32 —
+// the WebGPU one, for instance — keeps satisfying Backend exactly as before and is
+// never asked for this.
+//
+// THE CONTRACT IS WEIGHT-ONLY QUANTIZATION, and that is not a detail. An implementation
+// must compute
+//
+//	dst[m,n] = Σ_k a[m,k] · (float32(wq[n,k]) · wscales[n])
+//
+// with the ACTIVATIONS LEFT IN f32. It must not quantize `a`. The encoder's int8 path
+// is weight-only by measurement, not by accident: full W8A8 (quantized activations)
+// was tried and fell below the 0.97 reranker bar that TestModelQ8_cosineMatchesF32
+// enforces, whereas weight-only holds cosine 0.997 against f32. An implementation that
+// reached for a W8A8 kernel here would look like an optimization and land as a quality
+// regression.
+//
+// Returning false means "not handled" — the caller then runs the CPU path unchanged.
+// Decline for shapes too small to pay for a device round-trip, when no device is
+// available, and on any error. There is no error return: silently wrong numbers are
+// the one outcome this seam must make impossible.
+type Q8Backend interface {
+	MatmulBTQ8(dst, a []float32, wq []int8, wscales []float32, M, K, N int) bool
+}

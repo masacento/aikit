@@ -343,29 +343,50 @@ single short-sequence forward (small L, hidden 384) has no matmul above it, so t
 correctly stays entirely on the CPU and the numerics are identical — the device pays for batched
 or larger-model encode. (`BENCH-gpu.md`: microbenchmarks tune, end-to-end publishes.)
 
-**Still to do in Phase 4:** the int8 (`LoadQ8`) encoder path — the one open *decision* (route via
-the `WeightMat` W8A8 GEMV, per the scope note; don't widen `Backend`). One optional throughput
-follow-on remains, a **CUDA `wmma` (Tensor-Core) GEMM** on the Linux box — but note it is NOT a
-straight mirror of `gemm_f32_sg_big`: Tensor Cores have no true fp32 path, so an f32-accumulate
-`wmma` needs **tf32** inputs (~10-bit mantissa, ~1e-3 relative), which fails the encoder's 2e-4
-f32 parity bound. It is therefore a precision decision (relax the bound and document it, or use a
-non-Tensor-Core shared-memory GEMM), not a copy of the Metal kernel.
+**int8 encoder path — ✅ DONE on CUDA (weight-only, via `WeightMat`).** The int8 forward
+called `matmulBTQ8Into` directly, so int8 encoders got *zero* GPU acceleration even with a
+backend attached. Now routed through `scratch.mmq8` → the optional `encoder.Q8Backend`
+capability (discovered by type assertion; `encoder.Backend` is unchanged, so the f32-only
+WebGPU backend is never asked for it).
 
-**Metal f32 GEMM — the peak-push levers were explored and the ~1.08 TFLOP/s kernel is the
-practical ceiling for the simple approach.** `gemm_f32_sg_big` (direct device loads, no barriers)
-sits at ~23% of the M1-Pro's ~4.7 TFLOP/s f32 peak. Three standard levers were implemented and
-benchmarked (1s runs, `BenchmarkMetalGEMMF32`); none beat it, so none shipped:
-- **Wider register blocking** (64×64 tile, 16 fragments/simdgroup) — ~150 GFLOP/s: 24 live
-  simdgroup matrices spill registers and occupancy collapses.
-- **Double-buffered staging** (ping-pong threadgroup buffers, one barrier/K-step, prefetch under
-  compute) — *worse* at the shapes that matter (737 vs 968 GFLOP/s at 2416 MFLOP): the staged
-  path's extra device→threadgroup hop and output staging outweigh the barrier it saves.
-- **Register-level software prefetch** on the direct-load kernel (load next K-tile's fragments
-  under the current MACs) — marginal and shape-dependent (+14% at large-K 604 MFLOP, +2% at 8590,
-  but −24% at short-K 151 where the extra registers hurt); not a reliable win.
-Closing the remaining gap to peak needs a genuinely sophisticated kernel (large-tile blocking
-with co-tuned register/occupancy budgets, or Apple's newer tensor APIs) — a separate project with
-uncertain payoff, well beyond tuning. The direct-load kernel is where the simple approach lands.
+**The mechanism matters more than the plumbing, and the obvious plan was wrong.** The
+encoder's int8 is **weight-only**: int8 weights widened to f32, multiplied against **f32
+activations** (`matmulBTQ8Into`). It is *not* W8A8. Routing it through the shared W8A8 GEMV
+would quantize the activations — which was already tried, measured, and rejected for falling
+below the **0.97 reranker bar** that `TestModelQ8_cosineMatchesF32` still enforces
+(weight-only holds cosine 0.997 vs f32). `linalg.WeightMat` encodes the same distinction in
+its `w8a8` flag, which the encoder sets `false`. So `Q8Backend`'s contract is explicitly
+weight-only, and says why.
+
+Doing it correctly is also **faster than doing it the W8A8 way would have been**. The CPU
+redoes the `N*K` weight widen on *every* call — the comment on `matmulBTQ8Into` names that as
+the real reason `LoadQ8` ran ~5× slower than `Load`. `gpu/enccuda` dequantizes **once** and
+keeps the f32 weight resident, so the int8 speedup *exceeds* the f32 one:
+
+| shape | CPU | GPU | int8 | (f32 was) |
+|---|---|---|---|---|
+| 151 MFLOP | 2177 µs | 665 µs | **3.3×** | 1.6× |
+| 604 MFLOP | 12173 µs | 1924 µs | **6.3×** | 1.6× |
+| 2416 MFLOP | 15534 µs | 6854 µs | **2.3×** | 1.09× |
+
+A weight cache is **sound here** where it was not for f32: `wq` is a model weight (write-once),
+not attention's pooled `kH`/`vHT`. The negative control is still gated — the *activation*
+must never be cached, and a test asserts a new activation against a cached weight changes the
+result and stays correct.
+
+Parity vs the weight-only reference: worst relative Δ **1.1e-05**. Dispatch is gated the same
+way the f32 seam is — a spy `Q8Backend` must *observe* the int8 matmuls, declining must be
+bit-identical to no backend, and a deliberately-wrong one must move the output. apidiff vs
+`v1.12.0`: **5 compatible additions, 0 incompatible**.
+
+**Still to do in Phase 4:** the **Metal** side of `Q8Backend` (`gpu/encmetal`) — same split as
+every other mirror; an **end-to-end** encode measurement (`BENCH-gpu.md`: microbenchmarks tune,
+end-to-end publishes — `testdata/minilm-model` is still absent on the CUDA box); and a faster
+CUDA f32 GEMM. On that last one: Metal's `gemm_f32_sg_big` does **not** port as `wmma` —
+NVIDIA Tensor Cores have no fp32×fp32 path, and a tf32-input wmma (~10-bit mantissa, ~1e-3
+relative) cannot meet the encoder's 2e-4 bound. The CUDA analogue is a **non-Tensor-Core
+register-blocked f32 kernel**; tf32 would need its own deliberately-relaxed, separately
+documented gate and must stay off the parity-exact path.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
 waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a

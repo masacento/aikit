@@ -35,6 +35,7 @@ package enccuda
 import (
 	"fmt"
 	"sync"
+	"unsafe"
 
 	"github.com/townsendmerino/aikit/encoder"
 	gpu "github.com/townsendmerino/aikit/gpu"
@@ -89,6 +90,9 @@ type Backend struct {
 	mu               sync.Mutex
 	aBuf, bBuf, cBuf gpu.Buffer
 	aCap, bCap, cCap int
+	// q8 holds dequantized int8 weights resident on the device. Sound here (model
+	// weights are write-once) where an f32 cache would not be; see MatmulBTQ8.
+	q8 map[uintptr]q8w
 }
 
 // New creates the backend. It fails (rather than degrading silently) when there is no
@@ -179,4 +183,106 @@ func (b *Backend) Close() error {
 		b.dev = nil
 	}
 	return nil
+}
+
+// --- int8 (weight-only) path: encoder.Q8Backend ---
+//
+// The encoder's int8 is WEIGHT-ONLY — int8 weights widened to f32, multiplied against
+// f32 activations. It is NOT W8A8, and reaching for the W8A8 GEMV here would be a
+// quality regression, not an optimization: quantizing the activations was measured and
+// rejected for falling below the 0.97 reranker bar (see encoder.Q8Backend's contract).
+//
+// So this path dequantizes and then runs the SAME gemm_f32_tiled the f32 path uses —
+// identical arithmetic to the CPU's matmulBTQ8Into, which is what makes a tight parity
+// bound available.
+//
+// AND IT IS THE CHEAPER SHAPE, not merely the correct one. The CPU redoes the N*K
+// widen on EVERY call — the comment on matmulBTQ8Into names that as the actual reason
+// LoadQ8 ran ~5x slower than Load. Here the weight is dequantized ONCE and the f32
+// result stays resident, so a 12-layer forward pays it once per matrix instead of once
+// per matmul. That is the real win of the int8 GPU path, and a W8A8 implementation
+// would have thrown it away.
+//
+// Caching is SOUND here in a way it was not for f32. The f32 backend deliberately has
+// no cache because its `b` operand is attention's pooled kH/vHT scratch — stable
+// pointer, changing contents. The int8 `wq` is a model weight: loaded once, never
+// written. The negative control (activations must never be cached) is still tested.
+
+// q8w is one dequantized weight resident on the device.
+type q8w struct {
+	buf gpu.Buffer
+	n   int // element count, so a recycled address at a different length cannot hit
+}
+
+// residentQ8 returns the device buffer holding dequant(wq), uploading on first use.
+// Dequantization runs on the host: it is one pass per weight for the process lifetime,
+// so a device kernel would buy nothing and cost a launch.
+func (b *Backend) residentQ8(wq []int8, wscales []float32, K, N int) (gpu.Buffer, error) {
+	k := q8key(wq)
+	if c, ok := b.q8[k]; ok && c.n == len(wq) {
+		return c.buf, nil
+	}
+	deq := make([]float32, N*K)
+	for n := range N {
+		sc := wscales[n]
+		row, src := deq[n*K:(n+1)*K], wq[n*K:(n+1)*K]
+		for i := range row {
+			row[i] = float32(src[i]) * sc
+		}
+	}
+	buf := gpu.NewBufferOf(b.dev, deq)
+	if b.q8 == nil {
+		b.q8 = map[uintptr]q8w{}
+	}
+	b.q8[k] = q8w{buf: buf, n: len(wq)}
+	return buf, nil
+}
+
+func q8key(w []int8) uintptr {
+	if len(w) == 0 {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(&w[0]))
+}
+
+// MatmulBTQ8 implements encoder.Q8Backend: dst[M,N] = a[M,K] · dequant(wq)[N,K]ᵀ,
+// activations untouched. Returns false to leave the call on the CPU path.
+func (b *Backend) MatmulBTQ8(dst, a []float32, wq []int8, wscales []float32, M, K, N int) bool {
+	if 2*int64(M)*int64(K)*int64(N) < minGPUFlops || M <= 0 || K <= 0 || N <= 0 {
+		return false
+	}
+	if len(a) < M*K || len(wq) < N*K || len(wscales) < N || len(dst) < M*N {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.gpuMatmulQ8(dst, a, wq, wscales, M, K, N) == nil
+}
+
+func (b *Backend) gpuMatmulQ8(dst, a []float32, wq []int8, wscales []float32, M, K, N int) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("enccuda: device allocation failed: %v", r)
+		}
+	}()
+	wb, err := b.residentQ8(wq, wscales, K, N)
+	if err != nil {
+		return err
+	}
+	b.grow(&b.aBuf, &b.aCap, M*K)
+	b.grow(&b.cBuf, &b.cCap, M*N)
+	// The ACTIVATION is uploaded every call — it changes every call. Only the weight
+	// is resident.
+	if err := gpu.Upload(b.aBuf, a[:M*K]); err != nil {
+		return err
+	}
+	if err := b.q.Launch(b.k.GEMMF32Tiled, gpu.TileGrid(M, N),
+		gpu.Arg(b.aBuf), gpu.Arg(wb), gpu.Arg(b.cBuf),
+		gpu.ArgValue(int32(M)), gpu.ArgValue(int32(N)), gpu.ArgValue(int32(K))); err != nil {
+		return err
+	}
+	if err := b.q.Sync(); err != nil {
+		return err
+	}
+	return gpu.Download(b.cBuf, dst[:M*N])
 }
