@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"unsafe"
 
 	"github.com/townsendmerino/aikit/encoder"
 	gpu "github.com/townsendmerino/aikit/gpu"
@@ -103,6 +104,9 @@ type Backend struct {
 	aBuf, bBuf, cBuf gpu.Buffer
 	aCap, bCap, cCap int
 	mS, nS, kS       gpu.Buffer // reusable scalar buffers (Metal has no by-value arg)
+	// q8 holds DEQUANTIZED int8 weights resident on the device. Sound here (a model weight
+	// is write-once) where an f32 cache would not be; see MatmulBTQ8.
+	q8 map[uintptr]q8w
 }
 
 // New creates the backend. It fails (rather than degrading silently) when there is no
@@ -179,15 +183,109 @@ func (b *Backend) gpuMatmul(a, w, dst []float32, M, K, N int) (err error) {
 	return nil
 }
 
+// --- int8 (weight-only) path: encoder.Q8Backend ---
+//
+// The encoder's int8 is WEIGHT-ONLY — int8 weights widened to f32, multiplied against f32
+// activations. It is NOT W8A8, and reaching for the W8A8 GEMV here would be a quality
+// regression, not an optimization: quantizing the activations was measured and rejected for
+// falling below the 0.97 reranker bar (see encoder.Q8Backend's contract). UMA makes the
+// "just bind the int8 codes into gemm_w8a8" shortcut especially tempting — don't; the
+// activation must stay f32.
+//
+// So this dequantizes the weight ONCE, keeps the f32 result resident, and runs the SAME
+// GEMMF32Plan kernel (gemm_f32_sg_big) the f32 path uses — identical arithmetic to the CPU's
+// matmulBTQ8Into, which is what makes the tight parity bound available. It is also the CHEAPER
+// shape: the CPU redoes the N*K widen on every call (the documented reason LoadQ8 ran ~5×
+// slower than Load), whereas here a 12-layer forward pays the widen once per matrix.
+//
+// Caching is SOUND here where it was not for f32. The f32 backend has no cache because its
+// `b` operand is attention's pooled kH/vHT scratch (stable pointer, changing contents). A `wq`
+// is a model weight: loaded once, never written. The negative control (the ACTIVATION must
+// never be cached) is still tested.
+
+// q8w is one dequantized weight resident on the device.
+type q8w struct {
+	buf gpu.Buffer
+	n   int // element count, so a recycled address at a different length cannot hit
+}
+
+// residentQ8 returns the UMA buffer holding dequant(wq), dequantizing+uploading on first use.
+// Dequant runs on the host — one pass per weight for the process lifetime, so a device kernel
+// would buy nothing and cost a launch.
+func (b *Backend) residentQ8(wq []int8, wscales []float32, K, N int) gpu.Buffer {
+	k := q8key(wq)
+	if c, ok := b.q8[k]; ok && c.n == len(wq) {
+		return c.buf
+	}
+	deq := make([]float32, N*K)
+	for n := range N {
+		sc := wscales[n]
+		row, src := deq[n*K:(n+1)*K], wq[n*K:(n+1)*K]
+		for i := range row {
+			row[i] = float32(src[i]) * sc
+		}
+	}
+	buf := b.dev.NewBufferFloats(deq)
+	if b.q8 == nil {
+		b.q8 = map[uintptr]q8w{}
+	}
+	b.q8[k] = q8w{buf: buf, n: len(wq)}
+	return buf
+}
+
+func q8key(w []int8) uintptr {
+	if len(w) == 0 {
+		return 0
+	}
+	return uintptr(unsafe.Pointer(&w[0]))
+}
+
+// MatmulBTQ8 implements encoder.Q8Backend: dst[M,N] = a[M,K] · dequant(wq)[N,K]ᵀ, activations
+// untouched. Returns false to leave the call on the CPU path.
+func (b *Backend) MatmulBTQ8(dst, a []float32, wq []int8, wscales []float32, M, K, N int) bool {
+	if 2*int64(M)*int64(K)*int64(N) < minGPUFlops || M <= 0 || K <= 0 || N <= 0 {
+		return false
+	}
+	if len(a) < M*K || len(wq) < N*K || len(wscales) < N || len(dst) < M*N {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.gpuMatmulQ8(dst, a, wq, wscales, M, K, N) == nil
+}
+
+func (b *Backend) gpuMatmulQ8(dst, a []float32, wq []int8, wscales []float32, M, K, N int) (err error) {
+	defer func() {
+		if r := recover(); r != nil { // MustBuf panics on OOM; degrade, don't die
+			err = fmt.Errorf("encmetal: device allocation failed: %v", r)
+		}
+	}()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	wb := b.residentQ8(wq, wscales, K, N)
+	b.grow(&b.aBuf, &b.aCap, M*K)
+	b.grow(&b.cBuf, &b.cCap, M*N)
+	// The ACTIVATION is copied every call — it changes every call. Only the weight is resident.
+	copy(b.aBuf.Floats()[:M*K], a[:M*K])
+	b.mS.SetU32(uint32(int32(M)))
+	b.nS.SetU32(uint32(int32(N)))
+	b.kS.SetU32(uint32(int32(K)))
+	p, gx, gy, tgx, tgy := b.k.GEMMF32Plan(M, N, K)
+	b.q.Run2D(p, gx, gy, tgx, tgy, b.aBuf, wb, b.cBuf, b.mS, b.nS, b.kS)
+	copy(dst[:M*N], b.cBuf.Floats()[:M*N])
+	return nil
+}
+
 // Close releases the device and every reused buffer (buffers first, so no in-flight work
 // references freed memory; the last Run2D already waited).
 func (b *Backend) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.dev != nil {
-		b.dev.ReleaseAll()
+		b.dev.ReleaseAll() // frees the reused buffers AND the resident dequantized weights
 		b.dev.ReleaseObjects()
 		b.dev = nil
+		b.q8 = nil
 	}
 	return nil
 }

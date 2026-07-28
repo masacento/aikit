@@ -343,7 +343,7 @@ single short-sequence forward (small L, hidden 384) has no matmul above it, so t
 correctly stays entirely on the CPU and the numerics are identical — the device pays for batched
 or larger-model encode. (`BENCH-gpu.md`: microbenchmarks tune, end-to-end publishes.)
 
-**int8 encoder path — ✅ DONE on CUDA (weight-only, via `WeightMat`).** The int8 forward
+**int8 encoder path — ✅ DONE on CUDA + Metal (weight-only, via `WeightMat`).** The int8 forward
 called `matmulBTQ8Into` directly, so int8 encoders got *zero* GPU acceleration even with a
 backend attached. Now routed through `scratch.mmq8` → the optional `encoder.Q8Backend`
 capability (discovered by type assertion; `encoder.Backend` is unchanged, so the f32-only
@@ -374,19 +374,31 @@ not attention's pooled `kH`/`vHT`. The negative control is still gated — the *
 must never be cached, and a test asserts a new activation against a cached weight changes the
 result and stays correct.
 
-Parity vs the weight-only reference: worst relative Δ **1.1e-05**. Dispatch is gated the same
-way the f32 seam is — a spy `Q8Backend` must *observe* the int8 matmuls, declining must be
+Parity vs the weight-only reference: worst relative Δ **1.1e-05** (CUDA). Dispatch is gated the
+same way the f32 seam is — a spy `Q8Backend` must *observe* the int8 matmuls, declining must be
 bit-identical to no backend, and a deliberately-wrong one must move the output. apidiff vs
 `v1.12.0`: **5 compatible additions, 0 incompatible**.
 
-**Still to do in Phase 4:** the **Metal** side of `Q8Backend` (`gpu/encmetal`) — same split as
-every other mirror; an **end-to-end** encode measurement (`BENCH-gpu.md`: microbenchmarks tune,
-end-to-end publishes — `testdata/minilm-model` is still absent on the CUDA box); and a faster
-CUDA f32 GEMM. On that last one: Metal's `gemm_f32_sg_big` does **not** port as `wmma` —
-NVIDIA Tensor Cores have no fp32×fp32 path, and a tf32-input wmma (~10-bit mantissa, ~1e-3
-relative) cannot meet the encoder's 2e-4 bound. The CUDA analogue is a **non-Tensor-Core
-register-blocked f32 kernel**; tf32 would need its own deliberately-relaxed, separately
-documented gate and must stay off the parity-exact path.
+**Metal mirror — ✅ DONE (`gpu/encmetal`).** The `Q8Backend` is platform-neutral, so the Apple
+side is a structural copy: `residentQ8` dequantizes once into a UMA `NewBufferFloats` (cached,
+pointer-keyed — a model weight is write-once), then runs the SAME `GEMMF32Plan` kernel
+(`gemm_f32_sg_big`) the f32 path uses, activation copied in per call. UMA makes the "just bind
+the int8 codes into `gemm_w8a8`" shortcut *more* tempting — the package doc calls it out; the
+activation stays f32. Parity vs the weight-only reference: **1.2–1.4e-05** (dequant is exact, so
+only the f32 accumulation reassociates — a quantized-activation kernel could not fit inside 2e-4,
+which is how it'd be caught before dropping below the 0.97 bar). Same weight-residency + negative
+control (a new activation against a cached weight must change the result and stay correct). The
+int8 speedup exceeds f32 here too — vs the CPU widen-every-call path, **1.8× / 3.9× / 3.5×** at
+151 / 604 / 2416 MFLOP (lower ratios than CUDA only because the M1-Pro CPU is strong; the
+*pattern* — int8 beats CPU by more than f32 does — holds).
+
+**Still to do in Phase 4:** an **int8 end-to-end** encode measurement (the f32 end-to-end already
+ran on Metal — `testdata/minilm-model` present, CPU≡Metal cosine 1.0; the int8 one needs a
+`ModelQ8` checkpoint on a box); and a faster CUDA f32 GEMM. On that last one: Metal's
+`gemm_f32_sg_big` does **not** port as `wmma` — NVIDIA Tensor Cores have no fp32×fp32 path, and a
+tf32-input wmma (~10-bit mantissa, ~1e-3 relative) cannot meet the encoder's 2e-4 bound. The CUDA
+analogue is a **non-Tensor-Core register-blocked f32 kernel**; tf32 would need its own
+deliberately-relaxed, separately documented gate and must stay off the parity-exact path.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
 waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a
