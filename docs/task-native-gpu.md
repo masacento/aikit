@@ -188,8 +188,21 @@ should key off.
    everywhere: the second dispatch + the reduction pass cost more than the small-N readback they
    save, so it *lost* at N=1e4 and won at N≥1e5 (N=1e5 batch 64/256: **1.29→1.73× / 1.25→1.98×**).
    So it is **gated on N** (`topkMinN`): device top-k for N≥1e5, host top-k below — the best of
-   both, and the memory win grows with N. It did **not** help the batch-1/small end (that is the
-   GEMM-tile-utilisation limit, a separate lever), correcting the earlier guess.
+   both, and the memory win grows with N. It did **not** help the batch-1/small end — see below.
+
+4. **The batch-1/small-batch end is dispatch-bound, NOT a tile-utilisation problem — a kernel
+   lever was tried and does not flip it.** The obvious guess was that a 16×16 tile idling 15/16
+   of its threads at M=1 is the cause, so an **N-parallel skinny-M GEMV** was written (one
+   simdgroup per corpus row, lanes stream the row coalesced and `simd_sum`-reduce K, computing
+   all M query-dots per row — bit-identical, parity-gated at M=1/4). Measured, it did **not** win:
+   batch-1 improved only 0.08→0.13× (still losing) and it *regressed* batch-8 (0.69→0.46×, the
+   per-lane accumulator array spilling for M>1). Isolating the cost showed why — batch-1 at N=1e5
+   is ~5 ms of mostly two-dispatch floor + bandwidth, and even an optimal M=1 kernel (~0.75 ms)
+   barely ties the CPU's 0.62 ms. So the batch-1 loss is the **dispatch floor + no batch
+   amortization**, inherent to a single query; no kernel flips it, and the skinny kernel was NOT
+   shipped. The real lever is a **dispatch guard** — route small batches to the CPU per-query
+   path — which is exactly the `ann.Backend` decision the crossover thresholds (batch≥8/≥64) feed;
+   an adopter should gate `EnableGPU`/GPU-`QueryBatch` on batch size for their corpus N.
 
 The CUDA crossover is the NVIDIA box's to run with the same harness; the normalized summary will
 show both once its file lands in `docs/bench-records/`.
