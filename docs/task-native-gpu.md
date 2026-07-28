@@ -193,12 +193,28 @@ tower (16 patches × 32 hidden): it gates correctness sharply and says **nothing
 throughput. The correctness-first GEMM here is one thread per output element; tiling it is the
 throughput work, and it should be driven by a real SigLIP-so400m measurement, not by assumption.
 
-**Phase 4 — encoder native.** `encoder.Backend` already has `webgpu`; add native Metal/CUDA.
-Batch text embedding (M = L tokens / B·Lmax). Incremental over the existing cgo-WebGPU path —
-the win here is *cgo-free + native-class*, not GPU-where-there-was-none. **Not gated behind a
-trigger** — it is simply unbuilt, and Phase 3's kernel set (`gpu/vit.cu`) is most of the
-compute it needs, so the remaining work is the `encoder.Backend` wiring plus its own parity
-gate.
+**Phase 4 — encoder native. ⚠️ Bigger than this plan assumed: `encoder.Backend` is a DANGLING
+SEAM.** The plan says "`encoder.Backend` already has `webgpu`; add native Metal/CUDA", which
+reads as *plug a new backend into a working seam*. It isn't. The interface exists
+(`encoder/backend.go`), `NewBackend` resolves it, and `goinfer/gpu` registers `"webgpu"` — but
+**nothing in aikit's encoder forward ever calls `Backend.MatmulBT`**. `encoder/linalg.go`'s
+`matmulBT` dispatches straight to the pure-Go paths, and there is no caller of `NewBackend`
+anywhere in either repo. Registering a CUDA backend today would install a factory nobody
+invokes.
+
+So Phase 4 is two pieces of work, and the first is the real one:
+
+1. **Wire the seam into the forward** — thread a `Backend` through the encoder so the hot
+   matmuls dispatch through it, defaulting to the existing CPU path. This touches `encoder`,
+   a **Hard-tier** package (README stability tiers), so it needs an additive-only API and the
+   release-gate apidiff check. This is also what would make the *existing* WebGPU backend do
+   anything, so it is not native-GPU-specific work.
+2. **Then** the native backends, which are comparatively cheap: the seam is a single f32
+   `MatmulBT(a, b, dst, M, K, N)`, and `gpu/vit.cu`'s `gemm_f32` already is that kernel.
+
+Batch text embedding (M = L tokens / B·Lmax); the win is *cgo-free + native-class*, not
+GPU-where-there-was-none. Sequence it after Qwen2.5-VL: that finishes a phase, whereas this
+starts by reopening a Hard-tier package.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
 waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a
@@ -246,12 +262,13 @@ portable, CPU always).
 **Phase 0 ✅** → **Phase 1 ✅** (`aikit/gpu` + Metal device layer + minimal-kernel ANN proof +
 goinfer-Metal device re-point) → **Phase 2 ✅** (ANN-GPU batch-GEMM — the headline) → **Phase 1b
 ✅** (CUDA device impl + CUDA ANN backend + the tuned-GEMV blob-split + the goinfer CUDA device
-re-point, all parity-gated on an RTX 2070 SUPER) → **Phase 3 🟡** (CUDA SigLIP resident encoder
-done; Metal impl + Qwen2.5-VL path remain) → **Phase 4** (encoder native).
+re-point, all parity-gated on an RTX 2070 SUPER) → **Phase 3 🟡** (SigLIP resident encoder done
+on BOTH CUDA and Metal; Qwen2.5-VL path remains) → **Phase 4** (encoder native — but see the
+dangling-seam finding above: it starts with wiring, not with a backend).
 
 **Nothing is gated behind an unfired trigger any more.** Every "wait for X to settle" in this
 plan has been discharged: the tuned kernels stabilized, the blob-split turned out to be a clean
 entry-point cut rather than a disentangling, and both device re-points landed bit-identical.
-What remains — Metal ViT, Qwen2.5-VL, encoder-native, and tiling the correctness-first GEMMs —
-is simply unbuilt work, sequenced by value rather than by risk. `embed` is ruled out on the
+What remains — Qwen2.5-VL, encoder-native (wiring first), and tiling the correctness-first
+GEMMs — is simply unbuilt work, sequenced by value rather than by risk. `embed` is ruled out on the
 merits (above), not deferred.
