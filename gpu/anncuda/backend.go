@@ -40,7 +40,13 @@ type cudaBackend struct {
 	dev  *gpu.Device
 	q    gpu.Queue
 	gemv gpu.Pipeline // one query  × N rows (FlatI8.Query)
-	gemm gpu.Pipeline // M queries × N rows (FlatI8.QueryBatch)
+	gemm gpu.Pipeline // M queries × N rows (FlatI8.QueryBatch) — naive, kept as reference
+	// gemmT is gpu's TILED W8A8 GEMM, reused rather than duplicated here: its
+	// (A, aScale, B, bScale, C, M, N, K) is exactly this backend's
+	// (qi8, qscale, codes, scales, out, M, N, K). Bit-identical to gemm — int32 sums
+	// are associative, so re-chunking K cannot change a score.
+	gemmT gpu.Pipeline
+	topk  gpu.Pipeline // per-query top-k on the device (avoids the M×N readback)
 }
 
 // init reaches CUDA and registers the backend. If there is no CUDA device (no
@@ -66,7 +72,22 @@ func init() {
 		dev.ReleaseObjects()
 		return
 	}
-	ann.RegisterBackend(&cudaBackend{dev: dev, q: dev.NewCommandQueue(), gemv: gemv, gemm: gemm})
+	topk, err := dev.NewComputePipeline(lib, "topk_rows")
+	if err != nil {
+		dev.ReleaseObjects()
+		return
+	}
+	// The tiled GEMM lives in gpu's ViT module; loading it here reuses that kernel
+	// instead of keeping a second copy of the same 16×16 tile in this package.
+	vit, err := dev.NewViT()
+	if err != nil {
+		dev.ReleaseObjects()
+		return
+	}
+	ann.RegisterBackend(&cudaBackend{
+		dev: dev, q: dev.NewCommandQueue(),
+		gemv: gemv, gemm: gemm, gemmT: vit.GEMMW8A8Tiled, topk: topk,
+	})
 }
 
 func (b *cudaBackend) Name() string { return "cuda" }
@@ -180,18 +201,18 @@ func (x *cudaI8Index) ScoreBatch(queries [][]float32, dst []float32) (err error)
 			err = fmt.Errorf("gpu: batch scratch allocation failed: %v", r)
 		}
 	}()
-	total := M * N
 	qi8Buf := x.b.dev.NewBufferInt8(qi8)
 	qscaleBuf := x.b.dev.NewBufferFloats(qscale)
-	totalBuf := x.b.dev.NewBufferU32(uint32(total))
-	outBuf := x.b.dev.NewBufferLen(total)
+	outBuf := x.b.dev.NewBufferLen(M * N)
 	defer func() {
-		for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, totalBuf, outBuf} {
+		for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, outBuf} {
 			x.b.dev.ReleaseBuf(b)
 		}
 	}()
-	if err := x.b.q.Run1D(x.b.gemm, total, 256,
-		x.codes, qi8Buf, x.scales, x.kbuf, x.nbuf, qscaleBuf, outBuf, totalBuf); err != nil {
+	if err := x.launchGEMM(qi8Buf, qscaleBuf, outBuf, M, N, K); err != nil {
+		return err
+	}
+	if err := x.b.q.Sync(); err != nil {
 		return err
 	}
 	return outBuf.ReadFloats(dst)
@@ -239,4 +260,134 @@ func quantizeRowInt8(a []float32, dst []int8) (scale float32) {
 		dst[k] = int8(x)
 	}
 	return scale
+}
+
+// topkMinN is the row count below which TopKBatch declines to the score-then-host-topk
+// path. It is DERIVED FROM THIS BOX's sweep, not copied from Metal: the second launch
+// has to earn back more than the readback it saves, and CUDA's launch floor (~µs) sits
+// two orders of magnitude below Metal's command-buffer floor (~250 µs), so the two
+// platforms cross over in different places. See docs/BENCH-gpu-results.md.
+const topkMinN = 50_000
+
+// topkMinBatch is the second half of the device-top-k gate, and it is about OCCUPANCY
+// rather than transfer. topk_rows runs ONE BLOCK PER QUERY, so a batch of 1 occupies a
+// single SM of 40 while the rest of the card idles — and the readback it saves at that
+// size (N floats) is small anyway. Measured: at N=100k, batch=1 went 0.79x -> 0.43x with
+// device top-k unconditionally on, while batch=8 went 0.88x -> 3.93x. So the kernel
+// needs a real batch behind it.
+const topkMinBatch = 8
+
+// gemmTileMinM is where the TILED GEMM starts to pay. It stages a 16x16 output tile, so
+// a batch of M < 16 leaves (16-M)/16 of every block's rows idle — at M=1 that is 15/16
+// of the threads doing nothing, which is why batch=1 REGRESSED when the tiled kernel was
+// switched on unconditionally (N=10k: 1.32x -> 1.12x). The naive kernel parallelises over
+// M*N and has no such waste, so it stays the right choice for thin batches. This is the
+// opposite of the usual "tiling always wins" intuition and only shows up at small M.
+const gemmTileMinM = 2
+
+// TopKBatch implements ann.I8TopKIndex: score the batch on the device, select each
+// query's top-k THERE, and return only M*k hits.
+//
+// The point is the readback. ScoreBatch must copy the whole M×N score matrix to the
+// host — at N=1e6, batch=256 that is ~1 GB over PCIe, and on a discrete GPU that is a
+// real transfer, not the near-free UMA view Metal enjoys. Selecting on-device turns it
+// into M*k.
+//
+// It DECLINES (returns an error, which FlatI8.QueryBatch treats as "use the scoring
+// path") for small N, for k outside the range the kernel implements, and on any device
+// failure. The fallback's result is identical, so declining is always safe.
+//
+// The device selection reproduces ann.topHits's order exactly — score DESC, index ASC
+// on ties — so this returns the SAME hits the CPU would, not merely a plausible set.
+func (x *cudaI8Index) TopKBatch(queries [][]float32, k int) (hits [][]ann.Hit, err error) {
+	M := len(queries)
+	if M == 0 {
+		return nil, nil
+	}
+	N, K := x.n, x.dim
+	// k <= 0 or k >= N is topHits's full-sort path, which this kernel does not
+	// implement; below topkMinN the extra launch costs more than the readback it
+	// saves. Both decline rather than approximate.
+	if k <= 0 || k >= N || N < topkMinN || M < topkMinBatch {
+		return nil, fmt.Errorf("gpu: TopKBatch declined (k=%d n=%d batch=%d)", k, N, M)
+	}
+	qi8 := make([]int8, M*K)
+	qscale := make([]float32, M)
+	for m, q := range queries {
+		if len(q) != K {
+			return nil, fmt.Errorf("gpu: batch query %d dim %d != index dim %d", m, len(q), K)
+		}
+		qscale[m] = quantizeRowInt8(q, qi8[m*K:(m+1)*K])
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	defer func() {
+		if r := recover(); r != nil {
+			hits, err = nil, fmt.Errorf("gpu: topk scratch allocation failed: %v", r)
+		}
+	}()
+	qi8Buf := x.b.dev.NewBufferInt8(qi8)
+	qscaleBuf := x.b.dev.NewBufferFloats(qscale)
+	scoreBuf := x.b.dev.NewBufferLen(M * N)
+	idxBuf := gpu.NewBufferLenOf[int32](x.b.dev, M*k)
+	valBuf := x.b.dev.NewBufferLen(M * k)
+	mBuf := x.b.dev.NewBufferU32(uint32(M))
+	kBuf := x.b.dev.NewBufferU32(uint32(k))
+	defer func() {
+		for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, scoreBuf, idxBuf, valBuf, mBuf, kBuf} {
+			x.b.dev.ReleaseBuf(b)
+		}
+	}()
+
+	if err := x.launchGEMM(qi8Buf, qscaleBuf, scoreBuf, M, N, K); err != nil {
+		return nil, err
+	}
+	// One block per query; the kernel consumes winners in place, so scoreBuf is
+	// scratch by the time it returns.
+	if err := x.b.q.Launch(x.b.topk, gpu.LaunchConfig{
+		GridX: uint32(M), GridY: 1, GridZ: 1, BlockX: 256, BlockY: 1, BlockZ: 1,
+	}, gpu.Arg(scoreBuf), gpu.Arg(idxBuf), gpu.Arg(valBuf),
+		gpu.Arg(mBuf), gpu.Arg(x.nbuf), gpu.Arg(kBuf)); err != nil {
+		return nil, err
+	}
+	if err := x.b.q.Sync(); err != nil {
+		return nil, err
+	}
+	idx := make([]int32, M*k)
+	val := make([]float32, M*k)
+	if err := gpu.Download(idxBuf, idx); err != nil {
+		return nil, err
+	}
+	if err := gpu.Download(valBuf, val); err != nil {
+		return nil, err
+	}
+	out := make([][]ann.Hit, M)
+	for m := range M {
+		row := make([]ann.Hit, 0, k)
+		for j := range k {
+			i := idx[m*k+j]
+			if i < 0 {
+				break
+			}
+			row = append(row, ann.Hit{Index: int(i), Score: float64(val[m*k+j])})
+		}
+		out[m] = row
+	}
+	return out, nil
+}
+
+// launchGEMM dispatches the batched W8A8 GEMM, picking the tiled kernel only when the
+// batch is deep enough to fill its 16-row tile (see gemmTileMinM). Both kernels are
+// bit-identical — int32 sums are associative — so this is purely a throughput choice and
+// never changes a score.
+func (x *cudaI8Index) launchGEMM(qi8Buf, qscaleBuf, outBuf gpu.Buffer, M, N, K int) error {
+	if M >= gemmTileMinM {
+		return x.b.q.Launch(x.b.gemmT, gpu.TileGrid(M, N),
+			gpu.Arg(qi8Buf), gpu.Arg(qscaleBuf), gpu.Arg(x.codes), gpu.Arg(x.scales), gpu.Arg(outBuf),
+			gpu.ArgValue(int32(M)), gpu.ArgValue(int32(N)), gpu.ArgValue(int32(K)))
+	}
+	totalBuf := x.b.dev.NewBufferU32(uint32(M * N))
+	defer x.b.dev.ReleaseBuf(totalBuf)
+	return x.b.q.Run1D(x.b.gemm, M*N, 256,
+		x.codes, qi8Buf, x.scales, x.kbuf, x.nbuf, qscaleBuf, outBuf, totalBuf)
 }

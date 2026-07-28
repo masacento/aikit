@@ -153,6 +153,35 @@ the paged `LoadFlatI8MmapPaged` path. **Parity-gated:** GPU-ANN top-k ≡ CPU-AN
 indexes (rank-exact within the int8 tolerance). This is *new* coverage (ANN has none today) and
 the biggest single-workload win — the payoff the product bet is aimed at.
 
+**ANN on CUDA — ✅ MEASURED and TUNED, and the platforms genuinely disagree.** The CUDA
+crossover was run on an RTX 2070 SUPER against a Ryzen 7 3700X (records:
+`docs/bench-records/crossover-cuda.jsonl`, merged into `docs/BENCH-gpu-results.md`), then the
+kernels were tuned against what it showed. Parity is exact at every point — CUDA top-k ≡ CPU
+int8 top-k, recall identical.
+
+| N=100k | batch=1 | 8 | 64 | 256 |
+|---|--:|--:|--:|--:|
+| **cuda** ×vs-cpu | 0.74× | 3.83× | 10.38× | **15.25×** |
+| metal ×vs-cpu | 0.08× | 0.65× | 1.74× | 1.99× |
+
+Three findings, none of which transferred from Metal:
+
+- **Batch-1 wins on CUDA at N=10k (1.21×); on Metal it never can (0.10×).** Metal is bound by a
+  ~250 µs command-buffer floor that exceeds a single CPU query, so no kernel flips it. CUDA's
+  launch floor is ~µs. The derived thresholds differ accordingly: CUDA overtakes at **batch ≥ 1**
+  (N=10k) and **≥ 8** (N=100k), where Metal needs **≥ 8** and **≥ 64**.
+- **The naive kernel already beat the CPU here**, unlike on Metal where it lost ~5×. A weaker
+  amd64 CPU next to a stronger discrete GPU moves the whole curve — which is exactly why the
+  instruction was to measure before porting.
+- **Device top-k pays far more on CUDA than on Metal**, as predicted: the M×N readback is a real
+  PCIe copy rather than a UMA view. At N=100k it took batch=256 from 1.32× to **15.25×**.
+
+Two thresholds had to be *derived*, and both are the opposite of the naive intuition:
+`gemmTileMinM=2` — the tiled GEMM stages a 16×16 tile, so a single-query batch idles 15/16 of
+every block and the *naive* kernel wins there; and `topkMinBatch=8` — `topk_rows` runs one block
+per query, so batch=1 occupies one SM of 40 while saving a readback too small to matter (it made
+N=100k batch=1 *worse*, 0.79× → 0.43×, before the gate).
+
 **Benchmark scaffolding — ✅ DONE, and the first slice surfaced a real finding.** The
 `docs/BENCH-gpu.md` machinery is built: `bench/record.go` (the records.jsonl schema), `bench/report.go`
 + `bench/cmd/benchreport` (the results doc is GENERATED, never hand-typed — per-machine tables +

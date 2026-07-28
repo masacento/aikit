@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/townsendmerino/aikit/ann"
+	gpu "github.com/townsendmerino/aikit/gpu"
 )
 
 // randUnit builds n random L2-normalized dim-vectors (the FlatI8 invariant).
@@ -281,4 +282,182 @@ func TestCUDA_concurrentScore(t *testing.T) {
 		t.Error(e)
 	}
 	t.Logf("%d goroutines × %d queries: top-%d stable and CPU-identical", workers, iters, k)
+}
+
+// --- on-device top-k (ann.I8TopKIndex) ---
+
+// Compile-time proof the CUDA index offers the top-k capability, so
+// FlatI8.QueryBatch prefers it over score-then-host-select.
+var _ ann.I8TopKIndex = (*cudaI8Index)(nil)
+
+// TestCUDATopK_matchesCPU gates the device selection against the CPU's own top-k over
+// an index large enough to clear topkMinN. The hits must be IDENTICAL — same indices in
+// the same order — not merely a plausible set: the kernel reimplements topHits's
+// ordering, so anything else means the two disagree about what "top-k" is.
+func TestCUDATopK_matchesCPU(t *testing.T) {
+	if !ann.HasBackend() {
+		t.Skip("no CUDA backend registered (no GPU?)")
+	}
+	rng := rand.New(rand.NewSource(101))
+	const n, dim, k, M = 60_000, 64, 10, 8 // n > topkMinN so the device path engages
+	vecs := randUnit(rng, n, dim)
+	cpu := ann.NewFlatI8(vecs)
+	g := ann.NewFlatI8(vecs)
+	if err := g.EnableGPU(); err != nil {
+		t.Fatalf("EnableGPU: %v", err)
+	}
+	defer g.Close()
+
+	queries := randUnit(rng, M, dim)
+	got := g.QueryBatch(queries, k)
+	for m, q := range queries {
+		want := cpu.Query(q, k)
+		if len(got[m]) != len(want) {
+			t.Fatalf("q%d: %d hits, want %d", m, len(got[m]), len(want))
+		}
+		for i := range want {
+			if got[m][i].Index != want[i].Index {
+				t.Fatalf("q%d rank %d: device top-k index %d != CPU %d", m, i, got[m][i].Index, want[i].Index)
+			}
+			if math.Abs(got[m][i].Score-want[i].Score) > 1e-3 {
+				t.Fatalf("q%d rank %d: score %v vs CPU %v", m, i, got[m][i].Score, want[i].Score)
+			}
+		}
+	}
+	t.Logf("device top-k ≡ CPU top-%d over %d queries at n=%d", k, M, n)
+}
+
+// TestCUDATopK_tieBreak is the sharp one. With EVERY score equal, the ONLY thing
+// deciding the answer is the tie-break, so the result must be exactly [0..k-1] —
+// index ASC. A kernel that reduced on score alone would return an arbitrary k here and
+// still look correct on random data, which is precisely how a wrong tie-break survives.
+func TestCUDATopK_tieBreak(t *testing.T) {
+	if !ann.HasBackend() {
+		t.Skip("no CUDA backend registered")
+	}
+	const n, dim, k, M = 60_000, 32, 12, 3
+	// Every vector identical ⇒ every score identical for any query.
+	vecs := make([][]float32, n)
+	base := make([]float32, dim)
+	for d := range base {
+		base[d] = float32(1.0 / math.Sqrt(float64(dim)))
+	}
+	for i := range vecs {
+		vecs[i] = base
+	}
+	g := ann.NewFlatI8(vecs)
+	if err := g.EnableGPU(); err != nil {
+		t.Fatalf("EnableGPU: %v", err)
+	}
+	defer g.Close()
+
+	queries := make([][]float32, M)
+	for m := range queries {
+		queries[m] = base
+	}
+	got := g.QueryBatch(queries, k)
+	for m := range M {
+		if len(got[m]) != k {
+			t.Fatalf("q%d: %d hits, want %d", m, len(got[m]), k)
+		}
+		for i := range k {
+			if got[m][i].Index != i {
+				t.Fatalf("q%d rank %d: index %d, want %d — all scores are equal, so the tie-break (index ASC) is the whole answer",
+					m, i, got[m][i].Index, i)
+			}
+		}
+	}
+	t.Log("all-equal scores ⇒ top-k is [0..k-1]: tie-break matches topHits")
+}
+
+// newTestIndex builds a backend + index directly, so the decline paths can be
+// exercised on the concrete type. Reaching them through FlatI8 is not possible — the
+// index is unexported there — and asserting nothing would make this test vacuous.
+func newTestIndex(t *testing.T, vecs [][]float32) *cudaI8Index {
+	t.Helper()
+	dev, err := gpu.CreateSystemDefaultDevice()
+	if err != nil {
+		t.Skipf("no CUDA device: %v", err)
+	}
+	lib, err := dev.CompileLibrary(w8a8PTX)
+	if err != nil {
+		dev.ReleaseObjects()
+		t.Fatalf("CompileLibrary: %v", err)
+	}
+	gemv, err := dev.NewComputePipeline(lib, "gemv_w8a8")
+	if err != nil {
+		dev.ReleaseObjects()
+		t.Fatalf("gemv: %v", err)
+	}
+	topk, err := dev.NewComputePipeline(lib, "topk_rows")
+	if err != nil {
+		dev.ReleaseObjects()
+		t.Fatalf("topk: %v", err)
+	}
+	vit, err := dev.NewViT()
+	if err != nil {
+		dev.ReleaseObjects()
+		t.Fatalf("NewViT: %v", err)
+	}
+	b := &cudaBackend{dev: dev, q: dev.NewCommandQueue(), gemv: gemv, gemmT: vit.GEMMW8A8Tiled, topk: topk}
+	t.Cleanup(dev.ReleaseObjects)
+
+	// Quantize with the package's own quantizeRowInt8 — byte-identical to what
+	// FlatI8 stores, so the index under test holds the same codes it would in
+	// production.
+	n, dim := len(vecs), len(vecs[0])
+	bq := make([]int8, n*dim)
+	scales := make([]float32, n)
+	for i, v := range vecs {
+		scales[i] = quantizeRowInt8(v, bq[i*dim:(i+1)*dim])
+	}
+	idx, err := b.NewI8Index(bq, scales, n, dim)
+	if err != nil {
+		t.Fatalf("NewI8Index: %v", err)
+	}
+	return idx.(*cudaI8Index)
+}
+
+// TestCUDATopK_declines pins the fallback contract: outside the range the kernel
+// implements, TopKBatch must decline so QueryBatch takes the scoring path — and the
+// answer must still be right.
+func TestCUDATopK_declines(t *testing.T) {
+	if !ann.HasBackend() {
+		t.Skip("no CUDA backend registered")
+	}
+	rng := rand.New(rand.NewSource(102))
+	const dim, k, small = 48, 5, 2_000
+	vecs := randUnit(rng, small, dim)
+	idx := newTestIndex(t, vecs)
+	defer idx.Close()
+
+	q := [][]float32{randUnit(rng, 1, dim)[0]}
+	if _, err := idx.TopKBatch(q, k); err == nil {
+		t.Errorf("TopKBatch should decline at n=%d < topkMinN=%d", small, topkMinN)
+	}
+	if _, err := idx.TopKBatch(q, small); err == nil {
+		t.Error("TopKBatch should decline for k >= n (topHits's full-sort path)")
+	}
+	if _, err := idx.TopKBatch(q, 0); err == nil {
+		t.Error("TopKBatch should decline for k <= 0")
+	}
+
+	// A declining index must leave QueryBatch's answer identical to the CPU's.
+	cpu := ann.NewFlatI8(vecs)
+	g := ann.NewFlatI8(vecs)
+	if err := g.EnableGPU(); err != nil {
+		t.Fatalf("EnableGPU: %v", err)
+	}
+	defer g.Close()
+	queries := randUnit(rng, 4, dim)
+	got := g.QueryBatch(queries, k)
+	for m, qq := range queries {
+		want := cpu.Query(qq, k)
+		for i := range want {
+			if got[m][i].Index != want[i].Index {
+				t.Fatalf("q%d rank %d after decline: %d != CPU %d", m, i, got[m][i].Index, want[i].Index)
+			}
+		}
+	}
+	t.Log("declines below topkMinN, for k>=n and k<=0; the fallback answer is unchanged")
 }

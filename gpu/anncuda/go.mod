@@ -11,6 +11,7 @@ require (
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/eitamring/gocudrv v0.2.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
 )
 
 replace github.com/townsendmerino/aikit => ../../
