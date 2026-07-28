@@ -4,6 +4,7 @@ package gpu
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -13,6 +14,28 @@ import (
 // launch-many-then-sync-once. Together these are what let a consumer express a
 // whole decode loop importing only this package — no gocudrv type in any
 // signature. All against a real device; each test skips cleanly without one.
+
+// TestCUDA_argNull locks the null-pointer bias arg the tuned decode path needs. A zero
+// Buffer is NOT a null pointer: Arg(Buffer{}) marshals through gocudrv's Arg, which rejects
+// a nil buffer handle (ErrNilBuffer) — so a kernel that binds an absent optional buffer and
+// guards on `if (bias) …` cannot be handed "no bias" that way. ArgNull passes CUdeviceptr 0,
+// which marshals cleanly. (The end-to-end guard-on-null EXECUTION is validated by goinfer's
+// real decode kernels — the optional-bias path — since there is no nvcc on this box to
+// compile a bespoke guard kernel here.)
+func TestCUDA_argNull(t *testing.T) {
+	d, q, p := setup(t, "saxpy")
+	n := 8
+	dx := NewBufferLenOf[float32](d, n)
+	// A zero Buffer is rejected at the arg-marshaling stage — this is exactly why ArgNull exists.
+	err := q.Launch(p, Grid1D(n, 256), Arg(dx), Arg(Buffer{}), ArgValue(float32(1)), ArgValue(int32(n)))
+	if err == nil || !strings.Contains(err.Error(), "nil buffer") {
+		t.Fatalf("Arg(Buffer{}) should be rejected as a nil buffer; got err=%v", err)
+	}
+	// ArgNull is a real, initialized arg (a null CUdeviceptr), so it does not hit that path.
+	if ArgNull().a == nil {
+		t.Fatal("ArgNull produced an uninitialized KernelArg")
+	}
+}
 
 // setup reaches the device and builds a pipeline from smoke.ptx, or skips.
 func setup(t *testing.T, kernel string) (*Device, Queue, Pipeline) {

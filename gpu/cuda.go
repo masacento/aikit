@@ -606,6 +606,15 @@ func Arg(b Buffer) KernelArg { return KernelArg{a: b.arg()} }
 // `constant uint&` binds. Both work; a kernel's signature decides which it needs.
 func ArgValue[T Scalar](v T) KernelArg { return KernelArg{a: gc.ArgValue(v)} }
 
+// ArgNull passes a NULL device pointer (CUdeviceptr 0) as a kernel pointer
+// parameter — the "optional buffer, absent this call" arg a tuned kernel reads as
+// `if (bias) …`. It is distinct from Arg(Buffer{}): a zero Buffer marshals through
+// gocudrv's Arg, which rejects a nil buffer handle (ErrNilBuffer), whereas a kernel
+// that guards on a null pointer needs the pointer itself to be 0. goinfer's decode
+// path binds an absent bias this way (it was gc.ArgDevicePtr(0) before the
+// re-point); there is no host allocation, so it costs nothing.
+func ArgNull() KernelArg { return KernelArg{a: gc.ArgDevicePtr(0)} }
+
 // LaunchConfig is explicit launch geometry: grid and block dimensions plus dynamic
 // shared memory. Mirrors the driver's own shape, so a kernel author sizes blocks
 // and shared memory exactly as the kernel was written to expect — which
