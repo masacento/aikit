@@ -5,7 +5,7 @@
 > absolute numbers are never placed in adjacent columns — the CPU baselines are
 > different chips; compare within a machine, or via the normalized summary.
 
-aikit `b3fe1a2` · 16 records · 1 machine(s)
+aikit `e331284` · 16 records · 1 machine(s)
 
 ## Per-machine tables (apples-to-apples, same box)
 
@@ -13,14 +13,14 @@ aikit `b3fe1a2` · 16 records · 1 machine(s)
 
 | workload | shape | precision | cpu-arm64 q/s | metal q/s | speedup | recall@k | parity |
 |---|---|---|--:|--:|--:|--:|:--:|
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=1 k=10 | int8 | 6.4k queries/s | 1.2k queries/s | 0.19× | 1.0000 | ✅ |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=8 k=10 | int8 | 6.4k queries/s | 8.4k queries/s | 1.33× | 0.9875 | ✅ |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=64 k=10 | int8 | 6.3k queries/s | 16.1k queries/s | 2.56× | 0.9922 | ✅ |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=256 k=10 | int8 | 6.3k queries/s | 14.5k queries/s | 2.31× | 0.9883 | ✅ |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=1 k=10 | int8 | 1.7k queries/s | 205.2 queries/s | 0.12× | 1.0000 | ✅ |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=8 k=10 | int8 | 1.6k queries/s | 1.2k queries/s | 0.77× | 0.9750 | ✅ |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=64 k=10 | int8 | 1.5k queries/s | 1.9k queries/s | 1.29× | 0.9781 | ✅ |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=256 k=10 | int8 | 1.6k queries/s | 1.9k queries/s | 1.25× | 0.9754 | ✅ |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=1 k=10 | int8 | 6.4k queries/s | 646.7 queries/s | 0.10× | 1.0000 | ✅ |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=8 k=10 | int8 | 6.4k queries/s | 9.3k queries/s | 1.45× | 0.9875 | ✅ |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=64 k=10 | int8 | 6.3k queries/s | 16.7k queries/s | 2.64× | 0.9922 | ✅ |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=256 k=10 | int8 | 6.3k queries/s | 17.6k queries/s | 2.79× | 0.9883 | ✅ |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=1 k=10 | int8 | 1.6k queries/s | 132.8 queries/s | 0.08× | 1.0000 | ✅ |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=8 k=10 | int8 | 1.5k queries/s | 1.0k queries/s | 0.65× | 0.9750 | ✅ |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=64 k=10 | int8 | 1.5k queries/s | 2.7k queries/s | 1.74× | 0.9781 | ✅ |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=256 k=10 | int8 | 1.5k queries/s | 3.1k queries/s | 1.99× | 0.9754 | ✅ |
 
 ## Normalized cross-platform summary (speedup over each box's own CPU)
 
@@ -29,14 +29,14 @@ The only honest all-backends view: absolute ms don't compare across machines, bu
 
 | workload | shape | precision | metal ×vs-cpu |
 |---|---|---|--:|
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=1 k=10 | int8 | 0.19× |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=8 k=10 | int8 | 1.33× |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=64 k=10 | int8 | 2.56× |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=256 k=10 | int8 | 2.31× |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=1 k=10 | int8 | 0.12× |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=8 k=10 | int8 | 0.77× |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=64 k=10 | int8 | 1.29× |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=256 k=10 | int8 | 1.25× |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=1 k=10 | int8 | 0.10× |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=8 k=10 | int8 | 1.45× |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=64 k=10 | int8 | 2.64× |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=256 k=10 | int8 | 2.79× |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=1 k=10 | int8 | 0.08× |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=8 k=10 | int8 | 0.65× |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=64 k=10 | int8 | 1.74× |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=256 k=10 | int8 | 1.99× |
 
 ## Dispatch thresholds (the crossover — the input to backend dispatch)
 
