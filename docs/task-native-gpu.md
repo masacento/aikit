@@ -153,7 +153,7 @@ the paged `LoadFlatI8MmapPaged` path. **Parity-gated:** GPU-ANN top-k ≡ CPU-AN
 indexes (rank-exact within the int8 tolerance). This is *new* coverage (ANN has none today) and
 the biggest single-workload win — the payoff the product bet is aimed at.
 
-**Phase 3 — vision native + the Qwen ViT resident path — 🟡 CUDA + Metal SigLIP DONE, Qwen2.5-VL remains.**
+**Phase 3 — vision native + the Qwen ViT resident path — 🟡 SigLIP DONE on CUDA + Metal; Qwen2.5-VL DONE on CUDA (Metal mirror remains).**
 `vision.ResidentEncoder` already existed (WebGPU SigLIP, "~9×"); the native CUDA
 *and* Metal implementations now exist too:
 
@@ -274,8 +274,8 @@ portable, CPU always).
 **Phase 0 ✅** → **Phase 1 ✅** (`aikit/gpu` + Metal device layer + minimal-kernel ANN proof +
 goinfer-Metal device re-point) → **Phase 2 ✅** (ANN-GPU batch-GEMM — the headline) → **Phase 1b
 ✅** (CUDA device impl + CUDA ANN backend + the tuned-GEMV blob-split + the goinfer CUDA device
-re-point, all parity-gated on an RTX 2070 SUPER) → **Phase 3 🟡** (SigLIP resident encoder done
-on BOTH CUDA and Metal; Qwen2.5-VL path remains) → **Phase 4** (encoder native — but see the
+re-point, all parity-gated on an RTX 2070 SUPER) → **Phase 3 🟡** (SigLIP done on BOTH CUDA and Metal;
+Qwen2.5-VL done on CUDA — only the Metal mirror of its five kernels remains) → **Phase 4** (encoder native — but see the
 dangling-seam finding above: it starts with wiring, not with a backend).
 
 **Nothing is gated behind an unfired trigger any more.** Every "wait for X to settle" in this
