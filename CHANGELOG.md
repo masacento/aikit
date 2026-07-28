@@ -12,6 +12,18 @@ it.
 
 ### Added
 
+- **`aikit/gpu` CUDA API extended to fit a tuned kernel set (`gpu/v0.3.0`).** `v0.2.0`'s
+  dispatch was buffers-only on derived 1-D geometry, which the ANN proving kernels need and
+  a tuned decode path cannot express. Adds, all in `cuda.go` (`//go:build linux`):
+  `gpu.KernelArg` with `Arg(Buffer)` / `ArgValue[T](v)` so scalars pass **by value**
+  positionally between buffer args; `gpu.LaunchConfig` with `Grid1D` / `GridOne` helpers for
+  hand-picked geometry including **dynamic shared memory**; `Queue.Launch` (enqueue, no sync)
+  plus `Queue.Sync` for the launch-many-then-sync-at-a-boundary model; `gpu.HostBuffer[T]`
+  with `NewHostBuffer` / `ReadToHost` for **pinned** host readback; and generic buffer verbs
+  `NewBufferOf` / `NewBufferLenOf` / `Upload` / `Download` covering every scalar element type.
+  Together these let a consumer express a whole decode loop importing **only** `aikit/gpu` —
+  no `gocudrv` type appears in any signature. `Run1D` / `Run1DBatch` / `Encoder` are unchanged
+  and now built on the same machinery; the darwin surface is untouched.
 - **CUDA device layer + GPU-scored ANN on NVIDIA (native-GPU Phase 1b).** The Linux
   mirror of the shipped Metal work, so the substrate is now two-platform. `gpu/cuda.go`
   (`//go:build linux`) presents the same `Device`/`Buffer`/`Queue`/`Pipeline`/`Encoder`

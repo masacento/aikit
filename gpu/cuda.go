@@ -126,6 +126,21 @@ func (d *Device) TrackObj(c closer) {
 	d.mu.Unlock()
 }
 
+// untrackObj drops a tracked handle from the ledger, for a resource the caller
+// closes itself (HostBuffer.Close) — so ReleaseObjects neither double-frees it nor
+// leaves LedgerLen reporting a resource that is already gone.
+func (d *Device) untrackObj(c closer) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i, o := range d.objs {
+		if o == c {
+			d.objs[i] = d.objs[len(d.objs)-1]
+			d.objs = d.objs[:len(d.objs)-1]
+			return
+		}
+	}
+}
+
 // ReleaseAll frees every device allocation this Device handed out and empties the
 // ledger. Callers MUST ensure no launch is still in flight against them (releasing
 // memory a running kernel reads is a use-after-free). Idempotent.
@@ -425,6 +440,260 @@ func (b Buffer) ReadU32() (uint32, error) {
 	return v[0], nil
 }
 
+// ---- generic buffer verbs (any scalar element type) ----
+//
+// The NewBuffer*/Write*/Read* methods above name the element types aikit's own
+// consumers use, mirroring metal.go's constructors one for one. A consumer with a
+// wider mix of element types — a decode path allocating float32 activations, int32
+// indices, uint16 f16 scales and uint32 packed weights — wants the same four verbs
+// parameterized instead of a method per type. These are those, and they are free
+// functions for the same reason NewHostBuffer is: Go has no generic methods.
+//
+// Both spellings produce identical buffers; NewBufferFloats(x) is exactly
+// NewBufferOf(d, x).
+
+// NewBufferOf allocates a device buffer sized to data and uploads it. n for the
+// returned Buffer is len(data), in elements of T. Panics on allocation failure
+// (see MustBuf).
+func NewBufferOf[T Scalar](d *Device, data []T) Buffer {
+	var z T
+	b := d.MustBuf(len(data)*int(unsafe.Sizeof(z)), len(data), "typed")
+	if err := b.upload(asBytes(data)); err != nil {
+		panic(fmt.Sprintf("cuda: NewBufferOf upload: %v", err))
+	}
+	runtime.KeepAlive(data)
+	return b
+}
+
+// NewBufferLenOf allocates an uninitialized device buffer of n elements of T.
+func NewBufferLenOf[T Scalar](d *Device, n int) Buffer {
+	var z T
+	return d.MustBuf(n*int(unsafe.Sizeof(z)), n, "typed-len")
+}
+
+// Upload copies src into the buffer at its bind offset (host → device).
+func Upload[T Scalar](b Buffer, src []T) error {
+	err := b.upload(asBytes(src))
+	runtime.KeepAlive(src)
+	return err
+}
+
+// Download copies the buffer's contents at its bind offset into dst (device →
+// host). dst's length sizes the transfer.
+func Download[T Scalar](b Buffer, dst []T) error {
+	err := b.download(asBytes(dst))
+	runtime.KeepAlive(dst)
+	return err
+}
+
+// ---- pinned host memory ----
+
+// Scalar is the element type of a by-value kernel argument, a typed buffer verb,
+// or a pinned host buffer. It mirrors gocudrv's Supported exactly — fixed-size numeric scalars
+// only, with `int`/`uint` deliberately excluded because their width is not part of
+// the ABI the kernel was compiled against. Declaring it here is what lets
+// consumers write gpu.ArgValue(int32(x)) without ever naming gocudrv.
+type Scalar interface {
+	~int8 | ~uint8 |
+		~int16 | ~uint16 |
+		~int32 | ~uint32 |
+		~int64 | ~uint64 |
+		~float32 | ~float64
+}
+
+// HostBuffer is page-locked (pinned) host memory. A DtoH copy into pinned memory
+// can be done by the DMA engine without the driver staging through a bounce
+// buffer, which is why a hot readback path — goinfer's per-token logits vector, a
+// vocab-sized float32 every token — allocates one of these once and reuses it.
+//
+// Slice() hands back a []T view of that memory, so the readback costs one copy
+// rather than a copy plus an allocation. The Device tracks it, so ReleaseObjects
+// frees it; a HostBuffer MUST NOT outlive its Device (the free has to reach the
+// context's executor).
+type HostBuffer[T Scalar] struct {
+	d *Device
+	h *gc.HostBuffer[T]
+}
+
+// NewHostBuffer allocates n elements of pinned host memory on d.
+//
+// It is a package-level function rather than a method because Go has no generic
+// methods — Device.NewHostBuffer[T](n) is not expressible. Call it as
+// gpu.NewHostBuffer[float32](dev, vocab).
+func NewHostBuffer[T Scalar](d *Device, n int) (*HostBuffer[T], error) {
+	if d == nil || d.cx == nil {
+		return nil, fmt.Errorf("cuda: NewHostBuffer on a released device")
+	}
+	h, err := gc.AllocHost[T](d.cx, n)
+	if err != nil {
+		return nil, fmt.Errorf("cuda: AllocHost(%d): %w", n, err)
+	}
+	d.TrackObj(h)
+	return &HostBuffer[T]{d: d, h: h}, nil
+}
+
+// Slice is a []T view of the pinned memory, valid until Close. Read and write it
+// directly; it is ordinary host memory that happens to be page-locked.
+func (h *HostBuffer[T]) Slice() []T {
+	if h == nil {
+		return nil
+	}
+	return h.h.Slice()
+}
+
+// Len is the element count.
+func (h *HostBuffer[T]) Len() int {
+	if h == nil {
+		return 0
+	}
+	return h.h.Len()
+}
+
+// Close frees the pinned memory and drops it from the Device's ledger, so a later
+// ReleaseObjects neither double-frees it nor leaves the leak counters stale.
+// Idempotent.
+func (h *HostBuffer[T]) Close() error {
+	if h == nil || h.h == nil {
+		return nil
+	}
+	h.d.untrackObj(h.h)
+	return h.h.Close()
+}
+
+// ReadToHost copies the device buffer's contents (from its bind offset) into
+// pinned host memory — the readback goinfer's logits path uses. The transfer size
+// is dst's byte length, so dst sizes the copy.
+//
+// It is a free function for the same reason NewHostBuffer is: Buffer is not
+// generic (it is untyped bytes, like an MTLBuffer), and the element type lives
+// only on the host side here.
+func ReadToHost[T Scalar](b Buffer, dst *HostBuffer[T]) error {
+	if dst == nil {
+		return fmt.Errorf("cuda: ReadToHost into a nil host buffer")
+	}
+	s := dst.Slice()
+	if s == nil {
+		return fmt.Errorf("cuda: ReadToHost into a closed host buffer")
+	}
+	err := b.download(asBytes(s))
+	runtime.KeepAlive(dst)
+	return err
+}
+
+// ---- explicit launch geometry, scalar args, async dispatch ----
+//
+// Everything below is the surface a TUNED kernel set needs and the ANN proving
+// path does not: kernels that take scalars positionally between buffers, geometry
+// the author picks by hand (including dynamic shared memory), and a launch-many-
+// then-sync-at-a-boundary model rather than a sync per call. Run1D / Run1DBatch /
+// Encoder above stay as they are — they are the right ergonomics for aikit's own
+// consumers, and they are built on this same machinery.
+//
+// The design constraint is that a consumer can express its whole decode loop
+// importing ONLY this package: no gocudrv type appears in any signature here.
+
+// KernelArg is one positional kernel parameter — a device buffer (Arg) or a scalar
+// passed by value (ArgValue). A kernel's parameter list is these in order.
+type KernelArg struct{ a gc.KernelArg }
+
+// Arg passes a device buffer as a kernel pointer parameter. A buffer carrying a
+// bind offset (Buffer.At) passes base+offset.
+func Arg(b Buffer) KernelArg { return KernelArg{a: b.arg()} }
+
+// ArgValue passes a scalar BY VALUE — the calling convention the tuned kernels
+// use for their dimensions, epsilons and flags (`int32 n`, `float32 eps`), as
+// opposed to the 1-element-buffer convention the ANN kernels inherited from MSL's
+// `constant uint&` binds. Both work; a kernel's signature decides which it needs.
+func ArgValue[T Scalar](v T) KernelArg { return KernelArg{a: gc.ArgValue(v)} }
+
+// LaunchConfig is explicit launch geometry: grid and block dimensions plus dynamic
+// shared memory. Mirrors the driver's own shape, so a kernel author sizes blocks
+// and shared memory exactly as the kernel was written to expect — which
+// Run1D's derived 1-D geometry cannot express.
+type LaunchConfig struct {
+	GridX, GridY, GridZ    uint32
+	BlockX, BlockY, BlockZ uint32
+	SharedMemBytes         uint32
+}
+
+// Grid1D covers n elements with ceil(n/block) blocks of `block` threads — the
+// ordinary elementwise shape. As with every launch through this layer, the grid
+// overhangs n whenever block ∤ n, so the kernel must bounds-check.
+func Grid1D(n, block int) LaunchConfig {
+	if n <= 0 || block <= 0 {
+		return LaunchConfig{}
+	}
+	return LaunchConfig{
+		GridX: uint32((n + block - 1) / block), GridY: 1, GridZ: 1,
+		BlockX: uint32(block), BlockY: 1, BlockZ: 1,
+	}
+}
+
+// GridOne is a SINGLE block of `block` threads with sharedBytes of dynamic shared
+// memory — the shape a whole-vector reduction uses (an RMS norm over the hidden
+// state staging its partials in shared memory, say), where one cooperating block
+// is the point rather than a limitation.
+func GridOne(block, sharedBytes int) LaunchConfig {
+	if block <= 0 || sharedBytes < 0 {
+		return LaunchConfig{}
+	}
+	return LaunchConfig{
+		GridX: 1, GridY: 1, GridZ: 1,
+		BlockX: uint32(block), BlockY: 1, BlockZ: 1,
+		SharedMemBytes: uint32(sharedBytes),
+	}
+}
+
+// valid reports whether every dimension is non-zero (the driver rejects a zero).
+func (c LaunchConfig) valid() bool {
+	return c.GridX > 0 && c.GridY > 0 && c.GridZ > 0 &&
+		c.BlockX > 0 && c.BlockY > 0 && c.BlockZ > 0
+}
+
+func (c LaunchConfig) toGC() gc.LaunchConfig {
+	return gc.LaunchConfig{
+		GridX: c.GridX, GridY: c.GridY, GridZ: c.GridZ,
+		BlockX: c.BlockX, BlockY: c.BlockY, BlockZ: c.BlockZ,
+		SharedMemBytes: c.SharedMemBytes,
+	}
+}
+
+// Launch ENQUEUES one kernel on this queue's stream and returns without waiting.
+// Nothing has necessarily executed when it returns — call Sync to wait.
+//
+// This is the shape a tuned decode loop needs: a whole layer stack is enqueued
+// back-to-back and synchronized once at a readback boundary, so the GPU is never
+// idling on a per-launch round trip. Launches on one stream still run in issue
+// order and each sees the prior one's writes, so chained kernels need no barrier.
+//
+// Errors are returned, not latched — a caller driving a hot chain typically keeps
+// its own sticky first-error latch so it can discard returns in the inner loop
+// without losing a bad config.
+func (q Queue) Launch(p Pipeline, cfg LaunchConfig, args ...KernelArg) error {
+	if p.f == nil {
+		return fmt.Errorf("cuda: launch of a nil pipeline")
+	}
+	if !cfg.valid() {
+		return fmt.Errorf("cuda: invalid launch geometry (grid %dx%dx%d block %dx%dx%d)",
+			cfg.GridX, cfg.GridY, cfg.GridZ, cfg.BlockX, cfg.BlockY, cfg.BlockZ)
+	}
+	ga := make([]gc.KernelArg, len(args))
+	for i, a := range args {
+		if a.a == nil {
+			return fmt.Errorf("cuda: kernel arg %d is uninitialized", i)
+		}
+		ga[i] = a.a
+	}
+	if q.s == nil {
+		return p.f.Launch(bg, cfg.toGC(), ga...)
+	}
+	return p.f.LaunchOn(bg, q.s, cfg.toGC(), ga...)
+}
+
+// Sync blocks until every kernel enqueued on this queue has completed — the
+// explicit boundary the async Launch model is built around.
+func (q Queue) Sync() error { return q.sync() }
+
 // arg builds the kernel argument for this buffer. At offset 0 it goes through
 // gocudrv's Arg, which holds the buffer's lock for the launch (so a concurrent
 // Close cannot free memory out from under a running kernel); an offset view has to
@@ -458,12 +727,15 @@ func (d *Device) NewCommandQueue() Queue {
 	return Queue{d: d, s: s}
 }
 
-// grid computes the launch geometry for n threads at threadgroup width tg. CUDA
-// launches WHOLE blocks, so the tail block overruns n — every kernel dispatched
-// here must bounds-check its global index (divergence 2 in the file header).
-func grid(n, tg int) (gc.LaunchConfig, error) {
+// grid derives the launch geometry for n threads at threadgroup width tg — the
+// Metal-shaped convenience the ANN path uses, where the caller says "n threads"
+// and the block size is a tuning detail. tg is clamped to n and to CUDA's hard
+// 1024-threads-per-block ceiling. As always, the grid overhangs n whenever the
+// block size does not divide it, so the kernel must bounds-check (divergence 2 in
+// the file header).
+func grid(n, tg int) (LaunchConfig, error) {
 	if n <= 0 {
-		return gc.LaunchConfig{}, fmt.Errorf("cuda: dispatch of %d threads", n)
+		return LaunchConfig{}, fmt.Errorf("cuda: dispatch of %d threads", n)
 	}
 	if tg <= 0 {
 		tg = 256
@@ -474,33 +746,29 @@ func grid(n, tg int) (gc.LaunchConfig, error) {
 	if tg > 1024 {
 		tg = 1024 // CUDA's hard max threads-per-block
 	}
-	cfg := gc.LaunchConfig1D(n, tg)
-	if cfg.GridX == 0 {
+	cfg := Grid1D(n, tg)
+	if !cfg.valid() {
 		return cfg, fmt.Errorf("cuda: invalid launch geometry (n=%d tg=%d)", n, tg)
 	}
 	return cfg, nil
 }
 
-// launch enqueues one kernel on this queue's stream.
+// launch enqueues one kernel on this queue's stream, binding bufs positionally —
+// the all-buffers convention the ANN kernels use. It is Launch with the geometry
+// derived and every argument a buffer.
 func (q Queue) launch(p Pipeline, n, tg int, bufs []Buffer) error {
-	if p.f == nil {
-		return fmt.Errorf("cuda: dispatch of a nil pipeline")
-	}
 	cfg, err := grid(n, tg)
 	if err != nil {
 		return err
 	}
-	args := make([]gc.KernelArg, len(bufs))
+	args := make([]KernelArg, len(bufs))
 	for i, b := range bufs {
 		if b.b == nil {
 			return fmt.Errorf("cuda: kernel arg %d is a nil buffer", i)
 		}
-		args[i] = b.arg()
+		args[i] = Arg(b)
 	}
-	if q.s == nil {
-		return p.f.Launch(bg, cfg, args...)
-	}
-	return p.f.LaunchOn(bg, q.s, cfg, args...)
+	return q.Launch(p, cfg, args...)
 }
 
 // sync blocks until this queue's stream drains.
