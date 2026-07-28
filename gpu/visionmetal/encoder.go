@@ -158,7 +158,8 @@ func (e *encoder) gemmF32(a, b, c gpu.Buffer, M, N, K int) {
 	e.setI(e.s0, M)
 	e.setI(e.s1, N)
 	e.setI(e.s2, K)
-	e.q.Run1D(e.k.GEMMF32, M*N, vitTG(M*N), a, b, c, e.s0, e.s1, e.s2)
+	gx, gy, tgx, tgy := gpu.TileDims(M, N)
+	e.q.Run2D(e.k.GEMMF32Tiled, gx, gy, tgx, tgy, a, b, c, e.s0, e.s1, e.s2)
 }
 
 func (e *encoder) addBias(x, bias gpu.Buffer, rows, dim int) {
@@ -204,7 +205,8 @@ func (e *encoder) proj(src gpu.Buffer, m mat, bias, dst gpu.Buffer, M int) {
 	e.setI(e.s0, M)
 	e.setI(e.s1, N)
 	e.setI(e.s2, K)
-	e.q.Run1D(e.k.GEMMW8A8, M*N, vitTG(M*N), e.qi8, e.qs, m.q, m.s, dst, e.s0, e.s1, e.s2)
+	gx, gy, tgx, tgy := gpu.TileDims(M, N)
+	e.q.Run2D(e.k.GEMMW8A8Tiled, gx, gy, tgx, tgy, e.qi8, e.qs, m.q, m.s, dst, e.s0, e.s1, e.s2)
 	e.setI(e.s0, M)
 	e.setI(e.s1, N)
 	e.q.Run1D(e.k.AddBias, M*N, vitTG(M*N), dst, bias, e.s0, e.s1)

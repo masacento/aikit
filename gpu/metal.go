@@ -210,6 +210,7 @@ var (
 	selSetBuffers      = objc.RegisterName("setBuffers:offsets:withRange:")
 	selSetTgMem        = objc.RegisterName("setThreadgroupMemoryLength:atIndex:")
 	selDispatchThreads = objc.RegisterName("dispatchThreads:threadsPerThreadgroup:")
+	selDispatchTG      = objc.RegisterName("dispatchThreadgroups:threadsPerThreadgroup:")
 	selEndEncoding     = objc.RegisterName("endEncoding")
 	selCommit          = objc.RegisterName("commit")
 	selWaitCompleted   = objc.RegisterName("waitUntilCompleted")
@@ -420,6 +421,33 @@ func (q Queue) Run1D(p Pipeline, n, tg int, bufs ...Buffer) {
 	perTG := mtlSize{w: uint64(tg), h: 1, d: 1}
 	enc.Send(selDispatchThreads, unsafe.Pointer(&total), unsafe.Pointer(&perTG))
 	runtime.KeepAlive(&total)
+	runtime.KeepAlive(&perTG)
+	enc.Send(selEndEncoding)
+	cb.Send(selCommit)
+	cb.Send(selWaitCompleted)
+}
+
+// Run2D encodes and runs a 2-D kernel over gx×gy THREADGROUPS of tgx×tgy threads each,
+// via dispatchThreadgroups (UNIFORM whole threadgroups) — the shape a tiled GEMM needs.
+// Unlike Run1D's dispatchThreads (non-uniform, exactly n threads, no bounds check),
+// every thread in the final edge tiles must EXIST so the tile can cooperatively stage
+// its A/B sub-tiles into threadgroup memory and all reach the barrier; the kernel then
+// bounds-checks its own global (m,n,k) index, exactly like the CUDA tiled kernels.
+// Blocks until the GPU finishes. Manual autoreleasepool discipline, like Run1D.
+func (q Queue) Run2D(p Pipeline, gx, gy, tgx, tgy int, bufs ...Buffer) {
+	pool := objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc).Send(selInit)
+	defer pool.Send(selDrain)
+
+	cb := q.id.Send(selCommandBuffer)
+	enc := cb.Send(selComputeEncoder)
+	enc.Send(selSetPipeline, p.id)
+	for i, b := range bufs {
+		enc.Send(selSetBuffer, b.id, b.off, uintptr(i))
+	}
+	grid := mtlSize{w: uint64(gx), h: uint64(gy), d: 1}
+	perTG := mtlSize{w: uint64(tgx), h: uint64(tgy), d: 1}
+	enc.Send(selDispatchTG, unsafe.Pointer(&grid), unsafe.Pointer(&perTG))
+	runtime.KeepAlive(&grid)
 	runtime.KeepAlive(&perTG)
 	enc.Send(selEndEncoding)
 	cb.Send(selCommit)

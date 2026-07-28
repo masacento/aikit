@@ -245,9 +245,42 @@ either way. That is now fixed:
 `matmulBTQ8Into`, whose int8 weights and per-row scales do not fit that signature, and stay on
 the CPU. Widening `Backend` is a separate, deliberate decision — it is Hard-tier surface.
 
+> **Scope note — that f32 seam is f32-only, and the int8 path does NOT come along by widening it.**
+> `MatmulBT(a, b, dst []float32, …)` carries only f32, so a native encoder wired through it
+> accelerates the f32 path while the int8 `LoadQ8` projections (int8 weights + per-row scales)
+> stay on CPU — their representation doesn't fit that signature. The fix is **not** to widen
+> `Backend` with a quantized method: that grows an already **Hard-tier** interface *and* builds a
+> second quantized-dispatch surface parallel to `WeightMat`, re-duplicating exactly what the
+> §2.8 unification collapsed. encoder's Q8 projections are **already `linalg.WeightMat`s**, so the
+> int8 encoder path routes through `WeightMat.Int8()` into the **same `aikit/gpu` W8A8 GEMV the
+> Phase-1 first cut already builds for ANN** — no new interface, consistent with ANN and vision.
+> Consequence to accept: the native path (via `WeightMat`) does **both f32 and int8**; the WebGPU
+> path (via `Backend.MatmulBT`, f32-only) stays f32 — native is the more-capable fast path, WebGPU
+> the portable fallback. Widening `Backend` is reserved for a concrete **int8-on-WebGPU** pull,
+> which doesn't exist today; don't do it speculatively.
+
 **CUDA backend — ✅ DONE (`gpu/enccuda`).** Registers `"cuda"`, uses `gemm_f32_tiled`, and
 declines small shapes to the CPU path. Parity vs a float64 reference on both sides of the
 threshold; measured crossover in `minGPUFlops`'s doc comment.
+
+**Metal backend — ✅ DONE (`gpu/encmetal`).** The Apple mirror: registers `"metal"`, same
+`gemm_f32_tiled` (via `Run2D`), same decline-small-to-CPU, same float64-reference parity and
+the same pooled-scratch regression test (`TestEncMetal_noStaleOperands`). The UMA difference
+is the point — the "upload" is a `copy()` into the buffer's `Floats()` view and the download a
+`copy()` back, no PCIe transfer and none of the CUDA upload race (so the `Buffer.upload` sync
+`25d6de3` added on CUDA is deliberately NOT mirrored — there is no DMA to order against). Its
+`minGPUFlops` is **derived independently** and is ~2000× larger than CUDA's (`1<<31` ≈ 2.1
+GFLOP vs 1 MFLOP): on M1 Pro the pure-Go CPU is strong (~300 GFLOP/s) and the correctness-first
+16×16 tiled kernel tops out near ~340 GFLOP/s, so the device only pays at the large-batch end.
+
+**Tiled GEMMs — ✅ DONE on both platforms.** `gemm_w8a8_tiled` + `gemm_f32_tiled` stage a
+TILE×TILE block through shared/threadgroup memory. On Metal they launch via `Run2D`
+(`dispatchThreadgroups` — UNIFORM whole threadgroups, the one Metal kernel family that keeps the
+CUDA-style bounds checks, because cooperative tile-staging needs the edge threads to exist). The
+asymmetric gate ports intact: W8A8 tiled is **BIT-IDENTICAL** to untiled (int32 sums are
+order-independent), f32 tiled is gated against a **float64** reference (√K·ε, not against the
+untiled kernel). All ViT consumers (`visionmetal`/`qwenmetal`, `visioncuda`/`qwencuda`) route
+their big projections through the tiled kernels; parity is unchanged.
 
 Two findings the interface forced, both worth acting on:
 
@@ -259,18 +292,28 @@ Two findings the interface forced, both worth acting on:
   rescue it — at long sequences the per-head QKᵀ outgrows any threshold. `gpu/enccuda` therefore
   does not cache, and carries a regression test for exactly that trap. **Widening `Backend`
   with a resident-weight concept is the real fix**, and is a Hard-tier decision.
-- **The measured curve is not the expected one.** The GPU wins at every shape, but by the
-  *largest* margin on the *smallest* work (7.7× at 1 MFLOP, 1.09× at 2416 MFLOP). That is a CPU
-  result, not a GPU one: the pure-Go path switches from a scalar to a blocked-parallel kernel at
-  ~4 MFLOP, so it is weakest exactly where the device looks strongest, and hits 329 GFLOP/s
-  where the device is transfer-bound.
+- **The measured curve differs by platform — and both are CPU stories, not GPU ones.** On
+  CUDA the GPU wins at every shape but by the *largest* margin on the *smallest* work (7.7× at
+  1 MFLOP, 1.09× at 2416 MFLOP): the pure-Go path switches scalar→blocked-parallel at ~4 MFLOP,
+  so it is weakest where the device looks strongest, and hits 329 GFLOP/s where the device is
+  transfer-bound. On **Metal the crossover is ~2000× higher** — the device wins ONLY at ≥ ~2.4
+  GFLOP (1.05× at 2416 MFLOP, 1.29× at 8590), losing across the 19–604 MFLOP middle — because
+  the M1-Pro CPU is strong (~300 GFLOP/s) and the correctness-first tiled kernel tops out near
+  ~340. Same interface, opposite thresholds: the sweep *is* the deliverable, exactly as
+  `BENCH-gpu.md` argues, and copying one platform's constant to the other would have been wrong.
 
-**Still to do in Phase 4:** an **end-to-end encode measurement** — `BENCH-gpu.md` is explicit
-that microbenchmarks tune and end-to-end publishes, and `minGPUFlops` is currently
-microbenchmark-derived only (`testdata/minilm-model` is absent on the CUDA box). A forward makes
-~72 sequential backend calls each paying a device synchronize; that serial cost cannot appear in
-a per-call benchmark. Also: the **Metal** encoder backend, and widening `Backend` for the int8
-(`LoadQ8`) path.
+**End-to-end measurement — ✅ DONE on Metal (first Phase-4 end-to-end figure either box has).**
+`testdata/minilm-model` is present on the Apple box, so `TestEncMetal_endToEnd` times a real
+MiniLM `Encode`, CPU vs the `"metal"` backend: **CPU 88.9ms, Metal 89.1ms (1.00×), cosine
+1.000000000**. The finding corroborates the threshold: a single short-sequence forward has no
+matmul above the ~2.4 GFLOP crossover, so the backend correctly stays entirely on the CPU and
+the numerics are identical — the device pays only at large batch. (`BENCH-gpu.md`: microbenchmarks
+tune, end-to-end publishes.)
+
+**Still to do in Phase 4:** a **production Metal GEMM** (simdgroup_matrix / MPS — multi-TFLOP/s,
+which would move the Metal crossover down substantially; the current tiled kernel is
+correctness-first), and widening `Backend` for the int8 (`LoadQ8`) path — a Hard-tier decision,
+see the scope note above.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
 waiting on a trigger**, and it should not be re-opened as "the last un-done item": Model2Vec is a

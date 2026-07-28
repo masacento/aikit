@@ -72,6 +72,11 @@ func run1dTG(q Queue, p Pipeline, n, tg, tgBytes int, bufs ...Buffer) {
 	defer runtime.UnlockOSThread()
 	q.Run1DTG(p, n, tg, tgBytes, bufs...)
 }
+func run2d(q Queue, p Pipeline, gx, gy, tgx, tgy int, bufs ...Buffer) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	q.Run2D(p, gx, gy, tgx, tgy, bufs...)
+}
 
 func TestMetal_vitLayerNorm(t *testing.T) {
 	d, q, v := vitSetupM(t)
@@ -568,4 +573,84 @@ func TestMetal_vitAttentionSeg(t *testing.T) {
 		t.Error("break-it-first vacuous: windowed and full attention agree — bounds ignored?")
 	}
 	t.Log("attention_seg ≡ CPU per-segment MHA; full-attention differs (bounds enforced)")
+}
+
+// TestMetal_gemmTiledMatchesUntiled gates the tiled GEMMs asymmetrically, mirroring the
+// CUDA gate.
+//
+// W8A8 must be BIT-IDENTICAL to the untiled kernel: the accumulator is int32 and integer
+// addition is associative, so staging K through threadgroup memory in TILE-sized chunks
+// cannot change the sum. Asserting equality rather than a tolerance is what makes this
+// able to catch a real tiling bug — a mis-indexed shared tile shifts a handful of outputs,
+// which a loose bound would wave through.
+//
+// The f32 kernel is gated against a FLOAT64 CPU reference, not against its untiled
+// counterpart: comparing two f32 kernels to each other pins whichever way they happen to
+// agree as the expectation, so a shared bug would pass. The tiled kernel is what the
+// consumers run; the float64 reference is what it has to equal.
+func TestMetal_gemmTiledMatchesUntiled(t *testing.T) {
+	d, q, v := vitSetupM(t)
+	rng := rand.New(rand.NewSource(31))
+	for _, sh := range []struct{ M, N, K int }{
+		{1, 1, 1},       // degenerate
+		{16, 16, 16},    // exactly one tile
+		{17, 33, 47},    // overhang in all three dims + K tail
+		{64, 96, 129},   // K tail
+		{129, 65, 1152}, // realistic ViT projection
+	} {
+		A := make([]int8, sh.M*sh.K)
+		B := make([]int8, sh.N*sh.K)
+		for i := range A {
+			A[i] = int8(rng.Intn(255) - 127)
+		}
+		for i := range B {
+			B[i] = int8(rng.Intn(255) - 127)
+		}
+		as, bs := randF32M(rng, sh.M, 0.01), randF32M(rng, sh.N, 0.01)
+		dA, dB := d.NewBufferInt8(A), d.NewBufferInt8(B)
+		dAs, dBs := d.NewBufferFloats(as), d.NewBufferFloats(bs)
+		c1 := d.NewBufferLen(sh.M * sh.N) // untiled
+		c2 := d.NewBufferLen(sh.M * sh.N) // tiled
+		run1d(q, v.GEMMW8A8, sh.M*sh.N, mtg(sh.M*sh.N),
+			dA, dAs, dB, dBs, c1, i32b(d, sh.M), i32b(d, sh.N), i32b(d, sh.K))
+		gx, gy, tgx, tgy := TileDims(sh.M, sh.N)
+		run2d(q, v.GEMMW8A8Tiled, gx, gy, tgx, tgy,
+			dA, dAs, dB, dBs, c2, i32b(d, sh.M), i32b(d, sh.N), i32b(d, sh.K))
+		g1, g2 := c1.Floats(), c2.Floats()
+		for i := range g1 {
+			if g1[i] != g2[i] {
+				t.Fatalf("W8A8 M=%d N=%d K=%d: tiled[%d]=%v != untiled %v — int32 accumulation is order-independent, so this is a real tiling bug",
+					sh.M, sh.N, sh.K, i, g2[i], g1[i])
+			}
+		}
+
+		Af, Bf := randF32M(rng, sh.M*sh.K, 1), randF32M(rng, sh.N*sh.K, 1)
+		f2 := d.NewBufferLen(sh.M * sh.N)
+		run2d(q, v.GEMMF32Tiled, gx, gy, tgx, tgy, d.NewBufferFloats(Af), d.NewBufferFloats(Bf), f2,
+			i32b(d, sh.M), i32b(d, sh.N), i32b(d, sh.K))
+		h2 := f2.Floats()
+		worst := 0.0
+		for m := range sh.M {
+			for n := range sh.N {
+				var acc float64
+				for k := range sh.K {
+					acc += float64(Af[m*sh.K+k]) * float64(Bf[n*sh.K+k])
+				}
+				den := math.Abs(acc)
+				if den < 1 {
+					den = 1
+				}
+				if r := math.Abs(float64(h2[m*sh.N+n])-acc) / den; r > worst {
+					worst = r
+				}
+			}
+		}
+		// Same analytic bound as the CUDA gate: a K-term f32 dot accumulates ~sqrt(K)*eps
+		// against a float64 reference, ~5e-5 relative at K=1152; 2e-4 sits just above and
+		// still rejects anything structural. The SHARP gate is the W8A8 bit-identity above.
+		if worst > 2e-4 {
+			t.Fatalf("f32 tiled M=%d N=%d K=%d: worst relative Δ %.3g vs float64 CPU", sh.M, sh.N, sh.K, worst)
+		}
+	}
+	t.Log("gemm_w8a8_tiled BIT-IDENTICAL to untiled across 5 shapes; gemm_f32_tiled ≡ float64 CPU reference")
 }

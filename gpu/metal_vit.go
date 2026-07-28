@@ -354,6 +354,71 @@ kernel void gelu_erf(device float* x [[buffer(0)]], constant int& n [[buffer(1)]
 {
     float vv = x[gid];
     x[gid] = 0.5f * vv * (1.0f + erf_approx(vv / 1.4142135623730951f));
+}
+
+// ---------------------------------------------------------------------------
+// TILED GEMMs (throughput) — the Metal mirror of vit.cu's tiled section. The untiled
+// gemm_w8a8 / gemm_f32 above are correctness-first: one thread per output, each re-reading
+// a whole A row and B row from global memory. These stage a TILE×TILE block of A and of B
+// through threadgroup memory per K-chunk, so each element is read once per tile.
+//
+// Launched via Run2D (dispatchThreadgroups — UNIFORM whole threadgroups), so the edge
+// tiles are full and every thread reaches the barrier; each thread then bounds-checks its
+// own (m,n,k), exactly like the CUDA kernels. This is the ONE Metal kernel family that
+// keeps the CUDA bounds checks, because its dispatch is uniform, not dispatchThreads.
+//
+// gemm_w8a8_tiled is expected BIT-IDENTICAL to the untiled kernel: the accumulator is
+// int32 and integer addition is associative, so re-chunking K cannot change the sum (no
+// overflow at ViT shapes: K·127² ≈ 1.9e7 ≪ 2³¹). gemm_f32_tiled cannot claim that (f32
+// addition reassociates), so it is gated on a tight relative bound vs a float64 reference.
+#define TILE 16
+
+kernel void gemm_w8a8_tiled(
+    device const char* A [[buffer(0)]], device const float* aScale [[buffer(1)]],
+    device const char* B [[buffer(2)]], device const float* bScale [[buffer(3)]],
+    device float* C [[buffer(4)]],
+    constant int& M [[buffer(5)]], constant int& N [[buffer(6)]], constant int& K [[buffer(7)]],
+    uint2 tgpos [[threadgroup_position_in_grid]], uint2 tid [[thread_position_in_threadgroup]])
+{
+    threadgroup char As[TILE][TILE];
+    threadgroup char Bs[TILE][TILE];
+    int tx = (int)tid.x, ty = (int)tid.y;
+    int m = (int)tgpos.y * TILE + ty;
+    int n = (int)tgpos.x * TILE + tx;
+    int bRow = (int)tgpos.x * TILE + ty; // the B row this thread STAGES (not the one it uses)
+    int acc = 0;
+    for (int k0 = 0; k0 < K; k0 += TILE) {
+        int k = k0 + tx;
+        As[ty][tx] = (m < M && k < K) ? A[(uint)m * (uint)K + (uint)k] : (char)0;
+        Bs[ty][tx] = (bRow < N && k < K) ? B[(uint)bRow * (uint)K + (uint)k] : (char)0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < TILE; kk++) acc += (int)As[ty][kk] * (int)Bs[tx][kk];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (m < M && n < N) C[(uint)m * (uint)N + (uint)n] = (float)acc * aScale[m] * bScale[n];
+}
+
+kernel void gemm_f32_tiled(
+    device const float* A [[buffer(0)]], device const float* B [[buffer(1)]], device float* C [[buffer(2)]],
+    constant int& M [[buffer(3)]], constant int& N [[buffer(4)]], constant int& K [[buffer(5)]],
+    uint2 tgpos [[threadgroup_position_in_grid]], uint2 tid [[thread_position_in_threadgroup]])
+{
+    threadgroup float As[TILE][TILE];
+    threadgroup float Bs[TILE][TILE];
+    int tx = (int)tid.x, ty = (int)tid.y;
+    int m = (int)tgpos.y * TILE + ty;
+    int n = (int)tgpos.x * TILE + tx;
+    int bRow = (int)tgpos.x * TILE + ty;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TILE) {
+        int k = k0 + tx;
+        As[ty][tx] = (m < M && k < K) ? A[(uint)m * (uint)K + (uint)k] : 0.0f;
+        Bs[ty][tx] = (bRow < N && k < K) ? B[(uint)bRow * (uint)K + (uint)k] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < TILE; kk++) acc += As[ty][kk] * Bs[tx][kk];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (m < M && n < N) C[(uint)m * (uint)N + (uint)n] = acc;
 }`
 
 // Kernel entry points in vitMSL (identical names to the CUDA side).
@@ -373,7 +438,23 @@ const (
 	KernelAttentionSeg = "attention_seg"
 	KernelSiLUMul      = "silu_mul"
 	KernelGELUErf      = "gelu_erf"
+
+	// --- tiled GEMMs (throughput; identical names to the CUDA side) ---
+	KernelGEMMW8A8Tiled = "gemm_w8a8_tiled"
+	KernelGEMMF32Tiled  = "gemm_f32_tiled"
 )
+
+// GEMMTile is the tiled GEMMs' tile width; it must match vitMSL's TILE, which sizes the
+// threadgroup As/Bs staging arrays. Mirrors cuda_vit.go's GEMMTile.
+const GEMMTile = 16
+
+// TileDims is the tiled GEMMs' uniform-threadgroup 2-D geometry for Run2D: one
+// GEMMTile×GEMMTile output tile per threadgroup. (The CUDA side returns a LaunchConfig
+// from TileGrid; Metal's Run2D takes the grid/threadgroup extents directly, so this
+// returns them as four ints instead.)
+func TileDims(M, N int) (gx, gy, tgx, tgy int) {
+	return (N + GEMMTile - 1) / GEMMTile, (M + GEMMTile - 1) / GEMMTile, GEMMTile, GEMMTile
+}
 
 // ViTBlock is the threadgroup width the per-row/attention kernels reduce at; it must
 // match vitMSL's LNBLOCK (the static threadgroup reduction arrays are sized to it).
@@ -396,6 +477,10 @@ type ViT struct {
 	AttentionSeg Pipeline
 	SiLUMul      Pipeline
 	GELUErf      Pipeline
+
+	// Tiled GEMMs — same math, staged through threadgroup memory.
+	GEMMW8A8Tiled Pipeline
+	GEMMF32Tiled  Pipeline
 }
 
 // NewViT compiles vitMSL on this device and builds every encoder pipeline. The library
@@ -423,6 +508,8 @@ func (d *Device) NewViT() (ViT, error) {
 		{KernelAttentionSeg, &v.AttentionSeg},
 		{KernelSiLUMul, &v.SiLUMul},
 		{KernelGELUErf, &v.GELUErf},
+		{KernelGEMMW8A8Tiled, &v.GEMMW8A8Tiled},
+		{KernelGEMMF32Tiled, &v.GEMMF32Tiled},
 	} {
 		p, err := d.NewComputePipeline(lib, bind.name)
 		if err != nil {
