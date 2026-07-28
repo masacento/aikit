@@ -117,7 +117,9 @@ Two hard-won rules from the existing harnesses:
 ## Record schema (what every run emits)
 
 One JSON record per (workload × backend × shape × precision), so `benchstat` and
-ad-hoc analysis see comparable output across repos:
+ad-hoc analysis see comparable output across repos. **These records are the source
+of truth**; the human-readable results doc is generated from them (next section),
+so a published number can never drift from the run it came from.
 
 ```
 workload        e.g. "ann.FlatI8.QueryBatch" | "vision.SigLIP" | "goinfer.decode"
@@ -131,6 +133,51 @@ quality         {recall_at_k, parity_ok, max_delta_vs_cpu}
 speedup_vs_cpu  float   (same box; null if CPU-only or no CPU on this box)
 meta            {aikit_commit, go, build_flags, seed, warmup_launches, iters}
 ```
+
+## The results doc — generated from the records, never hand-maintained
+
+The published table (`docs/BENCH-gpu-results.md`) is **generated** by a `bench
+report` step that ingests `records.jsonl` and renders markdown — never hand-typed —
+the same drift-proof discipline `benchmarks/README.md` keeps. Re-generating after a
+run is the only way the doc changes.
+
+**"cpu / metal / cuda in one table" is a merge of two machine runs, not one run.**
+Metal exists only on Apple Silicon and CUDA only on NVIDIA; they never co-reside, so
+one run emits `{cpu-arm64, metal}` and another emits `{cpu-amd64, cuda}`. The report
+tool joins both machines' records on the comparable axis (workload × shape ×
+precision).
+
+**The `cpu` column is not one thing.** The CPU baseline paired with Metal is an
+M-series arm64 chip; paired with CUDA it's a different amd64 chip. Absolute
+latency/throughput compares *only within a machine*. So the report emits two views,
+and **never** a raw `cpu | metal | cuda` table of absolute numbers (that silently
+puts two different CPUs — and two machines — in adjacent columns):
+
+1. **Per-machine tables — primary, apples-to-apples.** One per device, each a true
+   same-box comparison showing the speedup the GPU actually delivers there:
+
+   ```
+   NVIDIA <gpu>, driver <v>, <cpu> amd64:
+   | workload | shape | precision | cpu-amd64 q/s | cuda q/s | speedup | recall | parity |
+   Apple <chip> arm64:
+   | workload | shape | precision | cpu-arm64 q/s | metal q/s | speedup | recall | parity |
+   ```
+
+2. **Normalized cross-platform summary — the only honest all-backends view.**
+   Absolute ms don't compare across machines, but *speedup over the CPU each GPU
+   ships next to* does — the decision-relevant "is the GPU worth it on this
+   platform" number:
+
+   ```
+   | workload | shape | precision | metal ×vs-M-CPU | cuda ×vs-amd64-CPU | crossover N×batch |
+   ```
+
+   The shared substrate GEMV is the one row even the raw kernel is cross-repo
+   comparable on — normalize it to **GB/s (or %-of-peak)**, not ms.
+
+goinfer's decode records feed the same `bench report` and land in their own
+per-machine table (its own CPU-and-Ollama baselines); only the substrate-GEMV row
+joins aikit's normalized summary.
 
 ## Where the benchmarks live
 

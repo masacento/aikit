@@ -153,7 +153,7 @@ the paged `LoadFlatI8MmapPaged` path. **Parity-gated:** GPU-ANN top-k ≡ CPU-AN
 indexes (rank-exact within the int8 tolerance). This is *new* coverage (ANN has none today) and
 the biggest single-workload win — the payoff the product bet is aimed at.
 
-**Phase 3 — vision native + the Qwen ViT resident path — 🟡 SigLIP DONE on CUDA + Metal; Qwen2.5-VL DONE on CUDA (Metal mirror remains).**
+**Phase 3 — vision native + the Qwen ViT resident path — ✅ DONE on CUDA + Metal (SigLIP and Qwen2.5-VL on both).**
 `vision.ResidentEncoder` already existed (WebGPU SigLIP, "~9×"); the native CUDA
 *and* Metal implementations now exist too:
 
@@ -186,12 +186,25 @@ the biggest single-workload win — the payoff the product bet is aimed at.
   `dispatchThreads` (no bounds checks), UMA (`Floats()` is a live view, no upload/download),
   scalars as 1-element buffers, and one `LockOSThread` per forward for the autorelease pool.
 
-**Qwen2.5-VL — ✅ DONE on CUDA.** `vision.QwenResidentEncoder` (the seam `qwen_encoder.go`
-flagged as a follow-on) plus `gpu/qwencuda`. Five kernels beyond the SigLIP set — weight-only
-RMSNorm, NeoX 2D rotary on a fused QKV, **segmented** attention (windowed vs full per block),
-gated SiLU, and an **erf**-GELU distinct from SigLIP's tanh one. Parity on the pinned tiny
-tower: ViT **cosine 1.000000000** (Δ 1.13e-06) and merged features **1.000000000** (Δ 6.71e-08),
-with both attention kinds exercised.
+**Qwen2.5-VL — ✅ DONE on CUDA + Metal.** `vision.QwenResidentEncoder` (the seam `qwen_encoder.go`
+flagged as a follow-on) plus `gpu/qwencuda` (CUDA) and `gpu/qwenmetal` (Metal). Five kernels
+beyond the SigLIP set — weight-only RMSNorm, NeoX 2D rotary on a fused QKV, **segmented**
+attention (windowed vs full per block), gated SiLU, and an **erf**-GELU distinct from SigLIP's
+tanh one. The seam itself (`vision/qwen_resident.go`: `BuildWindowPlan`, `IsFullAtt`,
+`MergeHidden`, the fp32-or-int8 `QwenGPUWeights`) is platform-neutral, so the Metal side was only
+the five MSL kernels + the resident wiring, structurally identical to `qwencuda`. Parity on the
+pinned tiny tower, **identical on both platforms**: ViT **cosine 1.000000000** (Δ 1.13e-06) and
+merged features **1.000000000** (CUDA Δ 6.71e-08, Metal Δ 5.96e-08), both attention kinds
+exercised, break-it-first −0.999971. Per-kernel Metal gates all beat the CUDA bars (rmsnorm
+9.5e-07, gelu_erf 4.8e-07 and distinct from gelu_tanh by 4.7e-4, silu 9.5e-07, rope exact with the
+v-third proven untouched, attention_seg 1.8e-07 with bounds-enforcement proven).
+
+Two Metal-specific notes worth recording. MSL's `half` is the f16 **type keyword** (the rotary's
+`hd/2` had to be renamed off it), and — contrary to the CUDA-box hand-off — **MSL has no stdlib
+`erf`** on this toolchain, so `gelu_erf` carries an Abramowitz-&-Stegun 7.1.26 approximation
+(max err ~1.5e-7, at the f32 floor); the erf-vs-tanh discrimination is unaffected. The f32
+reductions (no `double` in MSL) and the same `CompileLibraryPrecise` fast-math-off compile as the
+SigLIP set apply here too.
 
 Two deliberate host/device splits, documented in the package: the **window permutation** is done
 by permuting pixel ROWS before upload (the patch embed is row-wise, so this needs no gather
@@ -199,11 +212,10 @@ kernel) and reuses `vision.BuildWindowPlan` rather than reimplementing the index
 the **patch merger** stays on the CPU, being three small ops over n_patches/merge² groups against
 32 blocks of tower.
 
-**Still to do in Phase 3:** the **Metal** mirror of the five Qwen kernels (`metal_vit.go`'s ViT
-does not carry them yet, so a Qwen resident encoder is CUDA-only), and **tiling** the
-correctness-first GEMMs. Note the parity fixtures are *tiny* towers: they gate correctness
-sharply and say nothing about throughput, so tiling must be driven by a real SigLIP-so400m /
-dynamic-res Qwen measurement, not by assumption.
+**Still to do in Phase 3:** just **tiling** the correctness-first GEMMs. Note the parity fixtures
+are *tiny* towers: they gate correctness sharply and say nothing about throughput, so tiling must
+be driven by a real SigLIP-so400m / dynamic-res Qwen measurement, not by assumption
+(`docs/BENCH-gpu.md` is that methodology).
 
 **Phase 4 — encoder native. ⚠️ Bigger than this plan assumed: `encoder.Backend` is a DANGLING
 SEAM.** The plan says "`encoder.Backend` already has `webgpu`; add native Metal/CUDA", which
@@ -274,13 +286,14 @@ portable, CPU always).
 **Phase 0 ✅** → **Phase 1 ✅** (`aikit/gpu` + Metal device layer + minimal-kernel ANN proof +
 goinfer-Metal device re-point) → **Phase 2 ✅** (ANN-GPU batch-GEMM — the headline) → **Phase 1b
 ✅** (CUDA device impl + CUDA ANN backend + the tuned-GEMV blob-split + the goinfer CUDA device
-re-point, all parity-gated on an RTX 2070 SUPER) → **Phase 3 🟡** (SigLIP done on BOTH CUDA and Metal;
-Qwen2.5-VL done on CUDA — only the Metal mirror of its five kernels remains) → **Phase 4** (encoder native — but see the
+re-point, all parity-gated on an RTX 2070 SUPER) → **Phase 3 ✅** (SigLIP and Qwen2.5-VL both done
+on BOTH CUDA and Metal; only GEMM tiling remains, and it is throughput work driven by a real
+measurement) → **Phase 4** (encoder native — but see the
 dangling-seam finding above: it starts with wiring, not with a backend).
 
 **Nothing is gated behind an unfired trigger any more.** Every "wait for X to settle" in this
 plan has been discharged: the tuned kernels stabilized, the blob-split turned out to be a clean
 entry-point cut rather than a disentangling, and both device re-points landed bit-identical.
-What remains — Qwen2.5-VL, encoder-native (wiring first), and tiling the correctness-first
+What remains — encoder-native (wiring first), and tiling the correctness-first
 GEMMs — is simply unbuilt work, sequenced by value rather than by risk. `embed` is ruled out on the
 merits (above), not deferred.

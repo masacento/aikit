@@ -239,6 +239,10 @@ type Buffer struct {
 // buffer (e.g. q/k/v out of a fused QKV output). Zero-copy; only the bind offset changes.
 func (b Buffer) At(byteOff int) Buffer { b.off = uintptr(byteOff); return b }
 
+// Len reports the buffer's element count (float32s, or bytes for an int8 buffer) —
+// mirrors cuda.go's Buffer.Len so a consumer can guard on an empty/optional buffer.
+func (b Buffer) Len() int { return b.n }
+
 // NewCommandQueue creates the command queue (built once, reused per token in the real backend).
 func (d *Device) NewCommandQueue() Queue {
 	q := d.id.Send(selNewCommandQueue)

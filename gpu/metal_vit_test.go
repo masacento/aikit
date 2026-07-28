@@ -345,3 +345,227 @@ func TestMetal_vitAddOps(t *testing.T) {
 	}
 	t.Log("add_bias / add_vec ≡ CPU references")
 }
+
+// --- Qwen2.5-VL kernel gates (Metal mirror of cuda_vit_test.go's Qwen section) ---
+
+// segb binds int32 per-patch segment bounds as a device buffer. Non-negative bounds are
+// bit-identical as uint32, and the kernel reads them as `device const int*`.
+func segb(d *Device, s []int32) Buffer {
+	u := make([]uint32, len(s))
+	for i, v := range s {
+		u[i] = uint32(v)
+	}
+	return d.NewBufferUint32s(u)
+}
+
+// TestMetal_vitRMSNorm gates weight-only RMSNorm against vision/qwen_encoder.go's
+// rmsNorm: no mean subtraction, no bias, eps INSIDE the mean-square. The mean-square
+// reduces in f32 (no double in MSL), so the bar is looser than the CUDA 1e-5, stated.
+func TestMetal_vitRMSNorm(t *testing.T) {
+	d, q, v := vitSetupM(t)
+	rng := rand.New(rand.NewSource(21))
+	const eps = 1e-6
+	worstAll := 0.0
+	for _, shape := range []struct{ rows, dim int }{{1, 32}, {12, 128}, {7, 257}, {64, 1152}} {
+		x := randF32M(rng, shape.rows*shape.dim, 2)
+		w := randF32M(rng, shape.dim, 1)
+		want := make([]float32, len(x))
+		for r := range shape.rows {
+			xr := x[r*shape.dim : (r+1)*shape.dim]
+			var ss float64
+			for _, val := range xr {
+				ss += float64(val) * float64(val)
+			}
+			inv := 1.0 / math.Sqrt(ss/float64(shape.dim)+eps)
+			for i := range shape.dim {
+				want[r*shape.dim+i] = float32(float64(xr[i])*inv) * w[i]
+			}
+		}
+		out := d.NewBufferLen(len(x))
+		run1d(q, v.RMSNorm, shape.rows*ViTBlock, ViTBlock,
+			d.NewBufferFloats(x), d.NewBufferFloats(w), out, i32b(d, shape.rows), i32b(d, shape.dim), f32b(d, eps))
+		if dmax := maxAbsDiffM(out.Floats(), want); dmax > worstAll {
+			worstAll = dmax
+		}
+	}
+	t.Logf("rmsnorm f32-reduction worst Δ %.3g vs double CPU (CUDA bar was 1e-5)", worstAll)
+	if worstAll > 5e-5 {
+		t.Errorf("rmsnorm worst Δ %.3g exceeds the stated f32 bound 5e-5", worstAll)
+	}
+}
+
+// TestMetal_vitGELUErf gates the EXACT (erf) GELU and — the point of a separate kernel —
+// proves it is measurably DIFFERENT from gelu_tanh. Qwen's merger uses erf; SigLIP uses
+// tanh. MSL has no stdlib erf, so gelu_erf carries an A&S approximation; the bar vs the
+// float64 reference is a stated f32 bound, but the distinctness from tanh (~5e-4) is what
+// makes shipping the right one non-vacuous.
+func TestMetal_vitGELUErf(t *testing.T) {
+	d, q, v := vitSetupM(t)
+	rng := rand.New(rand.NewSource(22))
+	x := randF32M(rng, 4096, 3)
+	want := make([]float32, len(x))
+	for i, val := range x {
+		vv := float64(val)
+		want[i] = float32(0.5 * vv * (1.0 + math.Erf(vv/math.Sqrt2)))
+	}
+	dx := d.NewBufferFloats(x)
+	run1d(q, v.GELUErf, len(x), mtg(len(x)), dx, i32b(d, len(x)))
+	got := append([]float32(nil), dx.Floats()...)
+	dm := maxAbsDiffM(got, want)
+	t.Logf("gelu_erf f32-approx worst Δ %.3g vs double math.Erf (CUDA bar was 1e-6)", dm)
+	if dm > 5e-5 {
+		t.Fatalf("gelu_erf worst Δ %.3g exceeds the stated f32 bound 5e-5", dm)
+	}
+	dx2 := d.NewBufferFloats(x)
+	run1d(q, v.GELUTanh, len(x), mtg(len(x)), dx2, i32b(d, len(x)))
+	sep := maxAbsDiffM(dx2.Floats(), got)
+	if sep <= 1e-6 {
+		t.Errorf("gelu_erf and gelu_tanh are indistinguishable (Δ %.3g) — one of them is wrong", sep)
+	}
+	t.Logf("gelu_erf distinct from gelu_tanh by Δ %.3g", sep)
+}
+
+// TestMetal_vitSiLUMul gates gate = silu(gate) * up. silu runs in f32 here (no double),
+// so the bar is a stated f32 bound rather than the CUDA 1e-6.
+func TestMetal_vitSiLUMul(t *testing.T) {
+	d, q, v := vitSetupM(t)
+	rng := rand.New(rand.NewSource(23))
+	gate := randF32M(rng, 2048, 2)
+	up := randF32M(rng, 2048, 2)
+	want := make([]float32, len(gate))
+	for i := range gate {
+		vv := float64(gate[i])
+		want[i] = float32(vv/(1.0+math.Exp(-vv))) * up[i]
+	}
+	dg := d.NewBufferFloats(gate)
+	run1d(q, v.SiLUMul, len(gate), mtg(len(gate)), dg, d.NewBufferFloats(up), i32b(d, len(gate)))
+	dm := maxAbsDiffM(dg.Floats(), want)
+	t.Logf("silu_mul f32 worst Δ %.3g vs double CPU (CUDA bar was 1e-6)", dm)
+	if dm > 5e-5 {
+		t.Fatalf("silu_mul worst Δ %.3g exceeds the stated f32 bound 5e-5", dm)
+	}
+}
+
+// TestMetal_vitRopeQK gates the in-place NeoX rotary on the q and k thirds of a fused
+// qkv buffer, and that the v third is left ALONE — an off-by-one third would be invisible
+// to a q/k-only check. Pure elementwise f32, so the tight bound holds.
+func TestMetal_vitRopeQK(t *testing.T) {
+	d, q, v := vitSetupM(t)
+	rng := rand.New(rand.NewSource(24))
+	const seq, nH, hd = 9, 3, 16
+	hidden := nH * hd
+	qkv := randF32M(rng, seq*3*hidden, 1)
+	cos := randF32M(rng, seq*hd, 1)
+	sin := randF32M(rng, seq*hd, 1)
+
+	want := append([]float32(nil), qkv...)
+	hf := hd / 2
+	for i := range seq {
+		co, si := cos[i*hd:(i+1)*hd], sin[i*hd:(i+1)*hd]
+		for head := range nH {
+			for _, base := range []int{i*3*hidden + head*hd, i*3*hidden + hidden + head*hd} {
+				for dd := range hf {
+					x, y := want[base+dd], want[base+dd+hf]
+					want[base+dd] = x*co[dd] - y*si[dd]
+					want[base+dd+hf] = y*co[dd+hf] + x*si[dd+hf]
+				}
+			}
+		}
+	}
+
+	dq := d.NewBufferFloats(qkv)
+	run1d(q, v.RopeQK, seq*nH*hf, mtg(seq*nH*hf),
+		dq, d.NewBufferFloats(cos), d.NewBufferFloats(sin), i32b(d, seq), i32b(d, nH), i32b(d, hd))
+	got := dq.Floats()
+	if dm := maxAbsDiffM(got, want); dm > 1e-5 {
+		t.Fatalf("rope_qk worst Δ %.3g", dm)
+	}
+	for i := range seq {
+		vb := i*3*hidden + 2*hidden
+		for j := range hidden {
+			if got[vb+j] != qkv[vb+j] {
+				t.Fatalf("rope_qk modified v at patch %d dim %d", i, j)
+			}
+		}
+	}
+	t.Log("rope_qk ≡ CPU applyRotaryVision on q,k; v untouched")
+}
+
+// TestMetal_vitAttentionSeg gates segmented attention: each query attends only within
+// its own segment, with a structural break-it-first — a single whole-sequence segment
+// must give a different answer, or the bounds are being ignored.
+func TestMetal_vitAttentionSeg(t *testing.T) {
+	d, q, v := vitSetupM(t)
+	rng := rand.New(rand.NewSource(25))
+	const seq, nH, hd = 12, 2, 8
+	hidden := nH * hd
+	qkv := randF32M(rng, seq*3*hidden, 1)
+	segStart := make([]int32, seq)
+	segEnd := make([]int32, seq)
+	maxSeg := 0
+	for _, b := range [][2]int{{0, 5}, {5, 12}} {
+		if b[1]-b[0] > maxSeg {
+			maxSeg = b[1] - b[0]
+		}
+		for i := b[0]; i < b[1]; i++ {
+			segStart[i], segEnd[i] = int32(b[0]), int32(b[1])
+		}
+	}
+	scale := float32(1.0 / math.Sqrt(float64(hd)))
+
+	want := make([]float32, seq*hidden)
+	for h := range nH {
+		off := h * hd
+		for i := range seq {
+			s0, s1 := int(segStart[i]), int(segEnd[i])
+			sc := make([]float64, s1-s0)
+			maxv := math.Inf(-1)
+			for tt := s0; tt < s1; tt++ {
+				var acc float32
+				for dd := range hd {
+					acc += qkv[i*3*hidden+off+dd] * qkv[tt*3*hidden+hidden+off+dd]
+				}
+				sc[tt-s0] = float64(acc * scale)
+				if sc[tt-s0] > maxv {
+					maxv = sc[tt-s0]
+				}
+			}
+			var sum float64
+			for j := range sc {
+				sc[j] = math.Exp(sc[j] - maxv)
+				sum += sc[j]
+			}
+			for dd := range hd {
+				var acc float64
+				for tt := s0; tt < s1; tt++ {
+					acc += (sc[tt-s0] / sum) * float64(qkv[tt*3*hidden+2*hidden+off+dd])
+				}
+				want[i*hidden+off+dd] = float32(acc)
+			}
+		}
+	}
+
+	dq := d.NewBufferFloats(qkv)
+	out := d.NewBufferLen(seq * hidden)
+	run1dTG(q, v.AttentionSeg, seq*nH*ViTBlock, ViTBlock, maxSeg*4,
+		dq, out, segb(d, segStart), segb(d, segEnd), i32b(d, seq), i32b(d, nH), i32b(d, hd), f32b(d, scale))
+	got := append([]float32(nil), out.Floats()...)
+	dm := maxAbsDiffM(got, want)
+	t.Logf("attention_seg f32-softmax worst Δ %.3g vs double CPU (CUDA bar was 1e-5)", dm)
+	if dm > 5e-5 {
+		t.Fatalf("attention_seg worst Δ %.3g exceeds the stated f32 bound 5e-5", dm)
+	}
+
+	one := make([]int32, seq)
+	oneEnd := make([]int32, seq)
+	for i := range seq {
+		one[i], oneEnd[i] = 0, seq
+	}
+	out2 := d.NewBufferLen(seq * hidden)
+	run1dTG(q, v.AttentionSeg, seq*nH*ViTBlock, ViTBlock, seq*4,
+		dq, out2, segb(d, one), segb(d, oneEnd), i32b(d, seq), i32b(d, nH), i32b(d, hd), f32b(d, scale))
+	if maxAbsDiffM(out2.Floats(), got) < 1e-4 {
+		t.Error("break-it-first vacuous: windowed and full attention agree — bounds ignored?")
+	}
+	t.Log("attention_seg ≡ CPU per-segment MHA; full-attention differs (bounds enforced)")
+}
