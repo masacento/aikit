@@ -153,6 +153,26 @@ the paged `LoadFlatI8MmapPaged` path. **Parity-gated:** GPU-ANN top-k ≡ CPU-AN
 indexes (rank-exact within the int8 tolerance). This is *new* coverage (ANN has none today) and
 the biggest single-workload win — the payoff the product bet is aimed at.
 
+**Benchmark scaffolding — ✅ DONE, and the first slice surfaced a real finding.** The
+`docs/BENCH-gpu.md` machinery is built: `bench/record.go` (the records.jsonl schema), `bench/report.go`
++ `bench/cmd/benchreport` (the results doc is GENERATED, never hand-typed — per-machine tables +
+a normalized cross-platform summary + derived crossover thresholds), and the device-gated ANN
+crossover harnesses (`gpu/annmetal`, `gpu/anncuda`, run on real Model2Vec embeddings under
+`AIKIT_GPU_BENCH=1`). Generated output: `docs/BENCH-gpu-results.md` from `docs/bench-records/`.
+
+The first Apple run (M1 Pro, `FlatI8.QueryBatch`, N=1e4–1e5 × batch 1–256, int8) is a **negative
+result that the methodology exists to catch**: Metal **loses ~5×** to the CPU across the whole
+sweep (0.10–0.59×), and throughput is **flat across batch** (no amortization). Parity is perfect —
+Metal top-k ≡ CPU int8 top-k, recall identical — so this is not a bug, it is a **kernel-maturity**
+finding: `gpu/annmetal`'s `gemm_w8a8` is still the Phase-1 *correctness-only* one-thread-per-output
+GEMV (~8 GOP/s), and it re-copies the full M×N score matrix to host every call, so the strong
+M1-Pro SIMD CPU (~39 GOP/s) wins and the crossover is never reached. So **Phase 2's "headline
+unlock" is NOT yet realized on Apple** — it needs the deferred **tuned W8A8 GEMM** (the same
+`simdgroup_matrix`/tiling treatment `gemm_f32_sg_big` got) and ideally **on-device top-k** (to
+avoid the full-score D2H). The CUDA crossover is the NVIDIA box's to run with the same harness;
+its tuned kernel + a weaker CPU baseline may cross over where Metal does not — the normalized
+summary will show it once that file lands in `docs/bench-records/`.
+
 **Phase 3 — vision native + the Qwen ViT resident path — ✅ DONE on CUDA + Metal (SigLIP and Qwen2.5-VL on both).**
 `vision.ResidentEncoder` already existed (WebGPU SigLIP, "~9×"); the native CUDA
 *and* Metal implementations now exist too:
