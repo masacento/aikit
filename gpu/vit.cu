@@ -239,3 +239,167 @@ extern "C" __global__ void attention(
         oi[d] = acc;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Qwen2.5-VL ViT additions (Phase 3). The SigLIP set above covers the shared ops;
+// these are the five Qwen needs on top, and they are written against
+// vision/qwen_encoder.go's arithmetic for the same parity reason.
+//
+// Note gelu_erf below is a DIFFERENT function from gelu_tanh above. Qwen's patch
+// merger uses nn.GELU()'s exact erf form while its SigLIP counterpart uses the tanh
+// approximation; they differ by ~5e-4, which is far more than the parity bar. Both
+// are shipped, and callers must pick deliberately.
+// ---------------------------------------------------------------------------
+
+// rmsnorm: weight-only RMS normalization (no mean subtraction, no bias) —
+// x * rsqrt(mean(x^2) + eps) * w, double-accumulated to match rmsNorm. One block
+// per row.
+extern "C" __global__ void rmsnorm(
+    const float* __restrict__ x, const float* __restrict__ w,
+    float* __restrict__ out, int rows, int dim, float eps)
+{
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    const float* xr = x + (long)r * dim;
+    float* dst = out + (long)r * dim;
+    __shared__ double sm[LNBLOCK];
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        double v = (double)xr[i];
+        acc += v * v;
+    }
+    sm[threadIdx.x] = acc;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) sm[threadIdx.x] += sm[threadIdx.x + o];
+        __syncthreads();
+    }
+    double inv = 1.0 / sqrt(sm[0] / (double)dim + (double)eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        dst[i] = (float)((double)xr[i] * inv) * w[i];
+    }
+}
+
+// rope_qk: NeoX rotate_half 2D rotary applied IN PLACE to the q and k thirds of a
+// fused qkv buffer [seq, 3*hidden] — row layout [3, nH, hd], so q is at offset 0 and
+// k at offset hidden. v is untouched. Splitting qkv into three buffers first would be
+// a pure copy; indexing the thirds here avoids it.
+//
+// Each thread owns one (patch, head, d) pair with d < hd/2 and rotates BOTH q and k,
+// reading x and y before writing either — the pairs are disjoint, so this is
+// race-free and bit-identical to the CPU's in-place pairwise form.
+extern "C" __global__ void rope_qk(
+    float* __restrict__ qkv, const float* __restrict__ cos, const float* __restrict__ sin,
+    int seq, int nH, int hd)
+{
+    int half = hd / 2;
+    long g = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    long total = (long)seq * nH * half;
+    if (g >= total) return;
+    int d = (int)(g % half);
+    long rest = g / half;
+    int head = (int)(rest % nH);
+    int i = (int)(rest / nH);
+    int hidden = nH * hd;
+
+    const float* co = cos + (long)i * hd;
+    const float* si = sin + (long)i * hd;
+    long qoff = (long)i * 3 * hidden + (long)head * hd;
+    long koff = qoff + hidden;
+
+    float x = qkv[qoff + d], y = qkv[qoff + d + half];
+    qkv[qoff + d] = x * co[d] - y * si[d];
+    qkv[qoff + d + half] = y * co[d + half] + x * si[d + half];
+
+    x = qkv[koff + d]; y = qkv[koff + d + half];
+    qkv[koff + d] = x * co[d] - y * si[d];
+    qkv[koff + d + half] = y * co[d + half] + x * si[d + half];
+}
+
+// attention_seg: bidirectional MHA restricted to each patch's cu_seqlens SEGMENT —
+// a window for most blocks, a whole image for the fullatt blocks. The caller passes
+// per-patch segment bounds (segStart/segEnd) rather than the cu_seqlens prefix array,
+// so the kernel needs no search.
+//
+// Reads q/k/v from the FUSED qkv buffer [seq, 3*hidden] at offsets 0/hidden/2*hidden.
+// One block per (head, query); the segment's scores stage in dynamic shared memory,
+// so the caller sizes it to maxSegment*4 bytes.
+extern "C" __global__ void attention_seg(
+    const float* __restrict__ qkv, float* __restrict__ out,
+    const int* __restrict__ segStart, const int* __restrict__ segEnd,
+    int seq, int nH, int hd, float scale)
+{
+    int blk = blockIdx.x;
+    if (blk >= nH * seq) return;
+    int h = blk / seq, i = blk % seq;
+    int hidden = nH * hd, off = h * hd;
+    int s0 = segStart[i], s1 = segEnd[i], n = s1 - s0;
+    extern __shared__ float sc[];
+
+    const float* qi = qkv + (long)i * 3 * hidden + off;
+    for (int t = threadIdx.x; t < n; t += blockDim.x) {
+        const float* kj = qkv + (long)(s0 + t) * 3 * hidden + hidden + off;
+        float acc = 0.f;
+        for (int d = 0; d < hd; d++) acc += qi[d] * kj[d];
+        sc[t] = acc * scale;
+    }
+    __syncthreads();
+
+    __shared__ float smax[LNBLOCK];
+    __shared__ double ssum[LNBLOCK];
+    float m = -3.402823466e+38f;
+    for (int t = threadIdx.x; t < n; t += blockDim.x) if (sc[t] > m) m = sc[t];
+    smax[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o && smax[threadIdx.x + o] > smax[threadIdx.x]) smax[threadIdx.x] = smax[threadIdx.x + o];
+        __syncthreads();
+    }
+    float mx = smax[0];
+    __syncthreads();
+
+    double su = 0.0;
+    for (int t = threadIdx.x; t < n; t += blockDim.x) {
+        double e = exp((double)sc[t] - (double)mx);
+        sc[t] = (float)e;
+        su += e;
+    }
+    ssum[threadIdx.x] = su;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) ssum[threadIdx.x] += ssum[threadIdx.x + o];
+        __syncthreads();
+    }
+    double inv = 1.0 / ssum[0];
+    __syncthreads();
+    for (int t = threadIdx.x; t < n; t += blockDim.x) sc[t] = (float)((double)sc[t] * inv);
+    __syncthreads();
+
+    float* oi = out + (long)i * hidden + off;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float acc = 0.f;
+        for (int t = 0; t < n; t++) acc += sc[t] * qkv[(long)(s0 + t) * 3 * hidden + 2 * hidden + off + d];
+        oi[d] = acc;
+    }
+}
+
+// silu_mul: gate = silu(gate) * up, the gated-MLP activation. silu in double to match
+// the CPU's float64 exp.
+extern "C" __global__ void silu_mul(
+    float* __restrict__ gate, const float* __restrict__ up, int n)
+{
+    long g = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n) return;
+    double v = (double)gate[g];
+    gate[g] = (float)(v / (1.0 + exp(-v))) * up[g];
+}
+
+// gelu_erf: the EXACT (erf) GELU — nn.GELU()'s default, used by Qwen's patch merger.
+// Distinct from gelu_tanh above; see the header note.
+extern "C" __global__ void gelu_erf(float* __restrict__ x, int n)
+{
+    long g = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n) return;
+    double v = (double)x[g];
+    x[g] = (float)(0.5 * v * (1.0 + erf(v / 1.4142135623730951)));
+}

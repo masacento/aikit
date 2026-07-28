@@ -65,6 +65,36 @@ const (
 	// dynamic shared memory for the score row.
 	//   (q f32*, k f32*, v f32*, out f32*, np, nH, hd i32, scale f32)
 	KernelAttention = "attention"
+
+	// --- Qwen2.5-VL additions ---
+
+	// KernelRMSNorm is weight-only RMS normalization (no mean subtraction, no bias).
+	// Launch ONE BLOCK PER ROW.
+	//   (x f32*, w f32*, out f32*, rows i32, dim i32, eps f32)
+	KernelRMSNorm = "rmsnorm"
+
+	// KernelRopeQK applies NeoX rotate_half 2D rotary IN PLACE to the q and k thirds
+	// of a FUSED qkv buffer [seq, 3*hidden] (row layout [3, nH, hd]); v is untouched.
+	// One thread per (patch, head, d<hd/2).
+	//   (qkv f32*, cos f32*, sin f32*, seq, nH, hd i32)
+	KernelRopeQK = "rope_qk"
+
+	// KernelAttentionSeg is bidirectional MHA restricted to each patch's segment —
+	// a window, or a whole image for the fullatt blocks. Reads q/k/v from the fused
+	// qkv buffer. Launch ONE BLOCK PER (head, query) with maxSegment*4 bytes of
+	// dynamic shared memory. segStart/segEnd are PER-PATCH bounds, not cu_seqlens.
+	//   (qkv f32*, out f32*, segStart i32*, segEnd i32*, seq, nH, hd i32, scale f32)
+	KernelAttentionSeg = "attention_seg"
+
+	// KernelSiLUMul computes gate = silu(gate) * up — the gated-MLP activation.
+	//   (gate f32*, up f32*, n i32)
+	KernelSiLUMul = "silu_mul"
+
+	// KernelGELUErf is the EXACT (erf) GELU that nn.GELU() defaults to, used by
+	// Qwen's patch merger. NOT interchangeable with KernelGELUTanh — they differ by
+	// ~5e-4, far above any parity bar. Pick deliberately.
+	//   (x f32*, n i32)
+	KernelGELUErf = "gelu_erf"
 )
 
 // ViTBlock is the block width the per-row kernels reduce at. It must match vit.cu's
@@ -81,6 +111,13 @@ type ViT struct {
 	LayerNorm Pipeline
 	GELUTanh  Pipeline
 	Attention Pipeline
+
+	// Qwen2.5-VL additions.
+	RMSNorm      Pipeline
+	RopeQK       Pipeline
+	AttentionSeg Pipeline
+	SiLUMul      Pipeline
+	GELUErf      Pipeline
 }
 
 // NewViT loads ViTPTX on this device and builds every encoder pipeline. The module is
@@ -103,6 +140,11 @@ func (d *Device) NewViT() (ViT, error) {
 		{KernelLayerNorm, &v.LayerNorm},
 		{KernelGELUTanh, &v.GELUTanh},
 		{KernelAttention, &v.Attention},
+		{KernelRMSNorm, &v.RMSNorm},
+		{KernelRopeQK, &v.RopeQK},
+		{KernelAttentionSeg, &v.AttentionSeg},
+		{KernelSiLUMul, &v.SiLUMul},
+		{KernelGELUErf, &v.GELUErf},
 	} {
 		p, err := d.NewComputePipeline(lib, bind.name)
 		if err != nil {
@@ -122,6 +164,20 @@ func RowGrid(rows int) LaunchConfig {
 	return LaunchConfig{
 		GridX: uint32(rows), GridY: 1, GridZ: 1,
 		BlockX: ViTBlock, BlockY: 1, BlockZ: 1,
+	}
+}
+
+// SegAttentionGrid is attention_seg's geometry: one block per (head, query), with the
+// segment's score row in dynamic shared memory sized to the LARGEST segment (a window,
+// or a whole image on the fullatt blocks).
+func SegAttentionGrid(seq, heads, maxSeg int) LaunchConfig {
+	if seq <= 0 || heads <= 0 || maxSeg <= 0 {
+		return LaunchConfig{}
+	}
+	return LaunchConfig{
+		GridX: uint32(seq * heads), GridY: 1, GridZ: 1,
+		BlockX: ViTBlock, BlockY: 1, BlockZ: 1,
+		SharedMemBytes: uint32(maxSeg * 4),
 	}
 }
 

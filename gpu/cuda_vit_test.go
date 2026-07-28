@@ -428,3 +428,272 @@ func TestCUDA_vitAddOps(t *testing.T) {
 	}
 	t.Log("add_bias / add_vec ≡ CPU references")
 }
+
+// --- Qwen2.5-VL kernel gates ---
+
+// TestCUDA_vitRMSNorm gates weight-only RMSNorm against vision/qwen_encoder.go's
+// rmsNorm: no mean subtraction, no bias, eps INSIDE the mean-square.
+func TestCUDA_vitRMSNorm(t *testing.T) {
+	d, q, v := vitSetup(t)
+	rng := rand.New(rand.NewSource(11))
+	const eps = 1e-6
+	for _, shape := range []struct{ rows, dim int }{{1, 32}, {12, 128}, {7, 257}} {
+		x := randF32(rng, shape.rows*shape.dim, 2)
+		w := randF32(rng, shape.dim, 1)
+		want := make([]float32, len(x))
+		for r := range shape.rows {
+			xr := x[r*shape.dim : (r+1)*shape.dim]
+			var ss float64
+			for _, val := range xr {
+				ss += float64(val) * float64(val)
+			}
+			inv := 1.0 / math.Sqrt(ss/float64(shape.dim)+eps)
+			for i := range shape.dim {
+				want[r*shape.dim+i] = float32(float64(xr[i])*inv) * w[i]
+			}
+		}
+		dx, dw := NewBufferOf(d, x), NewBufferOf(d, w)
+		out := NewBufferLenOf[float32](d, len(x))
+		if err := q.Launch(v.RMSNorm, RowGrid(shape.rows), Arg(dx), Arg(dw), Arg(out),
+			ArgValue(int32(shape.rows)), ArgValue(int32(shape.dim)), ArgValue(float32(eps))); err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+		if err := q.Sync(); err != nil {
+			t.Fatalf("Sync: %v", err)
+		}
+		got := make([]float32, len(x))
+		if err := Download(out, got); err != nil {
+			t.Fatalf("Download: %v", err)
+		}
+		if dm := maxAbsDiff(got, want); dm > 1e-5 {
+			t.Fatalf("rows=%d dim=%d worst Δ %.3g", shape.rows, shape.dim, dm)
+		}
+		for _, b := range []Buffer{dx, dw, out} {
+			d.ReleaseBuf(b)
+		}
+	}
+	t.Log("rmsnorm ≡ CPU rmsNorm across 3 shapes")
+}
+
+// TestCUDA_vitGELUErf gates the EXACT erf-GELU and — the point of a separate kernel —
+// proves it is measurably DIFFERENT from gelu_tanh. Qwen's merger uses erf; SigLIP
+// uses tanh. Shipping one for both would be a silent numeric bug.
+func TestCUDA_vitGELUErf(t *testing.T) {
+	d, q, v := vitSetup(t)
+	rng := rand.New(rand.NewSource(12))
+	x := randF32(rng, 4096, 3)
+	want := make([]float32, len(x))
+	for i, val := range x {
+		vv := float64(val)
+		want[i] = float32(0.5 * vv * (1.0 + math.Erf(vv/math.Sqrt2)))
+	}
+	dx := NewBufferOf(d, x)
+	if err := q.Launch(v.GELUErf, Grid1D(len(x), 256), Arg(dx), ArgValue(int32(len(x)))); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := q.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	got := make([]float32, len(x))
+	if err := Download(dx, got); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if dm := maxAbsDiff(got, want); dm > 1e-6 {
+		t.Fatalf("gelu_erf worst Δ %.3g", dm)
+	}
+	dx2 := NewBufferOf(d, x)
+	if err := q.Launch(v.GELUTanh, Grid1D(len(x), 256), Arg(dx2), ArgValue(int32(len(x)))); err != nil {
+		t.Fatalf("tanh Launch: %v", err)
+	}
+	if err := q.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	tanhOut := make([]float32, len(x))
+	if err := Download(dx2, tanhOut); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	sep := maxAbsDiff(tanhOut, got)
+	if sep <= 1e-6 {
+		t.Errorf("gelu_erf and gelu_tanh are indistinguishable (Δ %.3g) — one of them is wrong", sep)
+	}
+	t.Logf("gelu_erf ≡ CPU geluErf; distinct from gelu_tanh by Δ %.3g", sep)
+}
+
+// TestCUDA_vitSiLUMul gates gate = silu(gate) * up.
+func TestCUDA_vitSiLUMul(t *testing.T) {
+	d, q, v := vitSetup(t)
+	rng := rand.New(rand.NewSource(13))
+	gate := randF32(rng, 2048, 2)
+	up := randF32(rng, 2048, 2)
+	want := make([]float32, len(gate))
+	for i := range gate {
+		vv := float64(gate[i])
+		want[i] = float32(vv/(1.0+math.Exp(-vv))) * up[i]
+	}
+	dg, du := NewBufferOf(d, gate), NewBufferOf(d, up)
+	if err := q.Launch(v.SiLUMul, Grid1D(len(gate), 256), Arg(dg), Arg(du), ArgValue(int32(len(gate)))); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := q.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	got := make([]float32, len(gate))
+	if err := Download(dg, got); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if dm := maxAbsDiff(got, want); dm > 1e-6 {
+		t.Fatalf("silu_mul worst Δ %.3g", dm)
+	}
+	t.Log("silu_mul ≡ CPU silu+multiply")
+}
+
+// TestCUDA_vitRopeQK gates the in-place NeoX rotary on the q and k thirds of a fused
+// qkv buffer, and that the v third is left ALONE — an off-by-one third would be
+// invisible to a q/k-only check.
+func TestCUDA_vitRopeQK(t *testing.T) {
+	d, q, v := vitSetup(t)
+	rng := rand.New(rand.NewSource(14))
+	const seq, nH, hd = 9, 3, 16
+	hidden := nH * hd
+	qkv := randF32(rng, seq*3*hidden, 1)
+	cos := randF32(rng, seq*hd, 1)
+	sin := randF32(rng, seq*hd, 1)
+
+	want := append([]float32(nil), qkv...)
+	half := hd / 2
+	for i := range seq {
+		co, si := cos[i*hd:(i+1)*hd], sin[i*hd:(i+1)*hd]
+		for head := range nH {
+			for _, base := range []int{i*3*hidden + head*hd, i*3*hidden + hidden + head*hd} {
+				for dd := range half {
+					x, y := want[base+dd], want[base+dd+half]
+					want[base+dd] = x*co[dd] - y*si[dd]
+					want[base+dd+half] = y*co[dd+half] + x*si[dd+half]
+				}
+			}
+		}
+	}
+
+	dq := NewBufferOf(d, qkv)
+	dc, ds := NewBufferOf(d, cos), NewBufferOf(d, sin)
+	if err := q.Launch(v.RopeQK, Grid1D(seq*nH*half, 256), Arg(dq), Arg(dc), Arg(ds),
+		ArgValue(int32(seq)), ArgValue(int32(nH)), ArgValue(int32(hd))); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := q.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	got := make([]float32, len(qkv))
+	if err := Download(dq, got); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if dm := maxAbsDiff(got, want); dm > 1e-6 {
+		t.Fatalf("rope_qk worst Δ %.3g", dm)
+	}
+	for i := range seq {
+		vb := i*3*hidden + 2*hidden
+		for j := range hidden {
+			if got[vb+j] != qkv[vb+j] {
+				t.Fatalf("rope_qk modified v at patch %d dim %d", i, j)
+			}
+		}
+	}
+	t.Log("rope_qk ≡ CPU applyRotaryVision on q,k; v untouched")
+}
+
+// TestCUDA_vitAttentionSeg gates segmented attention: each query attends only within
+// its own segment, with a structural break-it-first (a single whole-sequence segment
+// must give a different answer, or the bounds are being ignored).
+func TestCUDA_vitAttentionSeg(t *testing.T) {
+	d, q, v := vitSetup(t)
+	rng := rand.New(rand.NewSource(15))
+	const seq, nH, hd = 12, 2, 8
+	hidden := nH * hd
+	qkv := randF32(rng, seq*3*hidden, 1)
+	segStart := make([]int32, seq)
+	segEnd := make([]int32, seq)
+	maxSeg := 0
+	for _, b := range [][2]int{{0, 5}, {5, 12}} {
+		if b[1]-b[0] > maxSeg {
+			maxSeg = b[1] - b[0]
+		}
+		for i := b[0]; i < b[1]; i++ {
+			segStart[i], segEnd[i] = int32(b[0]), int32(b[1])
+		}
+	}
+	scale := float32(1.0 / math.Sqrt(float64(hd)))
+
+	want := make([]float32, seq*hidden)
+	for h := range nH {
+		off := h * hd
+		for i := range seq {
+			s0, s1 := int(segStart[i]), int(segEnd[i])
+			sc := make([]float64, s1-s0)
+			maxv := math.Inf(-1)
+			for tt := s0; tt < s1; tt++ {
+				var acc float32
+				for dd := range hd {
+					acc += qkv[i*3*hidden+off+dd] * qkv[tt*3*hidden+hidden+off+dd]
+				}
+				sc[tt-s0] = float64(acc * scale)
+				if sc[tt-s0] > maxv {
+					maxv = sc[tt-s0]
+				}
+			}
+			var sum float64
+			for j := range sc {
+				sc[j] = math.Exp(sc[j] - maxv)
+				sum += sc[j]
+			}
+			for dd := range hd {
+				var acc float64
+				for tt := s0; tt < s1; tt++ {
+					acc += (sc[tt-s0] / sum) * float64(qkv[tt*3*hidden+2*hidden+off+dd])
+				}
+				want[i*hidden+off+dd] = float32(acc)
+			}
+		}
+	}
+
+	dq := NewBufferOf(d, qkv)
+	dss, dse := NewBufferOf(d, segStart), NewBufferOf(d, segEnd)
+	out := NewBufferLenOf[float32](d, seq*hidden)
+	if err := q.Launch(v.AttentionSeg, SegAttentionGrid(seq, nH, maxSeg),
+		Arg(dq), Arg(out), Arg(dss), Arg(dse),
+		ArgValue(int32(seq)), ArgValue(int32(nH)), ArgValue(int32(hd)), ArgValue(scale)); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if err := q.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	got := make([]float32, seq*hidden)
+	if err := Download(out, got); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if dm := maxAbsDiff(got, want); dm > 1e-5 {
+		t.Fatalf("attention_seg worst Δ %.3g", dm)
+	}
+
+	one := make([]int32, seq)
+	oneEnd := make([]int32, seq)
+	for i := range seq {
+		one[i], oneEnd[i] = 0, seq
+	}
+	out2 := NewBufferLenOf[float32](d, seq*hidden)
+	if err := q.Launch(v.AttentionSeg, SegAttentionGrid(seq, nH, seq),
+		Arg(dq), Arg(out2), Arg(NewBufferOf(d, one)), Arg(NewBufferOf(d, oneEnd)),
+		ArgValue(int32(seq)), ArgValue(int32(nH)), ArgValue(int32(hd)), ArgValue(scale)); err != nil {
+		t.Fatalf("full Launch: %v", err)
+	}
+	if err := q.Sync(); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	full := make([]float32, seq*hidden)
+	if err := Download(out2, full); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	if maxAbsDiff(full, got) < 1e-4 {
+		t.Error("break-it-first vacuous: windowed and full attention agree — bounds ignored?")
+	}
+	t.Log("attention_seg ≡ CPU per-segment MHA; full-attention differs (bounds enforced)")
+}
