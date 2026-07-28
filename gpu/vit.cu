@@ -473,3 +473,82 @@ extern "C" __global__ void gemm_f32_tiled(
     }
     if (m < M && n < N) C[(long)m * N + n] = acc;
 }
+
+// ---------------------------------------------------------------------------
+// gemm_f32_reg — the register-blocked f32 GEMM (Phase 4 throughput).
+//
+// WHY THIS IS NOT A PORT OF METAL'S gemm_f32_sg_big. Metal's win came from dropping
+// shared staging entirely and loading A/B fragments straight from device memory. That
+// does not transfer, and the reason is the operand layout rather than the platform:
+// A is [M,K] and B is [N,K], both row-major, so BOTH operands are contiguous along K.
+// A thread owning output column n reads B[n*K + k] — consecutive threads are then K
+// floats apart, so a staging-free load is fully uncoalesced. The existing tiled kernel
+// is coalesced precisely BECAUSE it stages (consecutive threads read consecutive k).
+//
+// So this keeps shared staging to buy coalescing, and takes its speed from REGISTER
+// BLOCKING instead: each thread computes a 4x4 micro-tile, so one shared load feeds 16
+// FMAs instead of 1. Same idea as Metal's ("do more per thread"), opposite conclusion
+// about staging, for a layout reason — measured, not assumed.
+//
+// Geometry: 64x64 output tile per block, K stepped 16 at a time, 256 threads (16x16),
+// 4x4 outputs each. ALIGNED ONLY (M%64==0, N%64==0, K%16==0) so the inner loops carry
+// no bounds checks; GEMMF32Plan routes everything else to gemm_f32_tiled.
+//
+// The shared arrays are padded by one float. Without the pad, As is [16][64] and a
+// half-warp writing As[lc][lr] hits stride 64 — 64 % 32 == 0, so all 16 lanes land in
+// ONE bank (a 16-way conflict). Padding to 65 makes the stride odd and the writes
+// conflict-free. This is invisible in correctness and worth ~a third of the throughput.
+// ---------------------------------------------------------------------------
+
+#define RBM 64
+#define RBN 64
+#define RBK 16
+#define RTM 4
+#define RTN 4
+
+extern "C" __global__ void gemm_f32_reg(
+    const float* __restrict__ A, const float* __restrict__ B,
+    float* __restrict__ C, int M, int N, int K)
+{
+    __shared__ float As[RBK][RBM + 1];
+    __shared__ float Bs[RBK][RBN + 1];
+    int tid = threadIdx.y * blockDim.x + threadIdx.x; // 0..255
+    int m0 = blockIdx.y * RBM, n0 = blockIdx.x * RBN;
+    int lr = tid / RBK, lc = tid % RBK; // 16 rows x 16 k-cols per pass
+
+    float acc[RTM][RTN];
+    #pragma unroll
+    for (int i = 0; i < RTM; i++)
+        #pragma unroll
+        for (int j = 0; j < RTN; j++) acc[i][j] = 0.f;
+
+    for (int k0 = 0; k0 < K; k0 += RBK) {
+        // Coalesced global reads: consecutive tid → consecutive k.
+        #pragma unroll
+        for (int i = 0; i < RBM; i += 16) As[lc][lr + i] = A[(long)(m0 + lr + i) * K + k0 + lc];
+        #pragma unroll
+        for (int i = 0; i < RBN; i += 16) Bs[lc][lr + i] = B[(long)(n0 + lr + i) * K + k0 + lc];
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < RBK; kk++) {
+            float a[RTM], b[RTN];
+            #pragma unroll
+            for (int i = 0; i < RTM; i++) a[i] = As[kk][threadIdx.y * RTM + i];
+            #pragma unroll
+            for (int j = 0; j < RTN; j++) b[j] = Bs[kk][threadIdx.x * RTN + j];
+            #pragma unroll
+            for (int i = 0; i < RTM; i++)
+                #pragma unroll
+                for (int j = 0; j < RTN; j++) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < RTM; i++) {
+        int m = m0 + threadIdx.y * RTM + i;
+        #pragma unroll
+        for (int j = 0; j < RTN; j++) C[(long)m * N + n0 + threadIdx.x * RTN + j] = acc[i][j];
+    }
+}

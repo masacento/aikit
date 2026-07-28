@@ -51,30 +51,27 @@ func init() {
 // than picked.
 //
 // The measurement (RTX 2070 SUPER vs 16-thread CPU, same box, ns/op, both operands
-// uploaded and the result downloaded every call — the honest cost of this interface):
+// uploaded and the result downloaded every call — the honest cost of this interface),
+// re-taken after gemm_f32_reg replaced gemm_f32_tiled on the aligned path:
 //
-//	   1 MFLOP  M=80  K=64   N=80     cpu   352 us   gpu    46 us    7.7x
-//	   2 MFLOP  M=128 K=64   N=128    cpu  1076 us   gpu    60 us   17.9x
-//	  19 MFLOP  M=64  K=384  N=384    cpu   735 us   gpu   192 us    3.8x
-//	  24 MFLOP  M=80  K=384  N=384    cpu   925 us   gpu   238 us    3.9x
-//	 151 MFLOP  M=128 K=768  N=768    cpu  1439 us   gpu   875 us    1.6x
-//	 604 MFLOP  M=128 K=768  N=3072   cpu  4016 us   gpu  2482 us    1.6x
-//	2416 MFLOP  M=512 K=768  N=3072   cpu  7238 us   gpu  6646 us    1.09x
-//	8590 MFLOP  M=1024 K=1024 N=4096  cpu 42357 us   gpu 21685 us    2.0x
+//	   1 MFLOP  M=80  K=64   N=80     cpu   408 us   gpu    47 us    8.6x
+//	   2 MFLOP  M=128 K=64   N=128    cpu  1091 us   gpu    61 us   17.8x
+//	  19 MFLOP  M=64  K=384  N=384    cpu   524 us   gpu   199 us    2.6x
+//	  24 MFLOP  M=80  K=384  N=384    cpu   723 us   gpu   227 us    3.2x
+//	 151 MFLOP  M=128 K=768  N=768    cpu  1640 us   gpu   577 us    2.8x
+//	 604 MFLOP  M=128 K=768  N=3072   cpu  4283 us   gpu  1466 us    2.9x
+//	2416 MFLOP  M=512 K=768  N=3072   cpu  7109 us   gpu  2685 us    2.6x
+//	8590 MFLOP  M=1024 K=1024 N=4096  cpu 42010 us   gpu  6671 us    6.3x
 //
-// The GPU wins at every shape measured, and — counter-intuitively — by the LARGEST
-// margin on the SMALLEST work. That is not a GPU result, it is a CPU one: the pure-Go
-// path switches from a scalar naive kernel to a blocked parallel one at ~4 MFLOP, so
-// it is at its worst exactly where the device looks best, and reaches 329 GFLOP/s at
-// 2416 MFLOP where the device is transfer-bound.
+// The faster kernel fixed the shape of this curve, not just its level. With the tiled
+// kernel the device COLLAPSED at the large end — 1.09x at 2416 MFLOP and 2.0x at 8590 —
+// because it was transfer-bound while the pure-Go path hit 329 GFLOP/s. Register
+// blocking moved those to 2.6x and 6.3x. The small end is unchanged: those shapes are
+// unaligned, so they still run the tiled kernel, and they are dominated by the per-call
+// upload/download either way.
 //
-// So the threshold is set low (1 MFLOP) — but see the honesty note in the package doc:
-// this is a MICROBENCHMARK-derived number. BENCH-gpu.md is explicit that
-// microbenchmarks tune and end-to-end publishes, and the end-to-end encode has NOT
-// been measured here (testdata/minilm-model is not present on this box). Treat 1 MFLOP
-// as provisional until a real Encode is timed: a forward makes ~72 of these calls
-// sequentially, each paying a device synchronize, and that serial cost does not appear
-// in a per-call microbenchmark.
+// The threshold itself stays at 1 MFLOP — the device already won everywhere, and making
+// the kernel faster cannot make it lose.
 const minGPUFlops = 1 << 20 // 1 MFLOP — provisional, microbenchmark-derived
 
 // Backend is the CUDA encoder backend.
@@ -163,7 +160,8 @@ func (b *Backend) gpuMatmul(a, w, dst []float32, M, K, N int) (err error) {
 	if err := gpu.Upload(b.bBuf, w[:N*K]); err != nil {
 		return err
 	}
-	if err := b.q.Launch(b.k.GEMMF32Tiled, gpu.TileGrid(M, N),
+	gp, gcfg := b.k.GEMMF32Plan(M, N, K)
+	if err := b.q.Launch(gp, gcfg,
 		gpu.Arg(b.aBuf), gpu.Arg(b.bBuf), gpu.Arg(b.cBuf),
 		gpu.ArgValue(int32(M)), gpu.ArgValue(int32(N)), gpu.ArgValue(int32(K))); err != nil {
 		return err
@@ -276,7 +274,8 @@ func (b *Backend) gpuMatmulQ8(dst, a []float32, wq []int8, wscales []float32, M,
 	if err := gpu.Upload(b.aBuf, a[:M*K]); err != nil {
 		return err
 	}
-	if err := b.q.Launch(b.k.GEMMF32Tiled, gpu.TileGrid(M, N),
+	gp, gcfg := b.k.GEMMF32Plan(M, N, K)
+	if err := b.q.Launch(gp, gcfg,
 		gpu.Arg(b.aBuf), gpu.Arg(wb), gpu.Arg(b.cBuf),
 		gpu.ArgValue(int32(M)), gpu.ArgValue(int32(N)), gpu.ArgValue(int32(K))); err != nil {
 		return err

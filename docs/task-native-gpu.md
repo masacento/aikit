@@ -392,7 +392,27 @@ int8 speedup exceeds f32 here too — vs the CPU widen-every-call path, **1.8× 
 151 / 604 / 2416 MFLOP (lower ratios than CUDA only because the M1-Pro CPU is strong; the
 *pattern* — int8 beats CPU by more than f32 does — holds).
 
-**Still to do in Phase 4:** an **int8 end-to-end** encode measurement and a faster CUDA f32 GEMM.
+**Still to do in Phase 4:** an **int8 end-to-end** encode measurement and — **✅ now done** — a faster
+CUDA f32 GEMM: `gemm_f32_reg`, a register-blocked kernel reached through `ViT.GEMMF32Plan`
+(aligned M%64/N%64/K%16 → register kernel, anything else → the bounds-checked
+`gemm_f32_tiled`). Measured on an RTX 2070 SUPER, steady compute: **6.1–7.1×**, peaking at
+**3.56 TFLOP/s** (~39% of the card's fp32 peak).
+
+It is deliberately **not** a port of Metal's staging-free `gemm_f32_sg_big`, and the reason is
+the operand layout rather than the platform: A is `[M,K]` and B is `[N,K]`, both row-major, so
+both are contiguous along K. A thread owning output column *n* reads `B[n*K+k]`, putting
+consecutive threads K floats apart — a staging-free load is fully uncoalesced on CUDA. The
+tiled kernel is coalesced *because* it stages. So this keeps shared staging to buy coalescing
+and takes its speed from register blocking (4×4 outputs per thread, one shared load feeding 16
+FMAs). Same principle as Metal — do more per thread — opposite conclusion on staging.
+
+`nvcuda::wmma` was ruled out up front and stays ruled out: Tensor Cores have no fp32×fp32 path,
+and tf32 inputs (~10-bit mantissa, ~1e-3 relative) cannot meet the encoder's 2e-4 bound. A tf32
+lane would need its own relaxed, separately documented gate, off the parity-exact path.
+
+This fixed the *shape* of the encoder crossover, not just its level: with the tiled kernel the
+device collapsed to **1.09×** at 2416 MFLOP (transfer-bound while the CPU hit 329 GFLOP/s); it
+is now **2.6×** there and **6.3×** at 8590 MFLOP.
 
 - The int8 GPU path is fully **unit-parity-gated** on both platforms (MatmulBTQ8 vs the
   weight-only float64 reference, weight-residency, and the negative control). What is missing is

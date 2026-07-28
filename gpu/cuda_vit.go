@@ -104,6 +104,12 @@ const (
 	// Launch with TileGrid(M, N).
 	KernelGEMMW8A8Tiled = "gemm_w8a8_tiled"
 
+	// KernelGEMMF32Reg is the register-blocked f32 GEMM: a 64x64 output tile per block,
+	// 4x4 outputs per thread. ALIGNED ONLY — M%64==0, N%64==0, K%16==0 — so its inner
+	// loops carry no bounds checks. Use GEMMF32Plan rather than picking it directly.
+	// Same signature and binding order as gemm_f32_tiled.
+	KernelGEMMF32Reg = "gemm_f32_reg"
+
 	// KernelGEMMF32Tiled is gemm_f32 staged through shared memory. Same signature.
 	// NOT bit-identical to the untiled kernel — f32 addition reassociates — so it is
 	// gated on a tight relative bound instead. Launch with TileGrid(M, N).
@@ -139,6 +145,8 @@ type ViT struct {
 	// Tiled GEMMs — same math, staged through shared memory.
 	GEMMW8A8Tiled Pipeline
 	GEMMF32Tiled  Pipeline
+	// Register-blocked f32 GEMM (aligned fast path). Reach it via GEMMF32Plan.
+	GEMMF32Reg Pipeline
 }
 
 // NewViT loads ViTPTX on this device and builds every encoder pipeline. The module is
@@ -168,6 +176,7 @@ func (d *Device) NewViT() (ViT, error) {
 		{KernelGELUErf, &v.GELUErf},
 		{KernelGEMMW8A8Tiled, &v.GEMMW8A8Tiled},
 		{KernelGEMMF32Tiled, &v.GEMMF32Tiled},
+		{KernelGEMMF32Reg, &v.GEMMF32Reg},
 	} {
 		p, err := d.NewComputePipeline(lib, bind.name)
 		if err != nil {
@@ -231,3 +240,33 @@ func TileGrid(M, N int) LaunchConfig {
 		BlockX: GEMMTile, BlockY: GEMMTile, BlockZ: 1,
 	}
 }
+
+// RegBlock is gemm_f32_reg's output-tile width; it must match vit.cu's RBM/RBN. RegK is
+// its K step (RBK). Both are alignment requirements for the fast path.
+const (
+	RegBlock = 64
+	RegK     = 16
+)
+
+// GEMMF32Plan picks the f32 GEMM kernel and its launch geometry for a shape M×N×K —
+// the CUDA analogue of Metal's ViT.GEMMF32Plan.
+//
+// The register-blocked kernel is chosen when M and N are multiples of 64 and K of 16,
+// which every large encoder / ViT projection satisfies; anything else (odd tails, tiny
+// shapes) falls back to gemm_f32_tiled, which bounds-checks. Both bind identically
+// (A, B, C, M, N, K), so a caller only swaps the pipeline and config.
+func (v ViT) GEMMF32Plan(M, N, K int) (Pipeline, LaunchConfig) {
+	if M%RegBlock == 0 && N%RegBlock == 0 && K%RegK == 0 && M > 0 && N > 0 && K > 0 {
+		return v.GEMMF32Reg, LaunchConfig{
+			GridX: uint32(N / RegBlock), GridY: uint32(M / RegBlock), GridZ: 1,
+			BlockX: RegBlock / RTN, BlockY: RegBlock / RTM, BlockZ: 1,
+		}
+	}
+	return v.GEMMF32Tiled, TileGrid(M, N)
+}
+
+// RTM/RTN are gemm_f32_reg's per-thread micro-tile dims; they must match vit.cu.
+const (
+	RTM = 4
+	RTN = 4
+)

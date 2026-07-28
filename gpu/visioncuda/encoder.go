@@ -184,7 +184,8 @@ func (e *encoder) ForwardPatches(patches []float32) ([]float32, error) {
 		return nil, err
 	}
 	// patch embed: h = patches[np,cpp] · patchW[hidden,cpp]ᵀ + patchB + posEmb
-	if err := e.launch(e.k.GEMMF32Tiled, gpu.TileGrid(np, hidden),
+	pep, pecfg := e.k.GEMMF32Plan(np, hidden, e.cpp)
+	if err := e.launch(pep, pecfg,
 		gpu.Arg(e.patches), gpu.Arg(e.patchW), gpu.Arg(e.h),
 		gpu.ArgValue(int32(np)), gpu.ArgValue(int32(hidden)), gpu.ArgValue(int32(e.cpp))); err != nil {
 		return nil, err

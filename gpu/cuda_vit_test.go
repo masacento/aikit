@@ -3,6 +3,7 @@
 package gpu
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -810,4 +811,142 @@ func TestCUDA_gemmTiledMatchesUntiled(t *testing.T) {
 		}
 	}
 	t.Log("gemm_w8a8_tiled BIT-IDENTICAL to untiled across 5 shapes; gemm_f32_tiled ≡ float64 CPU reference")
+}
+
+// TestCUDA_gemmF32Reg gates the register-blocked f32 GEMM against a float64 CPU
+// reference at the 2e-4 bound the encoder's parity depends on, and — separately —
+// checks that GEMMF32Plan routes correctly.
+//
+// The routing check is not ceremony. gemm_f32_reg carries NO bounds checks (that is
+// where its speed comes from), so a plan that handed it a misaligned shape would read
+// and write out of range. The aligned/unaligned split is the only thing standing
+// between that kernel and memory corruption.
+func TestCUDA_gemmF32Reg(t *testing.T) {
+	d, q, v := vitSetup(t)
+	rng := rand.New(rand.NewSource(31))
+
+	for _, c := range []struct {
+		M, N, K int
+		wantReg bool
+	}{
+		{64, 64, 16, true},
+		{128, 256, 768, true}, // a real encoder projection
+		{63, 64, 16, false},   // M unaligned
+		{64, 65, 16, false},   // N unaligned
+		{64, 64, 17, false},   // K unaligned
+		{0, 64, 16, false},    // degenerate
+	} {
+		p, _ := v.GEMMF32Plan(c.M, c.N, c.K)
+		gotReg := p == v.GEMMF32Reg
+		if gotReg != c.wantReg {
+			t.Fatalf("GEMMF32Plan(%d,%d,%d) picked reg=%v, want %v — a misaligned shape on the unchecked kernel is out-of-bounds access",
+				c.M, c.N, c.K, gotReg, c.wantReg)
+		}
+	}
+
+	for _, s := range []struct{ M, N, K int }{
+		{64, 64, 16},
+		{128, 128, 256},
+		{256, 512, 768},
+		{512, 3072, 768},
+	} {
+		A, B := randF32(rng, s.M*s.K, 1), randF32(rng, s.N*s.K, 1)
+		dA, dB := NewBufferOf(d, A), NewBufferOf(d, B)
+		out := NewBufferLenOf[float32](d, s.M*s.N)
+		p, cfg := v.GEMMF32Plan(s.M, s.N, s.K)
+		if p != v.GEMMF32Reg {
+			t.Fatalf("shape %dx%dx%d should be on the register kernel", s.M, s.N, s.K)
+		}
+		if err := q.Launch(p, cfg, Arg(dA), Arg(dB), Arg(out),
+			ArgValue(int32(s.M)), ArgValue(int32(s.N)), ArgValue(int32(s.K))); err != nil {
+			t.Fatalf("Launch: %v", err)
+		}
+		if err := q.Sync(); err != nil {
+			t.Fatalf("Sync: %v", err)
+		}
+		got := make([]float32, s.M*s.N)
+		if err := Download(out, got); err != nil {
+			t.Fatalf("Download: %v", err)
+		}
+		worst := 0.0
+		for m := range s.M {
+			for n := range s.N {
+				var acc float64
+				for k := range s.K {
+					acc += float64(A[m*s.K+k]) * float64(B[n*s.K+k])
+				}
+				den := math.Abs(acc)
+				if den < 1 {
+					den = 1
+				}
+				if r := math.Abs(float64(got[m*s.N+n])-acc) / den; r > worst {
+					worst = r
+				}
+			}
+		}
+		if worst > 2e-4 {
+			t.Fatalf("M=%d N=%d K=%d: worst relative Δ %.3g vs float64 CPU (encoder bound is 2e-4)", s.M, s.N, s.K, worst)
+		}
+		for _, b := range []Buffer{dA, dB, out} {
+			d.ReleaseBuf(b)
+		}
+	}
+	t.Log("gemm_f32_reg ≡ float64 CPU within 2e-4 across 4 aligned shapes; GEMMF32Plan routes correctly")
+}
+
+// BenchmarkGEMMF32 compares the tiled and register-blocked f32 kernels at real encoder
+// / ViT shapes. Steady compute only (operands resident, warm, one Sync per iteration).
+func BenchmarkGEMMF32(b *testing.B) {
+	d, err := CreateSystemDefaultDevice()
+	if err != nil {
+		b.Skipf("no CUDA device: %v", err)
+	}
+	defer d.ReleaseObjects()
+	v, err := d.NewViT()
+	if err != nil {
+		b.Fatalf("NewViT: %v", err)
+	}
+	q := d.NewCommandQueue()
+	rng := rand.New(rand.NewSource(41))
+	for _, s := range []struct{ M, N, K int }{
+		{512, 3072, 768},
+		{1024, 1024, 1024},
+		{4096, 1152, 1152},
+		{4096, 4352, 1152},
+	} {
+		A, B := randF32(rng, s.M*s.K, 1), randF32(rng, s.N*s.K, 1)
+		dA, dB := NewBufferOf(d, A), NewBufferOf(d, B)
+		out := NewBufferLenOf[float32](d, s.M*s.N)
+		gflop := 2.0 * float64(s.M) * float64(s.N) * float64(s.K) / 1e9
+		run := func(p Pipeline, cfg LaunchConfig) {
+			_ = q.Launch(p, cfg, Arg(dA), Arg(dB), Arg(out),
+				ArgValue(int32(s.M)), ArgValue(int32(s.N)), ArgValue(int32(s.K)))
+			_ = q.Sync()
+		}
+		name := fmt.Sprintf("M%d_N%d_K%d", s.M, s.N, s.K)
+		b.Run(name+"/tiled", func(b *testing.B) {
+			for range 3 {
+				run(v.GEMMF32Tiled, TileGrid(s.M, s.N))
+			}
+			b.ResetTimer()
+			for range b.N {
+				run(v.GEMMF32Tiled, TileGrid(s.M, s.N))
+			}
+			b.ReportMetric(gflop/(b.Elapsed().Seconds()/float64(b.N)), "GFLOP/s")
+		})
+		b.Run(name+"/reg", func(b *testing.B) {
+			p, cfg := v.GEMMF32Plan(s.M, s.N, s.K)
+			for range 3 {
+				run(p, cfg)
+			}
+			b.ResetTimer()
+			for range b.N {
+				run(p, cfg)
+			}
+			b.ReportMetric(gflop/(b.Elapsed().Seconds()/float64(b.N)), "GFLOP/s")
+		})
+		for _, bb := range []Buffer{dA, dB, out} {
+			d.ReleaseBuf(bb)
+		}
+	}
 }
