@@ -330,3 +330,88 @@ func TestMatmulBTQ8_closeToF32(t *testing.T) {
 		}
 	}
 }
+
+// dequantRowInt4Ref is the pre-item-19 implementation, kept verbatim as the
+// bit-identity reference.
+func dequantRowInt4Ref(packed []byte, scales []float32, group, cols int, dst []float32) {
+	for k := range cols {
+		b := packed[k/2]
+		var nib byte
+		if k&1 == 0 {
+			nib = b & 0x0F
+		} else {
+			nib = b >> 4
+		}
+		dst[k] = float32(int(nib)-8) * scales[k/group]
+	}
+}
+
+// TestDequantizeRowInt4_bitIdenticalToRef gates perf item 19's rewrite (group-outer,
+// nibble-pair unrolled, no per-element integer divide) against the original.
+//
+// The case that actually needs gating is an ODD group: a packed byte then spans TWO
+// groups, so the pair-unrolled inner loop must not fuse across the boundary or it
+// would apply one group's scale to the next group's element. Odd `cols` exercises the
+// final trailing element.
+func TestDequantizeRowInt4_bitIdenticalToRef(t *testing.T) {
+	rng := rand.New(rand.NewSource(19))
+	for _, group := range []int{1, 2, 3, 4, 5, 7, 8, 16, 32, 64} {
+		for _, cols := range []int{1, 2, 3, 7, 8, 15, 16, 31, 64, 127, 128, 255, 768} {
+			if cols < group {
+				continue
+			}
+			nGroups := (cols + group - 1) / group
+			packed := make([]byte, (cols+1)/2)
+			for i := range packed {
+				packed[i] = byte(rng.Intn(256))
+			}
+			scales := make([]float32, nGroups)
+			for i := range scales {
+				scales[i] = float32(rng.NormFloat64())
+			}
+			got := make([]float32, cols)
+			want := make([]float32, cols)
+			DequantizeRowInt4(packed, scales, group, cols, got)
+			dequantRowInt4Ref(packed, scales, group, cols, want)
+			for k := range want {
+				if got[k] != want[k] {
+					t.Fatalf("group=%d cols=%d k=%d: got %v, want %v (must be bit-identical)",
+						group, cols, k, got[k], want[k])
+				}
+			}
+		}
+	}
+	t.Log("group-outer dequant ≡ reference across 10 group sizes × 13 column counts, incl. odd groups spanning a packed byte")
+}
+
+// BenchmarkDequantizeRowInt4 sizes a realistic tied-embedding row.
+//
+// cols/group are VARIABLES, not constants, and deliberately so: with a constant group
+// the compiler folds the divisor and strength-reduces away the very per-element divide
+// this benchmark exists to measure, making the unoptimised form look ~5× faster than
+// it is. See DequantizeRowInt4's benchmarking note.
+//
+//go:noinline
+func dequantBenchParams() (cols, group int) { return 4096, 32 }
+
+func BenchmarkDequantizeRowInt4(b *testing.B) {
+	// Obtained through a //go:noinline call so the compiler cannot constant-propagate
+	// `group`. A plain `cols, group := 4096, 32` is NOT enough: SSA folds the local,
+	// strength-reduces k/group away, and the unoptimised form then benchmarks ~5×
+	// faster than it really is — the measurement inverts the result.
+	cols, group := dequantBenchParams()
+	packed := make([]byte, cols/2)
+	for i := range packed {
+		packed[i] = byte(i * 7)
+	}
+	scales := make([]float32, cols/group)
+	for i := range scales {
+		scales[i] = 0.01
+	}
+	dst := make([]float32, cols)
+	b.SetBytes(int64(cols))
+	b.ResetTimer()
+	for range b.N {
+		DequantizeRowInt4(packed, scales, group, cols, dst)
+	}
+}

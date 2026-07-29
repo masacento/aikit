@@ -83,7 +83,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 16 | `Flat.Query` is single-threaded; shard it + per-shard selector | ann | 1.74–2.08× on 2 cores; 4–8× typical | = | M |
 | 17 | HNSW build: batch `prune`/`selectHeuristic`; kill 225 allocs/insert | ann | 1.5–2.5× build | ~ | M |
 | 18 | `vision/qwen_encoder.go` has no scratch arena — **~15 GB alloc+memset per image** | vision | removes ~1.5 s of memset | **=** | M |
-| 19 | `DequantizeRowInt4`: hardware integer divide per element | linalg | 2–4× on the dequant loop | = | S |
+| ~~19~~ | ~~`DequantizeRowInt4`: hardware integer divide per element~~ — **DONE, 4.93×** (§7.11) | linalg | above the 2–4× estimate | = | — |
 | 20 | Int8 register blocking (1×4 / 4×1) — the arm64 kernel has none | linalg | 1.2–1.6× GEMV, more at prefill | = (integer) | M |
 | ~~21~~ | ~~**(D)** `annmetal`: adopt the tiled/simdgroup kernel + on-GPU top-K~~ — **DONE** (§7.5) | gpu | measured: Metal 1.99×, CUDA 15.25× vs each box's own CPU @ N=100k/batch=256 | = (int32) | — |
 
@@ -865,6 +865,34 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     against `Push`'s own decision over a random stream at k ∈ {0,1,3,10}. Worth noting
     the shape: an optimisation that is correct in the package it was measured in, and
     wrong in the next package to adopt it.
+
+11. **Item 19 is DONE — 4.93×, above its estimate — and getting there produced the
+    sharpest methodology lesson of the campaign.**
+
+    ```
+    DequantizeRowInt4, 4096 cols, group 32   15,765 -> 3,198 ns   4.93x
+    ```
+
+    **The first three measurements said the opposite.** A benchmark written as
+    `const cols, group = 4096, 32` reports the ORIGINAL at 957 ns and the optimised
+    form at 3,210 ns — i.e. the fix looks like a 3.35× REGRESSION. It isn't: with a
+    constant divisor the compiler folds `group`, strength-reduces `k/group` to a shift,
+    and the benchmark measures a loop that never executes the divide at all. Changing
+    the constants to `:=` locals does **not** fix it — SSA constant-propagates those
+    too. Only obtaining them through a `//go:noinline` call defeats the folding, and
+    then the true figures appear.
+
+    So the doc's own item-1 thesis has now bitten three times, and this is the worst
+    case: not a benchmark that *misses* an effect, but one that **inverts** it. A
+    benchmark for an optimisation whose whole premise is "this divisor is not a
+    compile-time constant" must ensure the compiler agrees. The note is in the
+    function's doc comment so the next person does not re-derive it.
+
+    The rewrite is group-outer with the nibble pair unrolled. The case that needed
+    gating is an ODD `group`, where a packed byte spans two groups and the pair loop
+    would otherwise apply one group's scale to the next group's element — the
+    equivalence test covers 10 group sizes × 13 column counts against the original,
+    and caught exactly that bug on the first attempt.
 
 ---
 
