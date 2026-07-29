@@ -80,7 +80,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 |---|---|---|---|---|---|
 | ~~11~~ | ~~**(A)** touched-set selection + pooled accumulator~~ — **DONE, bm25 + sparse** (§7.9) | bm25, sparse | 1.3–218× on bm25, selectivity-dependent | = | — |
 | ~~12~~ | ~~**(B)** Rewrite `dotI8AVX2`~~ — **DONE, 2.10× kernel / 2.02× scan** (§7.6) | linalg | measured on Zen 2; int8 now at f32 MAC-parity | = (integer) | — |
-| ~~13~~ | ~~**(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto`~~ — **DONE for text, −20.1% geomean (1.25×)** (§7.16); pure Go, no assembly; vision + `tanhF32` remain | linalg→encoder, vision | **landed inside the predicted band** | ~ (contracts stated + gated) | — |
+| ~~13~~ | ~~**(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto`~~ — **DONE, all sites** (§7.16 text, §7.17 vision + cross-encoder); pure Go, no assembly | linalg→encoder, vision | text −20.1%; **cross-encoder −33.8%**; SigLIP −17.9%/−30.6% | ~ (contracts stated + gated) | — |
 | 14 | **(E)** Length-bucketed `EncodeBatch` under a token budget | encoder | 1.3–2× on ragged batches | **=** | M |
 | 15 | HNSW: batch neighbour scoring through `Dot8x4` | ann | **1.36–1.40× measured** end-to-end | ~ (1 ULP) | M |
 | 16 | `Flat.Query` is single-threaded; shard it + per-shard selector | ann | 1.74–2.08× on 2 cores; 4–8× typical | = | M |
@@ -1218,13 +1218,62 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     PyTorch computes these activations in float32 too, so Go's float64
     `math.Erf` was the outlier, not the f32 kernel replacing it.
 
-    **Left undone, deliberately:** `crossencoder.go:155`'s `math.Tanh` is 384
-    elements per `Score` (~15 µs against a ~10 ms forward) — optimizing it would
-    be measurement noise. The `vision` sites (item 13's largest predicted share,
-    ~40–70% for SigLIP) are untouched: no vision checkpoint on this box to
-    re-verify parity against, and SigLIP uses tanh-GELU, which needs a `TanhF32`
-    this does not yet provide. SIMD assembly for these kernels remains available
-    and would multiply with what landed.
+    **Vision and the cross-encoder followed (§7.17).** The "no vision checkpoint
+    on this box" that deferred them was wrong — see §7.17.
+
+    SIMD assembly for these kernels remains available and would multiply with
+    what landed.
+
+17. **Item 13 finished: vision, the cross-encoder, and a blocker that was not
+    real.** The remaining sites are done, and the model that gained most is the
+    one the doc predicted would.
+
+    | workload | before | after | |
+    |---|--:|--:|--:|
+    | `CrossEncoder.Score` L≈200 (D=384) | 560.3 ms | 370.9 ms | **−33.8%** (p=0.002) |
+    | SigLIP tower, 576 patches, h768 | 3.048 s | 2.115 s | **−30.6%** (p=0.008) |
+    | SigLIP tower, 196 patches, h512 | 478.3 ms | 392.9 ms | −17.9% (p=0.008) |
+
+    **The cross-encoder prediction was right, quantitatively.** §13's closed form
+    said the FFN activation share GROWS as D shrinks — 11% at D=768, ~22% at
+    D=384 — and put MiniLM-L6 at ~22% GELU + ~14% softmax. Measured: **33.8%**.
+    That is the doc's most precise correct call.
+
+    **The vision prediction was not.** "Up to 2× vision" against a measured
+    1.24× geomean (1.44× at the larger tower). But the *shape* is right and
+    visible: the win grows with patch count (17.9% at 196 → 30.6% at 576)
+    exactly as an O(patches²) softmax share should, and both towers here are far
+    below the so400m/np=4096/27-layer case the 40–70% estimate was for. The
+    trend supports the estimate; this hardware simply cannot reach the size
+    where it would be demonstrated.
+
+    `linalg` gains `TanhF32` (Cephes `tanhf`, ≤2 ULP measured 1.10) and
+    `GELUTanhF32` (≤1e-06 absolute, measured 4.33e-07). `TanhF32` needs the same
+    two-branch treatment `ErfF32` did and for the same reason: the closed form
+    (e^2x−1)/(e^2x+1) cancels as x→0, where tanh is most linear. A test asserts
+    the two GELUs stay *different functions* — SigLIP is trained on
+    `gelu_pytorch_tanh`, so a future "simplification" that aliases one to the
+    other would silently change every vision output, and now fails instead.
+
+    All four vision sites plus `crossencoder.go:155` now route through `linalg`.
+    The cross-encoder tanh is still measurement noise on its own (384 elements
+    per `Score`); it moved for consistency, so there is one tanh in the kit.
+
+    **The blocker was not real, and that is the lesson.** §7.16 deferred this
+    work saying "no vision checkpoint on this box to re-verify parity against".
+    Both vision fixtures were already present, and neither is a download —
+    `scripts/pin_siglip_vision.py` *generates* a tiny random `SiglipVisionModel`
+    locally, and `scripts/gen_siglip_bench.py` generates the real-sized towers.
+    The parity gates had been passing all along. Cost: one deferred item.
+    Recorded as a measurement-discipline entry in
+    [`measuring-performance.md`](measuring-performance.md) §1.13 — *verify a
+    blocker before reporting it*.
+
+    Also fetched `cross-encoder/ms-marco-MiniLM-L-6-v2`, so
+    `TestCrossEncoder_parity` now runs here rather than skipping: worst forward
+    Δ 4.29e-06 against the Python reference, scores matching to 4 decimal places.
+    That gate did not exist on this box when the tanh was changed, which is
+    exactly when a gate matters most.
 
 ---
 

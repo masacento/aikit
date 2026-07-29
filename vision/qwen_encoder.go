@@ -622,17 +622,11 @@ func applyRotaryVision(vec, cos, sin []float32) {
 }
 
 func silu(x []float32) {
-	for i, v := range x {
-		vv := float64(v)
-		x[i] = float32(vv / (1.0 + math.Exp(-vv)))
-	}
+	linalg.SiLUInto(x, x)
 }
 
 // geluErf is the exact (erf) GELU — nn.GELU() default, what the patch merger uses
 // (distinct from SigLIP's gelu-tanh).
 func geluErf(x []float32) {
-	for i, v := range x {
-		vv := float64(v)
-		x[i] = float32(0.5 * vv * (1.0 + math.Erf(vv/math.Sqrt2)))
-	}
+	linalg.GELUInto(x, x)
 }

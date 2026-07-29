@@ -90,3 +90,38 @@ snapshot_download('Snowflake/snowflake-arctic-embed-m-v2.0',
 
 Verify with `go test ./encoder/ -run TestGTE_parity -v` — worst emb cosine
 1.000000 against `testdata/gte_golden.json`.
+
+## Vision fixtures — generated, not downloaded
+
+Both SigLIP fixtures are built locally by scripts already in this repo; neither
+needs network access, and this is worth knowing before declaring vision work
+blocked on a missing checkpoint (it happened — perf-campaign §7.17):
+
+```sh
+.venv/bin/python scripts/pin_siglip_vision.py   # -> testdata/siglip-tiny/ + golden (parity)
+.venv/bin/python scripts/pin_qwen25vl_vision.py # -> testdata/qwen25vl-vision-tiny/ + golden
+.venv/bin/python scripts/gen_siglip_bench.py    # -> testdata/siglip-bench{,-l}/ (throughput)
+```
+
+The `pin_*` pair build TINY random towers (hidden 32, 2 layers) — enough to
+exercise every component for parity, useless for timing. `gen_siglip_bench.py`
+builds the real-sized ones (hidden 512/196 patches and 768/576 patches) that
+`BenchmarkSiglipTower` needs; random weights are correct there because
+throughput does not depend on weight values.
+
+## Fetching `testdata/crossencoder-model`
+
+`encoder/crossencoder_test.go` needs `cross-encoder/ms-marco-MiniLM-L-6-v2`
+(~88 MB, ships safetensors):
+
+```sh
+.venv/bin/python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('cross-encoder/ms-marco-MiniLM-L-6-v2',
+    allow_patterns=['config.json', 'tokenizer.json', 'tokenizer_config.json',
+                    'special_tokens_map.json', 'vocab.txt', 'model.safetensors'],
+    local_dir='testdata/crossencoder-model')"
+```
+
+Verify with `go test ./encoder/ -run TestCrossEncoder_parity -v` — scores should
+match the Python reference to 4 decimals (worst forward Δ ≈ 4.3e-06).

@@ -400,3 +400,68 @@ func TestSiLUF32_accuracy(t *testing.T) {
 		t.Errorf("SiLUF32(0) = %v, want 0", got)
 	}
 }
+
+func TestTanhF32_accuracy(t *testing.T) {
+	// tanh is judged relatively on both branches: neither the polynomial nor
+	// 1 - 2/(e^2x+1) cancels in its own domain, which is the whole point of the
+	// split. A single-branch (e^2x-1)/(e^2x+1) would fail this near zero.
+	const ulp = 1.0 / (1 << 23)
+	var worstRel float64
+	var at float32
+	for i := range 4_000_001 {
+		x := float32(-20 + 40*float64(i)/4_000_000)
+		want := math.Tanh(float64(x))
+		if want == 0 {
+			continue
+		}
+		if rel := math.Abs((float64(TanhF32(x)) - want) / want); rel > worstRel {
+			worstRel, at = rel, x
+		}
+	}
+	if worstRel > 2*ulp {
+		t.Errorf("tanh max relative error %.3g (%.2f ULP) at x=%v — exceeds 2 ULP",
+			worstRel, worstRel/ulp, at)
+	}
+	t.Logf("tanh max rel error %.3g (%.2f ULP) at x=%v", worstRel, worstRel/ulp, at)
+
+	for _, tc := range []struct{ in, want float32 }{
+		{0, 0}, {20, 1}, {-20, -1}, {10, 1}, {-10, -1},
+	} {
+		if got := TanhF32(tc.in); got != tc.want {
+			t.Errorf("TanhF32(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestGELUTanhF32_accuracy(t *testing.T) {
+	const c = 0.7978845608028654
+	var worstAbs float64
+	var at float32
+	for i := range 4_000_001 {
+		x := float32(-10 + 20*float64(i)/4_000_000)
+		xf := float64(x)
+		want := 0.5 * xf * (1 + math.Tanh(c*(xf+0.044715*xf*xf*xf)))
+		if d := math.Abs(float64(GELUTanhF32(x)) - want); d > worstAbs {
+			worstAbs, at = d, x
+		}
+	}
+	if worstAbs > 1e-6 {
+		t.Errorf("GELU-tanh max absolute error %.3g at x=%v — exceeds 1e-06", worstAbs, at)
+	}
+	t.Logf("GELU-tanh max abs error %.3g at x=%v", worstAbs, at)
+
+	// It must NOT be interchangeable with the erf GELU — they are different
+	// functions, and a future refactor that "simplifies" one into the other
+	// should fail here rather than silently change every SigLIP output.
+	var maxDiff float64
+	for i := range 20001 {
+		x := float32(-5 + 10*float64(i)/20000)
+		if d := math.Abs(float64(GELUTanhF32(x)) - float64(GELUF32(x))); d > maxDiff {
+			maxDiff = d
+		}
+	}
+	if maxDiff < 1e-4 {
+		t.Errorf("GELUTanhF32 and GELUF32 differ by only %g — they are supposed to be "+
+			"different activations; has one been aliased to the other?", maxDiff)
+	}
+}

@@ -199,6 +199,22 @@ before designing against it. Cross-machine comparisons belong in the normalized
   non-discriminating bit-identity test and an off-by-one row range in the same
   session.
 
+### 1.13 A blocker you did not verify is not a blocker
+
+Item 13's vision half was deferred with "no vision checkpoint on this box to
+re-verify parity against". Both fixtures were already present, and neither is a
+download: `scripts/pin_siglip_vision.py` **generates** a tiny random
+`SiglipVisionModel` locally, and `scripts/gen_siglip_bench.py` generates the
+real-sized towers. `TestSiglipEncoder_parity` had been passing the whole time.
+
+The same session then fetched a cross-encoder checkpoint and found the largest
+single win of item 13 (−33.8%) sitting behind it.
+
+**Guard:** before reporting work as blocked on a missing fixture, run the test
+and read the skip. Check whether the fixture is *generated* rather than
+downloaded — this repo has three generator scripts and two of them need no
+network at all. `ls testdata/` costs nothing; a deferred item costs a session.
+
 ---
 
 ## 2 · The recipe
@@ -252,6 +268,7 @@ Numbers here are for calibration, not for citing as results.
 | `math.Exp` (f64, scalar) | 15 ns/elem | item 13 |
 | `math.Erf` inside GELU | 29.4 ns/elem | item 13 |
 | `linalg.ExpF32` | 5.6–7.6 ns/elem | item 13 |
+| `math.Tanh` inside SigLIP's GELU | ~30 ns/elem | item 13 |
 | row-split matmul worker cap | `(M+31)/32` → **3 workers at M=91** | §7.14 |
 
 The split-CCX L3 is why the row-split matmul axis lost here and not on the M1
@@ -280,13 +297,21 @@ been consistently right; magnitudes consistently optimistic.**
 | 8 · GTE allocations | 12.6 MB/call | 12.7 MiB/call | ✅ |
 | 11 · touched-set selection | large | 1.3–218×, overshot | ✅ |
 | 12 · `dotI8AVX2` | in-band | 2.10× kernel / 2.02× scan | ✅ |
-| 13 · f32 transcendentals | 1.25–1.5× text | 1.25× (−20.1%) | ✅ |
+| 13 · f32 transcendentals (text) | 1.25–1.5× text | 1.25× (−20.1%) | ✅ |
+| 13 · …on the D=384 cross-encoder | ~22% GELU + ~14% softmax | **−33.8%** | ✅ |
+| 13 · …on SigLIP | up to 2× | 1.24× geomean (1.44× at 576 patches) | ❌ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
 largest encoder wins of the campaign: the parallel axis being wrong on amd64
 (§7.14) and the elementwise stages dominating once the matmuls were parallel
 (§7.15, `GTE.Encode` L=690 3.28×).
+
+Item 13's cross-encoder row is worth singling out as the counter-example to the
+"magnitudes are optimistic" pattern: it came from a **closed form** (activation ÷
+FFN-matmul = `t_act/(k·D·t_mac)`, which grows as D shrinks) rather than from a
+microbenchmark extrapolation. Derived predictions have held; measured-then-scaled
+ones have not.
 
 ---
 

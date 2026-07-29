@@ -354,12 +354,15 @@ func layerNormInto(out, x, w, b []float32, rows, dim int, eps float64) {
 	}
 }
 
+// geluTanh applies SigLIP's gelu_pytorch_tanh activation in place.
+//
+// linalg's float32 kernel, not f64 math.Tanh (perf-campaign item 13). SigLIP is
+// the heaviest transcendental consumer in the kit — a so400m tower at 4096
+// patches issues billions of these per image — and math.Tanh is a branchy scalar
+// f64 routine. Not bit-identical; contract is absolute error ≤1e-06, gated by
+// linalg's TestGELUTanhF32_accuracy and end-to-end by TestSiglipEncoder_parity.
 func geluTanh(x []float32) {
-	const c = 0.7978845608028654 // sqrt(2/π)
-	for i, val := range x {
-		v := float64(val)
-		x[i] = float32(0.5 * v * (1.0 + math.Tanh(c*(v+0.044715*v*v*v))))
-	}
+	linalg.GELUTanhInto(x, x)
 }
 
 func addBias(x, bias []float32, rows, dim int) {
@@ -371,21 +374,9 @@ func addBias(x, bias []float32, rows, dim int) {
 	}
 }
 
+// softmaxRow normalizes one attention row in place. Attention is O(patches²), so
+// this is the other half of item 13's vision share; linalg's kernel keeps the
+// float64 sum accumulator and moves only the exponentials to float32.
 func softmaxRow(s []float32) {
-	maxv := s[0]
-	for _, v := range s {
-		if v > maxv {
-			maxv = v
-		}
-	}
-	var sum float64
-	for i, v := range s {
-		e := math.Exp(float64(v) - float64(maxv))
-		s[i] = float32(e)
-		sum += e
-	}
-	inv := 1.0 / sum
-	for i := range s {
-		s[i] = float32(float64(s[i]) * inv)
-	}
+	linalg.SoftmaxRowInto(s, s)
 }

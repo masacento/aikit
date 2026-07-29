@@ -284,3 +284,71 @@ func SiLUInto(dst, src []float32) {
 		dst[i] = SiLUF32(v)
 	}
 }
+
+// TanhF32 returns tanh(x) in float32.
+//
+// TWO BRANCHES, for the same reason ErfF32 has them. The closed form
+// tanh(x) = (e^2x − 1)/(e^2x + 1) cancels catastrophically as x → 0: both e^2x
+// and 1 tend to 1, so the numerator loses every significant bit exactly where
+// tanh is at its most linear. Cephes' minimax polynomial x·P(x²) is used below
+// |x| = 0.625, where it has no subtraction at all; above it the exponential
+// form is written as 1 − 2/(e^2x + 1), which at x ≥ 0.625 subtracts at most
+// 0.445 from 1 and so is stable.
+//
+// Accuracy: ≤2 ULP relative (TestTanhF32_accuracy over [-20,20]).
+func TanhF32(x float32) float32 {
+	sign := float32(1)
+	if x < 0 {
+		sign, x = -1, -x
+	}
+	if x > 9 {
+		return sign // tanh(9) = 1 - 3.0e-08, below f32 resolution at 1
+	}
+	if x < 0.625 {
+		z := x * x
+		p := float32(-5.70498872745e-3)
+		p = p*z + 2.06390887954e-2
+		p = p*z - 5.37397155531e-2
+		p = p*z + 1.33314422036e-1
+		p = p*z - 3.33332819422e-1
+		return sign * (p*z*x + x)
+	}
+	return sign * (1 - 2/(ExpF32(2*x)+1))
+}
+
+// GELUTanhF32 returns the tanh approximation of GELU:
+//
+//	0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))
+//
+// This is HF's "gelu_pytorch_tanh" / "gelu_new" — a DIFFERENT function from the
+// exact erf GELU in GELUF32, not an approximation of it that may be swapped in.
+// SigLIP (and so Gemma 3's vision tower) is trained with this one; substituting
+// GELUF32 would be a silent model change.
+//
+// Contract is ABSOLUTE (≤1e-06), for the reason set out on GELUF32: it feeds a
+// matmul, and its negative branch is cancellation-dominated so a relative bound
+// there would constrain the wrong thing.
+func GELUTanhF32(x float32) float32 {
+	const c = 0.7978845608028654 // √(2/π)
+	return 0.5 * x * (1 + TanhF32(c*(x+0.044715*x*x*x)))
+}
+
+// GELUTanhInto writes GELUTanhF32(src[i]) into dst[i]. Same length; may alias.
+func GELUTanhInto(dst, src []float32) {
+	if len(dst) != len(src) {
+		panic("linalg: GELUTanhInto length mismatch")
+	}
+	for i, v := range src {
+		dst[i] = GELUTanhF32(v)
+	}
+}
+
+// TanhInto writes TanhF32(src[i]) into dst[i]. Same length; may alias.
+func TanhInto(dst, src []float32) {
+	if len(dst) != len(src) {
+		panic("linalg: TanhInto length mismatch")
+	}
+	for i, v := range src {
+		dst[i] = TanhF32(v)
+	}
+}
