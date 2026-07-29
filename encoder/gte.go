@@ -68,6 +68,9 @@ type GTE struct {
 	maxSeq  int
 	pool    pooling
 	st      *embed.SafetensorsFile
+	// ropeCache holds the rotary table across Encodes instead of rebuilding it
+	// per call. Grows to the longest sequence seen; zero value ready to use.
+	ropeCache ropeCache
 }
 
 // LoadGTE loads a GTE encoder (config.json + model.safetensors with GTE tensor
@@ -211,7 +214,8 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 	s.be = g.be
 	defer putScratch(s)
 	s.ensureLayer(L, D, I, c.Heads, headDim, L)
-	rope := newRopeTable(L, headDim, c.RopeTheta)
+	s.ensureFusedMLP(L, I)
+	rope := g.ropeCache.get(L, headDim, c.RopeTheta)
 
 	// Embeddings: word + token_type[0] (positions come from RoPE), then LayerNorm.
 	h := make([]float32, L*D)
@@ -232,7 +236,7 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 	layerNorm(h, g.embLNW, g.embLNB, L, D, eps)
 
 	qkv := s.qkv[:L*3*D]
-	upGate := make([]float32, L*2*I) // fused up/gate; no scratch field is 2I-wide
+	upGate := s.upGate[:L*2*I]
 	for li := range g.layers {
 		l := &g.layers[li]
 

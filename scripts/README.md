@@ -70,3 +70,23 @@ Untying the decoder makes `model.safetensors` (~532 MB) larger than the `.bin`;
 `testdata/splade-model` is git-ignored. Verify with
 `go test ./encoder/ -run SPLADE_parity -v` — it should report cosine 1.000000
 against `testdata/splade_golden.json`.
+
+## Fetching `testdata/arctic2-m`
+
+The GTE tests/benchmarks (`encoder/gte_test.go`, `encoder/gte_bench_test.go`,
+`encoder/rope_cache_test.go`) need `Snowflake/snowflake-arctic-embed-m-v2.0`.
+This one ships safetensors, so it is a plain download (~1.2 GB):
+
+```sh
+.venv/bin/python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('Snowflake/snowflake-arctic-embed-m-v2.0',
+    allow_patterns=['config.json', 'tokenizer.json', 'tokenizer_config.json',
+                    'special_tokens_map.json', 'model.safetensors',
+                    'modules.json', '1_Pooling/config.json',
+                    'config_sentence_transformers.json'],
+    local_dir='testdata/arctic2-m')"
+```
+
+Verify with `go test ./encoder/ -run TestGTE_parity -v` — worst emb cosine
+1.000000 against `testdata/gte_golden.json`.

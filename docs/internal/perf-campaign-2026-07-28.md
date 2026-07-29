@@ -67,7 +67,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~5~~ | ~~Index (de)serialization: bulk `copy`~~ — **DONE, 5.14×** (§7.8) | ann | 15.6 → 3.04 ms on a 50k×384 index; the 20–30× estimate was optimistic | = | — |
 | ~~6~~ | ~~BERT/GTE forwards never call `enterForward()`~~ — **DONE** (§7.12) | encoder | removes oversubscription | — | — |
 | ~~7~~ | ~~SPLADE vocab matmul runs **serial**~~ — **DONE, 1.05–1.19× on `Expand`** (§7.12); needed a trunk column fan-out too, since the trunk is NOT parallel at short L | encoder | 2.3× was optimistic | = | — |
-| 8 | `gte.go:230` allocates 12.6 MB/`Encode` outside the scratch arena | encoder | 12.6 MB/call | = | S |
+| ~~8~~ | ~~`gte.go:230` allocates 12.6 MB/`Encode` outside the scratch arena~~ — **DONE, −12.7 MiB/call (−43%)** (§7.13) | encoder | exactly as estimated; **no latency change** | = | — |
 | 9 | `SpanCache` LRU → MRU/scan-resistant; add `MADV_WILLNEED` on map; pipeline `Touch(b+1)` | mmap | 0% → max hit rate | — | S |
 | 10 | `bm25`: hoist `1/avgdl`; precompute per-posting impact at build time | bm25 | 1.5–2× scoring | ~ | S–M |
 
@@ -655,9 +655,12 @@ These came out of the refutation pass and aren't in the tables above:
   b-rows — the classic aliasing stride packing exists to avoid. It escapes only
   on Apple P-cores (128 KB L1D ⇒ 256 sets). One `+4` float pad makes it
   conflict-free by construction. (Item 24.)
-- **`gte.go:209`** builds `newRopeTable(L, headDim, RopeTheta)` per `Encode`,
-  recomputed from scratch rather than cached per (maxSeq, headDim) — a second
-  per-call allocation alongside item 8's 12.6 MB.
+- ~~**`gte.go:209`** builds `newRopeTable(L, headDim, RopeTheta)` per `Encode`~~ —
+  **DONE** with item 8 (§7.13); `GTE` now holds a `ropeCache` that grows to the
+  longest sequence seen and returns bit-identical views for shorter ones. The
+  five Nomic/`forward*.go` sites still rebuild per call and were left alone —
+  their shapes (L≤512, headDim 64) are where `newRopeTable`'s "cheap" comment is
+  actually true, and changing them needs its own measurement.
 - **`bm25/query.go:58-59`** divides by the loop-invariant `ix.avgdl` per posting;
   hoisting `invAvgdl` halves the divisions from two to one before you even get to
   precomputed impacts.
@@ -963,6 +966,48 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     box. `parallelThreshold`'s table (`parallel.go:47-55`) is tuned on an 8-core M1
     Pro; this is a 16-thread 3700X. Worth its own item before anyone trusts that
     table on amd64.
+
+13. **Item 8 is DONE — the estimate was exact, and the item was honest about what
+    it was buying.** Measured on a real `Snowflake/snowflake-arctic-embed-m-v2.0`
+    checkpoint (fetch recipe in `scripts/README.md`), `GTE.Encode`, benchstat n=4:
+
+    | L (wordpieces) | B/op before | after | | sec/op |
+    |---|--:|--:|--:|--:|
+    | 22 | 987.6 KiB | 568.5 KiB | −42.4% | ~ (p=1.000) |
+    | 175 | 6.023 MiB | 3.984 MiB | −33.9% | ~ (p=0.057) |
+    | 690 | 29.45 MiB | 16.75 MiB | −43.1% | **+1.38%** (p=0.029) |
+
+    The table's Win column said "12.6 MB/call" and the measurement is 12.7 MiB at
+    L=690 — the closest an estimate in this doc has come. Two allocations moved:
+    the fused up/gate buffer (`L*2*intermediate`, 17 MB at L=690) into a new
+    `scratch.upGate` field sized by `ensureFusedMLP`, kept out of `ensureLayer` so
+    BERT/Nomic scratches do not carry it; and the per-`Encode` `newRopeTable` into
+    a `ropeCache` on the `GTE` (the companion finding at §"more findings").
+
+    **Latency did not improve, and at the longest shape it got slightly worse.**
+    That is not a failure of the item — the item never claimed latency — but it is
+    worth writing down that removing 12.7 MiB of allocation from a 4.2 s call
+    buys nothing at single-call latency. The value is GC pressure under
+    concurrency, which this benchmark does not exercise. `allocs/op` is unchanged
+    (12.67k at L=690): these were 2 allocations, just enormous ones.
+
+    The RoPE cache rests on a bit-identity claim — row m is cos/sin of
+    m·invFreq[d] with no dependence on the table's own length, so a view over a
+    longer table's first L rows equals a table built at L. That is gated
+    (`TestRopeCache_viewIsBitIdentical` over 3 headDims × 3 bases × 8 lengths,
+    plus a grow/shrink/switch sequence against fresh tables) and the gate was
+    mutation-checked: a `view` that forgets to narrow fails both tests. Pooling
+    `upGate` also introduces a genuine hazard — the buffer now arrives holding a
+    previous forward's values — so `TestScratchUpGate_fullyOverwritten` poisons
+    every pooled scratch and re-encodes; a mutant whose fused matmul leaves tail
+    rows unwritten fails it.
+
+    **Unrelated, and larger than this item:** `GTE.Encode` at L=690 takes **4.2
+    seconds** on a 16-thread 3700X — roughly 37 GFLOP/s against ~156 GFLOP of
+    work, where the row-split path is supposed to be engaged. That is the same
+    smell as §7.12's closing note (row-split parallelism underperforming on
+    amd64), now on a second model. Both point at `parallelThreshold`'s M1-Pro
+    tuning table. It needs an item.
 
 ---
 

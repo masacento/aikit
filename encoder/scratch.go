@@ -62,6 +62,13 @@ type scratch struct {
 	val  []float32 // [L*intermediate]
 	gate []float32 // [L*intermediate]
 	mid  []float32 // [L*D] — MLP fc2 output
+	// upGate is the fused up/gate projection output [L, 2*intermediate] for
+	// models (GTE) whose MLP does ONE 2I-wide matmul instead of two I-wide ones.
+	// It cannot be served by val+gate: those are two separate [L,I] buffers,
+	// while this is one row-major block whose rows interleave up and gate —
+	// which is exactly what the single fused matmul writes. Sized only on
+	// request (ensureFusedMLP), so the BERT/Nomic scratches never carry it.
+	upGate []float32
 	// Per-head extracts (sized perHeadLen*headDim each). vH holds V
 	// TRANSPOSED to [headDim, perHeadLen] so the scores·V context step can run
 	// through the SIMD A·Bᵀ matmul instead of a scalar triple-loop.
@@ -133,6 +140,14 @@ func (s *scratch) ensureLayer(L, D, intermediate, heads, headDim, perHeadLen int
 	s.vH = ensureF32(s.vH, perHeadLen*headDim)
 	s.ctxHead = ensureF32(s.ctxHead, perHeadLen*headDim)
 	s.scores = ensureF32(s.scores, perHeadLen*perHeadLen)
+}
+
+// ensureFusedMLP sizes the fused up/gate buffer. Kept out of ensureLayer so the
+// models that never use it (BERT, Nomic) do not carry an extra L*2*intermediate
+// span in every pooled scratch — at L=690/I=3072 that is 17 MB, the bulk of
+// perf-campaign item 8.
+func (s *scratch) ensureFusedMLP(L, intermediate int) {
+	s.upGate = ensureF32(s.upGate, L*2*intermediate)
 }
 
 // mm is the encoder's f32 matmul dispatch point: dst[M,N] = a[M,K] · b[N,K]ᵀ.
