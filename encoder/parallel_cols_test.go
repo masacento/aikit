@@ -138,13 +138,11 @@ func TestSpladeVocabProj_colParallelIsBitIdentical(t *testing.T) {
 // above picks rows), and each is run both alone and with the in-flight counter
 // raised, which forces the serial fill.
 //
-// The reference is chosen per REGION, because matmulBTInto has an older split
-// this property does not cover: below 4 MFLOP it takes matmulBTNaiveInto, whose
-// i-n-k reduction order differs from the blocked kernel's k-tiling, so the two
-// are NOT bit-identical to each other. (linalg deleted its own naive threshold
-// for exactly this reason — see MatmulBT's M-INVARIANT note. The encoder still
-// has one.) Inside each region every path must agree; that is what the parallel
-// dispatch can break and what this test guards.
+// The reference is matmulBTBlockedInto at every shape. It used to have to be
+// chosen per region, because matmulBTInto carried a 4-MFLOP naive/blocked split
+// whose two sides disagreed on reduction order; that split is gone (items 27 +
+// 41), so ONE reference now covers the whole input space — which is the point of
+// removing it.
 func TestMatmulBTInto_dispatchIsNumericallyInert(t *testing.T) {
 	rng := rand.New(rand.NewSource(23))
 	cross := minRowsPerWorker * numCPU
@@ -155,17 +153,13 @@ func TestMatmulBTInto_dispatchIsNumericallyInert(t *testing.T) {
 		{cross, 256, 1024},     // exactly at it — rows
 		{cross + 1, 256, 1024}, // just above
 		{128, 768, 64},         // N too narrow to shard by column — rows
-		{8, 64, 64},            // below the 4 MFLOP cutoff — naive, never parallel
+		{8, 64, 64},            // below every parallel threshold — serial blocked
 	} {
 		a := randF32(rng, sh.M*sh.K)
 		b := randF32(rng, sh.N*sh.K)
 
 		want := make([]float32, sh.M*sh.N)
-		if int64(sh.M)*int64(sh.K)*int64(sh.N) < 4_000_000 {
-			matmulBTNaiveInto(a, b, want, sh.M, sh.K, sh.N)
-		} else {
-			matmulBTBlockedInto(a, b, want, sh.M, sh.K, sh.N)
-		}
+		matmulBTBlockedInto(a, b, want, sh.M, sh.K, sh.N)
 
 		got := make([]float32, sh.M*sh.N)
 		matmulBTInto(a, b, got, sh.M, sh.K, sh.N)
@@ -179,11 +173,11 @@ func TestMatmulBTInto_dispatchIsNumericallyInert(t *testing.T) {
 
 		for i := range want {
 			if got[i] != want[i] {
-				t.Fatalf("M=%d K=%d N=%d elem %d: idle dispatch %v, in-region reference %v",
+				t.Fatalf("M=%d K=%d N=%d elem %d: idle dispatch %v, serial blocked %v",
 					sh.M, sh.K, sh.N, i, got[i], want[i])
 			}
 			if busy[i] != want[i] {
-				t.Fatalf("M=%d K=%d N=%d elem %d: busy dispatch %v, in-region reference %v",
+				t.Fatalf("M=%d K=%d N=%d elem %d: busy dispatch %v, serial blocked %v",
 					sh.M, sh.K, sh.N, i, busy[i], want[i])
 			}
 		}

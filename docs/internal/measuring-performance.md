@@ -250,6 +250,23 @@ allocated its own destination buffer while production passes one from the arena.
 not one. And make the test's setup match production's aliasing exactly — for an
 arena test that means the outputs come from the arena too.
 
+### 1.15 A benchmark's name is not evidence of its shape
+
+`BenchmarkCrossEncoderScore/L200` ran at **L=512**. Its document tokenized to 897
+tokens and the tokenizer truncated to `maxSeq=512`, so every number attributed to
+"L≈200" was really a 512-token forward.
+
+It cost two things. Item 27 appeared to have **no effect** on the cross-encoder
+(the threshold it removes only bites below L≈250, and 512 is above it) — the real
+figure at L=200 is **−50.5%**. And item 13's cross-encoder result had been
+compared against a prediction the doc made specifically for L≈200, which was not
+the length measured; at the right length it is −29.4%, not −33.7%.
+
+**Guard:** for any benchmark whose shape comes from *text*, print the resulting
+token count once and check it against the name. Truncation to a model's `maxSeq`
+is silent, and a subtest name is an assertion no one verifies. The fixed version
+spans `L200` and `L512` deliberately, with a comment saying why.
+
 ---
 
 ## 2 · The recipe
@@ -335,10 +352,11 @@ been consistently right; magnitudes consistently optimistic.**
 | 11 · touched-set selection | large | 1.3–218×, overshot | ✅ |
 | 12 · `dotI8AVX2` | in-band | 2.10× kernel / 2.02× scan | ✅ |
 | 13 · f32 transcendentals (text) | 1.25–1.5× text | 1.25× (−20.1%) | ✅ |
-| 13 · …on the D=384 cross-encoder | ~22% GELU + ~14% softmax | **−33.8%** | ✅ |
+| 13 · …on the D=384 cross-encoder | ~29–36% at L≈200 | **−29.4%** at L=200 | ✅ |
 | 13 · …on SigLIP | up to 2× | 1.24× geomean (1.44× at 576 patches) | ❌ |
 | 22 · q8 weight widen | ~113 ms/fwd, L-independent | ~190 ms/fwd, L-independent | ✅ |
 | 18 · Qwen ViT arena | ~15 GB/image, ~1.5 s memset | −70/−85% B/op; **~3%** of latency | ⚠️ |
+| 27 · 4-MFLOP naive threshold | 3–9% for L<250 | **up to −50.5%** | ❌ (under) |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -356,6 +374,13 @@ the same at 10 tokens and at 350.
 
 **Derived predictions have held; measured-then-scaled ones have not.** When an
 estimate comes with a formula, trust its shape and re-measure only its constant.
+
+Item 27 is the counter-case and the only large UNDER-estimate so far: "3–9% for
+L<250" against a measured 50.5%. The formula there sized *one* diverted matmul
+and forgot that the diverted shape is the per-head attention matmul, which recurs
+heads × layers × 2 times per forward — 144× in a 12/12 model. **An estimate that
+sizes a kernel and omits its multiplicity is wrong by the multiplicity**, and the
+error is unbounded in the optimistic direction as easily as the pessimistic.
 
 ---
 

@@ -17,23 +17,33 @@ import (
 // reductions where parity matters (LayerNorm, softmax, final L2)
 // callers should use float64 explicitly.
 //
-// M3 dispatch: small or unaligned shapes go straight through the
-// i-n-k naive path (it's hard to beat for tiny tiles and avoids the
-// blocked kernel's prologue overhead); large shapes route through
-// matmulBTBlocked which is ~2-3× faster at the forward-pass shapes
-// (verified by BenchmarkMatmulBT_*). The threshold is the FLOP count
-// per call; tuned so the layer-7 attention QKᵀ at L=80 (~3 MFLOP) is
-// naive while everything bigger is blocked.
+// ALL shapes route through the blocked kernel. There used to be a 4-MFLOP
+// threshold below which this took the i-n-k naive path, on the theory that it
+// beat the blocked kernel's prologue at tiny tiles. Both halves of that were
+// wrong (perf-campaign items 27 + 41):
+//
+//   - It was slower, not faster, at every shape it diverted. Measured on a
+//     3700X by BenchmarkNaiveVsBlocked — per-head attention QKᵀ at L=128
+//     528→99 µs (5.3×), scores·V at L=250 2649→197 µs (13.5×). The threshold
+//     sent EVERY attention matmul below L≈250 to a scalar triple loop.
+//   - It made the reduction order observable. The naive span accumulates in a
+//     different order than the blocked kernel's k-tiling, so which side of the
+//     threshold a shape landed on changed the output: 13489 of 16384 elements
+//     differ at M=128,K=64,N=128, worst |Δ| 9.5e-06. linalg deleted its own
+//     copy of this threshold for exactly that reason (see MatmulBT's
+//     M-INVARIANT note) and measured the same speed result; the encoder kept a
+//     private one. Removing it also removes the last source of batch-vs-single
+//     divergence in forwardBatch.
 func matmulBT(a, b []float32, M, K, N int) []float32 {
-	if int64(M)*int64(K)*int64(N) < 4_000_000 {
-		return matmulBTNaive(a, b, M, K, N)
-	}
 	return matmulBTBlocked(a, b, M, K, N)
 }
 
-// matmulBTNaive is the correctness-first baseline. Loop order i-n-k:
-// inner reduction reads a[i,:] sequentially and b[n,:] sequentially —
-// both contiguous in row-major.
+// matmulBTNaive is the correctness-first baseline, kept as the reference the
+// blocked kernel is tested against (TestNaiveVsBlocked_reductionOrderDiffers,
+// linalg's own equivalence tests). It is NOT on any production path — see
+// matmulBT for why the threshold that used to select it is gone. Loop order
+// i-n-k: the inner reduction reads a[i,:] and b[n,:] sequentially, both
+// contiguous in row-major.
 func matmulBTNaive(a, b []float32, M, K, N int) []float32 {
 	dst := make([]float32, M*N)
 	for i := range M {
@@ -58,13 +68,9 @@ func matmulBTBlockedInto(a, b, dst []float32, M, K, N int) {
 	linalg.MatmulBTInto(dst, a, b, M, K, N)
 }
 
-// matmulBTInto dispatches by FLOP count, same as matmulBT, into a
-// caller-provided dst.
+// matmulBTInto is matmulBT into a caller-provided dst, plus the intra-op
+// parallelism dispatch. Like matmulBT it has no naive path — see there.
 func matmulBTInto(a, b, dst []float32, M, K, N int) {
-	if int64(M)*int64(K)*int64(N) < 4_000_000 {
-		matmulBTNaiveInto(a, b, dst, M, K, N)
-		return
-	}
 	// Intra-op parallelism kicks in only for a lone forward with a large
 	// enough shape. Under EncodeBatch's per-worker parallelism both gates
 	// are false, so the batch path stays on the serial blocked fill.

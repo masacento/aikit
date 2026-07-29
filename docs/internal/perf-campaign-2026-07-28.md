@@ -71,7 +71,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 9 | `SpanCache` LRU → MRU/scan-resistant; add `MADV_WILLNEED` on map; pipeline `Touch(b+1)` | mmap | 0% → max hit rate | — | S |
 | 10 | `bm25`: hoist `1/avgdl`; precompute per-posting impact at build time | bm25 | 1.5–2× scoring | ~ | S–M |
 | ~~40~~ | ~~**(NEW)** intra-op matmul fans across ROWS, replicating the weights per worker~~ — **DONE, −3.9% geomean / −15.8% on `SPLADE.Expand` L=91** (§7.14) | encoder | columns beat rows at every trunk shape, up to 3.33× | = | — |
-| 41 | **(NEW)** `matmulBTInto`'s 4 MFLOP naive/blocked split is not reduction-order-consistent; `linalg` deleted its own for that reason | encoder | correctness-of-contract, not speed | — | S |
+| ~~41~~ | ~~**(NEW)** `matmulBTInto`'s 4 MFLOP naive/blocked split is not reduction-order-consistent~~ — **DONE with item 27** (§7.20) | encoder | also removes the last batch-vs-single divergence | — | — |
 | 43 | **(NEW)** `TestQwenVisionEncoder_parity`'s threshold accepts cosine 0.99999156 / maxΔ 6.2e-03 — a dropped attention segment passes it (§7.19) | vision | gate strength, not speed | — | S |
 | ~~42~~ | ~~**(NEW)** attention softmax + GELU/GeGLU run SERIAL and are O(L²)/O(L·I)~~ — **DONE, −31% geomean, `GTE.Encode` L=690 3.28×** (§7.15) | encoder | the elementwise stages ARE the forward once the matmuls are parallel | = | — |
 
@@ -100,7 +100,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 24 | `matmul_blocked.go` packed stride is a 4096 B power-of-two — recreates the aliasing packing exists to remove | linalg | free | = | S |
 | 25 | arm64 `Dot2x8` has the wrong MR×NR: 4×4 needs 8 loads per 16 FMLAs vs today's 10 | linalg | 1.1–1.25× arm64 f32 GEMM | **=** | S–M |
 | 26 | `math.Round` is **not** an amd64 intrinsic (`math.Trunc` is) — verified in disassembly | linalg, encoder | ~12 int ops → 1 `ROUNDSD` | = | S |
-| 27 | Encoder's 4-MFLOP naive threshold sends **every** attention matmul at L<250 to a scalar triple loop | encoder | 3–9% for L<250 | ~ | S |
+| ~~27~~ | ~~Encoder's 4-MFLOP naive threshold sends **every** attention matmul at L<250 to a scalar triple loop~~ — **DONE, up to −50.5%** (§7.20) | encoder | estimated 3–9%; the first large UNDER-estimate | ~ | — |
 | 28 | `CrossEncoder` has **no batch API** and re-tokenizes the query per pair | encoder | unlocks item 14 for rerank | = | M |
 | 29 | `bm25` posting is 16 B (`sparse`'s is 8 B); build allocates 3.1× the payload | bm25 | 1.5–2× scoring, 3× build alloc | = | M |
 | 30 | `bm25.Tokenize` allocates a string per mixed-case token — 787 allocs for one 20 KB Go file | bm25 | 787 → ~10 | = | S |
@@ -1231,14 +1231,25 @@ Four things an earlier draft asserted that the refutation pass knocked down:
 
     | workload | before | after | |
     |---|--:|--:|--:|
-    | `CrossEncoder.Score` L≈200 (D=384) | 560.3 ms | 370.9 ms | **−33.8%** (p=0.002) |
+    | `CrossEncoder.Score` L=512 (D=384) | 559.2 ms | 371.0 ms | **−33.7%** (p=0.002) |
+    | `CrossEncoder.Score` L=200 (D=384) | 222.7 ms | 157.2 ms | **−29.4%** (p=0.002) |
     | SigLIP tower, 576 patches, h768 | 3.048 s | 2.115 s | **−30.6%** (p=0.008) |
     | SigLIP tower, 196 patches, h512 | 478.3 ms | 392.9 ms | −17.9% (p=0.008) |
 
     **The cross-encoder prediction was right, quantitatively.** §13's closed form
     said the FFN activation share GROWS as D shrinks — 11% at D=768, ~22% at
-    D=384 — and put MiniLM-L6 at ~22% GELU + ~14% softmax. Measured: **33.8%**.
-    That is the doc's most precise correct call.
+    D=384 — and put MiniLM-L6 at **L≈200** at ~22% GELU + ~14% softmax, i.e.
+    ~29–36%. Measured at L=200: **−29.4%**, the bottom of that range. The
+    L-dependence the model implies is visible too: 29.4% at L=200 rising to 33.7%
+    at L=512, since the softmax half grows as O(L²) while the GELU half
+    (activation ÷ FFN-matmul) is L-independent. This is the doc's most precise
+    correct call.
+
+    *(Corrected 2026-07-29: this row originally read "−33.8% at L≈200". The
+    benchmark was NAMED L200 but its document tokenized to 897 and truncated to
+    `maxSeq`, so it ran at L=512 — see §7.20 and `measuring-performance.md`
+    §1.15. The magnitude was right; the length it was attributed to was not, and
+    the comparison to an L≈200 prediction was therefore not apples-to-apples.)*
 
     **The vision prediction was not.** "Up to 2× vision" against a measured
     1.24× geomean (1.44× at the larger tower). But the *shape* is right and
@@ -1368,6 +1379,56 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     — it detects the damage and passes anyway. A vision parity threshold loose
     enough to accept a missing attention segment is worth tightening; filed as
     item 43.
+
+20. **Items 27 and 41 are DONE — one deletion, and the campaign's first large
+    UNDER-estimate.** They were the same root cause: the encoder kept a private
+    4-MFLOP naive/blocked threshold in `matmulBT`/`matmulBTInto` that `linalg`
+    had already deleted from its own copy. Both of the threshold's premises were
+    wrong.
+
+    It was **slower**, not faster, at every shape it diverted
+    (`BenchmarkNaiveVsBlocked`, 3700X):
+
+    | shape (M,K,N) | naive | blocked | |
+    |---|--:|--:|--:|
+    | QKᵀ L=64 · 64,64,64 | 139.7 µs | 37.0 | 3.8× |
+    | QKᵀ L=128 · 128,64,128 | 528.1 µs | 99.5 | 5.3× |
+    | QKᵀ L=250 · 250,64,250 | 2002 µs | 363.9 | 5.5× |
+    | scores·V L=128 · 128,128,64 | 652.3 µs | 53.7 | 12.1× |
+    | scores·V L=250 · 250,250,64 | 2649 µs | 196.9 | 13.5× |
+
+    And it made the **reduction order observable**: naive and blocked differ on
+    13489 of 16384 elements at M=128,K=64,N=128 (worst |Δ| 9.5e-06), so which
+    side of the threshold a shape fell on changed the output. `linalg` deleted
+    its own for exactly that reason (`MatmulBT`'s M-INVARIANT note). Removing the
+    encoder's also removes the last source of batch-vs-single divergence in
+    `forwardBatch`, which §14 had identified as the only one left.
+
+    End-to-end, benchstat n=6:
+
+    | workload | before | after | |
+    |---|--:|--:|--:|
+    | `CrossEncoder.Score` L=200 | 316.8 ms | 156.7 ms | **−50.5%** |
+    | `GTE.Encode` L=175 | 883.5 ms | 454.4 ms | **−48.6%** |
+    | `SPLADE.Expand` L=91 | 373.1 ms | 217.6 ms | **−41.7%** |
+    | `GTE.Encode` L=22 | 68.7 ms | 56.6 ms | −17.7% |
+    | `SPLADE.Expand` L=22 | 102.8 ms | 98.3 ms | −4.4% |
+    | L≥~350 (all models) | — | — | ~ (already above the threshold) |
+
+    **The estimate was "3–9% for L<250". Measured up to 50.5%.** Every other
+    miss in this campaign has been an over-estimate; this is the first large
+    under-estimate, and the reason is instructive: 3–9% is what one diverted
+    matmul costs, but the diverted shape is the PER-HEAD attention matmul, which
+    recurs heads × layers × 2 times per forward — 144× in a 12/12 model. An
+    estimate that sizes the kernel and forgets the multiplicity is wrong by the
+    multiplicity.
+
+    **A benchmark that asserted a shape it did not produce.** The cross-encoder
+    row above only appeared after fixing this: the benchmark was named `L200` but
+    its document tokenized to 897 tokens and the tokenizer truncated to
+    `maxSeq=512`, so it ran at L=512 — above the threshold, hence "no change".
+    The mislabel had also been carried into §7.17's item-13 record, now
+    corrected there. Filed as `measuring-performance.md` §1.15.
 
 ---
 
