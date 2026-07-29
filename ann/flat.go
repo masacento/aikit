@@ -96,6 +96,16 @@ func (f *Flat) Query(q []float32, k int) []Hit {
 // logical-delete / live-set filter applied at query time, so the index stays
 // immutable. Exact for Flat (it scores every vector and filters before selecting),
 // unlike the approximate HNSW.QueryFilter. A nil keep is exactly Query.
+//
+// keep MUST be a pure predicate that is safe for concurrent use. The scan is
+// sharded across cores, so keep is called from several goroutines at once, and
+// — because each shard maintains its own running top-k threshold — the SET of
+// ids it is asked about, and their order, differ from any serial
+// implementation. A read-only live-set lookup (the intended use) satisfies this;
+// a closure that counts calls or memoizes into shared state does not.
+//
+// The returned hits do not depend on any of that: they are the k highest by
+// score with ties broken by ascending index, identical to a serial scan.
 func (f *Flat) QueryFilter(q []float32, k int, keep func(id int) bool) []Hit {
 	return f.query(q, k, keep)
 }
@@ -122,8 +132,8 @@ func (f *Flat) query(q []float32, k int, keep func(int) bool) []Hit {
 	// Heap path: 0 < k < Len. Score every vector, push into the K-sized
 	// min-heap; the heap only retains the K highest seen so far.
 	var items []topk.ItemWithScore[int]
-	if w := flatQueryWorkers(len(f.vecs), f.dim, keep); w > 1 {
-		items = f.queryShards(q, k, w)
+	if w := flatQueryWorkers(len(f.vecs), f.dim); w > 1 {
+		items = f.queryShards(q, k, w, keep)
 	} else {
 		items = scanTopK(q, f.vecs, 0, k, keep)
 	}
@@ -174,15 +184,8 @@ func scanTopK(q []float32, vecs [][]float32, base, k int, keep func(int) bool) [
 const flatParallelThreshold = 1 << 19
 
 // flatQueryWorkers decides the fan-out for one query.
-//
-// It returns 1 — i.e. stay serial — whenever a filter is supplied. `keep` is
-// caller-supplied and QueryFilter has never required it to be safe for
-// concurrent use; calling it from N goroutines would silently change that
-// contract. Filtered queries therefore keep the serial path until the contract
-// is stated. (Everything else about the two paths is identical, so lifting this
-// later is a one-line change plus a doc sentence.)
-func flatQueryWorkers(n, dim int, keep func(int) bool) int {
-	if keep != nil || n < 2 {
+func flatQueryWorkers(n, dim int) int {
+	if n < 2 {
 		return 1
 	}
 	if int64(n)*int64(dim) < flatParallelThreshold {
@@ -208,7 +211,7 @@ func flatQueryWorkers(n, dim int, keep func(int) bool) int {
 // Sharding therefore cannot change which elements are returned, only how they
 // are found. TestFlatQuery_shardedMatchesSerial gates it on adversarial
 // all-ties input.
-func (f *Flat) queryShards(q []float32, k, workers int) []topk.ItemWithScore[int] {
+func (f *Flat) queryShards(q []float32, k, workers int, keep func(int) bool) []topk.ItemWithScore[int] {
 	n := len(f.vecs)
 	per := (n + workers - 1) / workers
 	parts := make([][]topk.ItemWithScore[int], workers)
@@ -222,7 +225,7 @@ func (f *Flat) queryShards(q []float32, k, workers int) []topk.ItemWithScore[int
 		wg.Add(1)
 		go func(w, lo, hi int) {
 			defer wg.Done()
-			parts[w] = scanTopK(q, f.vecs[lo:hi], lo, k, nil)
+			parts[w] = scanTopK(q, f.vecs[lo:hi], lo, k, keep)
 		}(w, lo, hi)
 	}
 	wg.Wait()

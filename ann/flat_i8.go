@@ -92,6 +92,11 @@ func (f *FlatI8) Query(q []float32, k int) []Hit {
 // QueryFilter is Query restricted to documents for which keep(id) is true — a
 // logical-delete / live-set filter applied at query time, so the index stays
 // immutable. Exact over the int8 scores. A nil keep is exactly Query.
+// keep must be a pure predicate that is safe for concurrent use, per
+// Flat.QueryFilter — that sibling shards its scan and calls keep from several
+// goroutines. This implementation applies it serially today; the requirement is
+// stated uniformly so one filter works with every index and so this path can
+// shard later without a second contract change.
 func (f *FlatI8) QueryFilter(q []float32, k int, keep func(id int) bool) []Hit {
 	return f.query(q, k, keep)
 }

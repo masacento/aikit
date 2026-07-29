@@ -84,7 +84,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~13~~ | ~~**(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto`~~ — **DONE, all sites** (§7.16 text, §7.17 vision + cross-encoder); pure Go, no assembly | linalg→encoder, vision | text −20.1%; **cross-encoder −33.8%**; SigLIP −17.9%/−30.6% | ~ (contracts stated + gated) | — |
 | 14 | **(E)** Length-bucketed `EncodeBatch` under a token budget | encoder | 1.3–2× on ragged batches | **=** | M |
 | 15 | HNSW: batch neighbour scoring through `Dot8x4` | ann | **1.36–1.40× measured** end-to-end | ~ (1 ULP) | M |
-| ~~16~~ | ~~`Flat.Query` is single-threaded; shard it + per-shard selector~~ — **DONE, 1.73–2.26×** (§7.23) | ann | "4–8× typical" was never available: the scan is DRAM-bandwidth-bound at ~25 GB/s | = | — |
+| ~~16~~ | ~~`Flat.Query` is single-threaded; shard it + per-shard selector~~ — **DONE, 1.73–2.26×; filtered path −42%** (§7.23) | ann | "4–8× typical" was never available: the scan is DRAM-bandwidth-bound at ~25 GB/s | = | — |
 | 17 | HNSW build: batch `prune`/`selectHeuristic`; kill 225 allocs/insert | ann | 1.5–2.5× build | ~ | M |
 | ~~18~~ | ~~`vision/qwen_encoder.go` has no scratch arena~~ — **DONE, −70/−85% B/op, now depth-independent** (§7.19) | vision | latency share is ~3%, not the ~1.5 s implied | **=** | — |
 | ~~19~~ | ~~`DequantizeRowInt4`: hardware integer divide per element~~ — **DONE, 4.93×** (§7.11) | linalg | above the 2–4× estimate | = | — |
@@ -1550,11 +1550,35 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     invariance test (1…6000 workers). Both mutants — a reversed merge tie-break
     and a dropped shard base offset — fail it.
 
-    **`QueryFilter` deliberately stays serial.** `keep` is caller-supplied and
-    has never been documented as safe for concurrent use; fanning it out would
-    change that contract silently. `TestFlatQueryFilter_staysSerial` pins the
-    restriction, and asserts the unfiltered path DOES fan out so the test cannot
-    pass vacuously. Lifting it later is one line plus a doc sentence.
+    **`QueryFilter` was held back at first, then measured and lifted.** `keep` is
+    caller-supplied and had never been documented as safe for concurrent use, so
+    the first cut kept filtered queries serial rather than change a contract
+    silently. Measured with a read-only live-set bitmap — the documented use, and
+    about as cheap as a real filter gets, so the least favourable case — the
+    filtered path wins exactly as much as the unfiltered one:
+
+    | index | serial | sharded | |
+    |---|--:|--:|--:|
+    | N=50k, d=384, 90% live | 5.405 ms | 3.083 ms | −43.0% |
+    | N=200k, d=384, 90% live | 21.06 ms | 12.18 ms | −42.2% |
+    | N=200k, d=384, 10% live | 21.27 ms | 12.16 ms | −42.8% |
+
+    That is worth a contract change, so it was made explicitly: `keep` must now
+    be a pure predicate safe for concurrent use. Two consequences beyond the
+    obvious one are documented on the method, because they would surprise
+    someone: the *set* of ids `keep` is asked about differs from a serial scan
+    (each shard rejects against its own running k-th score), and so does the
+    order. A read-only live-set lookup is unaffected; a closure that counts calls
+    is not. The requirement is stated on `FlatI8.QueryFilter` and
+    `HNSW.QueryFilter` too — they still apply `keep` serially, but stating it
+    uniformly means one filter works with every index and those paths can shard
+    later without a second contract change. Recorded in `CHANGELOG.md` under
+    Changed, since it is a behavioural break that `apidiff` cannot see.
+
+    The filtered path has its own exactness gate rather than relying on the
+    unfiltered one: the filter interacts with the per-shard threshold, so
+    `TestFlatQueryFilter_shardedMatchesSerial` runs all/none/evens/sparse/prefix/
+    suffix filters across the tie-heavy inputs.
 
 ---
 

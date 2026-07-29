@@ -424,6 +424,9 @@ func (h *HNSW) QueryEf(q []float32, k, ef int) []Hit {
 // heavy deletion the live result can fall short of k (the search runs out of live
 // nodes within ef) — rebuild the index to purge tombstones when that bites. A nil
 // keep is exactly Query.
+// keep must be a pure predicate that is safe for concurrent use, per
+// Flat.QueryFilter — see the note there. This implementation applies it
+// serially today; the requirement is stated uniformly across the indexes.
 func (h *HNSW) QueryFilter(q []float32, k int, keep func(id int) bool) []Hit {
 	return h.queryEf(q, k, h.efSearch, keep)
 }

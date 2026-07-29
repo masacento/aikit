@@ -41,7 +41,7 @@ func TestFlatQuery_shardedMatchesSerial(t *testing.T) {
 			// Serial reference: force workers to 1 by using the filter-free
 			// scan directly, which is what flatQueryWorkers returns 1 for.
 			want := sortedHits(scanTopK(q, f.vecs, 0, k, nil))
-			got := sortedHits(f.queryShards(q, k, 8))
+			got := sortedHits(f.queryShards(q, k, 8, nil))
 			if !reflect.DeepEqual(got, want) {
 				t.Errorf("%s k=%d: sharded result differs from serial\n got %v\nwant %v",
 					tc.name, k, got, want)
@@ -65,25 +65,56 @@ func TestFlatQuery_shardWidthIsInert(t *testing.T) {
 	const k = 17
 	want := sortedHits(scanTopK(q, f.vecs, 0, k, nil))
 	for _, w := range []int{1, 2, 3, 5, 8, 16, 64, 6000} {
-		got := sortedHits(f.queryShards(q, k, w))
+		got := sortedHits(f.queryShards(q, k, w, nil))
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("workers=%d: result differs from serial\n got %v\nwant %v", w, got, want)
 		}
 	}
 }
 
-// TestFlatQueryFilter_staysSerial pins the deliberate restriction: `keep` is
-// caller-supplied and not documented as safe for concurrent use, so a filtered
-// query must not fan out. This is a contract test, not a performance one.
-func TestFlatQueryFilter_staysSerial(t *testing.T) {
-	f, _ := buildFlatCase(20000, 64, "random")
-	if w := flatQueryWorkers(len(f.vecs), f.dim, func(int) bool { return true }); w != 1 {
-		t.Errorf("QueryFilter fanned out to %d workers; keep is not required to be "+
-			"concurrency-safe, so it must stay serial", w)
+// TestFlatQueryFilter_shardedMatchesSerial is the exactness gate for the
+// FILTERED path, which now shards too. The filter interacts with the per-shard
+// threshold — each shard rejects candidates against its own running k-th score —
+// so this is not implied by the unfiltered gate and is tested separately, on the
+// same adversarial tie inputs.
+func TestFlatQueryFilter_shardedMatchesSerial(t *testing.T) {
+	for _, mode := range []string{"random", "identical", "twolevel"} {
+		f, q := buildFlatCase(6000, 96, mode)
+		for _, sel := range []struct {
+			name string
+			keep func(int) bool
+		}{
+			{"all", func(int) bool { return true }},
+			{"none", func(int) bool { return false }},
+			{"evens", func(id int) bool { return id%2 == 0 }},
+			{"sparse", func(id int) bool { return id%997 == 0 }},
+			{"prefix", func(id int) bool { return id < 50 }},
+			{"suffix", func(id int) bool { return id >= 5950 }},
+		} {
+			for _, k := range []int{1, 10, 64} {
+				want := sortedHits(scanTopK(q, f.vecs, 0, k, sel.keep))
+				got := sortedHits(f.queryShards(q, k, 8, sel.keep))
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("%s/%s k=%d: sharded filtered result differs from serial\n got %v\nwant %v",
+						mode, sel.name, k, got, want)
+				}
+				if !reflect.DeepEqual(hitsOf(f.QueryFilter(q, k, sel.keep)), want) {
+					t.Errorf("%s/%s k=%d: QueryFilter differs from serial", mode, sel.name, k)
+				}
+			}
+		}
 	}
-	if w := flatQueryWorkers(len(f.vecs), f.dim, nil); w <= 1 {
-		t.Errorf("unfiltered query did NOT fan out (workers=%d) — the gate is inert "+
-			"and this whole test proves nothing", w)
+}
+
+// TestFlatQuery_fanOutIsReached is the vacuity guard for every sharding test
+// here: if the gate stopped firing they would all pass while measuring nothing.
+func TestFlatQuery_fanOutIsReached(t *testing.T) {
+	f, _ := buildFlatCase(20000, 64, "random")
+	if w := flatQueryWorkers(len(f.vecs), f.dim); w <= 1 {
+		t.Fatalf("query did NOT fan out (workers=%d) — the sharding tests prove nothing", w)
+	}
+	if w := flatQueryWorkers(100, 8); w != 1 {
+		t.Errorf("a tiny index fanned out to %d workers; the threshold is not being applied", w)
 	}
 }
 

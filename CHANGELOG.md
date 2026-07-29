@@ -10,6 +10,23 @@ it.
 
 ## [Unreleased]
 
+### Changed
+
+- **`ann.Flat.Query`/`QueryFilter` now shard the scan across cores** (perf
+  campaign item 16): 1.73–2.26× depending on index size, and −42% on the
+  filtered path. Results are unchanged — still the k highest by score with ties
+  broken by ascending index, identical to a serial scan, gated on
+  adversarial all-ties inputs and shard-width invariance.
+
+  **Contract note (behavioural, not a signature change):** `QueryFilter`'s `keep`
+  must now be a **pure predicate that is safe for concurrent use**. It is called
+  from several goroutines, and because each shard keeps its own running top-k
+  threshold, the *set* of ids it is asked about and their order differ from a
+  serial scan. A read-only live-set lookup — the intended use — is unaffected; a
+  closure that counts calls or memoizes into shared state is not. The same
+  requirement is now documented on `FlatI8.QueryFilter` and `HNSW.QueryFilter`,
+  which still apply `keep` serially, so one filter works with every index.
+
 ### Added
 
 - **Native-Metal SigLIP resident encoder (`gpu` + `gpu/visionmetal`, native-GPU
