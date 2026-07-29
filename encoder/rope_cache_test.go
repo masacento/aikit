@@ -153,3 +153,51 @@ func TestScratchUpGate_fullyOverwritten(t *testing.T) {
 		}
 	}
 }
+
+// TestGTEEncode_loadIndependent is the end-to-end version of the per-kernel
+// inertness gates: a forward now chooses among parallel and serial
+// implementations for its matmuls, its attention softmax AND its GeGLU
+// activation, and every one of those choices is made by reading the in-flight
+// counter. If any split were not numerically inert, an encoder's output would
+// depend on how busy the machine is — a golden that passes in CI and drifts in
+// production under a concurrent batch.
+//
+// Raising the counter forces every gate to decline, so this compares the
+// fully-parallel forward against the fully-serial one, bit for bit.
+func TestGTEEncode_loadIndependent(t *testing.T) {
+	g := loadTestGTE(t)
+	// Long enough that every threshold is cleared: softmax is O(L²) and the
+	// GeGLU pass is L*intermediate.
+	text := gteBenchText(256)
+
+	parallel, err := g.Encode(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	enterForward()
+	enterForward() // a batch owns the cores: every gate must decline
+	serial, err := g.Encode(text)
+	leaveForward()
+	leaveForward()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(parallel) != len(serial) {
+		t.Fatalf("length %d vs %d", len(parallel), len(serial))
+	}
+	var diff int
+	for i := range parallel {
+		if parallel[i] != serial[i] {
+			diff++
+		}
+	}
+	if diff != 0 {
+		t.Fatalf("%d/%d embedding components differ between the parallel and serial forwards — "+
+			"encoder output must not depend on machine load", diff, len(parallel))
+	}
+	if inflightForwards.Load() != 0 {
+		t.Fatalf("in-flight counter leaked: %d", inflightForwards.Load())
+	}
+}

@@ -272,9 +272,7 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 			for i := range scores {
 				scores[i] *= scale
 			}
-			for i := range L {
-				softmaxRow(scores[i*L : (i+1)*L])
-			}
+			softmaxRows(scores, L, L)
 			s.mm(scores, vHT, ctxHead, L, L, headDim)
 			for i := range L {
 				copy(ctx[i*D+headIdx*headDim:i*D+headIdx*headDim+headDim], ctxHead[i*headDim:(i+1)*headDim])
@@ -292,14 +290,21 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 		// mid = gelu(gate) ⊙ up; ffn = mid·Downᵀ + b; residual; post-norm.
 		s.mm(h, l.UpGate, upGate, L, D, 2*I)
 		mid := s.val[:L*I]
-		for i := range L {
-			up := upGate[i*2*I : i*2*I+I]
-			gate := upGate[i*2*I+I : i*2*I+2*I]
-			m := mid[i*I : (i+1)*I]
-			for j := range I {
-				m[j] = geluScalar(gate[j]) * up[j]
+		// Split by token row: each writes only its own mid[i], and the
+		// activation is elementwise, so this is numerically inert. It is worth
+		// splitting because geluScalar is math.Erf per element — after the
+		// attention softmax was parallelized this was the largest remaining
+		// serial stage of GTE.Encode, ~27% of the call at L=690.
+		parallelRows(L, L*I, func(start, end int) {
+			for i := start; i < end; i++ {
+				up := upGate[i*2*I : i*2*I+I]
+				gate := upGate[i*2*I+I : i*2*I+2*I]
+				m := mid[i*I : (i+1)*I]
+				for j := range I {
+					m[j] = geluScalar(gate[j]) * up[j]
+				}
 			}
-		}
+		})
 		ffn := s.mid[:L*D]
 		s.mm(mid, l.Down, ffn, L, I, D)
 		addBias(ffn, l.DownB, L, D)

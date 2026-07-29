@@ -174,9 +174,7 @@ func selfAttentionQ8(h []float32, wqkv, outProj *linalg.WeightMat,
 		for i := range scores {
 			scores[i] *= scale
 		}
-		for i := range L {
-			softmaxRow(scores[i*L : (i+1)*L])
-		}
+		softmaxRows(scores, L, L)
 		s.mm(scores, vHT, ctxHead, L, L, headDim)
 		for i := range L {
 			dst := i*D + headIdx*headDim
@@ -243,9 +241,7 @@ func selfAttentionQ8Batched(h []float32, wqkv, outProj *linalg.WeightMat,
 			for i := range scoresL {
 				scoresL[i] *= scale
 			}
-			for i := range L {
-				softmaxRow(scoresL[i*L : (i+1)*L])
-			}
+			softmaxRows(scoresL, L, L)
 			ctxHeadL := ctxHead[:L*headDim]
 			s.mm(scoresL, vHTl, ctxHeadL, L, L, headDim)
 			for i := range L {

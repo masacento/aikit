@@ -76,9 +76,7 @@ func selfAttention(h []float32, Wqkv, WqkvB, OutProj, OutProjB []float32, heads,
 		for i := range scores {
 			scores[i] *= scale
 		}
-		for i := range L {
-			softmaxRow(scores[i*L : (i+1)*L])
-		}
+		softmaxRows(scores, L, L)
 		// ctxHead[L, headDim] = scores[L, L] · V[L, headDim], as scores · (vHT)ᵀ.
 		s.mm(scores, vHT, ctxHead, L, L, headDim)
 		// Scatter this head's context into the interleaved ctx[L, D].

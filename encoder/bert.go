@@ -329,9 +329,7 @@ func (b *BERT) hiddenStates(ids, segs []int32) []float32 {
 			for i := range scores {
 				scores[i] *= scale
 			}
-			for i := range L {
-				softmaxRow(scores[i*L : (i+1)*L])
-			}
+			softmaxRows(scores, L, L)
 			s.mm(scores, vHT, ctxHead, L, L, headDim)
 			for i := range L {
 				copy(ctx[i*D+headIdx*headDim:i*D+headIdx*headDim+headDim], ctxHead[i*headDim:(i+1)*headDim])
@@ -381,9 +379,18 @@ func l2norm(v []float32) []float32 { return embed.L2Normalize(v) }
 // gelu applies the exact (erf-based) GELU in place: x·Φ(x) = 0.5x(1+erf(x/√2)).
 // transformers' "gelu" activation is the erf form, not the tanh approximation.
 func gelu(x []float32) {
-	for i, v := range x {
-		x[i] = geluScalar(v)
-	}
+	// Chunked so a long activation block (BERT's [L,intermediate]) splits across
+	// cores; geluScalar is math.Erf per element, which is expensive enough that
+	// this is one of the largest serial stages once the matmuls are parallel.
+	// Elementwise and in place, so the split is numerically inert.
+	const chunk = 4096
+	chunks := (len(x) + chunk - 1) / chunk
+	parallelRows(chunks, len(x), func(start, end int) {
+		lo, hi := start*chunk, min(end*chunk, len(x))
+		for i, v := range x[lo:hi] {
+			x[lo+i] = geluScalar(v)
+		}
+	})
 }
 
 // geluScalar is the exact erf GELU for one element — the same computation gelu

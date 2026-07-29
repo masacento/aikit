@@ -129,6 +129,7 @@ const minColsForSplit = 128
 // it 32% (boost plus cache). So parallelizing ONE stage of a forward can lose end
 // to end even when that stage gets 5× faster — the answer is to parallelize the
 // rest, not to revert.
+//
 // The crossover back to rows is where the row split stops being WORKER-STARVED.
 // matmulBTBlockedIntoParallel gives each worker at least minRowsPerWorker rows,
 // so it reaches full width only at M ≥ minRowsPerWorker·NumCPU (512 on a
@@ -160,6 +161,73 @@ func wantParallelCols(M, K, N int) bool {
 // dispatch path). GOMAXPROCS changes after init do not retune the crossover;
 // that is acceptable for a heuristic and avoids a syscall per matmul.
 var numCPU = runtime.NumCPU()
+
+// softmaxRows applies softmaxRow to each of `rows` consecutive `cols`-wide rows
+// of scores, in parallel when it is worth it.
+//
+// This is the other half of the attention cost, and it is the half that grows
+// fastest. The linear projections are O(L) work; the attention score matrix is
+// O(L²), and every element of it goes through math.Exp. Profiling GTE.Encode at
+// L=690 on a 16-thread 3700X: softmaxRow was 2.1 s of a 4.19 s call — HALF the
+// wall clock — running entirely on one core, of which 1.63 s was math.archExp.
+// Meanwhile the linears, which the parallel matmul does cover, were ~1.4 s.
+//
+// Rows are independent: each is max-subtracted, exponentiated and normalized
+// using only its own elements. Splitting them changes no arithmetic and no
+// order within a row, so the result is bit-identical — unlike parallelizing a
+// reduction, which would not be.
+//
+// The in-flight guard is the same contract the matmul gates use: under
+// EncodeBatch every core is already busy with sibling forwards.
+//
+// This does NOT make the exp itself cheaper — that is perf-campaign item 13's
+// SIMD expF32, which is orthogonal and multiplies with this.
+func softmaxRows(scores []float32, rows, cols int) {
+	parallelRows(rows, rows*cols, func(start, end int) {
+		for i := start; i < end; i++ {
+			softmaxRow(scores[i*cols : (i+1)*cols])
+		}
+	})
+}
+
+// parallelRows splits [0,rows) into contiguous ranges across cores and runs fn
+// on each, when `work` (the total element count) justifies the spawn and no
+// other forward is in flight. Otherwise it runs fn(0, rows) inline on this
+// goroutine — so the caller writes one loop body and gets both paths.
+//
+// fn MUST treat its range as exclusively owned; the callers here write only
+// row-local state, which is what makes the split numerically inert.
+//
+// This exists because parallelizing the matmuls promotes whatever elementwise
+// stage was second-largest into first place. Profiling GTE.Encode at L=690
+// after the softmax split, gelu was 0.5 s of a 1.88 s call — 27% — on one core.
+func parallelRows(rows, work int, fn func(start, end int)) {
+	if rows < 2 || work < parallelRowsThreshold || inflightForwards.Load() > 1 {
+		fn(0, rows)
+		return
+	}
+	workers := min(numCPU, rows)
+	rowsPer := (rows + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		start := w * rowsPer
+		if start >= rows {
+			break
+		}
+		end := min(start+rowsPer, rows)
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			fn(start, end)
+		}(start, end)
+	}
+	wg.Wait()
+}
+
+// parallelRowsThreshold is the element count at/above which splitting an
+// elementwise pass pays for the goroutine spawn (~µs against a pass that is
+// transcendental-bound at ~20 ns/element).
+const parallelRowsThreshold = 1 << 16
 
 // matmulBTColsInto computes dst[M,N] = a[M,K]·b[N,K]ᵀ, fanning across the N
 // (output-column) dimension instead of the M (row) dimension.

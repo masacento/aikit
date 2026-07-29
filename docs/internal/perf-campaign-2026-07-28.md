@@ -72,6 +72,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 10 | `bm25`: hoist `1/avgdl`; precompute per-posting impact at build time | bm25 | 1.5–2× scoring | ~ | S–M |
 | ~~40~~ | ~~**(NEW)** intra-op matmul fans across ROWS, replicating the weights per worker~~ — **DONE, −3.9% geomean / −15.8% on `SPLADE.Expand` L=91** (§7.14) | encoder | columns beat rows at every trunk shape, up to 3.33× | = | — |
 | 41 | **(NEW)** `matmulBTInto`'s 4 MFLOP naive/blocked split is not reduction-order-consistent; `linalg` deleted its own for that reason | encoder | correctness-of-contract, not speed | — | S |
+| ~~42~~ | ~~**(NEW)** attention softmax + GELU/GeGLU run SERIAL and are O(L²)/O(L·I)~~ — **DONE, −31% geomean, `GTE.Encode` L=690 3.28×** (§7.15) | encoder | the elementwise stages ARE the forward once the matmuls are parallel | = | — |
 
 ### Tier 1 — the big measured wins
 
@@ -1077,6 +1078,70 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     self-consistent so nothing is wrong today, but attention QKᵀ is `L·headDim·L`
     and crosses 4 MFLOP around L=256, meaning the same model uses different
     reduction orders for short and long inputs. Worth its own item.
+
+15. **Once the matmuls were parallel, the ELEMENTWISE stages were the forward —
+    another NEW item.** §7.14 ended with `GTE.Encode` at L=690 still taking 4.2 s
+    (~37 GFLOP/s of ~156 GFLOP). Profiling it, rather than assuming the matmuls
+    were at fault, gave the answer immediately:
+
+    ```
+    softmaxRow   2.11 s/call  (50% of a 4.19 s call)  ENTIRELY SERIAL
+      of which math.archExp        1.63 s
+    linears      ~1.4 s            (already parallel)
+    gelu         ~0.50 s           (27% after the softmax fix)  SERIAL
+    ```
+
+    The reason this hides is a difference in growth rate. The linear projections
+    are **O(L)** work and the attention score matrix is **O(L²)**, and every
+    element of that matrix goes through `math.Exp`. At L=22 softmax is 3% of a
+    forward and invisible; at L=690 it is half the call. Parallelizing the
+    matmuls does not touch it, so the more the matmul work is fixed the more
+    completely the elementwise stages own the profile.
+
+    Three splits, all across independent rows and therefore bit-identical (a row
+    softmax uses only its own elements; GeGLU and GELU are elementwise):
+    `softmaxRows` over the score matrix (6 call sites), `gelu`'s elementwise pass
+    in chunks, and GTE's fused GeGLU row loop. Factored into one `parallelRows`
+    helper that runs inline below threshold or when another forward is in flight
+    — the same in-flight contract as the matmul gates.
+
+    Measured against §7.14's state, benchstat n=5+6:
+
+    | | before | after | |
+    |---|--:|--:|--:|
+    | `GTE.Encode` L=690 | 4.189 s | **1.279 s** | **−69.5%** (3.28×) |
+    | `GTE.Encode` L=175 | 1.250 s | 956.7 ms | −23.5% |
+    | `GTE.Encode` L=22 | 99.8 ms | 86.6 ms | −13.2% |
+    | `SPLADE.Expand` L=357 | 1.957 s | 1.435 s | −26.7% |
+    | `SPLADE.Expand` L=91 | 579.2 ms | 443.0 ms | −23.5% |
+    | `SPLADE.Expand` L=22 | 148.0 ms | 140.1 ms | −5.4% |
+    | geomean | | | **−31.0%** |
+
+    Average parallelism across `GTE.Encode` went from 4.2× to 10.2×.
+
+    **A measurement caveat that cost a wrong conclusion, and is worth adopting.**
+    The `gelu` split appeared to REGRESS GTE by 4.5% (p=0.008, n=5) — on a code
+    path that provably does not exist in GTE, which has no `gelu()` call at all.
+    Re-running showed the whole GTE benchmark had drifted ~4.5% between
+    invocations as the box heated over a long session. **A provably-unchanged
+    code path moving 4.5% bounds the noise floor for cross-invocation benchstat
+    on this machine at ~5%**, which retroactively means §7.14's smaller GTE
+    numbers (−1.2%, and the L=690 "~") should be read as "within noise", not as
+    signal. Everything reported above is far outside it. The durable fix is
+    §7.12's lesson again in a new form: compare variants inside ONE process where
+    possible, and treat a sub-5% cross-run delta as unmeasured.
+
+    **Now load-dependent, so gated end to end.** A forward now picks among
+    parallel and serial implementations for its matmuls, its softmax AND its
+    activation, every choice made by reading the in-flight counter.
+    `TestGTEEncode_loadIndependent` compares a fully-parallel forward against a
+    fully-serial one bit for bit, because the failure this guards is not a crash
+    but an encoder whose output depends on how busy the machine is — passing in
+    CI and drifting in production under a concurrent batch.
+
+    **What is left at L=690:** `dotFMA8` 62% and `math.archExp` 21%, both now
+    parallel. The remaining transcendental cost is item 13 (SIMD
+    `expF32`/`erfF32`), which is orthogonal to this and multiplies with it.
 
 ---
 
