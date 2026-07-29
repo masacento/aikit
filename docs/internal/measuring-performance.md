@@ -156,6 +156,14 @@ exercise.
 **Guard:** report `B/op` and `sec/op` as separate results with separate claims.
 If the claim is about GC pressure, the benchmark has to have concurrency in it.
 
+Item 18 is the same shape and shows how to state it honestly. Removing 573 MiB
+of alloc+**memset** per forward is ~57 ms at ~10 GB/s, and 57 ms of a 1.88 s
+forward is 3.0% — measured 2.8%. The memset arithmetic in the estimate was
+right; what was oversold was the *share*. The real prize there is that
+allocation became depth-independent (103 MiB at depth 4 and at depth 8), which
+turns a ~15 GB peak into ~0.5 GB at production dims — a memory-ceiling result
+that the latency number does not express at all.
+
 ### 1.9 Profile attribution lies in two specific ways
 
 - **Goroutine samples do not appear in the spawning function's `cum`.** After
@@ -222,6 +230,25 @@ single win of item 13 (−33.8%) sitting behind it.
 and read the skip. Check whether the fixture is *generated* rather than
 downloaded — this repo has three generator scripts and two of them need no
 network at all. `ls testdata/` costs nothing; a deferred item costs a session.
+
+### 1.14 A gate that compares a run against itself cannot fail
+
+Item 18 moved the Qwen ViT's per-layer buffers into one reused arena, whose
+hazard is a buffer read before it is written — it would carry the previous
+layer's values. The first gate ran the forward twice and compared the results.
+
+It could never have worked. Stale-arena data is **deterministic**: both runs read
+the same stale bytes and agree, wrongly. It passed a mutant that dropped an
+entire attention segment.
+
+The working version poisons every arena buffer with NaN and compares against a
+run on a *fresh* arena — a known-good reference, not a second sample. Even that
+missed a partially-written output on the first attempt, because the test
+allocated its own destination buffer while production passes one from the arena.
+
+**Guard:** ask what reference a gate compares against. "The same code, again" is
+not one. And make the test's setup match production's aliasing exactly — for an
+arena test that means the outputs come from the arena too.
 
 ---
 
@@ -311,6 +338,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 13 · …on the D=384 cross-encoder | ~22% GELU + ~14% softmax | **−33.8%** | ✅ |
 | 13 · …on SigLIP | up to 2× | 1.24× geomean (1.44× at 576 patches) | ❌ |
 | 22 · q8 weight widen | ~113 ms/fwd, L-independent | ~190 ms/fwd, L-independent | ✅ |
+| 18 · Qwen ViT arena | ~15 GB/image, ~1.5 s memset | −70/−85% B/op; **~3%** of latency | ⚠️ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the

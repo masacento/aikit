@@ -72,6 +72,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 10 | `bm25`: hoist `1/avgdl`; precompute per-posting impact at build time | bm25 | 1.5–2× scoring | ~ | S–M |
 | ~~40~~ | ~~**(NEW)** intra-op matmul fans across ROWS, replicating the weights per worker~~ — **DONE, −3.9% geomean / −15.8% on `SPLADE.Expand` L=91** (§7.14) | encoder | columns beat rows at every trunk shape, up to 3.33× | = | — |
 | 41 | **(NEW)** `matmulBTInto`'s 4 MFLOP naive/blocked split is not reduction-order-consistent; `linalg` deleted its own for that reason | encoder | correctness-of-contract, not speed | — | S |
+| 43 | **(NEW)** `TestQwenVisionEncoder_parity`'s threshold accepts cosine 0.99999156 / maxΔ 6.2e-03 — a dropped attention segment passes it (§7.19) | vision | gate strength, not speed | — | S |
 | ~~42~~ | ~~**(NEW)** attention softmax + GELU/GeGLU run SERIAL and are O(L²)/O(L·I)~~ — **DONE, −31% geomean, `GTE.Encode` L=690 3.28×** (§7.15) | encoder | the elementwise stages ARE the forward once the matmuls are parallel | = | — |
 
 ### Tier 1 — the big measured wins
@@ -85,7 +86,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 15 | HNSW: batch neighbour scoring through `Dot8x4` | ann | **1.36–1.40× measured** end-to-end | ~ (1 ULP) | M |
 | 16 | `Flat.Query` is single-threaded; shard it + per-shard selector | ann | 1.74–2.08× on 2 cores; 4–8× typical | = | M |
 | 17 | HNSW build: batch `prune`/`selectHeuristic`; kill 225 allocs/insert | ann | 1.5–2.5× build | ~ | M |
-| 18 | `vision/qwen_encoder.go` has no scratch arena — **~15 GB alloc+memset per image** | vision | removes ~1.5 s of memset | **=** | M |
+| ~~18~~ | ~~`vision/qwen_encoder.go` has no scratch arena~~ — **DONE, −70/−85% B/op, now depth-independent** (§7.19) | vision | latency share is ~3%, not the ~1.5 s implied | **=** | — |
 | ~~19~~ | ~~`DequantizeRowInt4`: hardware integer divide per element~~ — **DONE, 4.93×** (§7.11) | linalg | above the 2–4× estimate | = | — |
 | 20 | Int8 register blocking (1×4 / 4×1) — the arm64 kernel has none | linalg | 1.2–1.6× GEMV, more at prefill | = (integer) | M |
 | ~~21~~ | ~~**(D)** `annmetal`: adopt the tiled/simdgroup kernel + on-GPU top-K~~ — **DONE** (§7.5) | gpu | measured: Metal 1.99×, CUDA 15.25× vs each box's own CPU @ N=100k/batch=256 | = (int32) | — |
@@ -1323,6 +1324,50 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     version (`SXTL`+`SCVTF`+`FMUL`) is straightforward but unmeasurable on this
     box, and §7.16 is the standing reminder that per-kernel ratios do not
     transfer between architectures.
+
+19. **Item 18 is DONE — a large allocation win, a small latency one, and a gate
+    that turned out not to be a gate.** `qwenScratch` now mirrors `encScratch`:
+    one arena per `Forward`, sized from `maxSeg` across BOTH cu_seqlens variants
+    (a full-attention block and a windowed block can each appear at any depth).
+    Measured at 1024 patches, benchstat n=6:
+
+    | | before | after | |
+    |---|--:|--:|--:|
+    | B/op, depth 4 | 348.7 MiB | 103.3 MiB | **−70.4%** |
+    | B/op, depth 8 | 676.2 MiB | 103.5 MiB | **−84.7%** |
+    | sec/op, depth 4 | 1.106 s | 1.061 s | −4.0% (p=0.009) |
+    | sec/op, depth 8 | 1.881 s | 1.829 s | −2.8% (p=0.015) |
+
+    Allocation is now **depth-independent** — 103.3 MiB at depth 4 and 103.5 at
+    depth 8, where before it doubled with depth. That is the property worth
+    having: at the real Qwen2.5-VL ViT (5184 patches, 32 layers) the ~15 GB the
+    item identified becomes a fixed ~0.5 GB, which is a peak-RSS question as much
+    as a speed one.
+
+    **The latency share is ~3%, not the ~1.5 s the Win column implies.** Both are
+    true: 573 MiB of alloc+memset removed at depth 8 is ~57 ms at ~10 GB/s, and
+    57 ms of 1.88 s is 3.0% — measured 2.8%. The doc's memset arithmetic is right;
+    it is the *share* that is small, and it stays small at real dims because the
+    O(patches²) attention grows faster than the O(patches) buffers. This is item
+    8's lesson again: an allocation item pays in GC pressure and peak memory, and
+    quoting it as latency oversells it.
+
+    **The gate I wrote first could not fail.** It ran the forward twice and
+    compared — but stale-arena data is *deterministic*, so both runs agree, and
+    agree wrongly. It passed a mutant that dropped an entire attention segment.
+    Replaced with one that poisons every arena buffer with NaN and compares
+    against a fresh arena, with the destinations taken from the arena itself
+    (`s.att`, `s.mlpOut`) exactly as `forwardViT` passes them — the first version
+    of *that* still missed a partially-written output because it allocated its own
+    destination. Now catches both mutants: an unwritten output lane and a buffer
+    read before fill.
+
+    **A pre-existing gate weakness, found by the same mutant and NOT fixed here.**
+    With one attention segment dropped, `TestQwenVisionEncoder_parity` reports
+    **cosine 0.99999156, maxΔ 6.18e-03** against a correct 1.00000000 / 7.75e-07
+    — it detects the damage and passes anyway. A vision parity threshold loose
+    enough to accept a missing attention segment is worth tightening; filed as
+    item 43.
 
 ---
 

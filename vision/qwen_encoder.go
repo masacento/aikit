@@ -326,24 +326,34 @@ func (e *QwenVisionEncoder) forwardViT(pixelValues []float32, gridTHW [][3]int) 
 	}
 
 	// 4. blocks (pre-norm residual). fullatt blocks attend per-image; others per-window.
+	//
+	// One arena for the whole tower (item 18); maxSeg covers both cu variants
+	// because a full-attention block and a windowed block can each appear at
+	// any depth.
+	maxSeg := max(maxSegment(cuWin), maxSegment(cuFull))
+	s := newQwenScratch(nPatches, hidden, c.IntermediateSize, headDim, maxSeg)
+	att := s.att[:nPatches*hidden]
+	o := s.o[:nPatches*hidden]
+	mlpOut := s.mlpOut[:nPatches*hidden]
+	n1 := s.n1[:nPatches*hidden]
+	n2 := s.n2[:nPatches*hidden]
 	for li := range e.blocks {
 		cu := cuWin
 		if e.isFullAtt(li) {
 			cu = cuFull
 		}
 		b := &e.blocks[li]
-		n1 := rmsNorm(hWin, b.norm1w, nPatches, hidden)
-		att := e.attention(n1, b, nPatches, cos, sin, cu)
-		o := make([]float32, nPatches*hidden)
+		rmsNormInto(n1, hWin, b.norm1w, nPatches, hidden)
+		e.attentionInto(att, n1, b, nPatches, cos, sin, cu, s)
 		b.projw.MatmulBT(att, o, nPatches)
 		addBias(o, b.projb, nPatches, hidden)
 		for i := range hWin {
 			hWin[i] += o[i]
 		}
-		n2 := rmsNorm(hWin, b.norm2w, nPatches, hidden)
-		mlp := e.mlp(n2, b, nPatches)
+		rmsNormInto(n2, hWin, b.norm2w, nPatches, hidden)
+		e.mlpInto(mlpOut, n2, b, nPatches, s)
 		for i := range hWin {
-			hWin[i] += mlp[i]
+			hWin[i] += mlpOut[i]
 		}
 	}
 
@@ -396,18 +406,18 @@ func (e *QwenVisionEncoder) merge(hidden []float32, gridTHW [][3]int) []float32 
 // attention runs bidirectional MHA within each cu_seqlens segment (window or full
 // image). qkv is fused (reshape seq,3,heads,head_dim); 2D rotary is applied to q,k
 // before attending. Per-head QKᵀ / scores·V run on the f32 SIMD A·Bᵀ kernel.
-func (e *QwenVisionEncoder) attention(x []float32, b *qwenBlock, seq int, cos, sin []float32, cu []int) []float32 {
+func (e *QwenVisionEncoder) attentionInto(out, x []float32, b *qwenBlock, seq int, cos, sin []float32, cu []int, s *qwenScratch) {
 	hidden, nH := e.Cfg.HiddenSize, e.Cfg.NumHeads
 	hd := hidden / nH
 	scale := float32(1.0 / math.Sqrt(float64(hd)))
 
-	qkv := make([]float32, seq*3*hidden)
+	qkv := s.qkv[:seq*3*hidden]
 	b.qkvw.MatmulBT(x, qkv, seq)
 	addBias(qkv, b.qkvb, seq, 3*hidden)
 	// split: row layout is [3, nH, hd], so q/k/v are the three contiguous halves.
-	q := make([]float32, seq*hidden)
-	k := make([]float32, seq*hidden)
-	v := make([]float32, seq*hidden)
+	q := s.q[:seq*hidden]
+	k := s.k[:seq*hidden]
+	v := s.v[:seq*hidden]
 	for i := range seq {
 		base := i * 3 * hidden
 		copy(q[i*hidden:(i+1)*hidden], qkv[base:base+hidden])
@@ -424,22 +434,12 @@ func (e *QwenVisionEncoder) attention(x []float32, b *qwenBlock, seq int, cos, s
 		}
 	}
 
-	out := make([]float32, seq*hidden)
-	maxSeg := 0
-	for s := 1; s < len(cu); s++ {
-		if l := cu[s] - cu[s-1]; l > maxSeg {
-			maxSeg = l
-		}
-	}
-	qh := make([]float32, maxSeg*hd)
-	kh := make([]float32, maxSeg*hd)
-	vt := make([]float32, hd*maxSeg)
-	scores := make([]float32, maxSeg*maxSeg)
-	oh := make([]float32, maxSeg*hd)
+	qh, kh, vt := s.qh, s.kh, s.vt
+	scores, oh := s.scores, s.oh
 	for head := range nH {
 		off := head * hd
-		for s := 1; s < len(cu); s++ {
-			start, n := cu[s-1], cu[s]-cu[s-1]
+		for si := 1; si < len(cu); si++ {
+			start, n := cu[si-1], cu[si]-cu[si-1]
 			for ii := range n {
 				gi := start + ii
 				copy(qh[ii*hd:(ii+1)*hd], q[gi*hidden+off:gi*hidden+off+hd])
@@ -463,26 +463,77 @@ func (e *QwenVisionEncoder) attention(x []float32, b *qwenBlock, seq int, cos, s
 			}
 		}
 	}
-	return out
+}
+
+// qwenScratch is the Qwen ViT's per-Forward arena. It mirrors encScratch on the
+// SigLIP side, which this encoder was written alongside but never got
+// (perf-campaign item 18).
+//
+// The buffers below were `make([]float32, …)` INSIDE the per-layer loop. make
+// zeroes, so that was not merely GC pressure — it was a mandatory memset of
+// every byte plus first-touch page faults, per layer. At Qwen2.5-VL ViT dims
+// (hidden 1280, inter 3420, 32 layers, ~5184 patches) it comes to ~540 MB per
+// layer, ≈15 GB allocated and zeroed per image, of which ~1.5 s is pure memset
+// before the collector does anything.
+//
+// Sized once per Forward. Bit-identical: same operations, same order, distinct
+// buffers — the only change is who owns the memory.
+type qwenScratch struct {
+	n1, n2, o, att []float32 // [np*hidden] block buffers
+	mlpOut         []float32 // [np*hidden]
+	qkv            []float32 // [np*3*hidden]
+	q, k, v        []float32 // [np*hidden]
+	qh, kh, oh     []float32 // [maxSeg*hd]
+	vt             []float32 // [hd*maxSeg]
+	scores         []float32 // [maxSeg*maxSeg]
+	gate, up       []float32 // [np*inter]
+}
+
+// newQwenScratch sizes every buffer for the largest shape the forward will use.
+// maxSeg is the longest attention segment across BOTH cu_seqlens variants — the
+// windowed blocks and the full-attention blocks partition the same patches
+// differently, and a layer of either kind may run at any depth.
+func newQwenScratch(np, hidden, inter, hd, maxSeg int) *qwenScratch {
+	return &qwenScratch{
+		n1: make([]float32, np*hidden), n2: make([]float32, np*hidden),
+		o: make([]float32, np*hidden), att: make([]float32, np*hidden),
+		mlpOut: make([]float32, np*hidden),
+		qkv:    make([]float32, np*3*hidden),
+		q:      make([]float32, np*hidden), k: make([]float32, np*hidden),
+		v:  make([]float32, np*hidden),
+		qh: make([]float32, maxSeg*hd), kh: make([]float32, maxSeg*hd),
+		oh: make([]float32, maxSeg*hd), vt: make([]float32, hd*maxSeg),
+		scores: make([]float32, maxSeg*maxSeg),
+		gate:   make([]float32, np*inter), up: make([]float32, np*inter),
+	}
+}
+
+// maxSegment returns the longest run in a cu_seqlens boundary list.
+func maxSegment(cu []int) int {
+	m := 0
+	for i := 1; i < len(cu); i++ {
+		if l := cu[i] - cu[i-1]; l > m {
+			m = l
+		}
+	}
+	return m
 }
 
 // mlp runs the gated SiLU MLP: down(silu(gate(x)) * up(x)).
-func (e *QwenVisionEncoder) mlp(x []float32, b *qwenBlock, seq int) []float32 {
+func (e *QwenVisionEncoder) mlpInto(down, x []float32, b *qwenBlock, seq int, s *qwenScratch) {
 	hidden, inter := e.Cfg.HiddenSize, e.Cfg.IntermediateSize
-	gate := make([]float32, seq*inter)
+	gate := s.gate[:seq*inter]
 	b.gatew.MatmulBT(x, gate, seq)
 	addBias(gate, b.gateb, seq, inter)
-	up := make([]float32, seq*inter)
+	up := s.up[:seq*inter]
 	b.upw.MatmulBT(x, up, seq)
 	addBias(up, b.upb, seq, inter)
 	silu(gate)
 	for i := range gate {
 		gate[i] *= up[i]
 	}
-	down := make([]float32, seq*hidden)
 	b.downw.MatmulBT(gate, down, seq)
 	addBias(down, b.downb, seq, hidden)
-	return down
 }
 
 func (e *QwenVisionEncoder) isFullAtt(layer int) bool {
@@ -589,8 +640,15 @@ func cuSeqlensFull(gridTHW [][3]int) []int {
 // rmsNorm is the weight-only RMSNorm (eps 1e-6) HF uses for the Qwen ViT — variance
 // over the last dim, no mean subtraction, no bias. Computed in f64 then cast.
 func rmsNorm(x, w []float32, rows, dim int) []float32 {
-	const eps = 1e-6
 	out := make([]float32, rows*dim)
+	rmsNormInto(out, x, w, rows, dim)
+	return out
+}
+
+// rmsNormInto is rmsNorm writing into a caller-owned dst[:rows*dim] — the form
+// the per-layer loop uses so it does not allocate. dst may not alias x.
+func rmsNormInto(out, x, w []float32, rows, dim int) {
+	const eps = 1e-6
 	for r := range rows {
 		xr := x[r*dim : r*dim+dim]
 		var ss float64
@@ -603,7 +661,6 @@ func rmsNorm(x, w []float32, rows, dim int) []float32 {
 			dst[d] = float32(float64(xr[d])*inv) * w[d]
 		}
 	}
-	return out
 }
 
 // applyRotaryVision applies NeoX rotate_half rotary to one head_dim vector in place,
