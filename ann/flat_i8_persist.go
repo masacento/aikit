@@ -3,6 +3,7 @@ package ann
 import (
 	"encoding/binary"
 	"math"
+	"unsafe"
 )
 
 // FlatI8 serialization — the //go:embed-an-index entry point for the int8 index,
@@ -40,17 +41,27 @@ const (
 // The point is the //go:embed pattern: quantize the corpus once offline, embed the
 // bytes, and Load at startup — no float32 vectors, no re-quantization per process.
 func (f *FlatI8) MarshalBinary() ([]byte, error) {
-	b := make([]byte, 0, 16+len(f.bq)+len(f.scales)*4)
-	put32 := func(v uint32) { b = binary.LittleEndian.AppendUint32(b, v) }
-	put32(flatI8Magic)
-	put32(flatI8Version)
-	put32(uint32(int32(f.dim)))
-	put32(uint32(int32(f.n)))
-	for _, code := range f.bq {
-		b = append(b, byte(code)) // int8 → byte is the two's-complement round-trip
+	// Allocated at exact capacity but LENGTH 16, then appended into. Using
+	// make([]byte, total) instead would zero the whole payload before overwriting
+	// every byte of it — a wasted pass over ~19 MB on a 50k×384 index. Appending
+	// into spare capacity is a memmove with no pre-zeroing.
+	//
+	// The previous version appended the code block ONE BYTE AT A TIME and pushed
+	// every scale through a `put32` closure that captured `b` by reference, so a
+	// 1M×768 index cost 768M appends plus 1M non-inlinable indirect calls.
+	b := make([]byte, 16, 16+len(f.bq)+len(f.scales)*4)
+	binary.LittleEndian.PutUint32(b[0:], flatI8Magic)
+	binary.LittleEndian.PutUint32(b[4:], flatI8Version)
+	binary.LittleEndian.PutUint32(b[8:], uint32(int32(f.dim)))
+	binary.LittleEndian.PutUint32(b[12:], uint32(int32(f.n)))
+	if len(f.bq) > 0 {
+		// int8 → byte is the two's-complement round-trip, and the two have identical
+		// layout, so the whole code block is one memmove. This is the same aliasing
+		// LoadFlatI8Mmap already relies on (flat_i8_mmap.go), in the other direction.
+		b = append(b, unsafe.Slice((*byte)(unsafe.Pointer(&f.bq[0])), len(f.bq))...)
 	}
 	for _, s := range f.scales {
-		put32(math.Float32bits(s))
+		b = binary.LittleEndian.AppendUint32(b, math.Float32bits(s))
 	}
 	return b, nil
 }

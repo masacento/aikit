@@ -120,9 +120,13 @@ func (f *Flat) query(q []float32, k int, keep func(int) bool) []Hit {
 	// Heap path: 0 < k < Len. Score every vector, push into the K-sized
 	// min-heap; the heap only retains the K highest seen so far.
 	sel := topk.New[int](k)
+	// See ann/flat_i8.go's topHits: the threshold is hoisted so the non-inlinable
+	// Push is only called for candidates that can actually be retained.
+	th := sel.Threshold()
 	scanFlat(q, f.vecs, func(i int, score float64) {
-		if keep == nil || keep(i) {
+		if score > th && (keep == nil || keep(i)) {
 			sel.Push(i, score)
+			th = sel.Threshold()
 		}
 	})
 	items := sel.Result() // descending by score; tie order is heap-internal

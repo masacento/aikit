@@ -62,9 +62,9 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 |---|---|---|---|---|---|
 | 1 | Revive the 3 dead benchmark files; add warm-up + alloc accounting + a concurrent-QPS mode to `bench/harness.go` | bench | unblocks everything | — | S |
 | 2 | SPLADE: hoist `log1p` outside the L×V max-reduce | encoder | 5–25× on that loop | **=** | S |
-| 3 | `topk.Push`: hoist the threshold compare above the non-inlinable call | topk | **1.43× measured** on selection | = | S |
+| ~~3~~ | ~~`topk.Push`: hoist the threshold compare~~ — **DONE** (§7.8) | topk, ann | **1.05× end-to-end** on `Flat.Query` (the 1.43× was the selection step alone) | = | — |
 | 4 | `FlatI8.Query`: pool the score buffer; stop allocating a `Workspace` per query | ann | 10–25% now, large at N≥1M | = | S |
-| 5 | Index (de)serialization: bulk `copy` instead of byte-at-a-time | ann | **~20–30×** | = | S |
+| ~~5~~ | ~~Index (de)serialization: bulk `copy`~~ — **DONE, 5.14×** (§7.8) | ann | 15.6 → 3.04 ms on a 50k×384 index; the 20–30× estimate was optimistic | = | — |
 | 6 | BERT/GTE forwards never call `enterForward()` → uncontrolled NumCPU² fan-out | encoder | removes oversubscription | — | S |
 | 7 | SPLADE vocab matmul runs **serial** while the trunk parallelizes | encoder | up to ~2.3× on `Expand` | = | S |
 | 8 | `gte.go:230` allocates 12.6 MB/`Encode` outside the scratch arena | encoder | 12.6 MB/call | = | S |
@@ -780,6 +780,31 @@ Four things an earlier draft asserted that the refutation pass knocked down:
    than f32; it is now 1.10x — MAC-parity. The int8 index finally converts its 4x
    memory cut into comparable throughput on amd64. arm64 was already correct and is
    untouched.
+
+8. **Items 5 and 3 are DONE — and both under-delivered against their estimates.**
+   Recorded here because a missed estimate is as useful as a hit.
+
+   **Item 5 (serialization): 5.14×, not 20–30×.** `MarshalBinary` appended the code
+   block one byte at a time and pushed every scale through a `put32` closure that
+   captured `b` by reference — a non-inlinable indirect call per scale. Replaced with
+   one `memmove` (via the same `int8`/`byte` aliasing `LoadFlatI8Mmap` already uses)
+   plus inlined `AppendUint32`. On a 50k×384 index: **15.6 ms → 3.04 ms**, 1243 →
+   6386 MB/s. Removing the redundant zeroing pass (`make([]byte, total)` →
+   `make([]byte, 16, total)`) changed nothing measurable, which locates the remaining
+   cost in the 19 MB allocation's page faults rather than in the copy. Getting past
+   5× needs an API that writes into a caller-supplied buffer, not a faster loop.
+
+   **Item 3 (topk threshold hoist): 1.05× end-to-end, not 1.43×.** The mechanism is
+   real — `Push` can't inline (siftUp/siftDown), so every rejected candidate paid a
+   call to fail one comparison — and the new `topk.Selector.Threshold()` is inlinable,
+   so the scan now only calls `Push` for candidates that can actually be retained.
+   But `Flat.Query` is dominated by the SIMD dot product, not by selection:
+   N=50k goes 3868 → 3666 µs. The doc's **1.43× was the selection step measured
+   alone**, which is a small fraction of query time. Worth keeping (free and
+   bit-identical), worth not expecting 1.43× from.
+
+   Both are bit-identical: the hoisted guard uses `>`, matching `Push`'s own strict
+   comparison, so a tied newcomer is rejected either way.
 
 ---
 

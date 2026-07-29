@@ -23,6 +23,8 @@
 // without the import path suggesting false coupling to BM25 or ANN.
 package topk
 
+import "math"
+
 // scored is the internal heap element: an item plus its score. Kept
 // non-generic-friendly (struct-of-T) so the slice backing the heap
 // is contiguous and benefits from CPU-cache locality on the up/down
@@ -110,6 +112,33 @@ func (s *Selector[T]) Push(item T, score float64) bool {
 	s.heap[0] = scored[T]{item: item, score: score, seq: seq}
 	s.siftDown(0)
 	return true
+}
+
+// Threshold is the score a new item must STRICTLY EXCEED to be retained: the current
+// minimum once the selector is at capacity, and -Inf before that (everything is
+// retained while there is room).
+//
+// It exists so a hot scan can skip the Push call entirely for the overwhelming
+// majority of candidates. Push cannot be inlined — it contains the siftUp/siftDown
+// calls — so every rejected candidate in an N-element scan pays a full call just to
+// fail one comparison. Threshold is small enough to inline, which turns that into a
+// compare in the caller's loop:
+//
+//	th := sel.Threshold()
+//	for i, s := range scores {
+//	    if s > th {
+//	        sel.Push(i, s)
+//	        th = sel.Threshold()   // only re-read when the heap actually changed
+//	    }
+//	}
+//
+// The guard must be `>`, matching Push's own strict comparison: a tied newcomer is
+// rejected either way, so hoisting it changes nothing about which items are kept.
+func (s *Selector[T]) Threshold() float64 {
+	if len(s.heap) < s.k {
+		return math.Inf(-1)
+	}
+	return s.heap[0].score
 }
 
 // ItemWithScore is the public read shape returned by Result.

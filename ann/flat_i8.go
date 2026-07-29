@@ -151,9 +151,16 @@ func (f *FlatI8) topHits(dst []float32, k int, keep func(int) bool) []Hit {
 	}
 
 	sel := topk.New[int](k)
+	// Hoist the retention threshold out of the loop: Push cannot be inlined (it
+	// calls siftUp/siftDown), so every rejected candidate otherwise pays a full call
+	// to fail one comparison. Once the heap is full, almost every candidate in a
+	// large scan is rejected. `>` matches Push's own strict test, so this changes
+	// which items are kept: not at all.
+	th := sel.Threshold()
 	for i, s := range dst {
-		if keep == nil || keep(i) {
+		if float64(s) > th && (keep == nil || keep(i)) {
 			sel.Push(i, float64(s))
+			th = sel.Threshold()
 		}
 	}
 	items := sel.Result()
