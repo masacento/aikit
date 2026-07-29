@@ -70,6 +70,8 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~8~~ | ~~`gte.go:230` allocates 12.6 MB/`Encode` outside the scratch arena~~ — **DONE, −12.7 MiB/call (−43%)** (§7.13) | encoder | exactly as estimated; **no latency change** | = | — |
 | 9 | `SpanCache` LRU → MRU/scan-resistant; add `MADV_WILLNEED` on map; pipeline `Touch(b+1)` | mmap | 0% → max hit rate | — | S |
 | 10 | `bm25`: hoist `1/avgdl`; precompute per-posting impact at build time | bm25 | 1.5–2× scoring | ~ | S–M |
+| ~~40~~ | ~~**(NEW)** intra-op matmul fans across ROWS, replicating the weights per worker~~ — **DONE, −3.9% geomean / −15.8% on `SPLADE.Expand` L=91** (§7.14) | encoder | columns beat rows at every trunk shape, up to 3.33× | = | — |
+| 41 | **(NEW)** `matmulBTInto`'s 4 MFLOP naive/blocked split is not reduction-order-consistent; `linalg` deleted its own for that reason | encoder | correctness-of-contract, not speed | — | S |
 
 ### Tier 1 — the big measured wins
 
@@ -960,12 +962,11 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     oversubscription the gate exists to prevent. The `forward_batch.go:58` double
     count is left alone — this doc numbers it item 34.
 
-    **One unrelated finding, not acted on.** In the same A/B at L=91, where the row
-    split *does* engage, the parallel trunk measured **636.8 ms vs 592.4 ms
+    **One unrelated finding, since chased down.** In the same A/B at L=91, where
+    the row split *does* engage, the parallel trunk measured **636.8 ms vs 592.4 ms
     serial** — the row-split path is a net loss at BERT-base trunk shapes on this
-    box. `parallelThreshold`'s table (`parallel.go:47-55`) is tuned on an 8-core M1
-    Pro; this is a 16-thread 3700X. Worth its own item before anyone trusts that
-    table on amd64.
+    box. That became §7.14, which found the cause (a row split replicates the
+    weights across workers; a column split partitions them) and retuned the axis.
 
 13. **Item 8 is DONE — the estimate was exact, and the item was honest about what
     it was buying.** Measured on a real `Snowflake/snowflake-arctic-embed-m-v2.0`
@@ -1005,9 +1006,77 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     **Unrelated, and larger than this item:** `GTE.Encode` at L=690 takes **4.2
     seconds** on a 16-thread 3700X — roughly 37 GFLOP/s against ~156 GFLOP of
     work, where the row-split path is supposed to be engaged. That is the same
-    smell as §7.12's closing note (row-split parallelism underperforming on
-    amd64), now on a second model. Both point at `parallelThreshold`'s M1-Pro
-    tuning table. It needs an item.
+    smell as §7.12's closing note, now on a second model. Both are §7.14, which
+    confirmed the axis was wrong and fixed it. (L=690 itself sits above the new
+    crossover and keeps the row split; the win landed at the shorter lengths.)
+
+14. **The row-split path was the wrong parallel axis on amd64 — a NEW item, found
+    by §7.12 and §7.13 independently, now measured and fixed.** `BenchmarkParallelAxis`
+    sweeps serial/rows/cols over the real trunk shapes with a 12-deep weight bank
+    (so no variant streams the same `b` out of L3 repeatedly). On a 16-thread
+    3700X, columns win at **every** shape:
+
+    | shape (M,K,N) | serial | rows | cols | cols/rows |
+    |---|--:|--:|--:|--:|
+    | fc11 L22 · 22,768,3072 | 2.32 ms | 2.29 ms | 0.69 ms | **3.33×** |
+    | qkv L91 · 91,768,2304 | 7.18 ms | 2.87 ms | 1.50 ms | **1.91×** |
+    | fc11 L91 · 91,768,3072 | 9.80 ms | 3.81 ms | 1.90 ms | **2.01×** |
+    | fc2 L91 · 91,3072,768 | 13.1 ms | 4.89 ms | 2.56 ms | **1.91×** |
+    | fc11 L357 · 357,768,3072 | 33.1 ms | 7.12 ms | 5.62 ms | 1.27× |
+    | upgate L175 · 175,768,6144 | 36.0 ms | 7.53 ms | 5.46 ms | 1.38× |
+    | upgate L690 · 690,768,6144 | 140 ms | 20.8 ms | 20.1 ms | 1.03× |
+
+    Two causes, both structural rather than mis-tuned constants:
+
+    1. **A row split replicates `b`; a column split partitions it.** Every row
+       worker reads the whole weight matrix (`parallel.go`'s own comment says so:
+       *"reads a[iStart\*K:iEnd\*K] + the shared read-only b"*), so a 9.4 MB fc11
+       weight is streamed `workers` times. In a transformer linear `a` is [L,K]
+       activations and `b` is [N,K] weights — the row split multiplies the
+       dominant memory traffic by the worker count. The gap closing as M grows is
+       this effect fading as arithmetic intensity rises.
+    2. **The row split is worker-starved at exactly the sizes that matter.**
+       `matmulBTBlockedIntoParallel` caps workers at `(M+31)/32`, so M=91 gets
+       **three** workers on a 16-thread box and M=22 gets one (i.e. serial).
+
+    Neither is arm64-specific, but the *cost* of (1) is: replicating `b` across an
+    M1 Pro's large unified cache is far cheaper than across a desktop part's
+    split-CCX L3, which is why the original tuning table never saw it.
+
+    **The fix is a crossover, not a global flip — and the micro-benchmark alone
+    would have got it wrong.** Making columns unconditional won SPLADE L=91 by
+    17.4% but LOST GTE L=690 by 2.32% (p=0.008), even though the micro predicted a
+    3% column win at that shape. Near a crossover the per-kernel number stops
+    being predictive. The boundary is therefore taken from the end-to-end
+    measurement and expressed as the condition that actually matters — *is the
+    row split able to fill the machine?* — i.e. columns below
+    `minRowsPerWorker·NumCPU`, rows at or above. Derived from `NumCPU` rather than
+    pinned, so it stays honest on other core counts.
+
+    Final, benchstat n=5, versus the row-first dispatch:
+
+    | | before | after | |
+    |---|--:|--:|--:|
+    | `SPLADE.Expand` L=91 | 688.0 ms | 579.2 ms | **−15.8%** (p=0.008) |
+    | `SPLADE.Expand` L=357 | 2.052 s | 1.957 s | −4.6% (p=0.008) |
+    | `GTE.Encode` L=175 | 1.265 s | 1.250 s | −1.2% (p=0.008) |
+    | `GTE.Encode` L=690 | 4.203 s | 4.189 s | ~ (p=0.841) |
+    | geomean | | | **−3.9%** |
+
+    All paths stay bit-identical, gated by
+    `TestMatmulBTInto_dispatchIsNumericallyInert` across the crossover and under a
+    raised in-flight counter. That matters more than usual here: the dispatch now
+    depends on machine load, so a non-inert path would mean a golden that passes
+    alone and fails under a concurrent batch.
+
+    **Found while writing that gate, not acted on:** `matmulBTInto` keeps a
+    4 MFLOP naive/blocked split, and the two are NOT bit-identical to each other
+    (different reduction order). `linalg` deleted its own such threshold for
+    exactly this reason — see `MatmulBT`'s M-INVARIANT note, which several
+    consumers depend on. The encoder's copy survives. Every shape is
+    self-consistent so nothing is wrong today, but attention QKᵀ is `L·headDim·L`
+    and crosses 4 MFLOP around L=256, meaning the same model uses different
+    reduction orders for short and long inputs. Worth its own item.
 
 ---
 

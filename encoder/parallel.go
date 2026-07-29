@@ -79,45 +79,87 @@ func wantParallelMatmul(M, K, N int) bool {
 	return M >= 2*minRowsPerWorker
 }
 
-// wantParallelCols reports whether a matmul the ROW split declined should
-// instead fan across output columns.
+// minColsForSplit is the narrowest N worth fanning across output columns.
+// linalg.MatmulBT shards 8-aligned and clamps its worker count to N, so this
+// only has to rule out outputs too narrow to give each worker a shard. Every
+// transformer linear is far above it (the narrowest here is N=768).
+const minColsForSplit = 128
+
+// wantParallelCols reports whether a matmul should fan across output COLUMNS.
+// This is the PRIMARY intra-op axis; the row split below is the fallback for
+// outputs too narrow to shard.
 //
-// It is deliberately the row gate's complement, not its rival: where M is tall
-// enough to split, the row split wins (it is the tuned, measured path, and its
-// workers share no output cache lines). wantParallelCols only picks up the
-// shapes the row split structurally cannot serve — M < 2*minRowsPerWorker.
+// That ordering is measured, and it reverses what this file originally did.
+// BenchmarkParallelAxis sweeps serial/rows/cols over the real trunk shapes with
+// a 12-deep weight bank (so no variant gets to stream b out of L3 repeatedly).
+// Columns win at every shape, on a 16-thread 3700X:
 //
-// Those shapes are not exotic. A SPLADE query or a reranker pair is often ~20
-// tokens, and M is the token count: at L=22 every projection in the BERT trunk
-// (wqkv 22·768·2304, fc11 22·768·3072, fc2 22·3072·768) clears the FLOP
-// threshold by 1.5-2× yet fails M ≥ 64, so the ENTIRE forward ran on one core
-// while 15 sat idle. Measured on a 3700X, that left the trunk at 128 ms of a
-// 153 ms SPLADE.Expand.
+//	shape (M,K,N)              serial     rows       cols      cols/rows
+//	fc11  L22   22,768,3072     2.32 ms   2.29 ms    0.69 ms     3.33×
+//	qkv   L91   91,768,2304     7.18 ms   2.87 ms    1.50 ms     1.91×
+//	fc11  L91   91,768,3072     9.80 ms   3.81 ms    1.90 ms     2.01×
+//	fc2   L91   91,3072,768     13.1 ms   4.89 ms    2.56 ms     1.91×
+//	fc11  L357  357,768,3072    33.1 ms   7.12 ms    5.62 ms     1.27×
+//	upgate L690 690,768,6144     140 ms   20.8 ms    20.1 ms     1.03×
 //
-// It also removes an interference effect that is invisible in a per-matmul
-// benchmark. Mixing an all-core burst into an otherwise serial forward costs the
-// serial part real time: a memory-free all-core burst alone slowed the following
-// serial trunk 12.8% (boost clock), and the real column-parallel vocabulary
-// projection slowed it 32% (boost plus cache). That is why parallelizing only
-// the vocabulary projection made short-query Expand 6.7% SLOWER end to end even
-// though the projection itself got 5× faster — the fix is for the trunk to be
-// parallel too, not for the projection to stay serial.
+// Two independent reasons, both structural rather than tuning:
 //
-// N is checked against the row gate's per-worker minimum for symmetry: a
-// fan-out needs enough columns to be worth the spawn, and linalg.MatmulBT
-// applies its own threshold below this one.
+//  1. A row split hands every worker the WHOLE of b, so the weights are streamed
+//     `workers` times; a column split partitions b, so they are streamed once. In
+//     a transformer linear a is [L,K] activations (small) and b is [N,K] weights
+//     (9.4 MB for one fc11) — the row split multiplies the dominant memory
+//     traffic by the worker count. This is why the gap closes as M grows: the
+//     arithmetic per byte of b rises until bandwidth stops being the limit.
+//  2. matmulBTBlockedIntoParallel caps workers at (M+31)/32, so M=91 gets THREE
+//     workers on a 16-thread box, and M=22 gets one (i.e. serial).
+//
+// Neither depends on the chip, but the cost of (1) does: the original tuning
+// table (parallelThreshold, below) was measured on an 8-core M1 Pro, where
+// replicating b across a unified, large shared cache is much cheaper than on a
+// desktop part with split-CCX L3.
+//
+// The in-flight guard is the contract wantParallelMatmul documents: under
+// EncodeBatch every core is already busy with sibling forwards, so this declines
+// and the batch path is behaviorally unchanged.
+//
+// One effect this makes it easy to misread, recorded because it cost real time
+// to diagnose (perf-campaign §7.12): mixing an all-core burst into an otherwise
+// serial forward taxes the serial part. A memory-free all-core burst alone slowed
+// a following serial trunk 12.8% (boost clock), and a real parallel matmul slowed
+// it 32% (boost plus cache). So parallelizing ONE stage of a forward can lose end
+// to end even when that stage gets 5× faster — the answer is to parallelize the
+// rest, not to revert.
+// The crossover back to rows is where the row split stops being WORKER-STARVED.
+// matmulBTBlockedIntoParallel gives each worker at least minRowsPerWorker rows,
+// so it reaches full width only at M ≥ minRowsPerWorker·NumCPU (512 on a
+// 16-thread box; 256 on 8). Below that it is running short-handed AND paying the
+// b-replication cost, which is why columns win by 3.33× at M=22 and 1.91× at
+// M=91. At and above it, the two converge (1.03× at M=690 in the micro) and the
+// end-to-end measurement tips the other way — GTE.Encode at L=690 is 2.3% faster
+// on rows (p=0.008), where the micro predicted a 3% column win. Near a crossover
+// the per-kernel benchmark stops being predictive, so the boundary is taken from
+// the end-to-end number.
+//
+// Deriving it from NumCPU rather than pinning a constant keeps it honest on other
+// core counts: the quantity that matters is whether the row split can fill the
+// machine, not any particular M.
 func wantParallelCols(M, K, N int) bool {
 	if inflightForwards.Load() > 1 {
 		return false
 	}
-	if M >= 2*minRowsPerWorker {
-		return false // the row split serves this shape; prefer it
-	}
 	if int64(M)*int64(K)*int64(N) < parallelThreshold {
 		return false
 	}
-	return N >= 2*minRowsPerWorker
+	if N < minColsForSplit {
+		return false
+	}
+	return M < minRowsPerWorker*numCPU
 }
+
+// numCPU caches runtime.NumCPU (it is not free, and this is on the matmul
+// dispatch path). GOMAXPROCS changes after init do not retune the crossover;
+// that is acceptable for a heuristic and avoids a syscall per matmul.
+var numCPU = runtime.NumCPU()
 
 // matmulBTColsInto computes dst[M,N] = a[M,K]·b[N,K]ᵀ, fanning across the N
 // (output-column) dimension instead of the M (row) dimension.

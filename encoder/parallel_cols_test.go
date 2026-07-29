@@ -127,3 +127,65 @@ func TestSpladeVocabProj_colParallelIsBitIdentical(t *testing.T) {
 	}
 	t.Logf("vocab projection bit-identical across %d logits (L=%d, V=%d)", len(want), L, V)
 }
+
+// TestMatmulBTInto_dispatchIsNumericallyInert is the safety property behind the
+// column/row crossover: matmulBTInto picks among three implementations by shape
+// and by how many forwards are in flight, and every one of them must produce the
+// same bits. If they did not, an encoder's output would depend on machine load —
+// a golden could pass alone and fail under a concurrent batch.
+//
+// Shapes straddle the crossover (M < minRowsPerWorker*numCPU picks columns, at or
+// above picks rows), and each is run both alone and with the in-flight counter
+// raised, which forces the serial fill.
+//
+// The reference is chosen per REGION, because matmulBTInto has an older split
+// this property does not cover: below 4 MFLOP it takes matmulBTNaiveInto, whose
+// i-n-k reduction order differs from the blocked kernel's k-tiling, so the two
+// are NOT bit-identical to each other. (linalg deleted its own naive threshold
+// for exactly this reason — see MatmulBT's M-INVARIANT note. The encoder still
+// has one.) Inside each region every path must agree; that is what the parallel
+// dispatch can break and what this test guards.
+func TestMatmulBTInto_dispatchIsNumericallyInert(t *testing.T) {
+	rng := rand.New(rand.NewSource(23))
+	cross := minRowsPerWorker * numCPU
+	for _, sh := range []struct{ M, K, N int }{
+		{22, 768, 3072},        // columns (short sequence)
+		{91, 768, 2304},        // columns (row split would be worker-starved)
+		{cross - 1, 256, 1024}, // just below the crossover
+		{cross, 256, 1024},     // exactly at it — rows
+		{cross + 1, 256, 1024}, // just above
+		{128, 768, 64},         // N too narrow to shard by column — rows
+		{8, 64, 64},            // below the 4 MFLOP cutoff — naive, never parallel
+	} {
+		a := randF32(rng, sh.M*sh.K)
+		b := randF32(rng, sh.N*sh.K)
+
+		want := make([]float32, sh.M*sh.N)
+		if int64(sh.M)*int64(sh.K)*int64(sh.N) < 4_000_000 {
+			matmulBTNaiveInto(a, b, want, sh.M, sh.K, sh.N)
+		} else {
+			matmulBTBlockedInto(a, b, want, sh.M, sh.K, sh.N)
+		}
+
+		got := make([]float32, sh.M*sh.N)
+		matmulBTInto(a, b, got, sh.M, sh.K, sh.N)
+
+		enterForward()
+		enterForward() // force the serial fallback
+		busy := make([]float32, sh.M*sh.N)
+		matmulBTInto(a, b, busy, sh.M, sh.K, sh.N)
+		leaveForward()
+		leaveForward()
+
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("M=%d K=%d N=%d elem %d: idle dispatch %v, in-region reference %v",
+					sh.M, sh.K, sh.N, i, got[i], want[i])
+			}
+			if busy[i] != want[i] {
+				t.Fatalf("M=%d K=%d N=%d elem %d: busy dispatch %v, in-region reference %v",
+					sh.M, sh.K, sh.N, i, busy[i], want[i])
+			}
+		}
+	}
+}

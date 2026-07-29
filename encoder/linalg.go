@@ -67,20 +67,20 @@ func matmulBTInto(a, b, dst []float32, M, K, N int) {
 		matmulBTNaiveInto(a, b, dst, M, K, N)
 		return
 	}
-	// Intra-op row parallelism kicks in only for a lone forward with a
-	// large enough shape (see wantParallelMatmul). Under EncodeBatch's
-	// per-worker parallelism this is false, so the batch path stays on
-	// the serial blocked fill.
-	if wantParallelMatmul(M, K, N) {
-		matmulBTBlockedIntoParallel(a, b, dst, M, K, N)
-		return
-	}
-	// Short sequences (a SPLADE query, a reranker pair) have too few rows to
-	// row-split but plenty of output columns; without this they ran the whole
-	// forward on one core. Bit-identical to both other paths — see
-	// wantParallelCols.
+	// Intra-op parallelism kicks in only for a lone forward with a large
+	// enough shape. Under EncodeBatch's per-worker parallelism both gates
+	// are false, so the batch path stays on the serial blocked fill.
+	//
+	// COLUMNS FIRST: a column split partitions the weights across workers
+	// while a row split replicates them, and it is not capped by the row
+	// count. Measured better at every trunk shape — see wantParallelCols.
 	if wantParallelCols(M, K, N) {
 		matmulBTColsInto(a, b, dst, M, K, N)
+		return
+	}
+	// Fallback for outputs too narrow to shard by column.
+	if wantParallelMatmul(M, K, N) {
+		matmulBTBlockedIntoParallel(a, b, dst, M, K, N)
 		return
 	}
 	matmulBTBlockedInto(a, b, dst, M, K, N)
