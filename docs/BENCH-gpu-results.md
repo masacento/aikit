@@ -5,7 +5,7 @@
 > absolute numbers are never placed in adjacent columns — the CPU baselines are
 > different chips; compare within a machine, or via the normalized summary.
 
-aikit `d9eda2b` · 32 records · 2 machine(s)
+aikit `d9eda2b` · 36 records · 2 machine(s)
 
 ## Per-machine tables (apples-to-apples, same box)
 
@@ -21,6 +21,8 @@ aikit `d9eda2b` · 32 records · 2 machine(s)
 | ann.FlatI8.QueryBatch | N=100k dim=256 batch=8 k=10 | int8 | 1.5k queries/s | 1.0k queries/s | 0.65× | 0.9750 | ✅ |
 | ann.FlatI8.QueryBatch | N=100k dim=256 batch=64 k=10 | int8 | 1.5k queries/s | 2.7k queries/s | 1.74× | 0.9781 | ✅ |
 | ann.FlatI8.QueryBatch | N=100k dim=256 batch=256 k=10 | int8 | 1.5k queries/s | 3.1k queries/s | 1.99× | 0.9754 | ✅ |
+| vision.SigLIP.Forward | dim=512 patches=196 | int8 | 4.4 images/s | 6.1 images/s | 1.37× | 0.9999 | ✅ |
+| vision.SigLIP.Forward | dim=768 patches=576 | int8 | 0.7 images/s | 1.1 images/s | 1.54× | 0.9999 | ✅ |
 
 ### nvidia-rtx2070s AMD Ryzen 7 3700X amd64 · GPU NVIDIA GeForce RTX 2070 SUPER (sm_75)
 
@@ -50,6 +52,8 @@ The only honest all-backends view: absolute ms don't compare across machines, bu
 | ann.FlatI8.QueryBatch | N=100k dim=256 batch=8 k=10 | int8 | 3.83× | 0.65× |
 | ann.FlatI8.QueryBatch | N=100k dim=256 batch=64 k=10 | int8 | 10.38× | 1.74× |
 | ann.FlatI8.QueryBatch | N=100k dim=256 batch=256 k=10 | int8 | 15.25× | 1.99× |
+| vision.SigLIP.Forward | dim=512 patches=196 | int8 | — | 1.37× |
+| vision.SigLIP.Forward | dim=768 patches=576 | int8 | — | 1.54× |
 
 ## Dispatch thresholds (the crossover — the input to backend dispatch)
 
