@@ -1,8 +1,6 @@
 package encoder
 
 import (
-	"math"
-
 	"github.com/townsendmerino/aikit/linalg"
 )
 
@@ -136,42 +134,27 @@ func addBias(dst []float32, bias []float32, M, N int) {
 }
 
 // softmaxRow normalizes row in-place along its last axis, using
-// max-subtraction for stability and float64 accumulators (plan §6:
-// softmax accumulates in f64). row is modified in place.
+// max-subtraction for stability and a float64 accumulator for the sum
+// (plan §6: softmax accumulates in f64).
+//
+// The exponentials themselves are float32 (linalg.SoftmaxRowInto), NOT Go's
+// float64 math.Exp. That is perf-campaign item 13, and it is the one change in
+// this campaign that is deliberately NOT bit-identical: math.Exp is a branchy
+// scalar f64 routine that cannot inline into this loop, and attention calls it
+// O(L²) times per head per layer. linalg's kernel is accurate to 0.68 ULP of
+// float32 (gated by TestExpF32_accuracy over 3.8M points) and softmax then
+// normalizes, which cancels most of the residual — the encoders' HF parity
+// goldens are the end-to-end check that this stays invisible.
 func softmaxRow(row []float32) {
-	if len(row) == 0 {
-		return
-	}
-	// max for stability
-	maxV := row[0]
-	for _, v := range row[1:] {
-		if v > maxV {
-			maxV = v
-		}
-	}
-	// sum of exp in f64
-	var sum float64
-	for i, v := range row {
-		e := math.Exp(float64(v - maxV))
-		row[i] = float32(e)
-		sum += e
-	}
-	if sum == 0 {
-		// degenerate — all-equal-to-zero output keeps the vector finite
-		for i := range row {
-			row[i] = 1.0 / float32(len(row))
-		}
-		return
-	}
-	inv := float32(1.0 / sum)
-	for i := range row {
-		row[i] *= inv
-	}
+	linalg.SoftmaxRowInto(row, row)
 }
 
-// silu returns x · sigmoid(x), the SwiGLU gate activation. f64
-// internally to avoid float32 saturation on large |x|.
+// silu returns x · sigmoid(x), the SwiGLU gate activation.
+//
+// linalg's float32 kernel (perf-campaign item 13), not f64 math.Exp. The
+// saturation the old f64 comment worried about is handled by ExpF32's own
+// overflow/underflow cases, and the accuracy contract is absolute error ≤1e-06
+// — see linalg.SiLUF32.
 func silu(x float32) float32 {
-	xf := float64(x)
-	return float32(xf / (1.0 + math.Exp(-xf)))
+	return linalg.SiLUF32(x)
 }

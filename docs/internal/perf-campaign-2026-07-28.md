@@ -80,7 +80,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 |---|---|---|---|---|---|
 | ~~11~~ | ~~**(A)** touched-set selection + pooled accumulator~~ — **DONE, bm25 + sparse** (§7.9) | bm25, sparse | 1.3–218× on bm25, selectivity-dependent | = | — |
 | ~~12~~ | ~~**(B)** Rewrite `dotI8AVX2`~~ — **DONE, 2.10× kernel / 2.02× scan** (§7.6) | linalg | measured on Zen 2; int8 now at f32 MAC-parity | = (integer) | — |
-| 13 | **(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto` | linalg→encoder, vision | 1.25–1.5× text, up to 2× vision | ~ or = (see item) | M–L |
+| ~~13~~ | ~~**(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto`~~ — **DONE for text, −20.1% geomean (1.25×)** (§7.16); pure Go, no assembly; vision + `tanhF32` remain | linalg→encoder, vision | **landed inside the predicted band** | ~ (contracts stated + gated) | — |
 | 14 | **(E)** Length-bucketed `EncodeBatch` under a token budget | encoder | 1.3–2× on ragged batches | **=** | M |
 | 15 | HNSW: batch neighbour scoring through `Dot8x4` | ann | **1.36–1.40× measured** end-to-end | ~ (1 ULP) | M |
 | 16 | `Flat.Query` is single-threaded; shard it + per-shard selector | ann | 1.74–2.08× on 2 cores; 4–8× typical | = | M |
@@ -1142,6 +1142,89 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     **What is left at L=690:** `dotFMA8` 62% and `math.archExp` 21%, both now
     parallel. The remaining transcendental cost is item 13 (SIMD
     `expF32`/`erfF32`), which is orthogonal to this and multiplies with it.
+
+16. **Item 13 is DONE for the text encoders — and it is the first item in this
+    campaign to land INSIDE its predicted band.** The doc estimated 1.25–1.5× on
+    text; measured geomean is **1.25×** (−20.06%). benchstat n=6, against §7.15:
+
+    | | before | after | |
+    |---|--:|--:|--:|
+    | `SPLADE.Expand` L=357 | 1.435 s | 1.016 s | **−29.2%** |
+    | `GTE.Encode` L=690 | 1.279 s | 911.5 ms | **−28.7%** |
+    | `SPLADE.Expand` L=22 | 140.1 ms | 104.2 ms | −25.6% |
+    | `GTE.Encode` L=22 | 86.6 ms | 71.7 ms | −17.3% |
+    | `SPLADE.Expand` L=91 | 443.0 ms | 390.1 ms | −11.9% |
+    | `GTE.Encode` L=175 | 956.7 ms | 912.2 ms | −4.7% |
+    | geomean | | | **−20.1%** |
+
+    **Its own measurement table did not transfer, and that changed the plan.**
+    Re-measured on the 3700X: GELU-erf **29.4 ns/element**, matching the doc's
+    28.9 — but `math.Exp` is **15 ns**, less than half the 34.3 quoted. So the
+    two halves of this item have very different ratios on amd64, and the "10–30×
+    on those loops" figure is unreachable without real SIMD. What was built
+    instead is PURE GO, portable to arm64 unchanged, and still delivered the
+    predicted end-to-end band:
+
+    | kernel | before | after | |
+    |---|--:|--:|--:|
+    | full softmax row (n=691) | 15.5–17.9 ns/elem | 8.4–8.6 | ~1.9× |
+    | GELU | 29.2–30.7 ns/elem | 15.2–17.5 | ~1.9× |
+
+    `linalg` gains `ExpF32`/`ErfF32`/`GELUF32`/`SiLUF32` plus `SoftmaxRowInto`/
+    `GELUInto`/`SiLUInto`; `encoder`'s `softmaxRow`, `geluScalar` and `silu` are
+    now three-line delegations.
+
+    **This is the one deliberately NON-bit-identical change in the campaign,** so
+    each kernel carries a stated, measured contract instead:
+
+    | kernel | contract | measured |
+    |---|---|---|
+    | `ExpF32` | ≤1 ULP relative | 0.68 ULP max, 0.19 mean (3.8M pts) |
+    | `ErfF32` | ≤2.5e-07 absolute | 1.92e-07 |
+    | `GELUF32` | ≤1e-06 absolute | 4.67e-07 |
+    | `SiLUF32` | ≤4 ULP relative | 1.21 ULP |
+
+    **The contracts are derived, not tuned to pass.** GELU's is absolute because
+    that is what propagates: it feeds an FFN matmul over I≈3072 with |W|~0.02, so
+    a per-element error ε contributes ~1.1ε to a hidden state, against goldens
+    already at maxΔ≈7.9e-06. GELU cannot be given a relative contract on x<0 at
+    all — there it evaluates erfc via (1+erf), which cancels as erf→−1, so no
+    absolutely-accurate erf yields relative accuracy; SiLU can, because
+    x/(1+e^−x) divides rather than subtracts. Getting this wrong sent me round
+    two false iterations of "loosen the threshold until it passes" before the
+    metric, not the kernel, turned out to be the problem.
+
+    **Two real bugs the gates caught, worth recording:**
+
+    - **A&S 7.1.26 is unusable near zero.** The textbook erf form computes
+      1 − P(t)·e^(−x²); as x→0 both terms tend to 1 and it loses nearly all
+      significance — measured 5.5e-07 absolute at x≈0.024, i.e. 2e-05 relative,
+      170 ULP, exactly where erf is at its most linear. Its quoted 1.5e-07 bound
+      is on the mathematical truncation, not on the floating-point evaluation.
+      Fixed with a Maclaurin branch for |x|<1, which shares the factor x and so
+      cannot cancel.
+    - **Rounding the series coefficients cost 4× the entire error budget.**
+      Writing 1/42 as `2.3810e-2` looks harmless; at |x|=1 every power of x is 1,
+      so a coefficient's own error lands undiminished in the result — that one
+      constant contributed 5.4e-07 against a 1.5e-07 target.
+
+    Also, at the top of `ExpF32`'s range k reaches 128 while the true result is
+    still finite, so building 2^128 in one step encodes +Inf and poisons an
+    answer that should be ≈2.4e38. Scaled in two steps instead.
+
+    **The goldens moved CLOSER to HF, not further.** GTE worst hidden maxΔ went
+    8.11e-06 → 5.96e-06 and cosine stayed 1.000000; SPLADE stayed at cosine
+    1.000000 / term-jaccard 1.0. That is the expected direction on reflection:
+    PyTorch computes these activations in float32 too, so Go's float64
+    `math.Erf` was the outlier, not the f32 kernel replacing it.
+
+    **Left undone, deliberately:** `crossencoder.go:155`'s `math.Tanh` is 384
+    elements per `Score` (~15 µs against a ~10 ms forward) — optimizing it would
+    be measurement noise. The `vision` sites (item 13's largest predicted share,
+    ~40–70% for SigLIP) are untouched: no vision checkpoint on this box to
+    re-verify parity against, and SigLIP uses tanh-GELU, which needs a `TanhF32`
+    this does not yet provide. SIMD assembly for these kernels remains available
+    and would multiply with what landed.
 
 ---
 

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/townsendmerino/aikit/embed"
+	"github.com/townsendmerino/aikit/linalg"
 )
 
 // bert.go — a MiniLM-class BERT encoder (roadmap §2.2), separate from the
@@ -395,7 +396,12 @@ func gelu(x []float32) {
 
 // geluScalar is the exact erf GELU for one element — the same computation gelu
 // applies, exposed for GeGLU where the activation is on a strided gate (gte.go).
+//
+// Routed through linalg's float32 kernel rather than math.Erf (perf-campaign
+// item 13). math.Erf is a multi-segment float64 rational and was the single
+// most expensive transcendental in the forward at 29.4 ns/element. Not
+// bit-identical; the contract is absolute error ≤1e-06, which is under 15% of
+// the HF goldens' existing maxΔ budget. See linalg.GELUF32.
 func geluScalar(v float32) float32 {
-	const invSqrt2 = 0.7071067811865476
-	return float32(0.5 * float64(v) * (1 + math.Erf(float64(v)*invSqrt2)))
+	return linalg.GELUF32(v)
 }
