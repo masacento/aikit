@@ -233,7 +233,11 @@ func BenchmarkMatmulBTW8A8(b *testing.B) {
 // tolerance. Covers 16-multiples and ragged tails, and the ±127 saturation range.
 func TestDotI8_matchesScalar(t *testing.T) {
 	rng := rand.New(rand.NewSource(8))
-	for _, n := range []int{0, 1, 7, 15, 16, 17, 31, 64, 127, 2048, 2049} {
+	// Boundaries matter more since dotI8AVX2 became 64-wide with a 16-wide
+	// remainder loop: 63/65 straddle the wide loop's entry, 128/192 are exact
+	// multiples of it, and 129/191 land mid-remainder. A regrouping bug in the
+	// four accumulators shows up as a wrong sum at exactly these lengths.
+	for _, n := range []int{0, 1, 7, 15, 16, 17, 31, 47, 63, 64, 65, 80, 127, 128, 129, 191, 192, 2048, 2049} {
 		a := make([]int8, n)
 		b := make([]int8, n)
 		for i := range a {

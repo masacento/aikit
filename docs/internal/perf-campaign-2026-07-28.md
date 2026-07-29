@@ -46,7 +46,7 @@ either validate or kill a whole branch of this doc. Do those before the big ones
 | **A** | BM25 and SPLADE queries cost **O(corpus), not O(postings)** — measured **>99% waste** on a selective query | `bm25/query.go:45`, `sparse/sparse.go:99` | The dense score array's *allocation alone* costs more than the entire posting traversal. A 3-term query over 200k docs: 412 µs, of which <1% is scoring. |
 | **B** | `dotI8AVX2` is **slower per MAC than the f32 blocked kernel** — so the int8 index buys a 4× memory cut and converts ~none of it into speed | `linalg/dot_amd64.s:311-340` | 7.9 MAC/cycle (int8) vs 14.9 (f32 `Dot8x4`), L1-resident. The arm64 SDOT path is correct; **this is an Apple-silicon-tuned project's amd64 blind spot.** |
 | **C** | Every transcendental in the forward pass is a **scalar `math.*` f64 call**; softmax `exp` costs **3.6–9× the attention GEMMs it sits between**, independent of L and head count | `encoder/linalg.go:147`, `bert.go:382`, `vision/encoder.go:361,383` | SigLIP-so400m at np=4096 issues **7.25 billion `math.Exp` calls per image**. |
-| **D** | `annmetal`'s `gemm_w8a8` is the untuned Phase-1 correctness kernel — **~8 GOP/s, ~5× slower than your SIMD CPU** — and the *tiled and simdgroup versions already exist in the same repo*, unused | `gpu/annmetal/backend.go:47-64` vs `gpu/metal_vit.go:377,~430` | The ANN-GPU crossover is never reached on Apple. Not a GPU-is-wrong result — a kernel-was-never-tuned result. |
+| ~~**D**~~ | ~~`annmetal`'s `gemm_w8a8` is the untuned Phase-1 correctness kernel~~ — **ALREADY FIXED before this doc was committed; see §7.5.** Both platforms now run a tiled GEMM + on-device top-k (`gpu/v0.15.0` Metal, `gpu/v0.16.0` CUDA). | `gpu/annmetal/backend.go`, `gpu/anncuda/backend.go` | The mechanism was real; only the "still unused" status was stale. Measured result now in `docs/BENCH-gpu-results.md`. |
 | **E** | `EncodeBatch` pads to `Lmax` **inside index-ordered chunks**; ~92% of FLOPs run over padding-inflated M | `encoder/model.go:177-211`, `forward_batch.go:132` | 50 docs uniform on [20,512] ⇒ **48% of all linear-layer FLOPs computed on pad rows**. The fix (length bucketing) is provably bit-identical. |
 
 ---
@@ -76,7 +76,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
 | 11 | **(A)** BM25/SPLADE: touched-set selection + pooled accumulator | bm25, sparse | **10–50×** on selective queries | = | M |
-| 12 | **(B)** Rewrite `dotI8AVX2`: 32 B/iter, 4 accumulators, bottom-tested | linalg | 2–3× int8 scan (4× w/ VNNI) | = (integer) | M |
+| ~~12~~ | ~~**(B)** Rewrite `dotI8AVX2`~~ — **DONE, 2.10× kernel / 2.02× scan** (§7.6) | linalg | measured on Zen 2; int8 now at f32 MAC-parity | = (integer) | — |
 | 13 | **(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto` | linalg→encoder, vision | 1.25–1.5× text, up to 2× vision | ~ or = (see item) | M–L |
 | 14 | **(E)** Length-bucketed `EncodeBatch` under a token budget | encoder | 1.3–2× on ragged batches | **=** | M |
 | 15 | HNSW: batch neighbour scoring through `Dot8x4` | ann | **1.36–1.40× measured** end-to-end | ~ (1 ULP) | M |
@@ -85,7 +85,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 18 | `vision/qwen_encoder.go` has no scratch arena — **~15 GB alloc+memset per image** | vision | removes ~1.5 s of memset | **=** | M |
 | 19 | `DequantizeRowInt4`: hardware integer divide per element | linalg | 2–4× on the dequant loop | = | S |
 | 20 | Int8 register blocking (1×4 / 4×1) — the arm64 kernel has none | linalg | 1.2–1.6× GEMV, more at prefill | = (integer) | M |
-| 21 | **(D)** `annmetal`: adopt the tiled/simdgroup kernel + on-GPU top-K | gpu | 5–30× the GPU path | = (int32) | M |
+| ~~21~~ | ~~**(D)** `annmetal`: adopt the tiled/simdgroup kernel + on-GPU top-K~~ — **DONE** (§7.5) | gpu | measured: Metal 1.99×, CUDA 15.25× vs each box's own CPU @ N=100k/batch=256 | = (int32) | — |
 
 ### Tier 2 — structural
 
@@ -729,6 +729,58 @@ Four things an earlier draft asserted that the refutation pass knocked down:
    M=1/dim=768 index below ~21.8k vectors runs fully serial, same as `Flat`. So
    item 16's framing ("FlatI8 is parallel, Flat isn't") holds only above that size.
 
+5. **Finding D / item 21 was already fixed before this doc was committed.** The
+   analysis ran against an older tree. `gpu/annmetal/backend.go` now carries
+   `gemm_w8a8_tiled` **and** `topk_rows` (`gpu/v0.15.0`), and the CUDA mirror landed
+   at 16:43 (`gpu/v0.16.0`) — 19 minutes before this doc's commit at 17:02.
+   Measured, vs each box's own CPU at N=100k / batch=256: **CUDA 15.25×, Metal
+   1.99×**. The mechanism the finding identified was real; only its "still unused"
+   status was stale.
+
+6. **Finding B is CONFIRMED on real amd64 hardware — and understated.** The doc's
+   numbers came from an x86 Xeon in a scratch module, never through the real build.
+   Re-measured on a Ryzen 7 3700X (Zen 2, AVX2, no VNNI) through the real toolchain
+   via the newly added `BenchmarkDotI8VsF32_K768`, K=768, L1-resident:
+
+   ```
+   int8  DotI8    41.4 ns/op   18.6 GMAC/s
+   f32   Dot8x4  142.7 ns/op   43.1 GMAC/s     <- 2.28x faster PER MAC
+   ```
+
+   The doc claimed 1.89× (7.9 vs 14.9 MAC/cycle); the real gap on Zen 2 is larger.
+   Finding B stands, and item 12 is the best-evidenced entry in this document. Note
+   there was **no int8 dot benchmark at all** to run — it had to be written first,
+   which is item 1's argument in miniature.
+
+7. **Item 12 is DONE, and it landed inside the predicted band.** `dotI8AVX2` rewritten
+   to 64 int8/iteration with four independent accumulators and a bottom-tested loop,
+   on a Ryzen 7 3700X:
+
+   ```
+   kernel (BenchmarkDotI8VsF32_K768)   18.6 -> 39.0 GMAC/s    2.10x
+   scan   (BenchmarkMatmulBTW8A8)     232.3 -> 115.2 us       2.02x
+   ```
+
+   The microbenchmark proposed and the scan-level measurement disposed — they agree,
+   so this is a real win rather than a harness artifact.
+
+   **One correction to the item's diagnosis.** It attributed the ceiling to
+   `VPMOVSXBW` port pressure and prescribed "32 B/iteration". Byte width is not what
+   mattered: `VPMOVSXBW` takes an **m128 source operand**, so the old kernel's separate
+   `VMOVDQU` loads were pure overhead — 6 uops per 16 MACs became 4. The win is a uop
+   reduction plus a broken accumulator dependency chain, not wider loads. Had the
+   ceiling really been `VPMOVSXBW` throughput, widening could not have helped at all,
+   because the widen:MAC ratio is invariant.
+
+   **`VPMADDUBSW` was considered and rejected** (the item's "cleanest" suggestion):
+   u8xi8 pair sums can exceed int16 and the instruction SATURATES, so it needs
+   range-limited codes. That belongs with the VNNI work (item 35), not here.
+
+   **Finding B's headline consequence is now retired**: int8 was 2.28x slower per MAC
+   than f32; it is now 1.10x — MAC-parity. The int8 index finally converts its 4x
+   memory cut into comparable throughput on amd64. arm64 was already correct and is
+   untouched.
+
 ---
 
 ## 8. Suggested sequencing
@@ -753,12 +805,10 @@ priority of items 29, 38 and 39.
 Items 20, 22, 23, 24, 25, 35. These want the Phase-0 harness as arbiter and
 several want an arm64 box for the real numbers.
 
-**Phase 4 — GPU, separately.**
-Item 21, on its own track. Step 1 (point `annmetal` at the existing tiled kernel)
-is small enough to slot into Phase 1; steps 2–4 are their own project. Re-run the
-crossover sweep only at the end, and annotate the current result in
-`docs/BENCH-gpu.md` as "untuned Phase-1 kernel" so it isn't later cited as a
-verdict on Metal.
+**Phase 4 — GPU. ✅ ALREADY DONE, ahead of this doc.**
+Item 21 landed on both platforms before this was committed (§7.5). The crossover
+has been re-run and `docs/BENCH-gpu-results.md` carries both machines, so there is
+no "untuned Phase-1 kernel" caveat left to add — those numbers are the tuned ones.
 
 **Gate on evidence:** items 36 (needs an M2+/Graviton3 box), 37 (needs a golden
 re-baseline), 38 and 39 (only after 11 and 12 re-baseline the retrieval profile).

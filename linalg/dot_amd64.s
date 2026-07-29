@@ -304,26 +304,73 @@ dotFMA8_reduce:
 
 // func dotI8AVX2(a *int8, b *int8, n int) int32
 // Σ a[i]*b[i] over n int8 pairs (n a multiple of 16), accumulated in int32.
-// Each iteration sign-extends 16 int8 of each operand to int16 (VPMOVSXBW),
-// multiplies and pair-adds them to 8 int32 (VPMADDWD), and adds those into an
-// int32 accumulator (VPADDD). Fully signed — no unsigned-offset correction. The
-// 8 lanes are horizontally summed at the end. The caller handles the n%16 tail.
+//
+// 64 int8 per iteration, FOUR independent int32 accumulators, bottom-tested.
+// Replaces a 16-per-iteration version that used separate 128-bit VMOVDQU loads, a
+// single accumulator, and an unconditional JMP back (two branches per iteration).
+//
+// The uop count per 16 MACs is what matters here, not the byte width. VPMOVSXBW takes
+// an m128 SOURCE OPERAND, so the explicit loads were pure overhead: 2 loads +
+// 2 VPMOVSXBW + VPMADDWD + VPADDD = 6 uops became 2 VPMOVSXBW(mem) + VPMADDWD +
+// VPADDD = 4. Four accumulators break the VPADDD dependency chain so the four
+// interleaved groups issue independently, and the bottom test drops one branch.
+//
+// Still fully signed — no unsigned-offset correction, so no saturation hazard.
+// (VPMADDUBSW would remove the widening entirely, but u8×i8 pair sums can exceed
+// int16 and it SATURATES; that route needs range-limited codes and belongs with the
+// VNNI work, not here.) Integer arithmetic, so regrouping the accumulators is
+// bit-exact — the differential tests against dotI8Scalar gate it.
 TEXT ·dotI8AVX2(SB), NOSPLIT, $0-28
 	MOVQ a+0(FP), SI
 	MOVQ b+8(FP), DI
 	MOVQ n+16(FP), CX
 
-	VPXOR Y0, Y0, Y0 // int32 accumulator (8 lanes)
+	VPXOR Y0, Y0, Y0 // acc0
+	VPXOR Y4, Y4, Y4 // acc1
+	VPXOR Y5, Y5, Y5 // acc2
+	VPXOR Y6, Y6, Y6 // acc3
+
+	CMPQ CX, $64
+	JL   dotI8_loop16
+
+dotI8_loop64:
+	VPMOVSXBW 0(SI), Y1
+	VPMOVSXBW 0(DI), Y2
+	VPMADDWD  Y2, Y1, Y3
+	VPADDD    Y3, Y0, Y0
+
+	VPMOVSXBW 16(SI), Y1
+	VPMOVSXBW 16(DI), Y2
+	VPMADDWD  Y2, Y1, Y3
+	VPADDD    Y3, Y4, Y4
+
+	VPMOVSXBW 32(SI), Y1
+	VPMOVSXBW 32(DI), Y2
+	VPMADDWD  Y2, Y1, Y3
+	VPADDD    Y3, Y5, Y5
+
+	VPMOVSXBW 48(SI), Y1
+	VPMOVSXBW 48(DI), Y2
+	VPMADDWD  Y2, Y1, Y3
+	VPADDD    Y3, Y6, Y6
+
+	ADDQ $64, SI
+	ADDQ $64, DI
+	SUBQ $64, CX
+	CMPQ CX, $64
+	JGE  dotI8_loop64
+
+	VPADDD Y4, Y0, Y0
+	VPADDD Y6, Y5, Y5
+	VPADDD Y5, Y0, Y0
 
 dotI8_loop16:
 	CMPQ CX, $16
 	JL   dotI8_reduce
-	VMOVDQU   0(SI), X1   // 16 int8 from a
-	VMOVDQU   0(DI), X2   // 16 int8 from b
-	VPMOVSXBW X1, Y1      // → 16 int16
-	VPMOVSXBW X2, Y2
-	VPMADDWD  Y2, Y1, Y3  // 8 int32 = pair products of int16
-	VPADDD    Y3, Y0, Y0  // accumulate
+	VPMOVSXBW 0(SI), Y1
+	VPMOVSXBW 0(DI), Y2
+	VPMADDWD  Y2, Y1, Y3
+	VPADDD    Y3, Y0, Y0
 	ADDQ      $16, SI
 	ADDQ      $16, DI
 	SUBQ      $16, CX
