@@ -370,6 +370,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 18 · Qwen ViT arena | ~15 GB/image, ~1.5 s memset | −70/−85% B/op; **~3%** of latency | ⚠️ |
 | 27 · 4-MFLOP naive threshold | 3–9% for L<250 | **up to −50.5%** | ❌ (under) |
 | 24 · packed-stride aliasing | "free" | unreachable on amd64; reverted | — |
+| 32 · vision preprocess | 2.3× | 2.45× on convert+resize; **−31.4%** end-to-end | ✅ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -394,6 +395,21 @@ and forgot that the diverted shape is the per-head attention matmul, which recur
 heads × layers × 2 times per forward — 144× in a 12/12 model. **An estimate that
 sizes a kernel and omits its multiplicity is wrong by the multiplicity**, and the
 error is unbounded in the optimistic direction as easily as the pessimistic.
+
+---
+
+### 1.16 A ratio without a denominator is not a result
+
+Item 32's Win column read "**2.3× measured**". End-to-end it delivered −31.4%.
+Both are correct: `image.Decode` is 46% of `Preprocess` and the item does not
+touch it, so 2.3× of the convert+resize work (measured 2.45×) becomes −31.4% of
+the call. Nobody was wrong; the table just never said what the ratio was over,
+and the obvious reading was the wrong one.
+
+**Guard:** record ratios as "X× on <the thing measured>", and when the thing
+measured is not the whole operation, give the end-to-end number beside it. The
+same applies in reverse to an estimate you are about to act on — establish its
+denominator before budgeting effort against it.
 
 ---
 

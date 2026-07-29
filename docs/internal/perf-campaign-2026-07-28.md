@@ -105,7 +105,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 29 | `bm25` posting is 16 B (`sparse`'s is 8 B); build allocates 3.1× the payload | bm25 | 1.5–2× scoring, 3× build alloc | = | M |
 | 30 | `bm25.Tokenize` allocates a string per mixed-case token — 787 allocs for one 20 KB Go file | bm25 | 787 → ~10 | = | S |
 | 31 | QKV split + per-head V transpose: 3 full `[L,D]` copies/layer, with a power-of-two stride pathology at exactly `DefaultMaxSeqLength=512` | encoder | 3.3× on the transpose (small absolute) | = | M |
-| 32 | Vision preprocess: `draw.Draw` costs more than the JPEG decode; resize recomputes the x-map per row | vision | **2.3× measured** | = (tested) | S–M |
+| ~~32~~ | ~~Vision preprocess: `draw.Draw` costs more than the JPEG decode~~ — **DONE, −31.4% end-to-end / 2.45× on the non-decode work** (§7.22) | vision | the 2.3× was of the convert+resize, not of Preprocess | = (tested) | — |
 | 33 | `moeMLP` is entirely M=1 — 2048 single-row GEMM calls per MoE layer at L=512 | encoder | group tokens by expert | = | M |
 | 34 | `forwardBatch` silently falls back for MoE / dense-GELU / qkv-bias models, **and double-counts `enterForward`** | encoder | correctness-ish perf bug | — | S |
 
@@ -1462,6 +1462,47 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     sets (64 KB, 4-way). So the one architecture that executes `packedFill` is
     largely the one where a 4096-byte stride does not collide. Needs an arm64 box
     to settle; belongs with items 36/37 under "gate on evidence".
+
+22. **Item 32 is DONE, and its "2.3× measured" reconciles exactly — once you ask
+    2.3× of WHAT.** Stage attribution first, on a 1920×1080 JPEG at size 384:
+
+    | stage | time | share |
+    |---|--:|--:|
+    | `image.Decode` | 30.7 ms | 46% |
+    | `toNRGBA` (`draw.Draw`) | 28.2 ms | **42%** |
+    | `resizeNormalize` | 4.1 ms | 6% |
+
+    So the item's framing — "`draw.Draw` costs more than the JPEG decode" — is
+    very nearly right (28.2 vs 30.7, just under). The cause is that the generic
+    path materializes the WHOLE image as NRGBA to serve a bilinear downscale that
+    only ever reads size²·4 ≈ 590 K taps out of 2.07 M pixels.
+
+    Fix: dispatch on the decoded type. `*image.YCbCr` (every JPEG) is sampled
+    directly with `color.YCbCrToRGB` at the four taps — no copy at all;
+    `*image.NRGBA` at origin is used in place; anything else keeps the old path.
+    Separately, the x sampling plan (`x0`, `x1`, `fx`) depends only on `dx`, `sw`
+    and `size` and was being recomputed once per ROW — hoisted into `newXMap`.
+
+    | workload | before | after | |
+    |---|--:|--:|--:|
+    | Preprocess, 1920×1080 JPEG | 64.04 ms | 43.93 ms | **−31.4%** (p=0.002) |
+    | …its B/op | 12.63 MiB | 4.72 MiB | **−62.6%** |
+    | Preprocess, 1920×1080 PNG | 84.50 ms | 81.78 ms | −3.2% |
+    | Preprocess, 640×480 JPEG | 19.33 ms | 18.73 ms | ~ (p=0.240) |
+
+    **Where the 2.3× went.** End-to-end is −31.4%, not the 2.3× the table
+    promised — because `image.Decode` is 46% of the call and this item does not
+    touch it. But the work the item actually addresses (convert + resize) goes
+    32.3 ms → ~13.2 ms = **2.45×**, which is the quoted figure. Both numbers are
+    honest; they answer different questions, and the table's Win column did not
+    say which. Worth stating the denominator whenever a ratio is recorded.
+
+    Bit-identical: `TestResizeNormalize_matchesGenericPath` compares every
+    dispatch path against `toNRGBA`+`resizeNormalize` on real encoded images —
+    JPEG and PNG, odd dimensions (chroma-subsampling edges), upscale as well as
+    downscale — requiring exact equality, plus `TestXMap_matchesInlineComputation`
+    for the hoist. `FuzzPreprocess` ran 8.35 M executions clean over the new
+    decode dispatch.
 
 ---
 
