@@ -79,6 +79,75 @@ func wantParallelMatmul(M, K, N int) bool {
 	return M >= 2*minRowsPerWorker
 }
 
+// wantParallelCols reports whether a matmul the ROW split declined should
+// instead fan across output columns.
+//
+// It is deliberately the row gate's complement, not its rival: where M is tall
+// enough to split, the row split wins (it is the tuned, measured path, and its
+// workers share no output cache lines). wantParallelCols only picks up the
+// shapes the row split structurally cannot serve — M < 2*minRowsPerWorker.
+//
+// Those shapes are not exotic. A SPLADE query or a reranker pair is often ~20
+// tokens, and M is the token count: at L=22 every projection in the BERT trunk
+// (wqkv 22·768·2304, fc11 22·768·3072, fc2 22·3072·768) clears the FLOP
+// threshold by 1.5-2× yet fails M ≥ 64, so the ENTIRE forward ran on one core
+// while 15 sat idle. Measured on a 3700X, that left the trunk at 128 ms of a
+// 153 ms SPLADE.Expand.
+//
+// It also removes an interference effect that is invisible in a per-matmul
+// benchmark. Mixing an all-core burst into an otherwise serial forward costs the
+// serial part real time: a memory-free all-core burst alone slowed the following
+// serial trunk 12.8% (boost clock), and the real column-parallel vocabulary
+// projection slowed it 32% (boost plus cache). That is why parallelizing only
+// the vocabulary projection made short-query Expand 6.7% SLOWER end to end even
+// though the projection itself got 5× faster — the fix is for the trunk to be
+// parallel too, not for the projection to stay serial.
+//
+// N is checked against the row gate's per-worker minimum for symmetry: a
+// fan-out needs enough columns to be worth the spawn, and linalg.MatmulBT
+// applies its own threshold below this one.
+func wantParallelCols(M, K, N int) bool {
+	if inflightForwards.Load() > 1 {
+		return false
+	}
+	if M >= 2*minRowsPerWorker {
+		return false // the row split serves this shape; prefer it
+	}
+	if int64(M)*int64(K)*int64(N) < parallelThreshold {
+		return false
+	}
+	return N >= 2*minRowsPerWorker
+}
+
+// matmulBTColsInto computes dst[M,N] = a[M,K]·b[N,K]ᵀ, fanning across the N
+// (output-column) dimension instead of the M (row) dimension.
+//
+// This is the counterpart to matmulBTInto for the shape where a row split
+// cannot help. The SPLADE vocabulary projection is [L,768]·[30522,768]ᵀ: N is
+// the 30k vocabulary, but M is a *query* length — often ~20 tokens. That fails
+// wantParallelMatmul's M ≥ 2*minRowsPerWorker test, which is the right test for
+// a row split and exactly wrong here, and left a ~500 MFLOP matmul on one core
+// for every short query (perf-campaign item 7).
+//
+// The in-flight guard is the same contract wantParallelMatmul documents: under
+// EncodeBatch every core is already busy with sibling forwards, so this stays on
+// the serial fill and the batch path is behaviorally unchanged. No FLOP gate is
+// needed — linalg.MatmulBT applies its own (parallelCols) and runs the span
+// inline below it.
+//
+// Numerics: linalg.MatmulBT shards output columns 8-aligned and runs the same
+// blockedFill per shard as the serial path, so each dst[i,j] is bit-identical to
+// matmulBTBlockedInto at any fan-out width — linalg's documented M-invariance
+// plus TestParallelWidth_bitIdentical; re-gated end-to-end here by
+// TestSpladeVocabProj_colParallelIsBitIdentical.
+func matmulBTColsInto(a, b, dst []float32, M, K, N int) {
+	if inflightForwards.Load() > 1 {
+		matmulBTBlockedInto(a, b, dst, M, K, N)
+		return
+	}
+	linalg.MatmulBT(a, b, dst, M, K, N)
+}
+
 // matmulBTBlockedIntoParallel splits the M (row) dimension across
 // NumCPU goroutines, each computing a disjoint, contiguous block of
 // output rows via the serial blocked fill. dst MUST have len ≥ M*N.

@@ -61,12 +61,12 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
 | 1 | Revive the 3 dead benchmark files; add warm-up + alloc accounting + a concurrent-QPS mode to `bench/harness.go` | bench | unblocks everything | — | S |
-| ~~2~~ | ~~SPLADE: hoist `log1p` outside the L×V max-reduce~~ — **DONE** (§7.10) | encoder | log1p calls: per positive logit → per vocab entry | **=** | — |
+| ~~2~~ | ~~SPLADE: hoist `log1p` outside the L×V max-reduce~~ — **DONE** (§7.10); **measured 1.28–1.47×** on the pooling step (§7.12) | encoder | pooling is ~0.5% of `Expand`, so invisible end-to-end | **=** | — |
 | ~~3~~ | ~~`topk.Push`: hoist the threshold compare~~ — **DONE** (§7.8) | topk, ann | **1.05× end-to-end** on `Flat.Query` (the 1.43× was the selection step alone) | = | — |
 | 4 | `FlatI8.Query`: pool the score buffer; stop allocating a `Workspace` per query | ann | 10–25% now, large at N≥1M | = | S |
 | ~~5~~ | ~~Index (de)serialization: bulk `copy`~~ — **DONE, 5.14×** (§7.8) | ann | 15.6 → 3.04 ms on a 50k×384 index; the 20–30× estimate was optimistic | = | — |
-| 6 | BERT/GTE forwards never call `enterForward()` → uncontrolled NumCPU² fan-out | encoder | removes oversubscription | — | S |
-| 7 | SPLADE vocab matmul runs **serial** while the trunk parallelizes | encoder | up to ~2.3× on `Expand` | = | S |
+| ~~6~~ | ~~BERT/GTE forwards never call `enterForward()`~~ — **DONE** (§7.12) | encoder | removes oversubscription | — | — |
+| ~~7~~ | ~~SPLADE vocab matmul runs **serial**~~ — **DONE, 1.05–1.19× on `Expand`** (§7.12); needed a trunk column fan-out too, since the trunk is NOT parallel at short L | encoder | 2.3× was optimistic | = | — |
 | 8 | `gte.go:230` allocates 12.6 MB/`Encode` outside the scratch arena | encoder | 12.6 MB/call | = | S |
 | 9 | `SpanCache` LRU → MRU/scan-resistant; add `MADV_WILLNEED` on map; pipeline `Touch(b+1)` | mmap | 0% → max hit rate | — | S |
 | 10 | `bm25`: hoist `1/avgdl`; precompute per-posting impact at build time | bm25 | 1.5–2× scoring | ~ | S–M |
@@ -893,6 +893,76 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     would otherwise apply one group's scale to the next group's element — the
     equivalence test covers 10 group sizes × 13 column counts against the original,
     and caught exactly that bug on the first attempt.
+
+12. **Items 2, 6 and 7 are DONE — and item 7's mechanism was right but incomplete,
+   in a way only an end-to-end measurement could show.** All three now measured on
+   a real `naver/splade-cocondenser-ensembledistil` checkpoint (fetch recipe in
+   `scripts/README.md`; the repo publishes only `pytorch_model.bin`, so it needs a
+   safetensors conversion). `SPLADE.Expand`, 3700X/16-thread, n=8, benchstat:
+
+    | L (wordpieces) | before | after | |
+    |---|--:|--:|--:|
+    | 22 | 154.1 ms | 146.2 ms | −5.1% (p=0.000) |
+    | 91 | 771.6 ms | 680.8 ms | −11.8% (p=0.000) |
+    | 357 | 2.424 s | 2.036 s | −16.0% (p=0.000) |
+
+    **Item 2 (hoisted `log1p`): 1.47× / 1.38× / 1.28×** on the pooling step at
+    L=22/91/357 — real, and the density caveat in §7.3 above is confirmed: nothing
+    like the synthetic 17.8×. Pooling is ~0.4–0.5% of `Expand`, so this is
+    invisible end-to-end. It is now also validated the strong way: the HF parity
+    golden passes at cosine 1.000000, not just the synthetic bit-identity test.
+
+    **Item 7 (serial vocab projection): the projection itself got 5.1×/6.3×/6.3×
+    faster — and short-query `Expand` got 6.7% SLOWER (p=0.005).** The doc's
+    estimate of "up to ~2.3× on `Expand`" assumed the premise on line 188, *"the
+    trunk goes through `s.mm` → `wantParallelMatmul` → the parallel path."* That
+    premise is false at short L. `wantParallelMatmul` requires `M ≥ 64`, and M is
+    the token count: at L=22 **every** projection in the trunk fails it, so the
+    whole forward ran on one core of sixteen. Parallelizing only the vocabulary
+    projection therefore dropped a single all-core burst into an otherwise serial
+    forward, and that costs the serial part real time. Measured directly with a
+    memory-free all-core spin burst as a control:
+
+    ```
+    trunk alone                              97.8 ms
+    trunk after a memory-free all-core burst 110.3 ms   (+12.8%, boost clock)
+    trunk after the real parallel projection 129.2 ms   (+32%,   boost + cache)
+    ```
+
+    So ~13 points of the interference is the package dropping out of single-core
+    boost and ~19 is cache/memory thrash. The fix is not to keep the projection
+    serial — it is for the trunk to be parallel too. `wantParallelCols` now picks
+    up exactly the shapes the row split structurally cannot serve (`M <
+    2*minRowsPerWorker`) and fans them across output columns instead;
+    `linalg.MatmulBT` already provided that, bit-identically, so no new linalg API
+    was needed. Alternating A/B in one process, L=22 trunk: **176.0 ms serial →
+    134.8 ms (1.31×)**. With both changes the short-query regression inverts to a
+    5.1% win.
+
+    Two lessons, both instances of patterns already in this doc. First, magnitude
+    again: mechanism right, size optimistic (2.3× estimated, 1.19× measured at the
+    most favourable L). Second, and new: **a per-kernel benchmark cannot see
+    interference between kernels.** The projection benchmark showed a clean 5–6×
+    at every L and was completely honest about the kernel; it simply could not
+    observe that making one stage parallel taxes every serial stage around it. Only
+    the end-to-end number showed the regression, and only a phase-attributed
+    measurement (a temporary `BenchmarkSpladePhases` splitting trunk/proj/tail)
+    located it in the trunk — a stage whose code had not changed at all.
+
+    **Item 6 (`enterForward` gap)** landed as specified for `bert.go` and `gte.go`
+    and is gated by `TestBERTFamily_bracketsInFlight`, which observes the counter
+    from inside a forward and fails (peak=0) without the brackets. It was a
+    prerequisite, not a bonus: extending intra-op parallelism to a family whose
+    in-flight counter is permanently 0 would have deepened exactly the
+    oversubscription the gate exists to prevent. The `forward_batch.go:58` double
+    count is left alone — this doc numbers it item 34.
+
+    **One unrelated finding, not acted on.** In the same A/B at L=91, where the row
+    split *does* engage, the parallel trunk measured **636.8 ms vs 592.4 ms
+    serial** — the row-split path is a net loss at BERT-base trunk shapes on this
+    box. `parallelThreshold`'s table (`parallel.go:47-55`) is tuned on an 8-core M1
+    Pro; this is a 16-thread 3700X. Worth its own item before anyone trusts that
+    table on amd64.
 
 ---
 

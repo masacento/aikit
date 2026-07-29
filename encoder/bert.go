@@ -228,6 +228,17 @@ func (b *BERT) Encode(text string) ([]float32, error) {
 // token-type (segment) id per position; nil means a single segment (all 0), as the
 // embedder uses — a cross-encoder passes two segments for the query/document pair.
 func (b *BERT) hiddenStates(ids, segs []int32) []float32 {
+	// The whole BERT family — BERT.Embed, CrossEncoder.Score, SPLADE.Expand —
+	// enters the transformer here, so this is where the in-flight accounting
+	// parallel.go:37-40 requires has to happen. Without it that counter stayed
+	// permanently 0 for every one of them, and the intra-op gate read "nothing
+	// else is running" unconditionally: the natural reranker loop (N goroutines
+	// each calling Score) became NumCPU×NumCPU runnable goroutines contending at
+	// the join barrier — exactly the oversubscription the gate exists to prevent
+	// (perf-campaign item 6).
+	enterForward()
+	defer leaveForward()
+
 	c := b.cfg
 	// Bound to the learned-position table: posEmb has only maxSeq (≤ MaxPos) rows,
 	// so gathering posEmb[i*D] for i beyond it panics. Encode already truncates

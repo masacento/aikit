@@ -95,7 +95,13 @@ func (s *SPLADE) expandIDs(ids []int32) sparse.SparseVec {
 	layerNorm(t, s.transLNW, s.transLNB, L, D, s.bert.cfg.LNEps)
 
 	// Vocabulary logits = t · decoderWᵀ + decoderB → [L, V].
-	logits := matmulBT(t, s.decoderW, L, D, V)
+	//
+	// Fanned across the V columns, not the L rows: L is a query length here (a
+	// handful of tokens is normal), so the trunk's row split has nothing to
+	// split, while V=30522 always does. Bit-identical to the serial fill — see
+	// matmulBTColsInto.
+	logits := make([]float32, L*V)
+	matmulBTColsInto(t, s.decoderW, logits, L, D, V)
 	addBias(logits, s.decoderB, L, V)
 
 	// SPLADE pooling: max over tokens of log(1 + relu(logit)).

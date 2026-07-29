@@ -75,6 +75,14 @@ func matmulBTInto(a, b, dst []float32, M, K, N int) {
 		matmulBTBlockedIntoParallel(a, b, dst, M, K, N)
 		return
 	}
+	// Short sequences (a SPLADE query, a reranker pair) have too few rows to
+	// row-split but plenty of output columns; without this they ran the whole
+	// forward on one core. Bit-identical to both other paths — see
+	// wantParallelCols.
+	if wantParallelCols(M, K, N) {
+		matmulBTColsInto(a, b, dst, M, K, N)
+		return
+	}
 	matmulBTBlockedInto(a, b, dst, M, K, N)
 }
 

@@ -192,6 +192,11 @@ func (g *GTE) Embed(ids []int32) []float32 {
 // hiddenStates runs the GTE transformer forward on token ids and returns the last
 // hidden state [L, hidden], row-major.
 func (g *GTE) hiddenStates(ids []int32) []float32 {
+	// In-flight accounting for the intra-op matmul gate — see BERT.hiddenStates
+	// (perf-campaign item 6). GTE.Encode had the same permanently-0 counter.
+	enterForward()
+	defer leaveForward()
+
 	c := g.cfg
 	if len(ids) > g.maxSeq {
 		ids = ids[:g.maxSeq]

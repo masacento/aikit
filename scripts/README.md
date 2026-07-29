@@ -35,3 +35,38 @@ Each script writes a fixed `testdata/*.json` path; run from the repo root, e.g.:
 
 Models are fetched from the Hugging Face Hub on first run. GGUF dequant scripts
 (`pin_iq_dequant.py`) additionally need `pip install gguf`.
+
+## Fetching `testdata/splade-model`
+
+The SPLADE tests and benchmarks (`encoder/splade_test.go`,
+`encoder/splade_bench_test.go`) skip without this checkpoint. It needs one extra
+step the other fixtures don't: `naver/splade-cocondenser-ensembledistil`
+publishes **only `pytorch_model.bin`**, while `LoadBERT` reads
+`model.safetensors`. Run from the repo root:
+
+```sh
+.venv/bin/python - <<'PY'
+import torch
+from huggingface_hub import snapshot_download
+from safetensors.torch import save_file
+
+d = snapshot_download('naver/splade-cocondenser-ensembledistil',
+                      allow_patterns=['config.json', 'tokenizer.json',
+                                      'tokenizer_config.json',
+                                      'special_tokens_map.json', 'vocab.txt',
+                                      'pytorch_model.bin'],
+                      local_dir='testdata/splade-model')
+sd = torch.load(d + '/pytorch_model.bin', map_location='cpu', weights_only=True)
+# clone() breaks the decoder.weight <-> word_embeddings.weight tying that
+# safetensors refuses to store; position_ids is a buffer, not a weight.
+save_file({k: v.contiguous().clone() for k, v in sd.items()
+           if v.dtype.is_floating_point and not k.endswith('position_ids')},
+          'testdata/splade-model/model.safetensors', metadata={'format': 'pt'})
+PY
+rm testdata/splade-model/pytorch_model.bin   # ~438 MB, no longer needed
+```
+
+Untying the decoder makes `model.safetensors` (~532 MB) larger than the `.bin`;
+`testdata/splade-model` is git-ignored. Verify with
+`go test ./encoder/ -run SPLADE_parity -v` — it should report cosine 1.000000
+against `testdata/splade_golden.json`.
