@@ -45,6 +45,18 @@ believe a null result. A counter, a `t.Log`, or a deliberate `panic()` in the ne
 path costs seconds. A null result is a claim and needs the same scrutiny as a
 positive one.
 
+It happened a second time, and the habit is what caught it. Item 24 pads
+`packedFill`'s pack stride; a sweep over pad ∈ {0,4,16} at four shapes came back
+uniformly inside noise. The reason was not that padding does not help — it is
+that `blockedFill` gates `packedFill` on `has2x8Kernel`, which is **false off
+arm64**. The whole function is dead code on this box and the benchmark measured
+an unexecuted branch. The change was reverted rather than shipped on the strength
+of a null result that meant nothing.
+
+**Corollary worth internalizing: a uniformly flat sweep is itself a signal.**
+Real tuning parameters produce *some* variation. When every setting ties exactly,
+suspect that none of them ran.
+
 ### 1.2 The compiler deletes the thing under test
 
 Item 19's benchmark reported the *unoptimised* form running **16× faster** than
@@ -357,6 +369,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 22 · q8 weight widen | ~113 ms/fwd, L-independent | ~190 ms/fwd, L-independent | ✅ |
 | 18 · Qwen ViT arena | ~15 GB/image, ~1.5 s memset | −70/−85% B/op; **~3%** of latency | ⚠️ |
 | 27 · 4-MFLOP naive threshold | 3–9% for L<250 | **up to −50.5%** | ❌ (under) |
+| 24 · packed-stride aliasing | "free" | unreachable on amd64; reverted | — |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the

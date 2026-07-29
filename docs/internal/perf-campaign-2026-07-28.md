@@ -97,7 +97,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 |---|---|---|---|---|---|
 | ~~22~~ | ~~Q8 encoder path re-widens the whole int8 weight matrix to f32 **per matmul**~~ — **DONE via fix (a), −58.2% at short input** (§7.18); fix (b) (fuse into `packedFill`) still open | encoder | cost model exactly right; ~190 ms/forward measured | = | — |
 | 23 | `packedFill` lost `blockedFill`'s m-blocking; a-panel re-read per 8-column group | linalg | plausibly large at prefill | = | M |
-| 24 | `matmul_blocked.go` packed stride is a 4096 B power-of-two — recreates the aliasing packing exists to remove | linalg | free | = | S |
+| 24 | `matmul_blocked.go` packed stride is a 4096 B power-of-two | linalg | **UNREACHABLE on amd64** — `packedFill` is arm64-only (§7.21); needs an arm64 box, and the proposed `+4` pad is too small to work | = | gate on evidence |
 | 25 | arm64 `Dot2x8` has the wrong MR×NR: 4×4 needs 8 loads per 16 FMLAs vs today's 10 | linalg | 1.1–1.25× arm64 f32 GEMM | **=** | S–M |
 | 26 | `math.Round` is **not** an amd64 intrinsic (`math.Trunc` is) — verified in disassembly | linalg, encoder | ~12 int ops → 1 `ROUNDSD` | = | S |
 | ~~27~~ | ~~Encoder's 4-MFLOP naive threshold sends **every** attention matmul at L<250 to a scalar triple loop~~ — **DONE, up to −50.5%** (§7.20) | encoder | estimated 3–9%; the first large UNDER-estimate | ~ | — |
@@ -1430,6 +1430,39 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     The mislabel had also been carried into §7.17's item-13 record, now
     corrected there. Filed as `measuring-performance.md` §1.15.
 
+21. **Item 24 is NOT DONE, and should be re-classified as evidence-gated — it is
+    unreachable on amd64.** Attempted, measured, reverted.
+
+    The pathology is real as described: `packKBlockFor` returns 1024 whenever
+    `K%768 != 0`, so `packedFill`'s 8 packed b-rows sit exactly 4096 bytes apart,
+    which is a power-of-two conflict stride. But **`packedFill` only runs on
+    arm64** — `blockedFill` gates it on `has2x8Kernel`
+    (`matmul_blocked.go:60`), which is `false` off arm64, and additionally
+    requires `K ≥ packKThreshold` (2048). On this box the entire function is dead
+    code.
+
+    A padded-stride version was written and swept in one process over pad ∈ {0,
+    4, 16} at K=1280/2048/3420 plus a K=768 control. Every result was inside
+    noise — necessarily, since none of it executed. **The sweep measured nothing,
+    and the only reason that was noticed is the §1.1 habit of confirming a
+    benchmark reaches the new code before believing a null result.** Reverted
+    rather than shipping a mutable package-level `packRowPad` and padding
+    arithmetic for a win that cannot be observed here.
+
+    **The fix's size was also wrong as specified.** §"more findings" proposes
+    "one `+4` float pad". Four floats is 16 bytes, less than a cache line, so it
+    cannot move a row to a different L1 set: with stride 4112,
+    `floor(bi·4112/64) mod 64 = floor(bi/4)`, which splits the 8 rows across just
+    2 sets. A full line (16 floats, stride 4160 = 65 lines) gives `bi mod 64` —
+    all 8 distinct. Whoever picks this up on arm64 should use 16, not 4.
+
+    **And it may be a no-op even where it is reachable.** The same finding notes
+    the pathology "escapes only on Apple P-cores (128 KB L1D ⇒ 256 sets)" — but
+    Apple P-cores are the dominant arm64 target, and Neoverse V1/N2 also have 256
+    sets (64 KB, 4-way). So the one architecture that executes `packedFill` is
+    largely the one where a 4096-byte stride does not collide. Needs an arm64 box
+    to settle; belongs with items 36/37 under "gate on evidence".
+
 ---
 
 ## 8. Suggested sequencing
@@ -1460,7 +1493,9 @@ has been re-run and `docs/BENCH-gpu-results.md` carries both machines, so there 
 no "untuned Phase-1 kernel" caveat left to add — those numbers are the tuned ones.
 
 **Gate on evidence:** items 36 (needs an M2+/Graviton3 box), 37 (needs a golden
-re-baseline), 38 and 39 (only after 11 and 12 re-baseline the retrieval profile).
+re-baseline), 38 and 39 (only after 11 and 12 re-baseline the retrieval profile),
+and now **24** — `packedFill` is arm64-only, so the amd64 box cannot measure it
+at all (§7.21).
 
 ---
 
