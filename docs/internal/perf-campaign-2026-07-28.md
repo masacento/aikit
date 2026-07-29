@@ -94,7 +94,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
-| 22 | Q8 encoder path re-widens the whole int8 weight matrix to f32 **per matmul** — 113 M converts + ~0.9 GB DRAM/forward | encoder | ~100 ms/forward | **=** | S (SIMD) / M (fuse into pack) |
+| ~~22~~ | ~~Q8 encoder path re-widens the whole int8 weight matrix to f32 **per matmul**~~ — **DONE via fix (a), −58.2% at short input** (§7.18); fix (b) (fuse into `packedFill`) still open | encoder | cost model exactly right; ~190 ms/forward measured | = | — |
 | 23 | `packedFill` lost `blockedFill`'s m-blocking; a-panel re-read per 8-column group | linalg | plausibly large at prefill | = | M |
 | 24 | `matmul_blocked.go` packed stride is a 4096 B power-of-two — recreates the aliasing packing exists to remove | linalg | free | = | S |
 | 25 | arm64 `Dot2x8` has the wrong MR×NR: 4×4 needs 8 loads per 16 FMLAs vs today's 10 | linalg | 1.1–1.25× arm64 f32 GEMM | **=** | S–M |
@@ -1274,6 +1274,55 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     Δ 4.29e-06 against the Python reference, scores matching to 4 decimal places.
     That gate did not exist on this box when the tanh was changed, which is
     exactly when a gate matters most.
+
+18. **Item 22 is DONE via fix (a) — and its cost model was exactly right.** The
+    doc predicted the widen is O(N·K) and INDEPENDENT of L, so it amortizes as
+    1/M. Measured on a 3700X with `nomic-ai/CodeRankEmbed`:
+
+    | shape | forward | widen (flat, per forward) | widen share |
+    |---|--:|--:|--:|
+    | ~10 tokens | 258 ms | **183 ms** | 35% flat / 42% cum |
+    | ~350 tokens | 1540 ms | **195 ms** | 2.2% |
+
+    Same absolute cost at both lengths — the prediction holds quantitatively.
+    (The doc estimated ~113 ms/forward from a 1.0 ns/elem widen; this box
+    measures ~190 ms, i.e. ~1.7 ns/elem in situ.)
+
+    Fix (a), the SIMD widen, landed as `linalg.DequantizeRowsInt8Into` with an
+    AVX2 kernel (`VPMOVSXBD` → `VCVTDQ2PS` → `VMULPS`, 32 elements per
+    iteration) and a portable fallback. **5.7× on the kernel**, and end-to-end,
+    benchstat n=6:
+
+    | input | before | after | |
+    |---|--:|--:|--:|
+    | ~10 tokens | 258.7 ms | **108.1 ms** | **−58.2%** (2.39×) |
+    | ~85 tokens | 666.1 ms | 506.4 ms | −24.0% |
+    | ~350 tokens | 1.537 s | 1.387 s | −9.7% |
+    | geomean | | | **−34.1%** |
+
+    Bit-identical, and not merely by argument: `float32(int8)` is exact and the
+    scale is one f32 multiply either way, so the gate asserts EXACT equality
+    against the scalar loop over lengths straddling both the 32- and 8-wide
+    loops, plus the sign-extension extremes (−128, −1, 0, 127) and a
+    write-past-the-end guard. `TestModelQ8_cosineMatchesF32` returns the same
+    cosines to six decimals as before the change.
+
+    **A §1.3 moment worth recording.** The kernel benchmark measures the scalar
+    widen at 0.50 ns/elem, but in situ it costs ~1.7. The benchmark rotates one
+    weight matrix that stays L3-resident; a real forward streams twelve
+    different cold ones. The kernel ratio (5.7×) therefore *understates* the
+    end-to-end effect at short L, which is the opposite of the usual direction
+    and the reason the arbiter is the only number quoted above.
+
+    **Fix (b) is still available and still worth doing.** Fusing the widen into
+    `packedFill`'s b-panel pack would eliminate the remaining ~33 ms, the 0.9 GB
+    DRAM round-trip, and `scratch.deqW` (up to 9.4 MB pinned per pooled
+    scratch). What landed is the S-effort half of the item.
+
+    **arm64 is untouched:** `dequantRowInt8` falls back to scalar there. The NEON
+    version (`SXTL`+`SCVTF`+`FMUL`) is straightforward but unmeasurable on this
+    box, and §7.16 is the standing reminder that per-kernel ratios do not
+    transfer between architectures.
 
 ---
 

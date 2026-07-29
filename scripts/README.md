@@ -125,3 +125,22 @@ snapshot_download('cross-encoder/ms-marco-MiniLM-L-6-v2',
 
 Verify with `go test ./encoder/ -run TestCrossEncoder_parity -v` — scores should
 match the Python reference to 4 decimals (worst forward Δ ≈ 4.3e-06).
+
+## Fetching `testdata/encoder-model`
+
+`nomic-ai/CodeRankEmbed` (~523 MB, ships safetensors) — the f32 and q8 encoder
+tests and `BenchmarkQ8Encode` all need it:
+
+```sh
+.venv/bin/python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('nomic-ai/CodeRankEmbed',
+    allow_patterns=['config.json', 'tokenizer.json', 'tokenizer_config.json',
+                    'special_tokens_map.json', 'vocab.txt', 'model.safetensors',
+                    'modules.json', 'sentence_bert_config.json',
+                    'config_sentence_transformers.json', '1_Pooling/config.json'],
+    local_dir='testdata/encoder-model')"
+```
+
+Verify with `go test ./encoder/ -run TestModelQ8_cosineMatchesF32 -v` — q8 vs f32
+cosine ≈ 0.997 on every case.

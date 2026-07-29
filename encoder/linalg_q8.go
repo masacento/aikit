@@ -1,5 +1,7 @@
 package encoder
 
+import "github.com/townsendmerino/aikit/linalg"
+
 // matmulBTQ8 is the M8 int8-weight variant of matmulBT. Same shape:
 // dst = a · bᵀ where a is [M, K] f32 (activations) and b is logically
 // [N, K] f32 stored as int8 quantized rows + per-row f32 scales:
@@ -49,14 +51,14 @@ func matmulBTQ8Into(dst, a []float32, bQ []int8, bScales []float32, M, K, N int,
 	if len(a) != M*K || len(bQ) != N*K || len(bScales) != N || len(dst) < M*N || len(deqW) < N*K {
 		panic("encoder: matmulBTQ8Into shape mismatch")
 	}
+	// The widen is O(N*K) and INDEPENDENT of M, so it does not amortize with
+	// sequence length: measured ~190 ms per CodeRankEmbed forward on a 3700X
+	// whether the input is 10 tokens or 350 — 35% of a short forward, 2% of a
+	// long one (perf-campaign item 22). linalg's kernel vectorizes it
+	// (VPMOVSXBD/VCVTDQ2PS/VMULPS on amd64) and is bit-identical to the scalar
+	// loop this replaced: float32(int8) is exact and the scale is one f32
+	// multiply either way.
 	w := deqW[:N*K]
-	for n := range N {
-		sc := bScales[n]
-		row := w[n*K : n*K+K]
-		bq := bQ[n*K : n*K+K]
-		for k := range row {
-			row[k] = float32(bq[k]) * sc
-		}
-	}
+	linalg.DequantizeRowsInt8Into(w, bQ, bScales, N, K)
 	matmulBTInto(a, w, dst, M, K, N)
 }

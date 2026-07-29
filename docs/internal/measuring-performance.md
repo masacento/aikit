@@ -71,6 +71,14 @@ partitions them.
 per transformer layer) so no iteration reuses the previous one's residency. See
 `BenchmarkParallelAxis` in `encoder/parallel_sweep_test.go`.
 
+It cuts the other way too, which is easy to miss. Item 22's int8→f32 widen
+benchmarks at **0.50 ns/elem** on one L3-resident weight but costs **~1.7** in a
+real forward, which streams twelve different cold ones. There the kernel ratio
+(5.7×) *understated* the end-to-end effect (−58% at short input). A warm kernel
+benchmark is not conservative — it is simply measuring a different workload, and
+which direction the error goes depends on whether the change is bound by
+compute or by memory.
+
 ### 1.4 Per-kernel benchmarks cannot see cross-kernel interference
 
 The sharpest lesson of the campaign (§7.12). Parallelizing *only* SPLADE's
@@ -269,6 +277,8 @@ Numbers here are for calibration, not for citing as results.
 | `math.Erf` inside GELU | 29.4 ns/elem | item 13 |
 | `linalg.ExpF32` | 5.6–7.6 ns/elem | item 13 |
 | `math.Tanh` inside SigLIP's GELU | ~30 ns/elem | item 13 |
+| scalar int8→f32 widen, cold weights | ~1.7 ns/elem | item 22 |
+| AVX2 int8→f32 widen | 0.089 ns/elem | item 22 |
 | row-split matmul worker cap | `(M+31)/32` → **3 workers at M=91** | §7.14 |
 
 The split-CCX L3 is why the row-split matmul axis lost here and not on the M1
@@ -300,6 +310,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 13 · f32 transcendentals (text) | 1.25–1.5× text | 1.25× (−20.1%) | ✅ |
 | 13 · …on the D=384 cross-encoder | ~22% GELU + ~14% softmax | **−33.8%** | ✅ |
 | 13 · …on SigLIP | up to 2× | 1.24× geomean (1.44× at 576 patches) | ❌ |
+| 22 · q8 weight widen | ~113 ms/fwd, L-independent | ~190 ms/fwd, L-independent | ✅ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -307,11 +318,16 @@ largest encoder wins of the campaign: the parallel axis being wrong on amd64
 (§7.14) and the elementwise stages dominating once the matmuls were parallel
 (§7.15, `GTE.Encode` L=690 3.28×).
 
-Item 13's cross-encoder row is worth singling out as the counter-example to the
-"magnitudes are optimistic" pattern: it came from a **closed form** (activation ÷
-FFN-matmul = `t_act/(k·D·t_mac)`, which grows as D shrinks) rather than from a
-microbenchmark extrapolation. Derived predictions have held; measured-then-scaled
-ones have not.
+Two rows are worth singling out as counter-examples to the "magnitudes are
+optimistic" pattern, and they have something in common. Item 13's cross-encoder
+share came from a **closed form** (activation ÷ FFN-matmul = `t_act/(k·D·t_mac)`,
+which grows as D shrinks). Item 22's widen cost came from a **structural
+argument** (O(N·K) work independent of M ⇒ amortizes as 1/M), and its
+L-independence held exactly, to the point where the measured per-forward cost was
+the same at 10 tokens and at 350.
+
+**Derived predictions have held; measured-then-scaled ones have not.** When an
+estimate comes with a formula, trust its shape and re-measure only its constant.
 
 ---
 
