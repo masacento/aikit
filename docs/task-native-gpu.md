@@ -319,11 +319,12 @@ are shared, `gpu/`-level, not vision-specific). Note the parity fixtures are *ti
 gate correctness sharply and say nothing about throughput, so all GEMM tuning was driven by the
 `BenchmarkMetalGEMMF32` sweep, not by the fixtures (`docs/BENCH-gpu.md` is that methodology).
 
-**Phase 4 — encoder native — ✅ DONE (f32); one int8 decision remains.** The seam is wired and
-both native backends (`gpu/enccuda`, `gpu/encmetal`) ship, parity-gated, with the production
-GEMMs and an end-to-end figure. The single open item is the **int8 (`LoadQ8`) encoder path**, and
-it is a *decision*, not unbuilt work — it routes through the existing `WeightMat` W8A8 GEMV, NOT
-by widening `Backend` (see the scope note below).
+**Phase 4 — encoder native — ✅ DONE (f32 + int8, both platforms).** The seam is wired and both
+native backends (`gpu/enccuda`, `gpu/encmetal`) ship, parity-gated, with the production GEMMs.
+The int8 (`LoadQ8`) path is also **built** — weight-only, routed through the existing `WeightMat`
+W8A8 GEMV via the optional `encoder.Q8Backend` capability, NOT by widening `Backend` (the scope
+note below records why). The only item left is a **published batched end-to-end wall-time number**,
+which is **checkpoint-blocked**, not a code gap (see below).
 
 The plan said "`encoder.Backend` already has `webgpu`; add native Metal/CUDA", which read as
 *plug a backend into a working seam*. It wasn't: the interface existed, `NewBackend` resolved
@@ -493,8 +494,7 @@ int8 speedup exceeds f32 here too — vs the CPU widen-every-call path, **1.8× 
 151 / 604 / 2416 MFLOP (lower ratios than CUDA only because the M1-Pro CPU is strong; the
 *pattern* — int8 beats CPU by more than f32 does — holds).
 
-**Still to do in Phase 4:** an **int8 end-to-end** encode measurement and — **✅ now done** — a faster
-CUDA f32 GEMM: `gemm_f32_reg`, a register-blocked kernel reached through `ViT.GEMMF32Plan`
+**Faster CUDA f32 GEMM — ✅ DONE.** `gemm_f32_reg`, a register-blocked kernel reached through `ViT.GEMMF32Plan`
 (aligned M%64/N%64/K%16 → register kernel, anything else → the bounds-checked
 `gemm_f32_tiled`). Measured on an RTX 2070 SUPER, steady compute: **6.1–7.1×**, peaking at
 **3.56 TFLOP/s** (~39% of the card's fp32 peak).
@@ -576,13 +576,13 @@ portable, CPU always).
 goinfer-Metal device re-point) → **Phase 2 ✅** (ANN-GPU batch-GEMM — the headline) → **Phase 1b
 ✅** (CUDA device impl + CUDA ANN backend + the tuned-GEMV blob-split + the goinfer CUDA device
 re-point, all parity-gated on an RTX 2070 SUPER) → **Phase 3 ✅** (SigLIP and Qwen2.5-VL both done
-on BOTH CUDA and Metal, tiled and then simdgroup-GEMM'd) → **Phase 4 ✅ (f32)** (encoder native:
-seam wired, `enccuda` + `encmetal` shipped with production GEMMs and an end-to-end figure; the
-int8 path is a remaining `WeightMat`-dispatch decision, not unbuilt work).
+on BOTH CUDA and Metal, tiled and then simdgroup-GEMM'd) → **Phase 4 ✅ (f32 + int8)** (encoder
+native: seam wired, `enccuda` + `encmetal` shipped with production GEMMs; the int8 path built via
+`WeightMat` / `Q8Backend`; only a checkpoint-blocked batched end-to-end wall-time number remains).
 
 **Nothing is gated behind an unfired trigger any more.** Every "wait for X to settle" in this
 plan has been discharged: the tuned kernels stabilized, the blob-split turned out to be a clean
 entry-point cut rather than a disentangling, and both device re-points landed bit-identical.
-What remains is a single int8-encoder dispatch decision (route via `WeightMat`, not by widening
-`Backend`) and optional CUDA-side GEMM throughput work; `embed` is ruled out on the merits
-(above), not deferred.
+What remains is a single **checkpoint-blocked** measurement — the batched encoder end-to-end
+wall-time — not code: the int8-encoder dispatch decision was made AND built (via `WeightMat` /
+`Q8Backend`), and the CUDA GEMM shipped. `embed` is ruled out on the merits (above), not deferred.
