@@ -42,27 +42,16 @@ func (ix *Index) DF(term string) int { return ix.df[term] }
 // Scores returns the BM25 score of every document for query (already
 // tokenized). The result is indexed by document id; length == ix.N().
 func (ix *Index) Scores(query []string) []float64 {
-	scores := make([]float64, ix.N())
-	seen := make(map[string]struct{}, len(query))
-	for _, term := range query {
-		if _, dup := seen[term]; dup {
-			continue // term contributes once; tf is per-document, not per-query
-		}
-		seen[term] = struct{}{}
-		idf := ix.idf(term)
-		if idf == 0 {
-			continue
-		}
-		for _, p := range ix.postings[term] {
-			var norm float64
-			if ix.avgdl > 0 {
-				norm = float64(ix.docLen[p.doc]) / ix.avgdl
-			}
-			denom := float64(p.tf) + ix.K1*(1-ix.B+ix.B*norm)
-			scores[p.doc] += idf * (float64(p.tf) * (ix.K1 + 1)) / denom
-		}
+	// Public API: must return a dense slice indexed by doc id, so this materializes
+	// one from the touched set. TopK does NOT go through here — it selects over the
+	// touched ids directly, which is the whole point of item 11.
+	a := ix.scoreQuery(query)
+	defer putAccum(a)
+	out := make([]float64, ix.N())
+	for _, d := range a.touched {
+		out[d] = a.scores[d]
 	}
-	return scores
+	return out
 }
 
 // TopK returns the k highest-scoring documents with Score > 0, ties broken
@@ -82,14 +71,15 @@ func (ix *Index) Scores(query []string) []float64 {
 //     with cap 0 always discards), matching the prior `k=0 → empty`
 //     behavior from the original truncation gate.
 func (ix *Index) TopK(query []string, k int) []Result {
-	scores := ix.Scores(query)
+	a := ix.scoreQuery(query)
+	defer putAccum(a)
 
 	// Full-sort path: k<0 means "no truncation, return everything".
 	if k < 0 {
-		res := make([]Result, 0, len(scores))
-		for d, s := range scores {
-			if s > 0 {
-				res = append(res, Result{Doc: d, Score: s})
+		res := make([]Result, 0, len(a.touched))
+		for _, d := range a.touched {
+			if s := a.scores[d]; s > 0 {
+				res = append(res, Result{Doc: int(d), Score: s})
 			}
 		}
 		sort.Slice(res, func(i, j int) bool {
@@ -104,10 +94,15 @@ func (ix *Index) TopK(query []string, k int) []Result {
 	// Heap path: k>=0. Push every positive-scored doc; the heap retains
 	// the K highest. k=0 selector discards everything → empty result,
 	// matching the prior gate's k=0 behavior.
+	// Selection over the TOUCHED SET, in ascending doc order — the same order the
+	// old full-corpus range produced, so topk's first-seen-wins tie-break retains
+	// exactly the same items.
 	sel := topk.New[int](k)
-	for d, s := range scores {
-		if s > 0 {
-			sel.Push(d, s)
+	th := sel.Threshold()
+	for _, d := range a.touched {
+		if s := a.scores[d]; s > 0 && s > th {
+			sel.Push(int(d), s)
+			th = sel.Threshold()
 		}
 	}
 	items := sel.Result()

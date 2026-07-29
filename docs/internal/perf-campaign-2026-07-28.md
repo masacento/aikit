@@ -75,7 +75,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
-| 11 | **(A)** BM25/SPLADE: touched-set selection + pooled accumulator | bm25, sparse | **10–50×** on selective queries | = | M |
+| 🟡 11 | **(A)** touched-set selection + pooled accumulator — **bm25 DONE (1.3–218×, §7.9); `sparse` still to do** | bm25, sparse | measured, selectivity-dependent | = | M |
 | ~~12~~ | ~~**(B)** Rewrite `dotI8AVX2`~~ — **DONE, 2.10× kernel / 2.02× scan** (§7.6) | linalg | measured on Zen 2; int8 now at f32 MAC-parity | = (integer) | — |
 | 13 | **(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto` | linalg→encoder, vision | 1.25–1.5× text, up to 2× vision | ~ or = (see item) | M–L |
 | 14 | **(E)** Length-bucketed `EncodeBatch` under a token budget | encoder | 1.3–2× on ragged batches | **=** | M |
@@ -805,6 +805,38 @@ Four things an earlier draft asserted that the refutation pass knocked down:
 
    Both are bit-identical: the hoisted guard uses `>`, matching `Push`'s own strict
    comparison, so a tied newcomer is rejected either way.
+
+9. **Item 11 is DONE for `bm25` (the `sparse` mirror remains), and it OVERSHOT its
+   estimate — but only at one end.** The estimate of "10–50×" is really a range that
+   depends entirely on query selectivity, which the mechanism makes inevitable: the fix
+   replaces O(corpus) with O(postings touched), so the win *is* the selectivity ratio.
+   200k docs × 120 tokens, 30k vocab, k=10:
+
+   ```
+   selective (tail-of-vocab, few postings)   262,412 -> 1,203 ns    218x
+   common    (14,243 of 200,000 docs)        599,886 -> 461,166 ns  1.30x
+   allocations, both cases               1,606,520 -> 888 B/op    ~1800x
+   ```
+
+   The doc's own scenario (2,335 postings of 200k) sits near the selective end, so its
+   "412 µs → 5–15 µs" was about right for that query. But quoting a single ratio for
+   this item is misleading in either direction — it should always be stated with the
+   selectivity it was measured at.
+
+   **Two implementation notes.** The touched set uses GENERATION STAMPS rather than a
+   "score != 0 means touched" test. Today every BM25 contribution is strictly positive
+   (the Lucene idf is > 0 for any known term), so the zero test would work — and would
+   break silently the day a scorer admits a zero or negative contribution, dropping the
+   doc from results entirely. And `accum.sortTouched` is load-bearing, not cosmetic:
+   `topk` keeps the FIRST-SEEN member of a tie, so reproducing the dense scan's exact
+   output requires visiting the touched set in ascending doc order.
+   `TestTopK_touchedSetMatchesDenseScan` gates that against a reference implementation
+   and asserts the fixture actually contains ties, so the tie-break path is not
+   silently untested.
+
+   Also folded in the item's second-order note: the per-query `seen` map is now a
+   linear scan over the preceding terms (queries are tens of terms, where the map's
+   allocation and hashing cost more than the scan).
 
 ---
 
