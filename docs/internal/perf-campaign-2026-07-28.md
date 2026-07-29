@@ -1262,6 +1262,12 @@ re-baseline), 38 and 39 (only after 11 and 12 re-baseline the retrieval profile)
 
 ## 9. One methodological note
 
+> **See also: [`measuring-performance.md`](measuring-performance.md)** — the
+> operational companion to this section. Every way a measurement misled us
+> during this campaign is catalogued there with its numbers, along with the
+> predicted-vs-measured scoreboard. Read it before designing a benchmark for
+> any remaining item.
+
 The pattern that produced the best findings here is the one already in your docs:
 **`task-perf-linalg.md`'s arbiter discipline** — a microbenchmark proposes, an
 end-to-end sweep disposes, and a negative result gets written down as
