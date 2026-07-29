@@ -174,3 +174,5 @@ testdata/paraphrase-ml
 testdata/granite-en
 testdata/arctic2-m
 testdata/siglip-tiny
+testdata/siglip-bench/
+testdata/siglip-bench-l/

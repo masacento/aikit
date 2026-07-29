@@ -233,8 +233,26 @@ should key off.
    path — which is exactly the `ann.Backend` decision the crossover thresholds (batch≥8/≥64) feed;
    an adopter should gate `EnableGPU`/GPU-`QueryBatch` on batch size for their corpus N.
 
-The CUDA crossover is the NVIDIA box's to run with the same harness; the normalized summary will
-show both once its file lands in `docs/bench-records/`.
+The CUDA crossover ran with the same harness and `docs/BENCH-gpu-results.md` now joins both
+machines in the one normalized summary: CUDA up to **15.25×** (N=1e5, batch 256), Metal up to
+**~2.8×**, every point parity-exact. Two more `BENCH-gpu.md` slices, same harness/record/report:
+
+- **ViT throughput — ✅ DONE (Metal), a modest win that grows with size.** A real-sized random
+  SigLIP tower (`scripts/gen_siglip_bench.py` — random weights, since throughput is value-blind
+  and parity is gated GPU-vs-CPU on the same tower) run CPU vs the Metal resident encoder:
+  **1.33×** at hidden 512 / 196 patches, **1.53×** at hidden 768 / 576 patches. It grows with the
+  tower because the resident encoder does **per-op command buffers** (~12 layers × ~10 ops, each a
+  ~250µs commit+wait), so it is **dispatch-floor-bound** — the same story as ANN batch-1 — and
+  bigger ops amortize the floor. The lever is batching a whole forward into ONE command buffer
+  (the `gpu.Encoder` batch API), not a faster kernel. Parity is cosine **0.9999** — the legitimate
+  deep-tower drift from Metal's f32 reductions (no `double` in MSL) accumulating over 12 layers,
+  retrieval-identical; the tiny 2-layer fixture never shows it.
+- **Encoder end-to-end — blocked on a checkpoint (not a code gap).** A *batched* encode is what
+  activates the GPU (large M), which needs `encoder.Load`/`Model.EncodeBatch` — but that path
+  requires a **SwiGLU/GELU** config, and the only local checkpoint (`testdata/minilm-model`) is
+  BERT-family (`encoder.Load` rejects it; `BERT` has only single-text `Encode`). So it needs a
+  GTE/SwiGLU sentence-model checkpoint on a box. The f32 single-text finding is already recorded
+  (CPU≡Metal cosine 1.0, correctly delegating below the threshold).
 
 **Phase 3 — vision native + the Qwen ViT resident path — ✅ DONE on CUDA + Metal (SigLIP and Qwen2.5-VL on both).**
 `vision.ResidentEncoder` already existed (WebGPU SigLIP, "~9×"); the native CUDA

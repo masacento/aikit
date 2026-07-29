@@ -371,6 +371,9 @@ func writeThresholds(b *strings.Builder, byMachine map[string]map[string]map[str
 			if cpu.Workload == "" || gpu.Workload == "" {
 				continue
 			}
+			if gpu.Shape.Batch == 0 { // only batch-swept workloads (ANN) have a crossover threshold
+				continue
+			}
 			key := fmt.Sprintf("%s (%s, N=%s)", gpu.Workload, gpu.Precision, humanInt(gpu.Shape.N))
 			grp[key] = append(grp[key], pt{gpu.Shape.N, gpu.Shape.Batch, speedup(gpu, cpu)})
 		}
