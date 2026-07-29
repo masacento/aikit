@@ -371,6 +371,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 27 · 4-MFLOP naive threshold | 3–9% for L<250 | **up to −50.5%** | ❌ (under) |
 | 24 · packed-stride aliasing | "free" | unreachable on amd64; reverted | — |
 | 32 · vision preprocess | 2.3× | 2.45× on convert+resize; **−31.4%** end-to-end | ✅ |
+| 16 · shard `Flat.Query` | 4–8× typical | **1.73–2.26×** on 16 threads | ❌ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -410,6 +411,30 @@ and the obvious reading was the wrong one.
 measured is not the whole operation, give the end-to-end number beside it. The
 same applies in reverse to an estimate you are about to act on — establish its
 denominator before budgeting effort against it.
+
+---
+
+### 1.17 Convert a bandwidth-bound result to GB/s before believing a core-count estimate
+
+Item 16 sharded `Flat.Query` across 16 threads and got **1.73–2.26×**, where the
+estimate said "1.74–2.08× on 2 cores; 4–8× typical". One number explains it:
+
+| index | working set | serial | sharded |
+|---|--:|--:|--:|
+| 10k×128 | 5.1 MB (L3) | 20.0 GB/s | **45.1 GB/s** |
+| 200k×384 | 307 MB (DRAM) | 14.6 GB/s | 25.2 GB/s |
+
+The DRAM cases sit at this box's practical dual-channel ceiling and do not move
+with core count. A flat cosine scan reads each byte once and does two FLOPs per
+float, so it is bandwidth-bound by construction — parallelism only closes the gap
+between one core (~14 GB/s) and the memory system, then stops. The L3-resident
+row is the control: same code, no DRAM wall, 2.26×.
+
+**Guard:** for any scan-shaped workload, divide the working set by the time and
+compare against the machine's memory bandwidth BEFORE estimating a speedup from
+core count. If the serial number is already a large fraction of the ceiling, the
+available win is `ceiling / serial`, not `cores`. This is cheap to compute and
+would have predicted the result exactly.
 
 ---
 

@@ -39,7 +39,9 @@
 package ann
 
 import (
+	"runtime"
 	"sort"
+	"sync"
 
 	"github.com/townsendmerino/aikit/linalg"
 	"github.com/townsendmerino/aikit/topk"
@@ -119,17 +121,12 @@ func (f *Flat) query(q []float32, k int, keep func(int) bool) []Hit {
 
 	// Heap path: 0 < k < Len. Score every vector, push into the K-sized
 	// min-heap; the heap only retains the K highest seen so far.
-	sel := topk.New[int](k)
-	// See ann/flat_i8.go's topHits: the threshold is hoisted so the non-inlinable
-	// Push is only called for candidates that can actually be retained.
-	th := sel.Threshold()
-	scanFlat(q, f.vecs, func(i int, score float64) {
-		if score > th && (keep == nil || keep(i)) {
-			sel.Push(i, score)
-			th = sel.Threshold()
-		}
-	})
-	items := sel.Result() // descending by score; tie order is heap-internal
+	var items []topk.ItemWithScore[int]
+	if w := flatQueryWorkers(len(f.vecs), f.dim, keep); w > 1 {
+		items = f.queryShards(q, k, w)
+	} else {
+		items = scanTopK(q, f.vecs, 0, k, keep)
+	}
 	// Stable secondary sort by ascending Index to honor the doc-comment
 	// tie-break contract. K is small (typically 10), so this is cheap.
 	sort.SliceStable(items, func(a, b int) bool {
@@ -152,6 +149,100 @@ func (f *Flat) query(q []float32, k int, keep func(int) bool) []Hit {
 // the blocked matmul uses — which beats one linalg.Dot call per vector. The
 // kernel covers the first ⌊d/4⌋·4 dims; a scalar tail handles the d%4 remainder,
 // and the final <8 vectors (plus any ragged-dim group) fall back to linalg.Dot.
+// scanTopK scores vecs against q and returns the k best as (score desc, index
+// asc), with indices offset by base. It is the shared body of both the serial
+// and the sharded query path — one implementation, so a shard cannot drift from
+// the whole.
+func scanTopK(q []float32, vecs [][]float32, base, k int, keep func(int) bool) []topk.ItemWithScore[int] {
+	sel := topk.New[int](k)
+	// See ann/flat_i8.go's topHits: the threshold is hoisted so the non-inlinable
+	// Push is only called for candidates that can actually be retained.
+	th := sel.Threshold()
+	scanFlat(q, vecs, func(i int, score float64) {
+		gi := base + i
+		if score > th && (keep == nil || keep(gi)) {
+			sel.Push(gi, score)
+			th = sel.Threshold()
+		}
+	})
+	return sel.Result()
+}
+
+// flatParallelThreshold is the scored-element count (N·dim) at or above which
+// sharding pays for the goroutine spawn. Below it the scan is a few hundred
+// microseconds and the fan-out is pure overhead.
+const flatParallelThreshold = 1 << 19
+
+// flatQueryWorkers decides the fan-out for one query.
+//
+// It returns 1 — i.e. stay serial — whenever a filter is supplied. `keep` is
+// caller-supplied and QueryFilter has never required it to be safe for
+// concurrent use; calling it from N goroutines would silently change that
+// contract. Filtered queries therefore keep the serial path until the contract
+// is stated. (Everything else about the two paths is identical, so lifting this
+// later is a one-line change plus a doc sentence.)
+func flatQueryWorkers(n, dim int, keep func(int) bool) int {
+	if keep != nil || n < 2 {
+		return 1
+	}
+	if int64(n)*int64(dim) < flatParallelThreshold {
+		return 1
+	}
+	w := runtime.NumCPU()
+	if w > n {
+		w = n
+	}
+	return w
+}
+
+// queryShards splits the scan across workers, each with its OWN k-selector, then
+// merges.
+//
+// The merge is exact, not approximate. Flat's contract is "the k highest by
+// score, ties broken by ascending index", and the serial path implements it by
+// scanning in ascending index order with topk's strict-> rule, so a tie at the
+// boundary keeps the first-seen (lowest) index. That is precisely a global sort
+// by (score desc, index asc) truncated to k. Any element in that global top-k is
+// also in its own shard's top-k under the same ordering — a shard is a subset —
+// so it survives to the merge, and the merge re-applies the same total order.
+// Sharding therefore cannot change which elements are returned, only how they
+// are found. TestFlatQuery_shardedMatchesSerial gates it on adversarial
+// all-ties input.
+func (f *Flat) queryShards(q []float32, k, workers int) []topk.ItemWithScore[int] {
+	n := len(f.vecs)
+	per := (n + workers - 1) / workers
+	parts := make([][]topk.ItemWithScore[int], workers)
+	var wg sync.WaitGroup
+	for w := range workers {
+		lo := w * per
+		if lo >= n {
+			break
+		}
+		hi := min(lo+per, n)
+		wg.Add(1)
+		go func(w, lo, hi int) {
+			defer wg.Done()
+			parts[w] = scanTopK(q, f.vecs[lo:hi], lo, k, nil)
+		}(w, lo, hi)
+	}
+	wg.Wait()
+
+	merged := make([]topk.ItemWithScore[int], 0, workers*k)
+	for _, p := range parts {
+		merged = append(merged, p...)
+	}
+	sort.Slice(merged, func(a, b int) bool {
+		if merged[a].Score != merged[b].Score {
+			return merged[a].Score > merged[b].Score
+		}
+		return merged[a].Item < merged[b].Item
+	})
+	if len(merged) > k {
+		merged = merged[:k]
+	}
+	return merged
+}
+
 func scanFlat(q []float32, vecs [][]float32, emit func(i int, score float64)) {
 	d := len(q)
 	n4 := d / 4

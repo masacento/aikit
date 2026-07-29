@@ -84,7 +84,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~13~~ | ~~**(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto`~~ — **DONE, all sites** (§7.16 text, §7.17 vision + cross-encoder); pure Go, no assembly | linalg→encoder, vision | text −20.1%; **cross-encoder −33.8%**; SigLIP −17.9%/−30.6% | ~ (contracts stated + gated) | — |
 | 14 | **(E)** Length-bucketed `EncodeBatch` under a token budget | encoder | 1.3–2× on ragged batches | **=** | M |
 | 15 | HNSW: batch neighbour scoring through `Dot8x4` | ann | **1.36–1.40× measured** end-to-end | ~ (1 ULP) | M |
-| 16 | `Flat.Query` is single-threaded; shard it + per-shard selector | ann | 1.74–2.08× on 2 cores; 4–8× typical | = | M |
+| ~~16~~ | ~~`Flat.Query` is single-threaded; shard it + per-shard selector~~ — **DONE, 1.73–2.26×** (§7.23) | ann | "4–8× typical" was never available: the scan is DRAM-bandwidth-bound at ~25 GB/s | = | — |
 | 17 | HNSW build: batch `prune`/`selectHeuristic`; kill 225 allocs/insert | ann | 1.5–2.5× build | ~ | M |
 | ~~18~~ | ~~`vision/qwen_encoder.go` has no scratch arena~~ — **DONE, −70/−85% B/op, now depth-independent** (§7.19) | vision | latency share is ~3%, not the ~1.5 s implied | **=** | — |
 | ~~19~~ | ~~`DequantizeRowInt4`: hardware integer divide per element~~ — **DONE, 4.93×** (§7.11) | linalg | above the 2–4× estimate | = | — |
@@ -1503,6 +1503,58 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     downscale — requiring exact equality, plus `TestXMap_matchesInlineComputation`
     for the hoist. `FuzzPreprocess` ran 8.35 M executions clean over the new
     decode dispatch.
+
+23. **Item 16 is DONE — and the ceiling is memory bandwidth, not core count.**
+    `Flat.Query`'s heap path now shards the scan across `NumCPU`, each worker
+    with its own k-selector, merged by the same total order. benchstat n=6:
+
+    | index | before | after | |
+    |---|--:|--:|--:|
+    | N=1k, d=128 | 13.60 µs | 13.41 µs | ~ (below threshold, stays serial) |
+    | N=10k, d=128 | 256.5 µs | 113.4 µs | **−55.8%** (2.26×) |
+    | N=50k, d=384 | 5.398 ms | 3.088 ms | −42.8% (1.75×) |
+    | N=200k, d=384 | 21.05 ms | 12.18 ms | −42.1% (1.73×) |
+
+    **The estimate was "1.74–2.08× on 2 cores; 4–8× typical". On SIXTEEN threads
+    it delivers 1.73–2.26× — i.e. what the doc predicted for two cores.** The
+    reason is visible the moment the working set is converted to bandwidth:
+
+    | index | working set | serial | sharded |
+    |---|--:|--:|--:|
+    | 10k×128 | 5.1 MB (L3-resident) | 20.0 GB/s | **45.1 GB/s** |
+    | 50k×384 | 76.8 MB (DRAM) | 14.2 GB/s | 24.9 GB/s |
+    | 200k×384 | 307.2 MB (DRAM) | 14.6 GB/s | 25.2 GB/s |
+
+    The DRAM-resident cases plateau at ~25 GB/s — roughly this box's practical
+    dual-channel DDR4 ceiling — and stay there whether 4 cores or 16 are scanning.
+    A flat cosine scan reads every byte of the index exactly once and does two
+    FLOPs per float, so it is bandwidth-bound almost by definition; parallelism
+    buys the gap between what ONE core can pull (≈14 GB/s) and what the memory
+    system can deliver, and nothing beyond. The L3-resident case reaching 45 GB/s
+    is the control that confirms it: same code, no DRAM ceiling, better scaling.
+
+    **So "4–8× typical" was never available on this shape** and the estimate
+    should be read as core-count arithmetic that omitted the memory system. The
+    corollary is useful: `FlatI8` moves ¼ the bytes for the same N and dim, so it
+    is correspondingly further from the wall — which is consistent with the GPU
+    crossover data, where `FlatI8` on CUDA reaches 15.25× while f32 paths do not.
+
+    **Exactness.** `Flat` is the exact retriever, so the merge must return what
+    the serial scan returns, not merely something as good. It does, provably:
+    the serial path scans in ascending index order and `topk` rejects ties at
+    capacity (strict `>`), so its result IS "global sort by (score desc, index
+    asc), truncated to k" — and any element of that global top-k is also in its
+    own shard's top-k under the same order, since a shard is a subset. The gate
+    runs adversarial all-identical-score and two-level-tie inputs where every
+    returned index is decided purely by tie-breaking, plus a shard-width
+    invariance test (1…6000 workers). Both mutants — a reversed merge tie-break
+    and a dropped shard base offset — fail it.
+
+    **`QueryFilter` deliberately stays serial.** `keep` is caller-supplied and
+    has never been documented as safe for concurrent use; fanning it out would
+    change that contract silently. `TestFlatQueryFilter_staysSerial` pins the
+    restriction, and asserts the unfiltered path DOES fan out so the test cannot
+    pass vacuously. Lifting it later is one line plus a doc sentence.
 
 ---
 
