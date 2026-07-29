@@ -96,39 +96,15 @@ func (ix *Index) Len() int { return ix.ndocs }
 // indexed by document id (length == Len()). Duplicate query terms have their
 // weights summed, so each term's posting list is walked at most once.
 func (ix *Index) Scores(q SparseVec) []float64 {
-	scores := make([]float64, ix.ndocs)
-	n := min(len(q.Terms), len(q.Weights))
-	// Accumulate duplicate query terms, but keep a STABLE order (first appearance
-	// in q.Terms) so each document's score below is summed in a fixed order.
-	// Ranging a map here made the float64 accumulation order random per call (Go
-	// randomizes map iteration), so identical queries produced scores like
-	// 0.6 vs 0.6000000000000001 across runs and ties flipped, against the
-	// ascending-doc-id determinism the package promises (audit #16). bm25.Scores
-	// already walks the query slice in order — this makes the two consistent.
-	type termWeight struct {
-		term uint32
-		w    float64
+	// Public API: dense slice indexed by doc id, materialized from the touched set.
+	// Query does NOT go through here — it selects over the touched ids directly.
+	a := ix.scoreQuery(q)
+	defer putAccum(a)
+	out := make([]float64, ix.ndocs)
+	for _, d := range a.touched {
+		out[d] = a.scores[d]
 	}
-	order := make([]termWeight, 0, n)
-	seen := make(map[uint32]int, n)
-	for i := range n {
-		t := q.Terms[i]
-		if j, ok := seen[t]; ok {
-			order[j].w += float64(q.Weights[i])
-			continue
-		}
-		seen[t] = len(order)
-		order = append(order, termWeight{t, float64(q.Weights[i])})
-	}
-	for _, tw := range order {
-		if tw.w == 0 {
-			continue
-		}
-		for _, p := range ix.postings[tw.term] {
-			scores[p.doc] += tw.w * float64(p.w)
-		}
-	}
-	return scores
+	return out
 }
 
 // Query returns the k highest-scoring documents with Score > 0, ordered by
@@ -137,13 +113,14 @@ func (ix *Index) Scores(q SparseVec) []float64 {
 // document shares no weighted term with the query iff its score is 0, so the
 // Score > 0 filter is "retrieve only documents the query actually touches".
 func (ix *Index) Query(q SparseVec, k int) []Hit {
-	scores := ix.Scores(q)
+	a := ix.scoreQuery(q)
+	defer putAccum(a)
 
 	if k < 0 {
-		out := make([]Hit, 0, len(scores))
-		for d, s := range scores {
-			if s > 0 {
-				out = append(out, Hit{Index: d, Score: s})
+		out := make([]Hit, 0, len(a.touched))
+		for _, d := range a.touched {
+			if s := a.scores[d]; s > 0 {
+				out = append(out, Hit{Index: int(d), Score: s})
 			}
 		}
 		sort.Slice(out, func(i, j int) bool {
@@ -155,10 +132,15 @@ func (ix *Index) Query(q SparseVec, k int) []Hit {
 		return out
 	}
 
+	// Selection over the TOUCHED SET in ascending doc order — the order the old
+	// full-corpus range produced, so topk's first-seen-wins tie-break retains the
+	// same items.
 	sel := topk.New[int](k)
-	for d, s := range scores {
-		if s > 0 {
-			sel.Push(d, s)
+	th := sel.Threshold()
+	for _, d := range a.touched {
+		if s := a.scores[d]; s > 0 && s > th {
+			sel.Push(int(d), s)
+			th = sel.Threshold()
 		}
 	}
 	items := sel.Result()

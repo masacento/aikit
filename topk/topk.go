@@ -135,6 +135,13 @@ func (s *Selector[T]) Push(item T, score float64) bool {
 // The guard must be `>`, matching Push's own strict comparison: a tied newcomer is
 // rejected either way, so hoisting it changes nothing about which items are kept.
 func (s *Selector[T]) Threshold() float64 {
+	// k == 0 discards everything, and the heap is permanently empty — so the
+	// threshold is +Inf ("nothing can be retained"), NOT heap[0], which would index
+	// an empty slice. Push handles k == 0 with its own early return, so a caller
+	// that hoists the threshold is the only way to reach this.
+	if s.k == 0 {
+		return math.Inf(1)
+	}
 	if len(s.heap) < s.k {
 		return math.Inf(-1)
 	}

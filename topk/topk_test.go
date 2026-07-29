@@ -2,6 +2,7 @@ package topk
 
 import (
 	"math"
+	"math/rand"
 	"reflect"
 	"testing"
 )
@@ -233,5 +234,46 @@ func TestSelector_tieBreakFirstSeen(t *testing.T) {
 	}
 	if !survivors[9] || !survivors[0] || !survivors[1] {
 		t.Errorf("survivors = %v, want {9,0,1} (first-seen ties kept)", survivors)
+	}
+}
+
+// TestThreshold_k0 pins the k==0 case. Threshold is the hoisted form of Push's own
+// guard, and Push returns early for k==0 — so a caller that hoists must get a value
+// that rejects everything rather than an index into the permanently empty heap.
+// A sparse k=0 query panicked here before this was handled.
+func TestThreshold_k0(t *testing.T) {
+	s := New[int](0)
+	th := s.Threshold()
+	if !math.IsInf(th, 1) {
+		t.Fatalf("Threshold() at k=0 = %v, want +Inf", th)
+	}
+	// And the hoisted guard must agree with Push: neither retains anything.
+	if 1e308 > th {
+		t.Error("a finite score passed the k=0 threshold guard")
+	}
+	if s.Push(1, 1e308) {
+		t.Error("Push retained an item at k=0")
+	}
+	if got := s.Result(); len(got) != 0 {
+		t.Errorf("k=0 Result() = %d items, want 0", len(got))
+	}
+}
+
+// TestThreshold_matchesPush cross-checks the hoisted guard against Push's own
+// decision across a random stream: if `score > Threshold()` disagrees with what Push
+// does, the optimisation changes which items are retained.
+func TestThreshold_matchesPush(t *testing.T) {
+	for _, k := range []int{0, 1, 3, 10} {
+		s := New[int](k)
+		rng := rand.New(rand.NewSource(5))
+		for i := range 500 {
+			score := rng.NormFloat64()
+			predicted := score > s.Threshold()
+			got := s.Push(i, score)
+			if predicted != got {
+				t.Fatalf("k=%d i=%d: Threshold guard said %v, Push did %v (score %v)",
+					k, i, predicted, got, score)
+			}
+		}
 	}
 }

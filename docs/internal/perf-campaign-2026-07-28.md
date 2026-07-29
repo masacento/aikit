@@ -61,7 +61,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
 | 1 | Revive the 3 dead benchmark files; add warm-up + alloc accounting + a concurrent-QPS mode to `bench/harness.go` | bench | unblocks everything | — | S |
-| 2 | SPLADE: hoist `log1p` outside the L×V max-reduce | encoder | 5–25× on that loop | **=** | S |
+| ~~2~~ | ~~SPLADE: hoist `log1p` outside the L×V max-reduce~~ — **DONE** (§7.10) | encoder | log1p calls: per positive logit → per vocab entry | **=** | — |
 | ~~3~~ | ~~`topk.Push`: hoist the threshold compare~~ — **DONE** (§7.8) | topk, ann | **1.05× end-to-end** on `Flat.Query` (the 1.43× was the selection step alone) | = | — |
 | 4 | `FlatI8.Query`: pool the score buffer; stop allocating a `Workspace` per query | ann | 10–25% now, large at N≥1M | = | S |
 | ~~5~~ | ~~Index (de)serialization: bulk `copy`~~ — **DONE, 5.14×** (§7.8) | ann | 15.6 → 3.04 ms on a 50k×384 index; the 20–30× estimate was optimistic | = | — |
@@ -75,7 +75,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
-| 🟡 11 | **(A)** touched-set selection + pooled accumulator — **bm25 DONE (1.3–218×, §7.9); `sparse` still to do** | bm25, sparse | measured, selectivity-dependent | = | M |
+| ~~11~~ | ~~**(A)** touched-set selection + pooled accumulator~~ — **DONE, bm25 + sparse** (§7.9) | bm25, sparse | 1.3–218× on bm25, selectivity-dependent | = | — |
 | ~~12~~ | ~~**(B)** Rewrite `dotI8AVX2`~~ — **DONE, 2.10× kernel / 2.02× scan** (§7.6) | linalg | measured on Zen 2; int8 now at f32 MAC-parity | = (integer) | — |
 | 13 | **(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto` | linalg→encoder, vision | 1.25–1.5× text, up to 2× vision | ~ or = (see item) | M–L |
 | 14 | **(E)** Length-bucketed `EncodeBatch` under a token budget | encoder | 1.3–2× on ragged batches | **=** | M |
@@ -837,6 +837,34 @@ Four things an earlier draft asserted that the refutation pass knocked down:
    Also folded in the item's second-order note: the per-query `seen` map is now a
    linear scan over the preceding terms (queries are tens of terms, where the map's
    allocation and hashing cost more than the scan).
+
+10. **Item 11's `sparse` half and item 2 are DONE — and finishing item 3 exposed a bug
+    I had introduced.**
+
+    **`sparse`** now mirrors bm25's pooled touched-set accumulator. One difference is
+    recorded in the code: bm25 could have used a "score != 0 means touched" test
+    (its contributions are strictly positive), but sparse genuinely cannot — a sparse
+    dot can produce a zero contribution from a zero-weight posting or from
+    cancellation, so there the zero test would be wrong *today*, not merely fragile.
+    Generation stamps are used in both for one shape. The existing first-appearance
+    dedupe order (audit #16, which exists so identical queries don't produce
+    0.6 vs 0.6000000000000001) is preserved: the `seen` map became a linear scan over
+    the accumulated terms, which preserves that order by construction.
+
+    **Item 2** is in, and its exactness claim is now gated directly rather than
+    inferred: `TestSpladePooling_hoistedLog1pIsExact` asserts bit-identity over a
+    64×3000 fixture and *checks the fixture contains both regimes* — my first version
+    had 3000 positive columns and **zero** all-negative ones, so the `f(0)=0` boundary
+    the hoist depends on was untested until the vacuity check caught it.
+
+    **A bug found by finishing the job.** Item 3's `topk.Threshold()` indexed
+    `heap[0]` when `k == 0`, where the heap is permanently empty. `ann` never hit it
+    (its callers guard `k <= 0` earlier), and bm25 has no k=0 test — sparse's
+    `TestQuery_kSemantics` panicked and found it. Fixed (k==0 → +Inf, "nothing can be
+    retained"), plus `TestThreshold_matchesPush`, which cross-checks the hoisted guard
+    against `Push`'s own decision over a random stream at k ∈ {0,1,3,10}. Worth noting
+    the shape: an optimisation that is correct in the package it was measured in, and
+    wrong in the next package to adopt it.
 
 ---
 

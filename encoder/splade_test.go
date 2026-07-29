@@ -3,6 +3,7 @@ package encoder
 import (
 	"encoding/json"
 	"math"
+	"math/rand"
 	"os"
 	"testing"
 
@@ -121,4 +122,77 @@ func TestSPLADE_parity(t *testing.T) {
 		}
 	}
 	t.Logf("SPLADE parity: worst cosine %.6f, worst term-jaccard %.4f", worstCos, worstJac)
+}
+
+// TestSpladePooling_hoistedLog1pIsExact gates perf item 2's load-bearing claim:
+// float32∘Log1p∘relu is monotone non-decreasing and maps 0→0, so taking the max of
+// the RAW logits and applying log1p once per vocab entry is BIT-IDENTICAL to applying
+// it per positive element and maxing the results.
+//
+// This is the whole justification for the rewrite, so it is asserted directly rather
+// than inferred from an end-to-end cosine — which would hide a 1-ULP drift.
+func TestSpladePooling_hoistedLog1pIsExact(t *testing.T) {
+	const L, V = 64, 3000
+	rng := rand.New(rand.NewSource(3))
+	logits := make([]float32, L*V)
+	for i := range L {
+		for v := range V {
+			switch {
+			case v%5 == 0:
+				// All-negative column: every row negative, so the max stays 0 and
+				// log1p is never applied. This is the boundary the hoist relies on
+				// (f(0)=0) and it must be present, or the equality is cheap.
+				logits[i*V+v] = float32(-rng.ExpFloat64())
+			case v%5 == 1 && i == 0:
+				logits[i*V+v] = 0 // exactly zero
+			default:
+				logits[i*V+v] = float32(rng.NormFloat64() * 3)
+			}
+		}
+	}
+
+	// Old form: log1p per positive element, then max.
+	want := make([]float32, V)
+	for i := range L {
+		for v, x := range logits[i*V : (i+1)*V] {
+			if x > 0 {
+				if w := float32(math.Log1p(float64(x))); w > want[v] {
+					want[v] = w
+				}
+			}
+		}
+	}
+	// New form: max the raw logits, then log1p once per vocab entry.
+	got := make([]float32, V)
+	for i := range L {
+		for v, x := range logits[i*V : (i+1)*V] {
+			if x > got[v] {
+				got[v] = x
+			}
+		}
+	}
+	for v, x := range got {
+		if x > 0 {
+			got[v] = float32(math.Log1p(float64(x)))
+		}
+	}
+
+	for v := range want {
+		if got[v] != want[v] {
+			t.Fatalf("vocab %d: hoisted %v != per-element %v (must be bit-identical)", v, got[v], want[v])
+		}
+	}
+	// Vacuity: the fixture must contain all three regimes, or the equality is cheap.
+	var pos, zero int
+	for _, x := range want {
+		if x > 0 {
+			pos++
+		} else {
+			zero++
+		}
+	}
+	if pos == 0 || zero == 0 {
+		t.Errorf("fixture degenerate: %d positive, %d zero columns — need both", pos, zero)
+	}
+	t.Logf("bit-identical over %d vocab entries (%d positive, %d zero/negative-only)", V, pos, zero)
 }

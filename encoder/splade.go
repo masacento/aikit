@@ -99,15 +99,31 @@ func (s *SPLADE) expandIDs(ids []int32) sparse.SparseVec {
 	addBias(logits, s.decoderB, L, V)
 
 	// SPLADE pooling: max over tokens of log(1 + relu(logit)).
+	//
+	// The log1p is applied ONCE PER VOCAB ENTRY, after the max — not once per
+	// positive element of the [L,V] logit matrix. That is exact, not an
+	// approximation: float32∘Log1p∘relu is monotone non-decreasing and maps 0→0, so
+	// max_i f(x_i) == f(max_i x_i), including the f32 narrowing, the zero
+	// initialisation, and the negative-only column (which stays 0 and is excluded by
+	// the `w > 0` filter below either way). NaN is skipped by `x > 0` in both forms.
+	//
+	// At L=512, V=30522 the old shape called math.Log1p once per positive logit —
+	// millions of scalar f64 calls per Expand; this makes it V (perf-campaign
+	// item 2). The saving scales with positive density, so it is largest on the
+	// dense-logit models and smaller on a trained SPLADE, whose logits are mostly
+	// negative by construction.
 	pooled := make([]float32, V)
 	for i := range L {
 		row := logits[i*V : (i+1)*V]
 		for v, x := range row {
-			if x > 0 {
-				if w := float32(math.Log1p(float64(x))); w > pooled[v] {
-					pooled[v] = w
-				}
+			if x > pooled[v] {
+				pooled[v] = x // raw max; log1p applied below
 			}
+		}
+	}
+	for v, x := range pooled {
+		if x > 0 {
+			pooled[v] = float32(math.Log1p(float64(x)))
 		}
 	}
 	var out sparse.SparseVec
