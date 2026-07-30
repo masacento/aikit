@@ -97,9 +97,20 @@ this is a Model2Vec / indexing-throughput item, not an inference item.
    `ids = append(ids, t.wordPiece(w)...)`, which copies the elements. No caller
    retains or mutates the returned slice. Verify this stays true if new callers
    appear.
-3. **Kill the remaining allocations.** Storing `[]int32` per entry is what leaves
+3. ~~**Kill the remaining allocations.** Storing `[]int32` per entry is what leaves
    7,427 allocs. A flat `[]int32` arena plus `map[string][2]int32` (offset, len)
-   makes it ~one allocation amortized, and improves locality on hit.
+   makes it ~one allocation amortized, and improves locality on hit.~~
+   **Tried and reverted (2026-07-30) — the premise was a misread.** Those ~9k
+   allocs are `wordPieceCompute`'s own `out` slices, NOT the cache's storage: the
+   per-entry design keeps `out` *as* the entry (zero-copy), so the arena can't
+   remove them — it *copies* `out` in and discards it, making population ~3%
+   WORSE (10,204 vs 9,865 mallocs on 8,983 distinct words). Steady-state hit
+   throughput is identical (both return a view/slice, no alloc). The only real
+   gain is ~4.7% retained compactness (4,708 vs 4,938 KB here; a few MB at the
+   262k-word cap) — not worth the append-only-arena concurrency reasoning and the
+   worse populate path. To actually cut the population allocs you'd have to compute
+   *directly into* the arena, which entangles the pooled-buffer compute path and
+   the differential-fuzz story for the same marginal memory win. Left as-is.
 4. **Bound it.** 9,463 entries for this corpus is trivial, and for natural text
    the unique-word set converges near vocab size. But adversarial or multilingual
    input can grow it unboundedly. Either cap with a simple clock/random eviction
