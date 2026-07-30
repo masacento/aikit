@@ -96,7 +96,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
-| ~~22~~ | ~~Q8 encoder path re-widens the whole int8 weight matrix to f32 **per matmul**~~ — **DONE via fix (a), −58.2% at short input** (§7.18); fix (b) (fuse into `packedFill`) still open | encoder | cost model exactly right; ~190 ms/forward measured | = | — |
+| ~~22~~ | ~~Q8 encoder path re-widens the whole int8 weight matrix to f32 **per matmul**~~ — **fix (a) DONE both arches** (amd64 −58.2% short input; arm64 NEON 3.43× kernel, §7.18); fix (b) (fuse into `packedFill`) still open | encoder | cost model exactly right; ~190 ms/forward measured | = | — |
 | 23 | `packedFill` lost `blockedFill`'s m-blocking; a-panel re-read per 8-column group | linalg | **arm64-only** — `packedFill` is gated on `has2x8Kernel` (§7.32), like item 24 | = | gate on evidence |
 | 24 | `matmul_blocked.go` packed stride is a 4096 B power-of-two | linalg | **UNREACHABLE on amd64** — `packedFill` is arm64-only (§7.21); needs an arm64 box, and the proposed `+4` pad is too small to work | = | gate on evidence |
 | 25 | arm64 `Dot2x8` has the wrong MR×NR: 4×4 needs 8 loads per 16 FMLAs vs today's 10 | linalg | 1.1–1.25× arm64 f32 GEMM | **=** | S–M |
@@ -573,7 +573,15 @@ Two fixes, both bit-identical (`float32(int8) * scale` is a single rounding
 either way):
 
 - **(a)** SIMD widen in `linalg` (`VPMOVSXBD`+`VCVTDQ2PS`+`VMULPS`; NEON
-  `SXTL`+`SCVTF`+`FMUL`) — 6–8×, effort S.
+  `SXTL`+`SCVTF`+`FMUL`) — 6–8×, effort S. **DONE both arches.** amd64 AVX2
+  landed earlier (−58.2% short input). **arm64 NEON landed 2026-07-30**
+  (`dequant_i8_arm64.s`, 16 elem/iter, `SXTL/SXTL2`→`SCVTF`→`FMUL` as raw WORDs —
+  no Go mnemonic — bit-identical, mutation-checked): **3.43× kernel**
+  (0.337→0.098 ns/elem on the M1 Pro), landing at the AVX2 rate (0.089) i.e. the
+  streaming-widen bandwidth ceiling. The predicted 6–8× did NOT transfer: the
+  arm64 *scalar* baseline is already 5× faster than amd64's (0.34 vs 1.7 ns/elem,
+  §1.11), so the same absolute ceiling is a smaller multiple. Still worth it — the
+  widen is a fixed ~38→11 ms/forward, so short Q8 inputs shed real latency.
 - **(b)** Fuse the widen into `blockedFill`'s b-panel pack so only an
   8×kBlock tile (≤24 KB, L1-resident) is ever materialized. `packedFill`
   (`matmul_blocked.go:211-259`) is the exact hook — same order, same bits. Kills

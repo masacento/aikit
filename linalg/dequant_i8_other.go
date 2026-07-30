@@ -1,10 +1,9 @@
-//go:build !amd64
+//go:build !amd64 && !arm64
 
 package linalg
 
-// dequantRowInt8 on non-amd64 is the portable scalar widen. An arm64 NEON
-// version (SXTL + SCVTF + FMUL) is the obvious follow-up; it is not written yet
-// because the measurement that justified this kernel was taken on amd64.
+// dequantRowInt8 on other arches is the portable scalar widen. amd64 (AVX2) and
+// arm64 (NEON) have vectorized kernels in their own files.
 func dequantRowInt8(dst []float32, q []int8, scale float32) {
 	dequantRowInt8Scalar(dst, q, scale)
 }
