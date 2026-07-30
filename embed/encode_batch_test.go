@@ -1,11 +1,15 @@
 package embed
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestEncodeBatch_matchesSerial is A1's gate, and it is EXACT over the WHOLE
@@ -159,4 +163,121 @@ func loadTestStaticModel(tb testing.TB) *StaticModel {
 		tb.Fatal(err)
 	}
 	return m
+}
+
+// TestPreTokenize_slicedMatchesRebuilt is A4's gate: the byte-slicing path must
+// produce exactly what the Builder rebuild produced, token for token.
+//
+// It runs over the whole repository, not a sample, plus a table of shapes real
+// source does not reliably contain — because the two paths agree everywhere
+// EXCEPT on invalid UTF-8, and normalize's cleanText removes that before
+// preTokenize ever sees it. The interesting inputs are therefore precisely the
+// ones the pipeline never delivers, which is why they are written down here.
+func TestPreTokenize_slicedMatchesRebuilt(t *testing.T) {
+	m := loadTestStaticModel(t)
+	tok := m.Tokenizer()
+
+	cases := []string{
+		"", " ", "   \t\n ", "plain words here",
+		"func Encode(text string) []float32 { return nil }",
+		"a.b.c", "...", "!!!", "a!!b", "!a", "a!",
+		"emoji 🙂 and 汉字 mixed", "naïve café", "«guillemets»", "—em—dash—",
+		"trailing punct...", "...leading punct",
+		"tabs\tand\nnewlines", "double  space",
+	}
+	for _, src := range allRepoGoSources(t) {
+		cases = append(cases, string(src))
+	}
+	// Invalid UTF-8, where the two paths legitimately differ and the rebuild is
+	// what must be used.
+	invalid := []string{"\xff", "ab\xffcd", "a\xc3", "\x80\x80", "ok \xf0\x9f then"}
+
+	checked := 0
+	for _, c := range cases {
+		if !utf8.ValidString(c) {
+			t.Fatalf("case %q is not valid UTF-8; it belongs in the invalid table", c)
+		}
+		got, want := tok.preTokenize(c), tok.preTokenizeRebuild(c)
+		if !slices.Equal(got, want) {
+			t.Fatalf("sliced and rebuilt disagree on %q:\n got %q\nwant %q", trunc(c), got, want)
+		}
+		checked += len(want)
+	}
+	if checked < 100_000 {
+		t.Fatalf("only %d tokens compared; the corpus is too small to be a gate", checked)
+	}
+	t.Logf("%d tokens compared across %d inputs", checked, len(cases))
+
+	for _, c := range invalid {
+		if utf8.ValidString(c) {
+			t.Fatalf("case %q is valid UTF-8 and does not test the fallback", c)
+		}
+		// preTokenize must route these to the rebuild, so the two agree here too.
+		if got, want := tok.preTokenize(c), tok.preTokenizeRebuild(c); !slices.Equal(got, want) {
+			t.Fatalf("invalid-UTF-8 input %q did not take the rebuild path:\n got %q\nwant %q", c, got, want)
+		}
+	}
+}
+
+// TestPreTokenize_tokensAreViews pins the property the memo's key-clone exists
+// for: on valid input every token is a SLICE of the argument, not a copy. If
+// that stops being true the clone in wpCache.put becomes dead weight, and if it
+// becomes true somewhere the clone is missing, the cache pins whole chunks.
+func TestPreTokenize_tokensAreViews(t *testing.T) {
+	m := loadTestStaticModel(t)
+	const src = "func Encode(text string) []float32"
+	toks := m.Tokenizer().preTokenize(src)
+	if len(toks) < 5 {
+		t.Fatalf("expected several tokens, got %q", toks)
+	}
+	for _, tk := range toks {
+		if len(tk) == 0 {
+			t.Fatal("empty token")
+		}
+		if !strings.Contains(src, tk) {
+			t.Fatalf("token %q is not a substring of the input", tk)
+		}
+	}
+}
+
+func trunc(s string) string {
+	if len(s) > 120 {
+		return s[:120] + "…"
+	}
+	return s
+}
+
+// allRepoGoSources returns every .go file in the repository.
+func allRepoGoSources(tb testing.TB) [][]byte {
+	tb.Helper()
+	root, err := filepath.Abs("..")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	var out [][]byte
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case "benchmarks", "testdata", ".git", ".venv":
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(p, ".go") {
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		out = append(out, b)
+		return nil
+	})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return out
 }

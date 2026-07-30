@@ -487,7 +487,51 @@ func isCJK(r rune) bool {
 // preTokenize splits text on whitespace, then within each whitespace-bounded
 // chunk further splits on punctuation (punctuation chars become their own
 // tokens). Matches HF's BertPreTokenizer exactly.
+//
+// Every token it emits is a contiguous byte range of `text`, so it SLICES rather
+// than rebuilding through a strings.Builder (perf-campaign A4). The rebuild cost
+// two things: a Builder allocation per whitespace-bounded chunk, and — worse on
+// punctuation-dense input like source code — `string(r)` per punctuation
+// character, which escape analysis confirms heap-allocates. preTokenize is 11.9%
+// of an index run (docs/internal/perf-amdahl-linux-amd64.md).
+//
+// THE VALIDITY GATE IS NOT PARANOIA. The two paths differ on invalid UTF-8, and
+// only there: ranging a string yields U+FFFD for a bad byte, so `WriteRune`
+// rebuilt it as the three-byte replacement character, while slicing preserves
+// the raw byte. Every caller reaches this through normalize → cleanText, which
+// drops U+FFFD outright, so the input is valid in practice — but `cleanText` is
+// a config flag, and a tokenizer with it off would take a silently different
+// path. One linear scan buys exactness for every input instead of for the
+// configurations someone checked.
 func (t *Tokenizer) preTokenize(text string) []string {
+	if !utf8.ValidString(text) {
+		return t.preTokenizeRebuild(text)
+	}
+	var out []string
+	for part := range strings.FieldsSeq(text) {
+		start := 0
+		for i := 0; i < len(part); {
+			r, w := utf8.DecodeRuneInString(part[i:])
+			if isPunct(r) {
+				if i > start {
+					out = append(out, part[start:i])
+				}
+				out = append(out, part[i:i+w])
+				start = i + w
+			}
+			i += w
+		}
+		if start < len(part) {
+			out = append(out, part[start:])
+		}
+	}
+	return out
+}
+
+// preTokenizeRebuild is the pre-A4 implementation, kept verbatim for invalid
+// UTF-8 — where its U+FFFD rebuilding is the behaviour to preserve, not a bug to
+// fix. TestPreTokenize_slicedMatchesRebuilt gates the two against each other.
+func (t *Tokenizer) preTokenizeRebuild(text string) []string {
 	var out []string
 	for part := range strings.FieldsSeq(text) {
 		var cur strings.Builder
@@ -509,8 +553,6 @@ func (t *Tokenizer) preTokenize(text string) []string {
 	return out
 }
 
-// isPunct per HF BERT: ASCII non-alphanumeric punctuation chars in the
-// canonical four ranges, PLUS any Unicode category P rune.
 func isPunct(r rune) bool {
 	if (r >= 33 && r <= 47) ||
 		(r >= 58 && r <= 64) ||
@@ -650,7 +692,14 @@ func (c *wpCache) put(word string, ids []int32) {
 	s := &c.shards[wpShard(word)]
 	s.mu.Lock()
 	if len(s.m) < wpCapPerShard {
-		s.m[word] = ids
+		// Clone the retained key. Since A4, `word` is a VIEW into the normalized
+		// text of whichever chunk was being tokenized, so storing it directly
+		// would pin that whole string for the cache's lifetime — up to 8192
+		// entries per shard each holding a ~1.5 KB chunk alive. The same hazard
+		// bm25.Build documents, arriving here the moment preTokenize stopped
+		// materializing its tokens. One clone per newly-cached word (9,463 for
+		// aikit's own tree) against a cache that exists to avoid recomputation.
+		s.m[strings.Clone(word)] = ids
 	}
 	s.mu.Unlock()
 }

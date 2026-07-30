@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // BenchmarkEncodeSplit decomposes StaticModel.Encode into its two halves —
@@ -175,3 +176,64 @@ func BenchmarkEncodeBatch(b *testing.B) {
 }
 
 var sinkBatch [][]float32
+
+// BenchmarkPreTokenize A/Bs the two implementations in one binary — the sliced
+// path against the Builder rebuild it replaced, which is still present because
+// invalid UTF-8 needs it. No cross-invocation drift to argue about, and the
+// ratio it reports is the one that belongs to A4 rather than to the whole
+// tokenizer stage around it.
+func BenchmarkPreTokenize(b *testing.B) {
+	const dir = "../testdata/model"
+	if _, err := os.Stat(filepath.Join(dir, "model.safetensors")); err != nil {
+		b.Skipf("no static model at %s — see testdata/README.md", dir)
+	}
+	m, err := LoadFromFS(os.DirFS(dir), ".")
+	if err != nil {
+		b.Fatal(err)
+	}
+	tok := m.tokenizer
+	// Normalized text, which is what preTokenize actually receives.
+	chunks := goSourceChunks(b)
+	texts := make([]string, len(chunks))
+	var n int
+	for i, c := range chunks {
+		texts[i] = tok.normalize(c)
+		n += len(texts[i])
+	}
+	b.Logf("%d chunks, %d normalized bytes", len(texts), n)
+
+	b.Run("rebuild", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(n))
+		for b.Loop() {
+			for _, t := range texts {
+				sinkWords = tok.preTokenizeRebuild(t)
+			}
+		}
+	})
+	b.Run("sliced", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(n))
+		for b.Loop() {
+			for _, t := range texts {
+				sinkWords = tok.preTokenize(t)
+			}
+		}
+	})
+	// The validity scan the sliced path pays for exactness on every input.
+	b.Run("validityScanOnly", func(b *testing.B) {
+		b.SetBytes(int64(n))
+		for b.Loop() {
+			ok := true
+			for _, t := range texts {
+				ok = ok && utf8.ValidString(t)
+			}
+			sinkValid = ok
+		}
+	})
+}
+
+var (
+	sinkWords []string
+	sinkValid bool
+)

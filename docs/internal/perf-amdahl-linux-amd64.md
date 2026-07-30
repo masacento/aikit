@@ -389,7 +389,76 @@ reason TypeScript is 1.14× where Go is 1.68×.
 
 ---
 
-## 8 · Step 0 status
+## 8 · Item B — already done
+
+`dotI8AVX2` was rewritten before this handoff was picked up:
+`1b9c88a linalg: rewrite dotI8AVX2 — 2.10x kernel, 2.02x scan (perf item 12 /
+finding B)`, in the predicted 2–3× band. 64 int8 per iteration, four independent
+accumulators, bottom-tested, and `VPMOVSXBW` taking its m128 source straight from
+memory so the explicit loads are gone.
+
+Its comment already records the analysis the handoff asks for: `VPMADDUBSW`
+would remove the widening entirely, but u8×i8 pair sums can exceed int16 and it
+**saturates**, so that route needs range-limited codes and belongs with the VNNI
+work. (The way past that is `VPABSB`/`VPSIGNB` — |a| as the unsigned operand and
+the sign folded into b keeps every pair sum under 2·127² = 32258 — which is worth
+recording as the shape a future attempt should take.)
+
+**This is the second Phase-A item found already landed**, after A3. Same lesson,
+now twice: a handoff describes the tree as of when it was written.
+
+---
+
+## 9 · A4 — `preTokenize` byte-slicing, 1.95×
+
+| | rebuild | sliced | |
+|---|---:|---:|---:|
+| `preTokenize` over the corpus | 71.63 ms | 36.76 ms | **1.95×** |
+| allocations | 663,488 | 15,436 | **43× fewer** |
+
+Predicted 2.65×; measured 1.95×. On the stage around it: `Tokenizer.Encode`
+181.01 → 163.29 ms (**1.11×**) with allocations 684,645 → 53,290 (**−92%**), and
+the whole `Encode` 297.37 → 281.13 ms (−5.5%).
+
+Every token preTokenize emits is already a contiguous byte range of its input, so
+the `strings.Builder` rebuild was pure copying — plus a `string(r)` heap
+allocation per punctuation character, which is most characters in source code.
+
+**The two paths differ on invalid UTF-8**, and only there: ranging a string
+yields U+FFFD for a bad byte, so `WriteRune` rebuilt it as the three-byte
+replacement character while slicing preserves the raw byte. In practice
+`normalize` → `cleanText` removes those before `preTokenize` sees them, but
+`cleanText` is a config flag. Rather than gate on the flag, the sliced path runs
+`utf8.ValidString` and falls back to the rebuild — measured at **1% of the sliced
+path**, which buys exactness for every input instead of for the configurations
+someone checked.
+
+**A4 also created a hazard that did not exist before.** Tokens are now views into
+the normalized chunk, and `wpCache.put` stores the token as a map key — so a
+cached word would pin its whole ~1.5 KB chunk, up to 8192 entries per shard. The
+key is cloned now, which is the same fix `bm25.Build` documents, arriving here
+the moment `preTokenize` stopped materializing its tokens.
+
+A4's second half — dropping the per-word `var out []int32` — **no longer
+applies**: `wordPieceCompute`'s slice is retained by A3's memo, so it cannot be a
+shared scratch.
+
+---
+
+## 10 · Where an index run stands
+
+| | ms |
+|---|---:|
+| Step 0 baseline (serial, before any of this) | 382.73 |
+| today, batched | **98.08** |
+
+**3.90×** on "index a repository", from A1 + `bm25.Build` + the chunker + A4.
+That is a cross-invocation comparison, so read it with the ~5% drift floor
+attached; the per-item ratios above are all same-session A/Bs.
+
+---
+
+## 11 · Step 0 status
 
 | | state |
 |---|---|
