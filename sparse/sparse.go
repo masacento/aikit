@@ -30,7 +30,7 @@
 package sparse
 
 import (
-	"sort"
+	"slices"
 
 	"github.com/townsendmerino/aikit/topk"
 )
@@ -130,12 +130,7 @@ func (ix *Index) Query(q SparseVec, k int) []Hit {
 				out = append(out, Hit{Index: int(d), Score: s})
 			}
 		}
-		sort.Slice(out, func(i, j int) bool {
-			if out[i].Score != out[j].Score {
-				return out[i].Score > out[j].Score
-			}
-			return out[i].Index < out[j].Index
-		})
+		slices.SortFunc(out, hitCmp)
 		return out
 	}
 
@@ -153,15 +148,42 @@ func (ix *Index) Query(q SparseVec, k int) []Hit {
 	items := sel.Result()
 	// Stable secondary sort by ascending doc id to honor the tie-break contract
 	// (the heap only orders by score).
-	sort.SliceStable(items, func(a, b int) bool {
-		if items[a].Score != items[b].Score {
-			return items[a].Score > items[b].Score
-		}
-		return items[a].Item < items[b].Item
-	})
+	slices.SortFunc(items, itemCmp)
 	out := make([]Hit, len(items))
 	for j, s := range items {
 		out[j] = Hit{Index: s.Item, Score: s.Score}
 	}
 	return out
+}
+
+// hitCmp and itemCmp order by score descending, then by ascending document id —
+// each a strict total order (the ids are unique), so slices.SortFunc reproduces
+// the previous sort.Slice/SliceStable output exactly without their reflect-based
+// Swapper (A5).
+func hitCmp(a, b Hit) int {
+	switch {
+	case a.Score > b.Score:
+		return -1
+	case a.Score < b.Score:
+		return 1
+	case a.Index < b.Index:
+		return -1
+	case a.Index > b.Index:
+		return 1
+	}
+	return 0
+}
+
+func itemCmp(a, b topk.ItemWithScore[int]) int {
+	switch {
+	case a.Score > b.Score:
+		return -1
+	case a.Score < b.Score:
+		return 1
+	case a.Item < b.Item:
+		return -1
+	case a.Item > b.Item:
+		return 1
+	}
+	return 0
 }

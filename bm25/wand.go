@@ -2,7 +2,7 @@ package bm25
 
 import (
 	"math"
-	"sort"
+	"slices"
 	"sync"
 
 	"github.com/townsendmerino/aikit/topk"
@@ -288,12 +288,7 @@ func (ix *Index) topKWANDState(query []string, k int, w *wandState) ([]Result, b
 	}
 
 	items := sel.Result()
-	sort.SliceStable(items, func(a, b int) bool {
-		if items[a].Score != items[b].Score {
-			return items[a].Score > items[b].Score
-		}
-		return items[a].Item < items[b].Item
-	})
+	slices.SortFunc(items, itemCmp)
 	out := make([]Result, len(items))
 	for j, s := range items {
 		out[j] = Result{Doc: s.Item, Score: s.Score}

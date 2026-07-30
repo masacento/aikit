@@ -1,6 +1,6 @@
 package fuse
 
-import "sort"
+import "slices"
 
 // Scored is one ranked item with its raw score — the input to RSF, which fuses by
 // score magnitude rather than rank alone. The score-aware counterpart of the bare
@@ -38,9 +38,14 @@ func RSFWeighted[K comparable](weights []float64, rankings ...[]Scored[K]) []Res
 		panic("fuse: len(weights) must equal number of rankings")
 	}
 
-	scores := make(map[K]float64)
-	firstSeen := make(map[K]int)
-	order := 0
+	// See RRFWeighted for why first-appearance order is positional here rather
+	// than held in a second map consulted from the sort comparator (A5).
+	total := 0
+	for _, ranking := range rankings {
+		total += len(ranking)
+	}
+	pos := make(map[K]int, total)
+	out := make([]Result[K], 0, total)
 
 	for r, ranking := range rankings {
 		if len(ranking) == 0 {
@@ -61,27 +66,30 @@ func RSFWeighted[K comparable](weights []float64, rankings ...[]Scored[K]) []Res
 		}
 		span := hi - lo
 		for _, s := range ranking {
-			if _, ok := firstSeen[s.Key]; !ok {
-				firstSeen[s.Key] = order
-				order++
+			i, ok := pos[s.Key]
+			if !ok {
+				i = len(out)
+				pos[s.Key] = i
+				out = append(out, Result[K]{Key: s.Key})
 			}
 			norm := 1.0 // all-equal (or single-item) list: no within-list signal
 			if span > 0 {
 				norm = (s.Score - lo) / span
 			}
-			scores[s.Key] += w * norm
+			out[i].Score += w * norm
 		}
 	}
 
-	out := make([]Result[K], 0, len(scores))
-	for key, s := range scores {
-		out = append(out, Result[K]{Key: key, Score: s})
-	}
-	sort.SliceStable(out, func(a, b int) bool {
-		if out[a].Score != out[b].Score {
-			return out[a].Score > out[b].Score
+	// Stable, and that is load-bearing: the tie-break now lives in the element
+	// positions rather than in a comparator key.
+	slices.SortStableFunc(out, func(a, b Result[K]) int {
+		switch {
+		case a.Score > b.Score:
+			return -1
+		case a.Score < b.Score:
+			return 1
 		}
-		return firstSeen[out[a].Key] < firstSeen[out[b].Key]
+		return 0
 	})
 	return out
 }

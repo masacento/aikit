@@ -2,7 +2,7 @@ package ann
 
 import (
 	"runtime"
-	"sort"
+	"slices"
 	"sync"
 
 	"github.com/townsendmerino/aikit/linalg"
@@ -164,12 +164,7 @@ func (f *FlatI8) topHits(dst []float32, k int, keep func(int) bool) []Hit {
 				hits = append(hits, Hit{Index: i, Score: float64(s)})
 			}
 		}
-		sort.Slice(hits, func(a, b int) bool {
-			if hits[a].Score != hits[b].Score {
-				return hits[a].Score > hits[b].Score
-			}
-			return hits[a].Index < hits[b].Index
-		})
+		slices.SortFunc(hits, hitCmp)
 		return hits
 	}
 
@@ -187,12 +182,7 @@ func (f *FlatI8) topHits(dst []float32, k int, keep func(int) bool) []Hit {
 		}
 	}
 	items := sel.Result()
-	sort.SliceStable(items, func(a, b int) bool {
-		if items[a].Score != items[b].Score {
-			return items[a].Score > items[b].Score
-		}
-		return items[a].Item < items[b].Item
-	})
+	slices.SortFunc(items, itemCmp)
 	hits := make([]Hit, len(items))
 	for j, s := range items {
 		hits[j] = Hit{Index: s.Item, Score: s.Score}

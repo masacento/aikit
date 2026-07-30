@@ -48,6 +48,20 @@ it.
 
 ### Changed
 
+- **`fuse.RRF` / `fuse.RSF` are 4.8–5.4× faster** (perf campaign A5): 46.4 → 8.7 µs
+  at k=50, geomean 5.36× across k=10…1000, allocations 22 → 4. On a hybrid
+  retrieval query that is **−20%** end to end, since RRF was 23.3% of it.
+
+  Output is unchanged — same keys, same scores, same order — gated against a
+  reference implementation of the previous algorithm on tie-heavy inputs. The
+  win is mostly not the map presizing: first-appearance order used to live in a
+  second map consulted from the sort comparator, i.e. O(n log n) map lookups, and
+  now lives in the result slice's own positions.
+
+  **Scope:** `fuse` is O(shortlist), not O(corpus). This is a
+  small-to-medium-corpus finding — at n=1M it is under 0.1% of a query, and
+  behind a reranker the whole retrieval stack is a thousandth of one.
+
 - **`bm25.Index.TopK` now uses WAND dynamic pruning** (perf campaign item 39)
   for `k >= 0`: documents whose per-term upper bounds cannot beat the current
   k-th best score are skipped instead of scored. **3.88× on a mixed-selectivity

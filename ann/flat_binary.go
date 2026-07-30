@@ -2,7 +2,7 @@ package ann
 
 import (
 	"runtime"
-	"sort"
+	"slices"
 	"sync"
 
 	"github.com/townsendmerino/aikit/linalg"
@@ -400,12 +400,7 @@ func finishCandidates(parts [][]topk.ItemWithScore[int32], cand int, sc *binScra
 		merged = append(merged, p...)
 	}
 	sc.merged = merged
-	sort.Slice(merged, func(a, b int) bool {
-		if merged[a].Score != merged[b].Score {
-			return merged[a].Score > merged[b].Score
-		}
-		return merged[a].Item < merged[b].Item
-	})
+	slices.SortFunc(merged, itemCmp32)
 	if len(merged) > cand {
 		merged = merged[:cand]
 	}
@@ -414,7 +409,7 @@ func finishCandidates(parts [][]topk.ItemWithScore[int32], cand int, sc *binScra
 		ids = append(ids, m.Item)
 	}
 	sc.ids = ids
-	sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+	slices.Sort(ids)
 	return ids
 }
 
@@ -445,12 +440,7 @@ func (f *FlatBinary) rerank(sc *binScratch, q []float32, ids []int32, k int) []H
 		}
 	})
 	items := sel.Result()
-	sort.SliceStable(items, func(a, b int) bool {
-		if items[a].Score != items[b].Score {
-			return items[a].Score > items[b].Score
-		}
-		return items[a].Item < items[b].Item
-	})
+	slices.SortFunc(items, itemCmp)
 	hits := make([]Hit, len(items))
 	for j, s := range items {
 		hits[j] = Hit{Index: s.Item, Score: s.Score}

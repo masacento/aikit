@@ -29,7 +29,7 @@
 //	fused  := fuse.RRF(60, dense, lexical)
 package fuse
 
-import "sort"
+import "slices"
 
 // DefaultK is the rank-fusion constant from the original RRF paper. It
 // damps the influence of top ranks: larger k makes the fusion flatter
@@ -73,11 +73,39 @@ func RRFWeighted[K comparable](k float64, weights []float64, rankings ...[]K) []
 		panic("fuse: len(weights) must equal number of rankings")
 	}
 
-	// Accumulate fused score per key, remembering the order each key was
-	// first seen so ties resolve deterministically.
-	scores := make(map[K]float64)
-	firstSeen := make(map[K]int)
-	order := 0
+	// Accumulate fused score per key, in first-appearance order so ties resolve
+	// deterministically.
+
+	// FIRST-SEEN ORDER IS NOW POSITIONAL, WHICH IS THE WHOLE CHANGE.
+	//
+	// This used to carry a second map from key to first-appearance index and consult
+	// it inside the sort comparator — a map lookup per comparison, so O(n log n) of
+	// them, which at k=1000 was most of the call. Accumulating into `out` directly,
+	// in first-appearance order, makes that ordering the slice's own positions: a
+	// STABLE sort on score alone then breaks ties by first appearance, identically,
+	// with no lookup at all.
+	//
+	// Three consequences, all measured in A5: one map instead of two, the
+	// key-to-index map replacing the score map rather than joining it; no second
+	// pass to project the map into a slice; and slices.SortStableFunc in place of
+	// sort.SliceStable, which sorted through reflect.Swapper.
+	//
+	// The stability is load-bearing now in a way it was not before. Previously the
+	// comparator was a total order (first-seen is unique per key) and stability was
+	// irrelevant; now the tie-break lives in the element positions, so a non-stable
+	// sort would reorder tied keys. Do not "optimize" SortStableFunc to SortFunc.
+	//
+	// The maps are presized to the total input length — the upper bound on
+	// distinct keys. Rankings overlap by construction (fusing disjoint lists is
+	// not what RRF is for), so this over-allocates, which costs one larger
+	// bucket array against the several rehashes an unsized map performs while
+	// growing.
+	total := 0
+	for _, ranking := range rankings {
+		total += len(ranking)
+	}
+	pos := make(map[K]int, total)
+	out := make([]Result[K], 0, total)
 
 	for r, ranking := range rankings {
 		w := 1.0
@@ -85,24 +113,25 @@ func RRFWeighted[K comparable](k float64, weights []float64, rankings ...[]K) []
 			w = weights[r]
 		}
 		for rank0, key := range ranking {
-			if _, ok := firstSeen[key]; !ok {
-				firstSeen[key] = order
-				order++
+			i, ok := pos[key]
+			if !ok {
+				i = len(out)
+				pos[key] = i
+				out = append(out, Result[K]{Key: key})
 			}
 			// rank is 1-based: element 0 is rank 1.
-			scores[key] += w / (k + float64(rank0+1))
+			out[i].Score += w / (k + float64(rank0+1))
 		}
 	}
 
-	out := make([]Result[K], 0, len(scores))
-	for key, s := range scores {
-		out = append(out, Result[K]{Key: key, Score: s})
-	}
-	sort.SliceStable(out, func(a, b int) bool {
-		if out[a].Score != out[b].Score {
-			return out[a].Score > out[b].Score
+	slices.SortStableFunc(out, func(a, b Result[K]) int {
+		switch {
+		case a.Score > b.Score:
+			return -1
+		case a.Score < b.Score:
+			return 1
 		}
-		return firstSeen[out[a].Key] < firstSeen[out[b].Key]
+		return 0
 	})
 	return out
 }

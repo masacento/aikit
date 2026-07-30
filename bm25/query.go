@@ -2,7 +2,7 @@ package bm25
 
 import (
 	"math"
-	"sort"
+	"slices"
 
 	"github.com/townsendmerino/aikit/topk"
 )
@@ -100,12 +100,7 @@ func (ix *Index) topKExhaustive(query []string, k int) []Result {
 				res = append(res, Result{Doc: int(d), Score: s})
 			}
 		}
-		sort.Slice(res, func(i, j int) bool {
-			if res[i].Score != res[j].Score {
-				return res[i].Score > res[j].Score
-			}
-			return res[i].Doc < res[j].Doc
-		})
+		slices.SortFunc(res, resultCmp)
 		return res
 	}
 
@@ -126,15 +121,43 @@ func (ix *Index) topKExhaustive(query []string, k int) []Result {
 	items := sel.Result()
 	// Stable secondary sort by ascending Doc id to honor the doc-comment
 	// tie-break contract.
-	sort.SliceStable(items, func(a, b int) bool {
-		if items[a].Score != items[b].Score {
-			return items[a].Score > items[b].Score
-		}
-		return items[a].Item < items[b].Item
-	})
+	slices.SortFunc(items, itemCmp)
 	out := make([]Result, len(items))
 	for j, s := range items {
 		out[j] = Result{Doc: s.Item, Score: s.Score}
 	}
 	return out
+}
+
+// resultCmp and itemCmp order by score descending, then by ascending document
+// id. Both second keys are unique within the slice, so each is a strict total
+// order and slices.SortFunc reproduces the previous sort.Slice/SliceStable
+// output exactly while avoiding their reflect-based Swapper (A5; the same change
+// audit #24 made in ann/hnsw.go).
+func resultCmp(a, b Result) int {
+	switch {
+	case a.Score > b.Score:
+		return -1
+	case a.Score < b.Score:
+		return 1
+	case a.Doc < b.Doc:
+		return -1
+	case a.Doc > b.Doc:
+		return 1
+	}
+	return 0
+}
+
+func itemCmp(a, b topk.ItemWithScore[int]) int {
+	switch {
+	case a.Score > b.Score:
+		return -1
+	case a.Score < b.Score:
+		return 1
+	case a.Item < b.Item:
+		return -1
+	case a.Item > b.Item:
+		return 1
+	}
+	return 0
 }

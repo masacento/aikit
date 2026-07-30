@@ -237,7 +237,73 @@ items that were not in it now outrank two that are.
 
 ---
 
-## 5 · Step 0 status
+## 5 · A5 — measured, and it splits in two
+
+The item bundled ten call sites under one ratio. They do not behave the same way,
+and the bundling is the finding.
+
+### The two `fuse` sites: 4.80×
+
+| | before | after | |
+|---|---:|---:|---:|
+| `RRF` k=50, 2 lists | 46.42 µs | 8.685 µs | **5.34×** |
+| `RRF` k=10 | 6.768 µs | 1.511 µs | 4.48× |
+| `RRF` k=200 | 255.3 µs | 40.66 µs | 6.28× |
+| `RRF` k=1000 | 1658.9 µs | 292.1 µs | 5.68× |
+| `RSF` k=50 | 47.69 µs | 9.177 µs | 5.20× |
+| geomean | | | **5.36×** (−81.3%) |
+
+Allocations 22 → 4 at k=50 (−82%). Predicted 2.18× and 22 → 7.
+
+On the real query path: `fuse.RRF` **25.97 → 5.41 µs (4.80×)**, and the whole W2
+retrieval query **115.6 → 92.4 µs (1.25×, −20.0%)** with bytes per query −26%.
+
+The presize was the smaller half of it. The larger half was removing a map
+lookup from the sort comparator: first-appearance order used to live in a second
+map consulted on every comparison — O(n log n) lookups — and now lives in the
+slice's own positions, so a stable sort on score alone reproduces it exactly.
+One map instead of two, no projection pass, and `slices.SortStableFunc` instead
+of `sort.SliceStable`.
+
+### The other eight sites: inside noise
+
+`ann/flat.go`, `ann/flat_i8.go`, `ann/flat_binary.go`, `bm25/query.go`,
+`bm25/wand.go`, `sparse/sparse.go` — `sort.Slice`/`SliceStable` → `slices.SortFunc`.
+Controlled A/B on the paths where they run, `-count=6`:
+
+| | before | after | |
+|---|---:|---:|---:|
+| `FlatI8.Query` (k=50) | 41.60 µs | 40.40 µs | −2.9% |
+| `bm25.TopK` (k=50) | 28.77 µs | 29.47 µs | **+2.5%** |
+
+Opposite directions, both a hair outside the ~5% drift floor. **The handoff's
+"3.3–4.6× each" does not survive contact with the end-to-end path**, and the
+honest reading is that these eight measured at zero. Bytes per query fell ~2%
+(p=0.002), which is the only consistent signal.
+
+The mechanism is nonetheless real, which is worth separating from the outcome.
+`BenchmarkSortSites` isolates it on the same element type and comparator:
+
+| n | `sort.Slice` | `slices.SortFunc` | |
+|---:|---:|---:|---:|
+| 10 | 822 ns | 86 ns | 9.52× |
+| 50 | 3369 ns | 1143 ns | 2.95× |
+| 1000 | 109.4 µs | 55.6 µs | 1.97× |
+
+So why does 2.2 µs of isolated saving at n=50 not show in a 41 µs stage? Because
+the fixture sorts RANDOM data with many ties, and the real sites sort the array
+`topk.Selector.Result` returns — a heap, already partially ordered. pdqsort and
+reflect-based quicksort respond very differently to partially-ordered input. A
+microbenchmark on random data does not predict either one here.
+
+**They were kept anyway, and not as a performance claim.** They delete eight
+duplicated comparator closures in favour of three shared functions, they finish
+the change audit #24 made in `hnsw.go` and never propagated, and no site got
+slower beyond noise. The commit says they measured at zero.
+
+---
+
+## 6 · Step 0 status
 
 | | state |
 |---|---|
