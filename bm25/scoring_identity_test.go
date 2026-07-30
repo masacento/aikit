@@ -3,6 +3,7 @@ package bm25
 import (
 	"math/rand"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -187,6 +188,65 @@ func TestTokenize_arenaMatchesPerTokenAllocation(t *testing.T) {
 		for _, tok := range want {
 			if m[tok] == 0 {
 				t.Fatalf("%.40q: token %q missing when used as a map key", in, tok)
+			}
+		}
+	}
+}
+
+// TestOrderTouched_matchesSort gates item 44: the Q-way run merge must produce
+// exactly what slices.Sort produced. It is driven through the real scoreQuery so
+// the run boundaries come from real posting lists, not a hand-built fixture —
+// the bookkeeping (empty runs from terms whose docs were all already touched, an
+// odd run count, single-term queries) is the part most likely to be wrong.
+func TestOrderTouched_matchesSort(t *testing.T) {
+	rng := rand.New(rand.NewSource(44))
+	vocab := make([]string, 300)
+	for i := range vocab {
+		vocab[i] = string(rune('a'+i%26)) + string(rune('a'+(i/26)%26)) + string(rune('0'+i%10))
+	}
+	for _, nDocs := range []int{1, 2, 17, 500} {
+		docs := make([][]string, nDocs)
+		for d := range docs {
+			n := 1 + rng.Intn(60)
+			toks := make([]string, n)
+			for i := range toks {
+				toks[i] = vocab[rng.Intn(len(vocab))]
+			}
+			docs[d] = toks
+		}
+		ix := Build(docs)
+		// Query widths 1..8 so the merge sees odd and even run counts, plus
+		// duplicate and unknown terms (which contribute no run at all).
+		for width := 1; width <= 8; width++ {
+			for trial := range 40 {
+				q := make([]string, width)
+				for i := range q {
+					switch {
+					case trial%7 == 0 && i > 0:
+						q[i] = q[0] // duplicate term: dupTerm skips it, no run
+					case trial%5 == 0 && i == width-1:
+						q[i] = "zzz_not_in_corpus" // idf==0, no run
+					default:
+						q[i] = vocab[rng.Intn(len(vocab))]
+					}
+				}
+				a := ix.scoreQuery(q)
+				got := append([]int32(nil), a.touched...)
+				putAccum(a)
+
+				want := append([]int32(nil), got...)
+				slices.Sort(want)
+
+				if !slices.Equal(got, want) {
+					t.Fatalf("nDocs=%d width=%d q=%v: merged order != sorted order\n got %v\nwant %v",
+						nDocs, width, q, got, want)
+				}
+				// And distinctness, which the merge's exactness argument relies on.
+				for i := 1; i < len(got); i++ {
+					if got[i] == got[i-1] {
+						t.Fatalf("nDocs=%d q=%v: duplicate doc %d in touched set", nDocs, q, got[i])
+					}
+				}
 			}
 		}
 	}

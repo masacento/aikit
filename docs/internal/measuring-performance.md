@@ -375,6 +375,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 30 · bm25 tokenizer allocs | 787 → ~10 | **983 → 2**, −44.7% time | ✅ |
 | 29 · bm25 8-byte posting | 1.5–2× scoring | ~0% scoring; **−50% index memory** | ⚠️ |
 | 10 · bm25 precomputed norm | 1.5–2× scoring | ~0% scoring | ❌ |
+| 44 · bm25 touched-set order | ~18% (pprof share) | **−43.5%** on the query | ❌ (under) |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -465,6 +466,25 @@ the index's dominant storage (381.7 MB → 190.9 MB at 200k docs). Its Win colum
 just led with the effect that evaporated rather than the one that survived, which
 is §1.16's lesson in a different costume: **state which quantity a claim is
 about.**
+
+---
+
+### 1.19 A pprof percentage is a share of what pprof measured
+
+Item 44 was sized at "~18% of a common query" from a `pprof -top` line. The
+measured win on the query is **−43.5%**.
+
+The profile was not wrong; it was answering a different question. The benchmark's
+setup builds a 200k-document index, which takes seconds, while the measured loop
+takes ~0.5 ms per iteration — so a large share of every sample belonged to
+`Build`, not to the query. `sortTouched` was 18% *of the whole binary run* and a
+far larger share of the thing being optimized.
+
+**Guard:** before quoting a pprof share as an item's size, check that the profile
+window is dominated by the code under test — raise `-benchtime` until the setup
+is negligible, or profile the operation directly. Cross-check the share against
+wall-clock: 18% of a 0.5 ms query is 90 µs, which was implausible next to a
+sort of ~100k int32s.
 
 ---
 

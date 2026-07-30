@@ -73,7 +73,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~40~~ | ~~**(NEW)** intra-op matmul fans across ROWS, replicating the weights per worker~~ — **DONE, −3.9% geomean / −15.8% on `SPLADE.Expand` L=91** (§7.14) | encoder | columns beat rows at every trunk shape, up to 3.33× | = | — |
 | ~~41~~ | ~~**(NEW)** `matmulBTInto`'s 4 MFLOP naive/blocked split is not reduction-order-consistent~~ — **DONE with item 27** (§7.20) | encoder | also removes the last batch-vs-single divergence | — | — |
 | 43 | **(NEW)** `TestQwenVisionEncoder_parity`'s threshold accepts cosine 0.99999156 / maxΔ 6.2e-03 — a dropped attention segment passes it (§7.19) | vision | gate strength, not speed | — | S |
-| 44 | **(NEW)** `bm25` `sortTouched` is an O(T log T) sort of every touched doc id, purely to reproduce topk's first-seen tie-break — an explicit (score desc, doc asc) tie-break makes it O(T + k log k) (§7.24) | bm25 | **~18% of a common query** | = | S–M |
+| ~~44~~ | ~~**(NEW)** `bm25` `sortTouched` is an O(T log T) sort of every touched doc id~~ — **DONE, −43.5% on a common query** (§7.25); fixed by merging the already-sorted per-term runs, not by changing the tie-break | bm25 | profile said ~18%; query-only win is 43.5% | = | — |
 | ~~42~~ | ~~**(NEW)** attention softmax + GELU/GeGLU run SERIAL and are O(L²)/O(L·I)~~ — **DONE, −31% geomean, `GTE.Encode` L=690 3.28×** (§7.15) | encoder | the elementwise stages ARE the forward once the matmuls are parallel | = | — |
 
 ### Tier 1 — the big measured wins
@@ -1637,6 +1637,37 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     first-seen tie-break by visiting ids in ascending order. Selecting with an
     explicit (score desc, doc asc) tie-break instead — exactly what §7.23's shard
     merge does — replaces it with O(T + k log k). ~18% of a common query.
+
+25. **Item 44 is DONE — −43.5% on the common-query path, found by the profile
+    that explained why items 10 and 29 did nothing.** `sortTouched` was a full
+    `slices.Sort` over every touched doc id, O(T log T), existing only so that
+    topk's first-seen tie-break sees ids in ascending order.
+
+    It does not need a sort. `touched` is never arbitrary: `Build` appends each
+    term's postings in document order and `add` records a doc on its FIRST touch,
+    so the slice is a concatenation of Q ascending runs for a Q-term query.
+    Merging them is O(T log Q), and the single-term case — one run, already
+    ascending — is free. The output is the same permutation `slices.Sort`
+    produced: both yield ascending order, and ids are distinct (a doc enters
+    `touched` exactly once), so no tie exists for a merge to order differently.
+
+    | query | before | after | |
+    |---|--:|--:|--:|
+    | `TopK` common, 200k docs | 465.3 µs | 263.1 µs | **−43.5%** (p=0.002) |
+    | `ScoreReal` common | 2.966 µs | 2.108 µs | −28.9% (p=0.026) |
+    | `ScoreReal` mixed | 2.074 µs | 1.777 µs | −14.3% (p=0.041) |
+    | `TopK` selective | 2.350 µs | 2.496 µs | ~ (short lists; the sort was already trivial) |
+
+    The profile had put `sortTouched` at ~18%; the query-only win is 43.5%,
+    because that share was of the whole binary run including a multi-second
+    `Build` setup. **A pprof percentage is a share of what pprof measured, which
+    is rarely the thing being optimized** — worth remembering next time a share is
+    used to size an item.
+
+    Gated by driving the real `scoreQuery` at query widths 1–8 with duplicate and
+    unknown terms mixed in, so the run bookkeeping (empty runs, odd run counts,
+    single-term queries) comes from real posting lists rather than a fixture, and
+    comparing against `slices.Sort` of the same ids. Dropping `beginRun` fails it.
 
 ---
 

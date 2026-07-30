@@ -1,9 +1,6 @@
 package bm25
 
-import (
-	"slices"
-	"sync"
-)
+import "sync"
 
 // accum is a pooled scoring accumulator that makes a query cost O(postings touched)
 // instead of O(corpus) — perf-campaign-2026-07-28.md finding A / item 11.
@@ -28,6 +25,13 @@ type accum struct {
 	stamp   []uint32
 	gen     uint32
 	touched []int32
+	// runs holds the start offset in `touched` of each contributing term's
+	// first-touch run, plus a terminating len(touched). Each run is ascending
+	// by construction (Build appends postings in document order and `add`
+	// records a doc on first touch only), so ordering `touched` is a MERGE of
+	// sorted runs, not a sort — see orderTouched (item 44).
+	runs  []int32
+	merge []int32 // scratch destination for the merge
 }
 
 var accumPool = sync.Pool{New: func() any { return new(accum) }}
@@ -44,6 +48,7 @@ func getAccum(n int) *accum {
 	a.scores = a.scores[:n]
 	a.stamp = a.stamp[:n]
 	a.touched = a.touched[:0]
+	a.runs = a.runs[:0]
 	a.gen++
 	if a.gen == 0 { // wrapped: the only case where stamps must actually be cleared
 		clear(a.stamp)
@@ -64,14 +69,85 @@ func (a *accum) add(doc int, v float64) {
 	a.scores[doc] += v
 }
 
-// sortTouched puts the touched ids in ascending doc order.
+// beginRun marks the start of a new term's postings in `touched`.
+func (a *accum) beginRun() { a.runs = append(a.runs, int32(len(a.touched))) }
+
+// orderTouched puts the touched ids in ascending doc order.
 //
 // This is not cosmetic. topk's selector keeps the FIRST-SEEN item of a tie (a tied
 // newcomer is rejected at capacity), so which member of a tie survives depends on
 // push order. The old code pushed in ascending doc order because it ranged over the
 // dense array; visiting the touched set in the same order reproduces the identical
 // result set, not merely an equally-valid one.
-func (a *accum) sortTouched() { slices.Sort(a.touched) }
+//
+// It used to be a full slices.Sort — O(T log T), and measured at ~18% of a common
+// 200k-doc query once item 11 had taken the posting scan off the critical path
+// (item 44). But `touched` is never arbitrary: each term appends its first-touch
+// docs in ascending order, so the slice is a concatenation of Q ascending runs for
+// a Q-term query. Merging them is O(T log Q), and for the single-term case — one
+// run, already sorted — it is free.
+//
+// The output is byte-for-byte what slices.Sort produced: both yield the ascending
+// permutation, and the ids are distinct (a doc enters `touched` exactly once), so
+// there is no tie for a merge to order differently.
+func (a *accum) orderTouched() {
+	// Close the final run.
+	a.runs = append(a.runs, int32(len(a.touched)))
+	// Drop empty runs (a term whose postings were all already touched).
+	dst := a.runs[:0]
+	for i := 0; i+1 < len(a.runs); i++ {
+		if a.runs[i] < a.runs[i+1] {
+			dst = append(dst, a.runs[i])
+		}
+	}
+	dst = append(dst, int32(len(a.touched)))
+	a.runs = dst
+
+	nRuns := len(a.runs) - 1
+	if nRuns <= 1 {
+		return // one run (or none): already ascending
+	}
+	if nRuns == 2 {
+		a.merge = mergeTwo(a.merge[:0], a.touched[a.runs[0]:a.runs[1]], a.touched[a.runs[1]:a.runs[2]])
+		a.touched, a.merge = a.merge, a.touched
+		return
+	}
+	// Few enough terms that pairwise merging beats a heap, and Q is bounded by
+	// the query length in practice.
+	for nRuns > 1 {
+		a.merge = a.merge[:0]
+		out := a.runs[:0]
+		i := 0
+		for ; i+1 < nRuns; i += 2 {
+			out = append(out, int32(len(a.merge)))
+			a.merge = mergeTwo(a.merge, a.touched[a.runs[i]:a.runs[i+1]], a.touched[a.runs[i+1]:a.runs[i+2]])
+		}
+		if i < nRuns { // odd run out: carry it forward unchanged
+			out = append(out, int32(len(a.merge)))
+			a.merge = append(a.merge, a.touched[a.runs[i]:a.runs[i+1]]...)
+		}
+		out = append(out, int32(len(a.merge)))
+		a.touched, a.merge = a.merge, a.touched
+		a.runs = out
+		nRuns = len(a.runs) - 1
+	}
+}
+
+// mergeTwo appends the ascending merge of two ascending slices to dst.
+func mergeTwo(dst, x, y []int32) []int32 {
+	i, j := 0, 0
+	for i < len(x) && j < len(y) {
+		if x[i] <= y[j] {
+			dst = append(dst, x[i])
+			i++
+		} else {
+			dst = append(dst, y[j])
+			j++
+		}
+	}
+	dst = append(dst, x[i:]...)
+	return append(dst, y[j:]...)
+}
 
 // scoreQuery accumulates every (deduped) query term's postings and returns the
 // accumulator. The caller must putAccum it.
@@ -85,6 +161,7 @@ func (ix *Index) scoreQuery(query []string) *accum {
 		if idf == 0 {
 			continue
 		}
+		a.beginRun()
 		// K1/B are exported and may be tuned by the caller before querying, so
 		// they cannot be folded into the postings at Build (item 10's
 		// "precompute the impact" would bake them in). Hoisting them out of the
@@ -97,7 +174,7 @@ func (ix *Index) scoreQuery(query []string) *accum {
 			a.add(int(p.doc), idf*(tf*k1p1)/denom)
 		}
 	}
-	a.sortTouched()
+	a.orderTouched()
 	return a
 }
 
