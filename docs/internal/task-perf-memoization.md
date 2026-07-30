@@ -292,6 +292,28 @@ the tokenizer win. Only look at this if profiling shows the pooling gather is
 still material afterwards. `m.weights[id]` is per-id (`:213`), so the presum must
 fold the weights in and `wsum` must be cached alongside — don't split them.
 
+**Gate check (2026-07-30) — measured both conditions; verdict: not worth it now.**
+§1 shipped, so the two gates were tested on the real corpus:
+
+- *Bit-exactness (problem 1): PASSES.* A direct simulation of the two accumulation
+  orders — full-doc `(((s+t₁)+t₂)+t₃)` vs per-word-presum `s + (t₁+t₂+t₃)` — over
+  300 random docs (dim=384, 1–4 subwords/word) found **0 docs** differ in the f32
+  output after the `/wsum` narrowing. So precision is not the blocker, as predicted.
+- *Win size (gate on "pooling still material"): WEAK — the doc overstated it 2×.*
+  The "3-subword word → one add" framing used the per-*distinct* mean (3.119). What
+  pooling actually pays is the **frequency-weighted** mean, measured at **1.412**
+  subwords/word (75.9% of tokens are single-subword — nothing to collapse). So the
+  presum shrinks the pooling gather only ~1.412→1.0 ≈ **29%**, not 3×, and pooling
+  is only part of `Encode`.
+
+That ~29% pooling trim would cost the ~29–61 MB of problem 2 **plus** a hot-path
+rewrite (restructure `Encode` to iterate words with a per-word presum cache rather
+than flatten-then-pool), for a memoization that is bit-exact only empirically —
+fragile to any dim/weight/vocab change. With no live StaticModel indexing-throughput
+need ([[gpu-scope-b-on-hold]]), it doesn't clear the bar. **Deferred, not dead:** if
+a real StaticModel indexing bottleneck appears where pooling dominates, revisit —
+bit-exactness already checks out, so only the throughput case would need making.
+
 ---
 
 ## 6. Where memoization does not help, and why
@@ -359,9 +381,12 @@ The useful half of the audit. Each of these looks like a candidate and isn't:
    16 B posting struct is **[campaign #29]** — both DONE. The remaining
    per-posting precomputed-impact change belongs there (it mutates the posting
    struct), not in this memo audit.
-5. **§5 `StaticModel` presum — conditional, not started.** Only if profiling
-   still points at `StaticModel` pooling after §1, and only if the f64
-   reassociation proves bit-exact in practice. Speculative until then.
+5. **§5 `StaticModel` presum — gate-checked 2026-07-30, deferred.** Bit-exactness
+   PASSES (0/300 sim docs differ), but the win is weak: the pooling gather collapses
+   only ~29% (frequency-weighted 1.412 subwords/word, not the doc's assumed 3×), and
+   that costs ~29–61 MB + a hot-path rewrite for an only-empirically-bit-exact memo.
+   No live indexing-throughput need, so it doesn't clear the bar. See §5 for the
+   numbers; revisit only if StaticModel pooling becomes a measured bottleneck.
 
 §3 and §6 are **documentation-only, not doing**: §3 (Q8 dequant is a *trap* —
 caching the dequantized rows defeats int8; the real fix is fusion, tracked in
