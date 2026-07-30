@@ -167,7 +167,9 @@ func Tokenize(text string) []string {
 	// Retention note: arena-backed tokens keep `lowered` alive, so holding a
 	// single token from a very large document retains that document's lowered
 	// forms. This matches strings.Split and friends, and the indexing path
-	// consumes all tokens immediately.
+	// consumes all tokens immediately — and bm25.Build interns the distinct
+	// keys it retains (§1b), so the Index itself pins neither the arena nor the
+	// caller's text.
 	if len(bufs.refs) == 0 {
 		// Preserve the original nil-vs-empty distinction: text with no
 		// identifier runs returned a nil slice, and callers may compare against
