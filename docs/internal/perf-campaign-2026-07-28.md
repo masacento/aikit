@@ -102,7 +102,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 25 | arm64 `Dot2x8` has the wrong MR×NR: 4×4 needs 8 loads per 16 FMLAs vs today's 10 | linalg | 1.1–1.25× arm64 f32 GEMM | **=** | S–M |
 | 26 | `math.Round` is **not** an amd64 intrinsic (`math.Trunc` is) — verified in disassembly | linalg, encoder | ~12 int ops → 1 `ROUNDSD` | = | S |
 | ~~27~~ | ~~Encoder's 4-MFLOP naive threshold sends **every** attention matmul at L<250 to a scalar triple loop~~ — **DONE, up to −50.5%** (§7.20) | encoder | estimated 3–9%; the first large UNDER-estimate | ~ | — |
-| 28 | `CrossEncoder` has **no batch API** and re-tokenizes the query per pair | encoder | unlocks item 14 for rerank | = | M |
+| ~~28~~ | ~~`CrossEncoder` has **no batch API** and re-tokenizes the query per pair~~ — **DONE, 7.56×** (§7.30) | encoder | the re-tokenization half was 0.066%; the API was everything | = | — |
 | ~~29~~ | ~~`bm25` posting is 16 B~~ — **DONE, −50% index memory (381.7→190.9 MB at 200k docs)** (§7.24) | bm25 | ~0% scoring, −16% build alloc; the Win column led with the wrong effect | = | — |
 | ~~30~~ | ~~`bm25.Tokenize` allocates a string per mixed-case token~~ — **DONE, 983 → 2 allocs, −44.7%** (§7.24) | bm25 | beat its "787 → ~10" estimate | = | — |
 | 31 | QKV split + per-head V transpose: 3 full `[L,D]` copies/layer, with a power-of-two stride pathology at exactly `DefaultMaxSeqLength=512` | encoder | 3.3× on the transpose (small absolute) | = | M |
@@ -1887,6 +1887,40 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     also capped at `ceil(n/concurrency)`, which reproduces exactly as many
     dispatchable units as the old partition — so this item changes which
     sequences share a forward without changing how many forwards run at once.
+
+30. **Item 28 is DONE — 7.56× — but not for the reason the item gives.** The
+    item names two costs: no batch API, and "re-tokenizes the query per pair".
+    Profiling a 50-document rerank first, the second one is **0.066%**: `pairIDs`
+    totals 40 ms of 60.33 s, and the query-encode line does not register at all
+    (the `embed` wordPiece memoization landed between the item being written and
+    this measurement). The forward is 100% of the cost — `dotFMA8` alone 56.6%.
+
+    So the win is the API. `CrossEncoder.ScoreBatch(query, docs, concurrency)`
+    runs several forwards at once instead of one at a time, dispatching **longest
+    pair first**:
+
+    | | before (Score loop) | after (ScoreBatch) | |
+    |---|--:|--:|--:|
+    | 50 documents | 6.16 s | **814 ms** | **7.56×** |
+    | allocs/op | 87.0 k | 12.1 k | −86% |
+
+    Why longest-first rather than item 14's length bucketing: BERT has no padded
+    batch kernel, so every pair is its own forward and there is no padding to
+    bucket away. That leaves makespan as the only scheduling question, and
+    longest-processing-time-first is the standard answer for one sort.
+
+    The query is hoisted out of the per-pair path anyway — it makes `pairIDsFrom`
+    the single implementation with `pairIDs` as its one-shot wrapper — but the
+    honest accounting is that it buys nothing measurable.
+
+    Scores are bit-identical to `Score`, gated at concurrency 1/3/NumCPU over a
+    corpus that includes a pair overflowing `maxSeq` (so the longest_first trim
+    runs) and an empty document. Batching raises the in-flight count, which makes
+    the intra-op matmul gate decline — a path already gated bit-identical
+    elsewhere, and confirmed again here.
+
+    Recorded in `CHANGELOG.md` under Added: this is new public API on a Hard-tier
+    package.
 
 ---
 

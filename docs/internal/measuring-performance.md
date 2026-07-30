@@ -381,6 +381,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 15 · HNSW batched scoring | 1.36–1.40× | **1.36×/1.33×** | ✅ |
 | 17 · HNSW build batching | 1.5–2.5× build | 1.34×; allocs 225 → **89**/insert | ❌ (time) ✅ (allocs) |
 | 14 · length-bucketed batch | 1.3–2× ragged | **1.15×** ragged, neutral uniform | ❌ |
+| 28 · CrossEncoder batch API | "unlocks item 14 for rerank" | **7.56×**, but from parallelism not tokenization | ✅ (size) ❌ (cause) |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the

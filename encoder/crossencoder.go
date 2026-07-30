@@ -2,6 +2,10 @@ package encoder
 
 import (
 	"fmt"
+	"runtime"
+	"sort"
+	"sync"
+	"sync/atomic"
 
 	"github.com/townsendmerino/aikit/linalg"
 )
@@ -108,12 +112,83 @@ func (ce *CrossEncoder) ScoreAll(query, doc string) ([]float32, error) {
 	return ce.scoreIDs(ids, segs), nil
 }
 
+// ScoreBatch scores one query against many documents, returning label 0's logit
+// per document in the caller's order. concurrency <= 0 means NumCPU.
+//
+// This is perf-campaign item 28. That item also names "re-tokenizes the query
+// per pair" as a cost; measured, it is 0.066% of a 50-document rerank (pairIDs
+// totals 40 ms of 60.33 s and the query line does not register at all), so the
+// query is hoisted below for tidiness, not for speed. The win is the batch API
+// itself: a caller looping over Score runs one forward at a time, each
+// parallelizing internally, and document-level parallelism beats intra-op — the
+// same result EncodeBatch has.
+//
+// Documents are dispatched LONGEST FIRST. Cost is roughly linear in pair length,
+// and BERT has no padded batch kernel, so unlike EncodeBatch there is no padding
+// to bucket away and the only scheduling question left is makespan.
+// Longest-processing-time-first is the standard answer and costs one sort.
+func (ce *CrossEncoder) ScoreBatch(query string, docs []string, concurrency int) ([]float32, error) {
+	if len(docs) == 0 {
+		return nil, nil
+	}
+	if concurrency <= 0 {
+		concurrency = runtime.NumCPU()
+	}
+	concurrency = min(concurrency, len(docs))
+
+	// Tokenize the query ONCE. pairIDsFrom still re-derives the trim per pair,
+	// because longest_first depends on that document's length.
+	qIDs := ce.bert.tok.Encode(query)
+
+	type pair struct{ ids, segs []int32 }
+	pairs := make([]pair, len(docs))
+	for i, d := range docs {
+		ids, segs := ce.pairIDsFrom(qIDs, d)
+		pairs[i] = pair{ids: ids, segs: segs}
+	}
+	order := make([]int, len(pairs))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return len(pairs[order[a]].ids) > len(pairs[order[b]].ids)
+	})
+
+	out := make([]float32, len(docs))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range concurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				k := int(next.Add(1)) - 1
+				if k >= len(order) {
+					return
+				}
+				i := order[k]
+				out[i] = ce.scoreIDs(pairs[i].ids, pairs[i].segs)[0]
+			}
+		}()
+	}
+	wg.Wait()
+	return out, nil
+}
+
 // pairIDs builds [CLS] query [SEP] document [SEP] with token-type segments 0/1,
 // right-truncating the document (then the query) to the model's max sequence length.
 func (ce *CrossEncoder) pairIDs(query, doc string) (ids, segs []int32) {
+	return ce.pairIDsFrom(ce.bert.tok.Encode(query), doc)
+}
+
+// pairIDsFrom is pairIDs with the query already tokenized, so a batch shares one
+// encode. It is the single implementation; pairIDs is the one-shot wrapper.
+func (ce *CrossEncoder) pairIDsFrom(qTok []int32, doc string) (ids, segs []int32) {
 	cls, _ := ce.bert.tok.SpecialID("[CLS]")
 	sep, _ := ce.bert.tok.SpecialID("[SEP]")
-	q := ce.bert.tok.Encode(query)
+	// Copy before trimming: every pair in a batch shares qTok, and the trim
+	// below reslices it.
+	q := append([]int32(nil), qTok...)
 	d := ce.bert.tok.Encode(doc)
 
 	avail := max(ce.bert.maxSeq-3, 0) // room for [CLS] + 2×[SEP]

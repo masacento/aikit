@@ -10,6 +10,15 @@ it.
 
 ## [Unreleased]
 
+### Added
+
+- **`encoder.CrossEncoder.ScoreBatch(query, docs, concurrency)`** (perf campaign
+  item 28) — scores one query against many documents, returning label 0's logit
+  per document in the caller's order. **7.56× over a `Score` loop** at 50
+  documents (6.16 s → 814 ms) with allocations down 87k → 12.1k, from
+  document-level parallelism plus longest-pair-first scheduling. Scores are
+  bit-identical to `Score`.
+
 ### Changed
 
 - **`ann.Flat.Query`/`QueryFilter` now shard the scan across cores** (perf
