@@ -336,6 +336,10 @@ Numbers here are for calibration, not for citing as results.
 | scalar int8→f32 widen, cold weights | ~1.7 ns/elem | item 22 |
 | AVX2 int8→f32 widen | 0.089 ns/elem | item 22 |
 | row-split matmul worker cap | `(M+31)/32` → **3 workers at M=91** | §7.14 |
+| exact f32 dot scan, per candidate | 43.5 ns (d256) / 118.4 ns (d768) | item 38 |
+| Hamming scan, per candidate (POPCNTQ) | 2.96 ns (d256) / 8.31 ns (d768) | item 38 |
+| `math/bits.OnesCount64` without POPCNTQ | **1.55× slower** — not intrinsified at `GOAMD64=v1` | item 38 |
+| streaming scan bandwidth ceiling | **~26 GB/s** (both scans hit it at N≥100k) | item 38 |
 
 The split-CCX L3 is why the row-split matmul axis lost here and not on the M1
 Pro: replicating the weight matrix per worker is far cheaper across a large
@@ -414,6 +418,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 26 · `math.Round` not intrinsic | ~5% of the matmul | **0.61%**; the proposed fix is a wash — closed | ❌ |
 | 33 · MoE expert grouping | "group tokens by expert" | **1.81×**; `moeMLP` was 48.9% of the encode | ✅ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
+| 38 · binary Hamming prefilter | ~10× first stage | **13–26×** end-to-end, geomean 18.6× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
 largest encoder wins of the campaign: the parallel axis being wrong on amd64
@@ -664,6 +669,60 @@ and twice the model was available:
 minutes to find out which model it needs — read the config fields the loader
 actually parses — and whether it is downloadable or generated. Both deferrals
 cost more than the check would have.
+
+---
+
+### 1.27 An approximate index measured on structureless data measures its own noise floor
+
+Item 38's first recall gate built 20k random unit vectors, ran the binary
+prefilter against the exact scan, and got **recall@10 = 0.31**. That reads as a
+broken prefilter. It was not:
+
+- the angular gap between the 10th and the 160th nearest of a random dim-256
+  corpus is ~0.051 rad;
+- the Hamming estimator's own standard deviation at that dim is ~0.097 rad.
+
+There is nothing there to resolve. Random high-dimensional vectors are all
+nearly equidistant, so "the true top-10" is decided by differences smaller than
+any approximate method's noise. **The corpus had no neighborhoods, so there were
+no neighborhoods to find.**
+
+The second version fixed the corpus and not the queries: it generated clustered
+vectors, then drew the queries from a *second, independent* set of centers. Every
+query was still a random direction with no near neighbors in the corpus, and
+recall came back at 0.28 — the corpus's structure was there and entirely
+unreachable. Only when the queries were drawn around the *same* centers did the
+gate reach 0.94, and the real-corpus test 0.96.
+
+**Guard:** an approximate-retrieval gate needs a corpus with neighborhoods AND
+queries that land in them; the generator should produce both together so they
+cannot drift apart. Sanity-check by computing what the exact top-k similarities
+actually are — if the 1st and the 100th neighbor score about the same, the
+benchmark cannot distinguish any two methods, including a correct one from a
+broken one. Keep a real-checkpoint recall test alongside it: synthetic clusters
+are isotropic and zero-mean, which happens to be the geometry binary
+quantization likes best, and it hid the entire effect of mean-centering.
+
+### 1.28 Benchmark the knob, not just its default
+
+Item 38's quality knob (`overquery`, the prefilter's candidate multiplier)
+looked free from the design: the scan reads the whole corpus either way, and
+only the rerank grows. Sweeping it said otherwise — 594 µs at 4 and 2042 µs at
+32, a **3.4× swing on a parameter that controls only recall**. The cost was not
+in the rerank at all but in per-shard selection heaps sized by the candidate
+count. Rewritten as a counting sort, the same sweep is 877 → 901 µs.
+
+Two things follow. The obvious one: a knob users are told to raise for quality
+must be measured across its range, not at its default, or the first person who
+raises it pays a cost nobody priced. The less obvious one: **the sweep localized
+the bug.** A flat-in-theory parameter that is steep in practice is pointing at
+an implementation detail scaling with it, and that is a far sharper signal than
+a single slow number.
+
+It also inverts the usual order. The knob's price is what decides where the
+default belongs — once raising it was nearly free, the default moved from where
+the implementation stopped hurting (8) to where the recall curve actually
+flattens (16).
 
 ---
 

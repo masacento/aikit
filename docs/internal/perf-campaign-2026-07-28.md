@@ -117,7 +117,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 35 | AVX2/VNNI int8: the unsigned-offset correction is **free here** because weights are static | linalg | 1.3–1.8× on VNNI boxes | = | M |
 | 36 | arm64 **i8mm (SMMLA)** — 2× int8, but **only for prefill/batch, and your M1 Pro can't run it** | linalg | ≤2× prefill on M2+/Graviton3+ | = | M–L |
 | ~~37~~ | ~~Outer-product f32 microkernel via by-element `FMLA` — 4.0 FMLA/load vs today's 1.6~~ — **BUILT + MEASURED ON M1 PRO, NOT WORTH IT** (§6): raw kernel only **1.10×** (not 1.45×) because `dotNEON2x8` is already **~95% of FMLA peak** here — compute-bound, not load-bound as on amd64 — and the mandatory transpose-pack of both operands made the full path **4× slower**. Reverted. | linalg | prediction was amd64-shaped; §1.11 | **≠** | L |
-| 38 | Binary/Hamming prefilter + exact rerank (composes with `embed.Truncate`) | ann | ~10× first stage | ≠ (recall) | L |
+| ~~38~~ | ~~Binary/Hamming prefilter + exact rerank~~ — **DONE, 13–26× end-to-end** (§7.36) | ann | geomean **18.6×**, recall@10 1.00 on the real corpus | ≠ (recall) | — |
 | 39 | WAND / block-max WAND / MaxScore dynamic pruning | bm25, sparse | 2–10× **on top of** item 11 | = | L |
 | 40 | Flash-attention / online-softmax tiling | encoder, vision | 1.05–1.15× alone; 67 MB → 1 MB scratch | ≠ | L |
 
@@ -2119,6 +2119,77 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     `matmulBTInto`'s 4 MFLOP blocking threshold and would take the naive path.
     That threshold no longer exists — item 27 removed it — so the justification
     was obsolete even before this change.
+
+36. **Item 38 is DONE — 13–26× end-to-end, against a predicted "~10× first
+    stage".** `ann.FlatBinary`: a 1-bit sign-quantized Hamming prefilter over
+    the whole corpus, then an exact float32 rerank of the survivors. n=5,
+    p=0.008 throughout:
+
+    | shape | exact scan | binary + rerank | |
+    |---|--:|--:|--:|
+    | d256, N=100k | 4.083 ms | 283.5 µs | **14.4×** |
+    | d256, N=1M | 39.85 ms | 3.011 ms | **13.2×** |
+    | d768, N=100k | 11.60 ms | 449.7 µs | **25.8×** |
+    | d768, N=1M | 115.6 ms | 4.783 ms | **24.2×** |
+    | geomean | | | **18.6×** |
+
+    Allocations fall too: 90 → 40 per query, −55%.
+
+    The prediction was low because it priced only the kernel ratio. Both scans
+    are DRAM-bandwidth-bound at these sizes (~26 GB/s exact, ~25 GB/s binary),
+    so the speedup converges on the **byte** ratio — 3072 B/candidate at d768
+    against 96 B, i.e. 32× — not on any instruction-count argument. At d256 the
+    codes fit in L3 and the ratio drops to ~14× because only one side is
+    bandwidth-bound. That is a derivable shape, and it is the campaign's rule
+    again (§4 of measuring-performance.md): the mechanism was right, the
+    magnitude came from scaling instead of from the structure.
+
+    **Three things this needed that the one-line item did not say.**
+
+    *(a) `math/bits.OnesCount64` is not a popcount on amd64.* It is
+    intrinsified only at `GOAMD64 >= v2`, and the default is v1 — so a library
+    build gets the SWAR fallback, ~12 ops per word. `linalg/hamming_amd64.s` is
+    a POPCNTQ kernel with four independent accumulators (POPCNTQ is 1-cycle
+    latency, 4/cycle throughput, so a single accumulator's ADDQ chain would set
+    the pace), CPUID-gated at init like `hasAVX2`. Worth **1.55×** over the
+    portable path: 8.31 ns/vec against 12.92 at d768. arm64 needs none of this —
+    `OnesCount64` IS intrinsified there (`VCNT`/`VADDV`).
+
+    *(b) The corpus mean has to come out first.* On the Model2Vec corpus, 25 of
+    256 dimensions have 90%+ of the vectors agreeing in sign; those contribute a
+    constant to every distance and carry no information about which document is
+    which. Centering is worth recall@10 0.9625 against 0.9375 — real, and
+    smaller than one step of overquery. The synthetic gates cannot see it at all
+    (zero-mean cluster centers ⇒ the mean is already ~0), which is why the real
+    corpus test exists.
+
+    *(c) The first selection implementation made the recall knob expensive.*
+    Per-shard top-cand heaps meant 16 workers each allocating and merging a
+    `cand`-sized heap, so at d768/N=200k/k=10 a query cost 594 µs at overquery 4
+    and 2042 µs at 32 — a 3.4× swing on a knob that controls **only quality**,
+    while the scan underneath it does not change at all. Replaced with a
+    counting sort over the distance histogram (a Hamming distance is an integer
+    in [0, dim], so dim+1 counters describe the corpus exactly): now 877 µs at
+    overquery 4 and 901 µs at 32. That is what let `DefaultOverquery` be set at
+    **16**, where recall reaches 1.00 on both the real and the synthetic corpus,
+    instead of at 8 where the old implementation stopped hurting.
+
+    The histogram is not uniformly better and the code says so: below
+    `cand ≈ 100` on a 200k corpus the heap wins (614 µs vs 877 at k=10,
+    overquery 4), because the histogram materializes a distance per document and
+    makes a second pass. The dispatch is on the presence of a filter alone, not
+    on a fitted candidate-count threshold — that crossover was measured at one
+    corpus size on one machine and scales with n.
+
+    **Recall, and what gates it.** 1.0000 at overquery 16 on the real Model2Vec
+    corpus (0.5625 / 0.7250 / 0.8375 / 0.9625 / 1.0000 at 1 / 2 / 4 / 8 / 16),
+    0.9375 → 1.0000 on synthetic clusters. Two gates are exact rather than
+    statistical, and they are the ones that catch structural bugs: the result
+    must equal `Flat`'s **hit for hit and score bit for bit** whenever the
+    candidate set covers the corpus, and the histogram and heap paths must agree
+    exactly on identical data (an always-true filter selects the heap). Five of
+    six mutants died; the survivor — `>=` → `>` in the threshold search — is
+    genuinely equivalent whenever `cand < n`, which `query` guarantees.
 
 ---
 
