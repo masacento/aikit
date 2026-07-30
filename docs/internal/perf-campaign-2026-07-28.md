@@ -89,7 +89,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~17~~ | ~~HNSW build: batch `prune`/`selectHeuristic`; kill 225 allocs/insert~~ — **DONE, 1.34× build; 225 → 89 allocs/insert** (§7.28) | ann | estimated 1.5–2.5×; allocation beat the ask | ~ (recall identical) | — |
 | ~~18~~ | ~~`vision/qwen_encoder.go` has no scratch arena~~ — **DONE, −70/−85% B/op, now depth-independent** (§7.19) | vision | latency share is ~3%, not the ~1.5 s implied | **=** | — |
 | ~~19~~ | ~~`DequantizeRowInt4`: hardware integer divide per element~~ — **DONE, 4.93×** (§7.11) | linalg | above the 2–4× estimate | = | — |
-| 20 | Int8 register blocking (1×4 / 4×1) — the arm64 kernel has none | linalg | 1.2–1.6× GEMV, more at prefill | = (integer) | M |
+| 20 | Int8 register blocking (1×4 / 4×1) — the arm64 kernel has none | linalg | 1.2–1.6× GEMV, more at prefill — **but a DECODE (M=1 GEMV) lever, not encoder: the Q8 encoder widens int8→f32 and runs the f32 `dotNEON2x8`, no int8 GEMV in its hot path (2026-07-30 profile). goinfer's call.** | = (integer) | M |
 | ~~21~~ | ~~**(D)** `annmetal`: adopt the tiled/simdgroup kernel + on-GPU top-K~~ — **DONE** (§7.5) | gpu | measured: Metal 1.99×, CUDA 15.25× vs each box's own CPU @ N=100k/batch=256 | = (int32) | — |
 
 ### Tier 2 — structural
@@ -99,7 +99,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~22~~ | ~~Q8 encoder path re-widens the whole int8 weight matrix to f32 **per matmul**~~ — **fix (a) DONE both arches** (amd64 −58.2% short input; arm64 NEON 3.43× kernel, §7.18); fix (b) (fuse into `packedFill`) still open | encoder | cost model exactly right; ~190 ms/forward measured | = | — |
 | 23 | `packedFill` lost `blockedFill`'s m-blocking; a-panel re-read per 8-column group | linalg | **arm64-only** — `packedFill` is gated on `has2x8Kernel` (§7.32), like item 24 | = | gate on evidence |
 | 24 | `matmul_blocked.go` packed stride is a 4096 B power-of-two | linalg | **UNREACHABLE on amd64** — `packedFill` is arm64-only (§7.21); needs an arm64 box, and the proposed `+4` pad is too small to work | = | gate on evidence |
-| 25 | arm64 `Dot2x8` has the wrong MR×NR: 4×4 needs 8 loads per 16 FMLAs vs today's 10 | linalg | 1.1–1.25× arm64 f32 GEMM | **=** | S–M |
+| 25 | arm64 `Dot2x8` has the wrong MR×NR: 4×4 needs 8 loads per 16 FMLAs vs today's 10 | linalg | 1.1–1.25× arm64 f32 GEMM — **likely DEAD on M1 Pro: `dotNEON2x8` measured at ~95% FMLA peak (item 37), so it is compute-bound; cutting loads 10→8 can't help, same as 37** | **=** | S–M |
 | 26 | `math.Round` is **not** an amd64 intrinsic — premise re-verified in disassembly | linalg, encoder | **CLOSED, not worth doing** (§7.34): `math.Round` is 0.61% of the W8A8 matmul and `Trunc+Copysign` measures as a wash | = | closed |
 | ~~27~~ | ~~Encoder's 4-MFLOP naive threshold sends **every** attention matmul at L<250 to a scalar triple loop~~ — **DONE, up to −50.5%** (§7.20) | encoder | estimated 3–9%; the first large UNDER-estimate | ~ | — |
 | ~~28~~ | ~~`CrossEncoder` has **no batch API** and re-tokenizes the query per pair~~ — **DONE, 7.56×** (§7.30) | encoder | the re-tokenization half was 0.066%; the API was everything | = | — |
