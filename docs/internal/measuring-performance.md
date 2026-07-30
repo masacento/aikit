@@ -347,6 +347,25 @@ unified cache.
 Treat every constant in it as unverified on amd64 until re-measured — §7.14 found
 the *axis* itself was wrong on the 3700X.
 
+| fact | value | source |
+|---|--:|---|
+| cols-first matmul axis | **correct here too** (not just amd64) | 2026-07-30 |
+| cols→rows crossover, GTE end-to-end | **M ≈ 80–96** (rows wins from L96) | BenchmarkGTEAxisProbe |
+| forced-rows penalty at small M | up to **+178%** (L32: row split → 1 worker = serial) | " |
+| rows' mid-length edge (L96–128) | 3–8% (wide unified cache ⇒ cheap b-replication) | " |
+
+**The 2026-07-30 axis re-check (Task 0 of the arm64 handoff): cols-first stays
+the default.** The fear was that the amd64-driven cols-first flip would be
+neutral-to-negative on the M1 Pro, whose original table showed row splitting
+winning 2.6–4.5×. It is not: columns are *essential* at short input (the row
+split collapses to one worker below M=64) and only lose 3–8% in the L96–128 GTE
+band. Capturing that band needs the *narrow-N* shapes (fc11/fc2, N≤3072) on rows
+too — a shape-aware upgate-only carve-out recovered none of it — so a crossover
+change would land on exactly the shapes plain BERT depends on, for a sub-10%,
+band-limited, thermally-hard-to-measure gain. Not worth the BERT regression risk;
+left as-is. `wantParallelCols`'s `M < minRowsPerWorker·NumCPU` crossover (256 here)
+is conservative for GTE but safe across models.
+
 ---
 
 ## 4 · Scoreboard: predicted vs measured
