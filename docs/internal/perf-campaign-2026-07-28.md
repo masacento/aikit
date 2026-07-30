@@ -767,6 +767,18 @@ These came out of the refutation pass and aren't in the tables above:
   kernel packs neither a, and b cheaply) made the full serial path **~4× slower**.
   Net: correct but pointless on this µarch — and it is `≠` (a different f32 order),
   so it would perturb every encoder golden for a loss. **Reverted.**
+- **Pre-packing weights to kill `packedFill`'s per-forward b-copy — built, measured,
+  reverted.** `packedFill` rebuilds the conflict-free b-layout every forward (and
+  every doc under `EncodeBatch`) though the weights are immutable, and it profiles at
+  **13%** of a GTE forward (`runtime.memmove`, 98% from `packedFill`). Pre-packing
+  once at load (`PackWeightBT` + `MatmulBTPacked`, bit-identical to `MatmulBT`,
+  mutation-checked) *should* remove it. Measured on the M1 Pro: **~0–3%, within
+  noise** (fc2/down, M=91–690). The 13% is pprof self-time the copy spends
+  *overlapping* the compute-bound `Dot2x8` of adjacent tiles on an out-of-order core
+  (measuring-performance §1.4) — not wall-clock you can remove. Not worth an
+  architectural change (weight storage + a pre-packed entry point + per-model wiring)
+  for ~1%. Reverted before integrating — measure-first earned its keep. With
+  `dotNEON2x8` at ~95% FMLA peak too, **the f32 encoder is at its arm64 floor here.**
 - **AVX-512 for f32:** your deprioritization still holds, but for a *different*
   reason than the doc gives. The modern blocker isn't downclocking (Zen 4/5 have
   none) — it's that Intel client parts ship AVX-512 fused off, so the f32 win only

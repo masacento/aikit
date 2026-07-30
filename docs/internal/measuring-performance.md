@@ -358,24 +358,25 @@ the *axis* itself was wrong on the 3700X.
 | `GTE.Encode` L512 profile | **`dotNEON2x8` 52%**, `memmove` 17%, `packedFill` 20% | 2026-07-30 |
 | `dotNEON2x8` f32 GEMM kernel | **~42 GMAC/s ≈ 95% of single-core FMLA peak** (compute-bound) | item 37 |
 | outer-product 8×8 kernel (item 37) | 46 GMAC/s = **1.10×** raw; 4× slower with packing → reverted | item 37 |
-| GTE L512 addressable breakdown | `dotNEON2x8` 51% (at peak), **thread fork/join ~21%**, `packedFill` b-copy `memmove` **13%** | 2026-07-30 |
+| GTE L512 addressable breakdown | `dotNEON2x8` 51% (at peak), thread fork/join ~21%, `packedFill` `memmove` 13% (**not addressable — overlaps compute**) | 2026-07-30 |
 | Q8 forward hot path | widen→**f32 `dotNEON2x8`** (no int8 GEMV kernel); item 20 is a *decode* (goinfer) lever, not encoder | 2026-07-30 |
 | cols-first matmul axis | **correct here too** (not just amd64) | 2026-07-30 |
 | cols→rows crossover, GTE end-to-end | **M ≈ 80–96** (rows wins from L96) | BenchmarkGTEAxisProbe |
 | forced-rows penalty at small M | up to **+178%** (L32: row split → 1 worker = serial) | " |
 | rows' mid-length edge (L96–128) | 3–8% (wide unified cache ⇒ cheap b-replication) | " |
 
-**The one live f32-encoder lever left on the M1 Pro (2026-07-30):** with
-`dotNEON2x8` at ~95% FMLA peak (killing the microkernel items 25/37) and thread
-fork/join already minimized (the spin-park pool was built and pulled, §6), the
-remaining addressable cost is `packedFill`'s **13%** b-panel `memmove`. It runs
-only for K≥`packKThreshold`=2048 — the fc2/down (K=3072) projections — and it
-re-packs the **immutable** weights on *every* forward (and every document under
-`EncodeBatch`). Pre-packing those large-K weight matrices into the conflict-free
-layout once at load would remove it entirely — bit-identical (`=`), a copy moved
-from per-forward to load-time. It is an architectural change (weight storage + a
-pre-packed matmul entry point + per-model wiring), so it wants a dedicated pass,
-not a kernel tweak.
+**The f32 encoder is at its arm64 floor on the M1 Pro (2026-07-30).** `dotNEON2x8`
+runs at ~95% FMLA peak (killing microkernel items 25/37), fork/join is already
+minimized (the spin-park pool was built and pulled, §6), and the last candidate —
+`packedFill`'s **13%** b-panel `memmove` — turned out **not addressable**. It runs
+only for K≥`packKThreshold`=2048 (fc2/down) and re-packs the immutable weights every
+forward, so pre-packing them once at load *looks* like a 13% win. Built it
+(`PackWeightBT`/`MatmulBTPacked`, bit-identical to `MatmulBT`, mutation-checked) and
+measured: **~0–3%, within noise.** The 13% is pprof *self*-time, not addressable
+wall-clock — on the M1's out-of-order core the copy overlaps the compute-bound
+`Dot2x8` of adjacent tiles (§1.4 again: a profile attributes cycles it cannot prove
+are on the critical path). Reverted. **Measuring before the architectural
+integration saved the whole change for a ~1% gain** — the point of measure-first.
 
 **The 2026-07-30 axis re-check (Task 0 of the arm64 handoff): cols-first stays
 the default.** The fear was that the amd64-driven cols-first flip would be
