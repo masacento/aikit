@@ -86,7 +86,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 14 | **(E)** Length-bucketed `EncodeBatch` under a token budget | encoder | 1.3–2× on ragged batches | **=** | M |
 | ~~15~~ | ~~HNSW: batch neighbour scoring through `Dot8x4`~~ — **DONE, 1.36×/1.33×** (§7.27) | ann | matched the prototype; heap pooling (the alloc half) still open | ~ (2 ULP, 0 rank changes over 4,500 hits) | — |
 | ~~16~~ | ~~`Flat.Query` is single-threaded; shard it + per-shard selector~~ — **DONE, 1.73–2.26×; filtered path −42%** (§7.23) | ann | "4–8× typical" was never available: the scan is DRAM-bandwidth-bound at ~25 GB/s | = | — |
-| 17 | HNSW build: batch `prune`/`selectHeuristic`; kill 225 allocs/insert | ann | 1.5–2.5× build | ~ | M |
+| ~~17~~ | ~~HNSW build: batch `prune`/`selectHeuristic`; kill 225 allocs/insert~~ — **DONE, 1.34× build; 225 → 89 allocs/insert** (§7.28) | ann | estimated 1.5–2.5×; allocation beat the ask | ~ (recall identical) | — |
 | ~~18~~ | ~~`vision/qwen_encoder.go` has no scratch arena~~ — **DONE, −70/−85% B/op, now depth-independent** (§7.19) | vision | latency share is ~3%, not the ~1.5 s implied | **=** | — |
 | ~~19~~ | ~~`DequantizeRowInt4`: hardware integer divide per element~~ — **DONE, 4.93×** (§7.11) | linalg | above the 2–4× estimate | = | — |
 | 20 | Int8 register blocking (1×4 / 4×1) — the arm64 kernel has none | linalg | 1.2–1.6× GEMV, more at prefill | = (integer) | M |
@@ -1763,6 +1763,56 @@ Four things an earlier draft asserted that the refutation pass knocked down:
 
     The int8 path stays scalar: `linalg` has no gathered 8-row int8 kernel, and
     `DotI8` already runs a SIMD reduction per candidate.
+
+28. **Item 17 is DONE — 1.34× build, allocations 225 → 89 per insert — and it
+    produced the campaign's only silent-corruption bug.**
+
+    Profiling the build first: `selectHeuristic` was **57.7%** of build CPU, with
+    `simIDs` alone at 50.2% in single-row dots, and the allocation profile put
+    `selectHeuristic` + `prune` + `sortCandsDesc` at ~76% of 2,245,749
+    allocations for a 10k build — exactly the doc's 225 per insert.
+
+    Both halves fixed. `simIDsInto` batches through `Dot8x4` the same way item 15
+    did, in groups of 8 with the early exit kept BETWEEN groups (so a candidate
+    rejected by its first comparison still costs one group, not all of `r`).
+    And the three per-call slices move to build scratch on the `HNSW` — safe
+    without a lock because `Add` is documented not-concurrent.
+
+    | | before | after | |
+    |---|--:|--:|--:|
+    | `BuildHNSW` 10k×d256 | 7.713 s | 5.754 s | **−25.4%** (1.34×) |
+    | B/op | 1240.9 MiB | 479.8 MiB | **−61.3%** |
+    | allocs/op | 2.246 M (225/insert) | 897.1 k (**89/insert**) | −60.1% |
+
+    Estimated 1.5–2.5×; measured 1.34×. The allocation result beat what the item
+    asked for.
+
+    **Recall is unchanged, exactly**: pristine vs batched builds measure
+    1.0000/1.0000, 0.9970/0.9970, 1.0000/1.0000, 0.9810/0.9810 across d∈{64,256}
+    × n∈{2000,8000}. Equality was the wrong gate here — unlike item 15 this
+    changes the GRAPH, since a ULP-level score move can flip selectHeuristic's
+    `> e.sim` test — so the gate builds both ways from the same vectors and seed
+    and compares recall against brute force.
+
+    **The bug, because it is the most instructive thing in this item.** Returning
+    the scratch directly (rather than copying) looked safe: both callers copy the
+    ids into a fresh `[]int32` immediately. That reading came from the first six
+    lines of the caller and was wrong. `Add` then iterates the SAME slice again
+    to add back-edges, and calls `prune` inside that loop — which re-enters
+    `selectHeuristic` and overwrites the scratch **mid-iteration**.
+
+    Nothing crashed. Nothing raced. `-race` was clean, every structural test
+    passed, and the graph was quietly corrupted: **recall@10 fell 1.00 → 0.83**,
+    caught only by the recall gates. The fix needs no copy at all — iterate the
+    freshly allocated `ids` array instead, which `prune` cannot touch because it
+    only rewrites `h.nodes[c.id]`, never `h.nodes[id]`. That is both correct and
+    faster than copying.
+
+    Two things worth carrying forward: **an aliasing contract has to be verified
+    against every path out of the caller, not the first one**, and **recall is
+    the only test that could have caught this** — which is an argument for
+    keeping quality gates on optimization work even when the change looks
+    structural rather than numerical.
 
 ---
 

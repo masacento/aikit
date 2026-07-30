@@ -148,6 +148,18 @@ type HNSW struct {
 	// scorers against the SAME graph and compare full ranked result lists, which
 	// is the only way to check the transformation preserved push order.
 	scoreUnbatched bool
+
+	// Build-time scratch. Add is documented "not safe for concurrent use", so
+	// these need no pool or lock — they exist because selectHeuristic, prune and
+	// sortCandsDesc allocated fresh slices on EVERY call, which at 10k×d256 was
+	// 225 allocations per insert (perf-campaign item 17).
+	bSort []cand
+	bKeep []cand
+	bDisc []cand
+	bIDs  []int
+	bSims []float64
+	bCand []cand
+	bOut2 []int
 }
 
 // NewHNSW creates an empty index. Add vectors with Add, or use BuildHNSW
@@ -307,6 +319,29 @@ func (h *HNSW) scoreInto(qv queryVec, ids []int, dst []float64) []float64 {
 	return dst
 }
 
+// simIDsInto fills dst[i] with simIDs(base, ids[i]).
+//
+// Same 8-row batching as scoreInto, for the BUILD path: selectHeuristic compares
+// one candidate against every already-selected neighbour and prune scores one
+// node against all of its neighbours, both of which are one-vector-vs-many —
+// exactly Dot8x4's shape. simIDs was 50% of build CPU in single-row dots
+// (perf-campaign item 17).
+//
+// Like scoreInto this is not bit-identical to per-pair Dot, and here the
+// consequence is larger: a moved score can flip selectHeuristic's `> e.sim`
+// test and change the GRAPH, not just one query's traversal. The gate is
+// therefore recall, not equality — see TestHNSW_batchedBuildKeepsRecall.
+func (h *HNSW) simIDsInto(base int, ids []int, dst []float64) []float64 {
+	dst = dst[:0]
+	if h.scoreUnbatched || h.int8 || len(h.vecs) == 0 {
+		for _, id := range ids {
+			dst = append(dst, h.simIDs(base, id))
+		}
+		return dst
+	}
+	return h.scoreInto(queryVec{f32: h.vecs[base]}, ids, dst)
+}
+
 func (h *HNSW) randomLevel() int {
 	// floor(-ln(U) * mL), U in (0,1].
 	r := h.rng.Float64()
@@ -363,10 +398,18 @@ func (h *HNSW) Add(vec []float32) int {
 		}
 		h.nodes[id].nbrs[layer] = ids
 		// Link neighbors → id, pruning any that overflow mmax.
-		for _, c := range neighbors {
-			h.nodes[c.id].nbrs[layer] = append(h.nodes[c.id].nbrs[layer], int32(id))
-			if len(h.nodes[c.id].nbrs[layer]) > h.mmax(layer) {
-				h.prune(c.id, layer)
+		//
+		// Iterating `ids` rather than `neighbors` is load-bearing: prune re-enters
+		// selectHeuristic, which overwrites the build scratch `neighbors` aliases
+		// (item 17). `ids` is a freshly allocated []int32 that prune cannot touch
+		// — it only rewrites h.nodes[c.id], never h.nodes[id]. Ranging over
+		// `neighbors` here silently corrupted the graph: recall@10 fell from 1.00
+		// to 0.83 with no test failing except the recall gates.
+		for _, nid := range ids {
+			c := int(nid)
+			h.nodes[c].nbrs[layer] = append(h.nodes[c].nbrs[layer], int32(id))
+			if len(h.nodes[c].nbrs[layer]) > h.mmax(layer) {
+				h.prune(c, layer)
 			}
 		}
 		if len(w) > 0 {
@@ -381,12 +424,27 @@ func (h *HNSW) Add(vec []float32) int {
 }
 
 // prune trims node id's neighbor list at layer to the mmax most similar.
+// bIDs2 returns a length-n slice of the secondary id scratch.
+func (h *HNSW) bIDs2(n int) []int {
+	if cap(h.bOut2) < n {
+		h.bOut2 = make([]int, n)
+	}
+	h.bOut2 = h.bOut2[:n]
+	return h.bOut2
+}
+
 func (h *HNSW) prune(id, layer int) {
 	nbrs := h.nodes[id].nbrs[layer]
-	cands := make([]cand, len(nbrs))
+	ids := h.bIDs2(len(nbrs))
 	for i, n := range nbrs {
-		cands[i] = cand{id: int(n), sim: h.simIDs(id, int(n))} // node-node, both modes
+		ids[i] = int(n)
 	}
+	h.bSims = h.simIDsInto(id, ids, h.bSims) // node-node, both modes
+	cands := h.bCand[:0]
+	for i, n := range ids {
+		cands = append(cands, cand{id: n, sim: h.bSims[i]})
+	}
+	h.bCand = cands
 	kept := h.selectNeighbors(cands, h.mmax(layer))
 	out := make([]int32, len(kept))
 	for i, c := range kept {
@@ -572,38 +630,58 @@ func (h *HNSW) simIDs(a, b int) float64 {
 //
 // Cost: O(|w|·m) similarity computations vs selectNearest's heap — heavier, paid
 // once at build time for the recall win.
+//
+// ALIASING CONTRACT: the returned slice points into build scratch and is valid
+// only until the next selectHeuristic call — including one made INDIRECTLY. Both
+// callers copy the ids into a fresh []int32 immediately and then use that copy;
+// Add in particular must, because its back-edge loop calls prune, which re-enters
+// here. Getting this wrong does not crash — it silently rewrites the slice being
+// iterated and degrades the graph (recall@10 1.00 → 0.83, caught only by the
+// recall gates). A future caller that keeps the result must copy it.
 func (h *HNSW) selectHeuristic(w []cand, m int) []cand {
-	cands := sortCandsDesc(w)
+	h.bSort = sortCandsDescInto(h.bSort, w)
+	cands := h.bSort
 	if len(cands) <= m {
 		return cands
 	}
-	r := make([]cand, 0, m)
-	discarded := make([]cand, 0, len(cands))
+	r := h.bKeep[:0]
+	discarded := h.bDisc[:0]
+	rIDs := h.bIDs[:0]
 	for _, e := range cands {
 		if len(r) >= m {
 			break
 		}
+		// e is closer to an already-selected neighbor than to the base ⇒
+		// redundant (same direction), discard it. Scored EIGHT selected
+		// neighbours at a time, with the early exit kept between groups so a
+		// candidate rejected by its first comparison still costs at most one
+		// group instead of the whole of r (item 17).
 		keep := true
-		for _, sel := range r {
-			// e is closer to an already-selected neighbor than to the base ⇒
-			// redundant (same direction), discard it.
-			if h.simIDs(e.id, sel.id) > e.sim {
-				keep = false
-				break
+		for j := 0; j < len(rIDs) && keep; j += 8 {
+			end := min(j+8, len(rIDs))
+			h.bSims = h.simIDsInto(e.id, rIDs[j:end], h.bSims)
+			for _, s := range h.bSims {
+				if s > e.sim {
+					keep = false
+					break
+				}
 			}
 		}
 		if keep {
 			r = append(r, e)
+			rIDs = append(rIDs, e.id)
 		} else {
 			discarded = append(discarded, e)
 		}
 	}
+	h.bKeep, h.bDisc, h.bIDs = r, discarded, rIDs
 	for _, e := range discarded { // keepPrunedConnections: maintain degree
 		if len(r) >= m {
 			break
 		}
 		r = append(r, e)
 	}
+	h.bKeep = r
 	return r
 }
 
@@ -633,6 +711,13 @@ func sortCandsDesc(w []cand) []cand {
 	copy(out, w)
 	slices.SortFunc(out, candCmp)
 	return out
+}
+
+// sortCandsDescInto is sortCandsDesc reusing dst (item 17).
+func sortCandsDescInto(dst, w []cand) []cand {
+	dst = append(dst[:0], w...)
+	slices.SortFunc(dst, candCmp)
+	return dst
 }
 
 func selectNearest(w []cand, m int) []cand {

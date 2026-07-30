@@ -147,3 +147,77 @@ func TestHNSW_batchedQueryMatchesPristine(t *testing.T) {
 	t.Logf("%d ranked hits, %d index differences, max |Δscore| %g (%.2f ULP)",
 		totalHits, idxDiffs, worstDelta, worstDelta/ulp)
 }
+
+// TestHNSW_batchedBuildKeepsRecall is the gate for item 17. Batching the build's
+// simIDs is a bigger claim than item 15's: a ~1 ULP score move can flip
+// selectHeuristic's `> e.sim` test, which changes which EDGES are kept — so the
+// graph itself differs, not just one traversal. Equality is therefore the wrong
+// property; recall is.
+//
+// Both graphs are built from the same vectors with the same seed, differing only
+// in the scorer, and measured against exact brute force.
+func TestHNSW_batchedBuildKeepsRecall(t *testing.T) {
+	rng := rand.New(rand.NewSource(17))
+	for _, d := range []int{64, 256} {
+		for _, n := range []int{2000, 8000} {
+			vecs := make([][]float32, n)
+			for i := range vecs {
+				v := make([]float32, d)
+				var norm float64
+				for j := range v {
+					v[j] = float32(rng.NormFloat64())
+					norm += float64(v[j]) * float64(v[j])
+				}
+				inv := float32(1 / math.Sqrt(norm))
+				for j := range v {
+					v[j] *= inv
+				}
+				vecs[i] = v
+			}
+			cfg := Config{M: 16, EfConstruction: 200, EfSearch: 64, Seed: 1}
+
+			build := func(unbatched bool) *HNSW {
+				h := NewHNSW(cfg)
+				h.scoreUnbatched = unbatched
+				for _, v := range vecs {
+					h.Add(v)
+				}
+				h.scoreUnbatched = false // query side is item 15's, gated separately
+				return h
+			}
+			pristine, batched := build(true), build(false)
+			flat := &Flat{vecs: vecs, dim: d}
+
+			recall := func(h *HNSW) float64 {
+				var hits, total int
+				qr := rand.New(rand.NewSource(99))
+				for range 100 {
+					q := vecs[qr.Intn(n)]
+					want := flat.Query(q, 10)
+					got := h.Query(q, 10)
+					set := map[int]bool{}
+					for _, g := range got {
+						set[g.Index] = true
+					}
+					for _, w := range want {
+						total++
+						if set[w.Index] {
+							hits++
+						}
+					}
+				}
+				return float64(hits) / float64(total)
+			}
+			rp, rb := recall(pristine), recall(batched)
+			t.Logf("d=%d n=%d: recall@10 pristine=%.4f batched=%.4f", d, n, rp, rb)
+			if rb < rp-0.01 {
+				t.Errorf("d=%d n=%d: batched build recall %.4f is worse than pristine %.4f "+
+					"by more than 1pp — the ULP-level score change altered the graph for the worse",
+					d, n, rb, rp)
+			}
+			if rb < 0.90 {
+				t.Errorf("d=%d n=%d: batched build recall %.4f below 0.90 floor", d, n, rb)
+			}
+		}
+	}
+}

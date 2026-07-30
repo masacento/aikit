@@ -379,6 +379,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 4 · FlatI8 query scratch | 10–25% time | −5.4% time; **−99.2% B/op** | ⚠️ |
 | 34 · double `enterForward` | correctness-ish | unmeasurable on this box's checkpoints | — |
 | 15 · HNSW batched scoring | 1.36–1.40× | **1.36×/1.33×** | ✅ |
+| 17 · HNSW build batching | 1.5–2.5× build | 1.34×; allocs 225 → **89**/insert | ❌ (time) ✅ (allocs) |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -531,6 +532,31 @@ say which part of the argument rests on reasoning rather than evidence. Here the
 gate verifies the weaker property callers depend on (identical ranked results)
 and does catch a genuinely wrong gathered row; the order argument stands on
 reading the code.
+
+---
+
+### 1.22 A quality gate catches what a correctness gate cannot
+
+Item 17 returned build scratch instead of copying it. Both callers appeared to
+copy the ids out immediately — a reading taken from the first six lines of the
+caller, and wrong. `Add` iterates the same slice AGAIN to add back-edges and
+calls `prune` inside that loop, which re-enters `selectHeuristic` and overwrites
+the scratch mid-iteration.
+
+Nothing crashed. `-race` was clean. Every structural test passed. The graph was
+simply, quietly worse: **recall@10 fell from 1.00 to 0.83**, and the only things
+that noticed were the recall gates.
+
+**Guards, two:**
+
+- Verify an aliasing contract against *every* path out of the caller, including
+  indirect re-entry. "The caller copies it immediately" is a claim about the
+  whole function, not its first statement.
+- Keep quality gates (recall, cosine, parity) running on work that looks purely
+  structural. The instinct is that a refactor which preserves arithmetic needs
+  only correctness tests; this one preserved arithmetic perfectly and still
+  degraded the output, because it corrupted the data structure rather than the
+  numbers.
 
 ---
 
