@@ -1,29 +1,74 @@
 package regex
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/townsendmerino/aikit/chunk"
 )
 
-// loadFixture reads a real source file from this repo. The Go fixture
-// (ken's own internal/search/index.go) is the same one BM25 / embed
-// benchmarks use — non-trivial size (~30KB, 650 lines). The TypeScript
-// and Python fixtures come from testdata/repo/, which are smaller (~25
-// lines each) but real — there are no larger TS/Py files checked in
-// outside the COIR bench corpus, and reaching into that would couple
-// the chunker benchmarks to bench data they don't otherwise share.
-// Briefing judgment call #5: documented the choice in this comment +
-// the commit message.
-func loadFixture(b *testing.B, relPath string) []byte {
+// loadFixture reads a real source file from this repo, relative to the repo
+// root rather than to this package.
+//
+// Both fixture paths here were wrong, and both failed silently
+// (perf-campaign item 1). `../../search/index.go` is a leftover `ken` path —
+// aikit has no search/ directory. `../../../testdata/repo/…` resolves from
+// <root>/chunk/regex to the PARENT OF THE REPO ROOT, so it could never have
+// matched even in a complete checkout. b.Skipf turned both into passing
+// benchmarks, leaving the default regex chunker with no live coverage at all.
+//
+// It now FAILS on a missing fixture: these are files checked into this
+// repository, so absence means the benchmark is broken, not that the
+// environment is unusual.
+func loadFixture(b *testing.B, rel ...string) []byte {
 	b.Helper()
-	data, err := os.ReadFile(relPath)
+	path := filepath.Join(append([]string{"..", ".."}, rel...)...)
+	data, err := os.ReadFile(path)
 	if err != nil {
-		b.Skipf("fixture not found at %s: %v", relPath, err)
+		b.Fatalf("in-repo fixture %s is missing: %v", path, err)
 	}
 	return data
+}
+
+// typescriptFixture builds a representative TypeScript source. Unlike Go and
+// Python there is no .ts file checked into this repository, and the chunker
+// splits on syntax — so this is generated with real structure (imports,
+// interfaces, classes with methods, exported functions) rather than borrowed
+// from a corpus the chunker benchmarks do not otherwise depend on. Documented
+// as synthetic because it is.
+func typescriptFixture(n int) []byte {
+	var b strings.Builder
+	b.WriteString("import { Widget } from './widget';\nimport type { Config } from './config';\n\n")
+	for i := range n {
+		fmt.Fprintf(&b, `
+export interface Shape%d {
+  id: string;
+  size: number;
+}
+
+export class Renderer%d {
+  private cache: Map<string, Shape%d> = new Map();
+
+  constructor(private readonly cfg: Config) {}
+
+  public render(shape: Shape%d): string {
+    if (this.cache.has(shape.id)) {
+      return this.cache.get(shape.id)!.id;
+    }
+    this.cache.set(shape.id, shape);
+    return shape.id;
+  }
+}
+
+export function makeShape%d(id: string, size: number): Shape%d {
+  return { id, size };
+}
+`, i, i, i, i, i, i)
+	}
+	return []byte(b.String())
 }
 
 func benchChunk(b *testing.B, lang string, source []byte) {
@@ -40,16 +85,13 @@ func benchChunk(b *testing.B, lang string, source []byte) {
 }
 
 func BenchmarkChunker_Go(b *testing.B) {
-	src := loadFixture(b, filepath.Join("..", "..", "search", "index.go"))
-	benchChunk(b, "go", src)
+	benchChunk(b, "go", loadFixture(b, "ann", "hnsw.go"))
 }
 
 func BenchmarkChunker_TypeScript(b *testing.B) {
-	src := loadFixture(b, filepath.Join("..", "..", "..", "testdata", "repo", "widget.ts"))
-	benchChunk(b, "typescript", src)
+	benchChunk(b, "typescript", typescriptFixture(40))
 }
 
 func BenchmarkChunker_Python(b *testing.B) {
-	src := loadFixture(b, filepath.Join("..", "..", "..", "testdata", "repo", "auth.py"))
-	benchChunk(b, "python", src)
+	benchChunk(b, "python", loadFixture(b, "scripts", "encoder_model.py"))
 }

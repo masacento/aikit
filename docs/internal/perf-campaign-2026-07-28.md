@@ -60,7 +60,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
-| 1 | Revive the 3 dead benchmark files; add warm-up + alloc accounting + a concurrent-QPS mode to `bench/harness.go` | bench | unblocks everything | — | S |
+| ~~1~~ | ~~Revive the 3 dead benchmark files; add warm-up + alloc accounting + a concurrent-QPS mode~~ — **DONE** (§7.33) | bench | dead benches now FAIL rather than skip; QPS shows Flat at 22% of cores×serial | — | — |
 | ~~2~~ | ~~SPLADE: hoist `log1p` outside the L×V max-reduce~~ — **DONE** (§7.10); **measured 1.28–1.47×** on the pooling step (§7.12) | encoder | pooling is ~0.5% of `Expand`, so invisible end-to-end | **=** | — |
 | ~~3~~ | ~~`topk.Push`: hoist the threshold compare~~ — **DONE** (§7.8) | topk, ann | **1.05× end-to-end** on `Flat.Query` (the 1.43× was the selection step alone) | = | — |
 | ~~4~~ | ~~`FlatI8.Query`: pool the score buffer; stop allocating a `Workspace` per query~~ — **DONE, −99.2% B/op; −5.4% time at N=100k** (§7.26) | ann | estimated 10–25% time; the win is allocation | = | — |
@@ -1975,6 +1975,50 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     against a realistic ~400–500 achievable on this part, i.e. roughly 2× still
     in `dotFMA8`. Tier 3 has item 37 for that on **arm64** (outer-product FMLA)
     and nothing equivalent for amd64 — a gap in the doc worth naming.
+
+33. **Item 1 is DONE — the Phase-0 item, landed last.** Both halves.
+
+    **The three dead benchmark files are alive.** All three referenced `ken`
+    paths and `b.Skipf`'d, which is green — so `bm25.Tokenize` (the hottest
+    indexing function in the package), `bm25.TopK`, and BOTH chunkers had zero
+    live coverage while reporting success. The chunk fixtures were doubly wrong:
+    `../../../testdata/repo/…` resolves from `<root>/chunk/regex` to the
+    **parent of the repo root**, so it could not have matched in any checkout.
+
+    They now read in-repo files (`ann/hnsw.go`, `scripts/encoder_model.py`) and
+    **fail rather than skip** — these are files checked into this repository, so
+    absence means the benchmark is broken. TypeScript has no `.ts` file in the
+    repo, so that fixture is generated with real syntactic structure and
+    documented as synthetic; the regex and treesitter copies must stay
+    byte-identical for the cross-chunker comparison to mean anything.
+
+    The comparison that file's comment always promised, possible for the first
+    time:
+
+    | language | regex | treesitter | |
+    |---|--:|--:|--:|
+    | Go | 72.99 MB/s | 0.87 MB/s | **84×** |
+    | TypeScript | 18.47 MB/s | 1.14 MB/s | 16× |
+    | Python | 551.25 MB/s | 1.37 MB/s | **402×** |
+
+    Treesitter also allocates **12.5 MB per Go chunk call**. None of this was
+    observable while both benchmarks skipped; none of it is acted on here, but it
+    is now measurable, which is the point of the item.
+
+    **The harness gained the three things the item asked for**, each justified by
+    something this campaign got wrong without them:
+
+    - **Untimed warm-up** (8 queries). A cold first call — empty `sync.Pool`,
+      unmaterialised scratch arena, cold page cache — otherwise lands in the
+      latency distribution and moves p99 most.
+    - **Allocation accounting** (`AllocsPerQuery`, `BytesPerQuery`). Item 8
+      removed 12.7 MiB per call for **no** time change and item 4 cut allocation
+      99% for −5%; a latency-only harness cannot see either result.
+    - **Concurrent QPS.** Throughput is not `cores / Mean`: measured here, Flat's
+      serial p50 implies 41.7k q/s and 16 cores would suggest 667k, but the
+      concurrent pass measures **149.7k — 22%**. That gap is item 16's
+      memory-bandwidth ceiling, and the harness now shows it instead of leaving
+      it to be inferred.
 
 ---
 

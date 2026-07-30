@@ -11,8 +11,11 @@ package bench
 
 import (
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/townsendmerino/aikit/ann"
@@ -28,6 +31,25 @@ type Result struct {
 	P99, Mean float64 // ms
 	MemMB     float64 // index storage (HNSW includes the graph, via MarshalBinary)
 	QueriesA  int     // number of queries measured
+
+	// AllocsPerQuery and BytesPerQuery come from runtime.MemStats deltas across
+	// the measured loop (perf-campaign item 1). They are here because several
+	// campaign items moved allocation without moving latency — item 8 removed
+	// 12.7 MiB per GTE.Encode for no time change, item 4 cut FlatI8 query
+	// allocation 99% for −5% — and a harness that reports only latency cannot
+	// see either. Approximate by construction: MemStats is process-wide, so a
+	// concurrent GC or another goroutine perturbs it. Read them as a magnitude.
+	AllocsPerQuery float64
+	BytesPerQuery  float64
+
+	// QPS is throughput under CONCURRENT load: Concurrency goroutines issuing
+	// queries at once. It is a different question from 1/Mean — a
+	// bandwidth-bound scan saturates well before it runs out of cores (item 16
+	// measured Flat.Query plateauing at ~25 GB/s regardless of worker count), so
+	// serial latency systematically over-predicts throughput. Zero when the
+	// concurrent pass was not run.
+	QPS         float64
+	Concurrency int
 }
 
 // Run benchmarks Flat, HNSW, and FlatI8 over corpus (each vector L2-normalized,
@@ -65,7 +87,23 @@ func Run(corpus, queries [][]float32, k int, cfg ann.Config) []Result {
 	}
 }
 
+// warmupQueries is how many queries run untimed before measurement. The first
+// call through an index pays costs the steady state does not — a cold page
+// cache, a sync.Pool with nothing in it, a parser or scratch arena materialised
+// on first use — and folding those into the latency distribution moves p99 in
+// particular. Untimed warm-up is why the treesitter chunker benchmark measures
+// steady-state cAST cost rather than pool init (perf-campaign item 1).
+const warmupQueries = 8
+
 func measure(name string, query func([]float32, int) []ann.Hit, queries [][]float32, k int, truth []map[int]bool, n, d int, buildMs, memBytes float64) Result {
+	for i := range min(warmupQueries, len(queries)) {
+		_ = query(queries[i], k)
+	}
+
+	var msBefore, msAfter runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&msBefore)
+
 	lat := make([]float64, len(queries))
 	var recallSum float64
 	for i, q := range queries {
@@ -83,25 +121,77 @@ func measure(name string, query func([]float32, int) []ann.Hit, queries [][]floa
 			recallSum += float64(got) / float64(len(want))
 		}
 	}
+	runtime.ReadMemStats(&msAfter)
 	sort.Float64s(lat)
+
+	nq := float64(max(len(queries), 1))
+	conc := runtime.NumCPU()
 	return Result{
 		Name: name, N: n, Dim: d, K: k, BuildMs: buildMs,
-		Recall: recallSum / float64(max(len(queries), 1)),
+		Recall: recallSum / nq,
 		P50:    pct(lat, 50), P95: pct(lat, 95), P99: pct(lat, 99), Mean: meanOf(lat),
 		MemMB:    memBytes / 1e6,
 		QueriesA: len(queries),
+
+		AllocsPerQuery: float64(msAfter.Mallocs-msBefore.Mallocs) / nq,
+		BytesPerQuery:  float64(msAfter.TotalAlloc-msBefore.TotalAlloc) / nq,
+		QPS:            concurrentQPS(query, queries, k, conc),
+		Concurrency:    conc,
 	}
+}
+
+// concurrentQPS measures sustained throughput with `conc` goroutines issuing
+// queries at once, each taking the next index from a shared counter.
+//
+// This is the number a serving deployment actually cares about, and it is not
+// 1/Mean × cores: an index scan is bandwidth-bound long before it is core-bound,
+// so serial latency over-predicts throughput — measured, Flat.Query plateaus at
+// ~25 GB/s whether 4 cores or 16 are scanning (perf-campaign item 16). Reporting
+// both makes the gap visible instead of inferred.
+func concurrentQPS(query func([]float32, int) []ann.Hit, queries [][]float32, k, conc int) float64 {
+	if len(queries) == 0 || conc < 1 {
+		return 0
+	}
+	// Enough passes that the measured window is not dominated by goroutine
+	// start-up on a fast index.
+	const passes = 4
+	total := len(queries) * passes
+
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	t0 := time.Now()
+	for range conc {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= total {
+					return
+				}
+				_ = query(queries[i%len(queries)], k)
+			}
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(t0).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(total) / elapsed
 }
 
 // Table renders results as a GitHub-flavored Markdown table — paste-ready for a
 // README or a benchmark report.
 func Table(results []Result) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "| index | N | dim | recall@%d | build ms | p50 ms | p95 ms | p99 ms | mem MB |\n", results[0].K)
-	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+	fmt.Fprintf(&b, "| index | N | dim | recall@%d | build ms | p50 ms | p95 ms | p99 ms | mem MB | QPS×%d | allocs/q | B/q |\n",
+		results[0].K, results[0].Concurrency)
+	b.WriteString("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, r := range results {
-		fmt.Fprintf(&b, "| %s | %d | %d | %.4f | %.1f | %.3f | %.3f | %.3f | %.1f |\n",
-			r.Name, r.N, r.Dim, r.Recall, r.BuildMs, r.P50, r.P95, r.P99, r.MemMB)
+		fmt.Fprintf(&b, "| %s | %d | %d | %.4f | %.1f | %.3f | %.3f | %.3f | %.1f | %.0f | %.0f | %.0f |\n",
+			r.Name, r.N, r.Dim, r.Recall, r.BuildMs, r.P50, r.P95, r.P99, r.MemMB,
+			r.QPS, r.AllocsPerQuery, r.BytesPerQuery)
 	}
 	return b.String()
 }

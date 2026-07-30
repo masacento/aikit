@@ -7,19 +7,25 @@ import (
 	"testing"
 )
 
-// loadRealSource reads a real Go source file from this repo. The choice
-// is deliberate — ken's own internal/search/index.go is checked in,
-// non-trivial in size, exercises camelCase / snake_case / digit-bearing
-// identifiers, and would never be missing on a developer machine.
-// Skips if not found (so benchmarks don't fail in an unusual checkout).
+// loadRealSource reads a real Go source file from this repo — non-trivial in
+// size and full of camelCase / snake_case / digit-bearing identifiers, which is
+// what the tokenizer's split paths exist for.
+//
+// It used to point at `../search/index.go`, a leftover `ken` path. aikit has no
+// search/ directory, so every benchmark in this file SKIPPED, and skipping is
+// green: `bm25.Tokenize` — the hottest indexing function in the package — and
+// `bm25.TopK` had zero live benchmark coverage while looking fine
+// (perf-campaign item 1).
+//
+// It now FAILS rather than skips. The fixture is a file checked into this
+// repository; if it is missing, the benchmark is broken and should say so
+// instead of quietly reporting nothing.
 func loadRealSource(b *testing.B) string {
 	b.Helper()
-	// internal/bm25 → ../search/index.go from this file's CWD when go test
-	// runs (CWD = package dir, by Go test convention).
-	path := filepath.Join("..", "search", "index.go")
+	path := filepath.Join("..", "ann", "hnsw.go")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		b.Skipf("real source not found at %s: %v", path, err)
+		b.Fatalf("in-repo fixture %s is missing: %v", path, err)
 	}
 	return string(data)
 }

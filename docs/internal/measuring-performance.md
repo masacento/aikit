@@ -384,6 +384,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 28 · CrossEncoder batch API | "unlocks item 14 for rerank" | **7.56×**, but from parallelism not tokenization | ✅ (size) ❌ (cause) |
 | 9 · SpanCache eviction | "0% → max hit rate" | **0% → 10.9/45.0/88.6%**; the 0% was literal | ✅ |
 | 31 · QKV transpose | 3.3× on the transpose | **0.06%** of the forward — closed unimplemented | ❌ |
+| 1 · revive dead benchmarks | "unblocks everything" | 3 files revived; harness gained allocs + QPS | ✅ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -581,6 +582,23 @@ benchmark satisfies it — as a precondition, not an afterthought. Related to §
 had nothing to do. **Pair it with a control** that should NOT improve — a uniform
 batch here — because a control that stays flat is what distinguishes a real
 effect from a lucky configuration.
+
+---
+
+### 1.24 A skipping benchmark is a passing benchmark
+
+Three benchmark files in this repo pointed at paths that do not exist — leftover
+`ken` locations, one of which (`../../../testdata/repo/…`) resolved to the
+*parent of the repo root* and so could never have matched in any checkout. Each
+called `b.Skipf`. `go test ./...` was green throughout, and `bm25.Tokenize` — the
+hottest indexing function in that package — had **no live benchmark coverage at
+all** for as long as those files had been checked in.
+
+**Guard:** a fixture checked into the repository is not an environment
+condition. `b.Skipf` is for "this machine lacks a 4 GB checkpoint"; for
+"this file is in git", use `b.Fatalf`, so a broken path fails loudly instead of
+reporting success by omission. And periodically run `go test -bench . ./... 2>&1
+| grep -c SKIP` — a skip you did not intend is a measurement you are not taking.
 
 ---
 
