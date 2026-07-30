@@ -662,10 +662,28 @@ These came out of the refutation pass and aren't in the tables above:
   conflict-free by construction. (Item 24.)
 - ~~**`gte.go:209`** builds `newRopeTable(L, headDim, RopeTheta)` per `Encode`~~ —
   **DONE** with item 8 (§7.13); `GTE` now holds a `ropeCache` that grows to the
-  longest sequence seen and returns bit-identical views for shorter ones. The
-  five Nomic/`forward*.go` sites still rebuild per call and were left alone —
-  their shapes (L≤512, headDim 64) are where `newRopeTable`'s "cheap" comment is
-  actually true, and changing them needs its own measurement.
+  longest sequence seen and returns bit-identical views for shorter ones. ~~The
+  five Nomic/`forward*.go` sites still rebuild per call and were left alone~~ —
+  **now also DONE** (memoization audit §2, b001891): the same `ropeCache` moved
+  onto `Weights`/`WeightsQ8` and the five remaining forwards (`forward.go`,
+  `forward_q8.go` ×2, `forward_tokens.go`, `forward_batch.go`) draw views from it
+  instead of rebuilding. Bit-identical (the prefix-identity test), `-race`-clean —
+  the "changing them needs its own measurement" caveat is discharged.
+- ~~**`wordPiece` recomputes greedy-match per token**~~ — **DONE** (memoization
+  audit §1, 6b69133): a sharded-RWMutex memo on the `Tokenizer` keys ids by word.
+  Measured **4.59×** cold→memo on the real minilm vocab (96.8% repeat rate),
+  byte-identical, concurrent-parity + `-race` gated. Not previously a campaign
+  item — the audit's headline win. See
+  [`task-perf-memoization.md`](task-perf-memoization.md) §1.
+
+  > **Memoization audit — remaining items** ([`task-perf-memoization.md`](task-perf-memoization.md) §7):
+  > §1b `bm25` interning already shipped as **item 30** (983→2 allocs); §4
+  > `bm25` scoring constants fold into **items 10 (`invAvgdl` hoist) + 29 (posting
+  > struct)** — both DONE, the remaining precomputed-impact change stays there
+  > since it mutates the posting; §5 `StaticModel` presum is **conditional**
+  > (only if profiling still points there *and* the f64 reassociation is
+  > bit-exact). §3 (Q8 dequant is a caching *trap* — real fix is fusion, **item
+  > 22**) and §6 (the "doesn't help" list) are documentation-only, not doing.
 - **`bm25/query.go:58-59`** divides by the loop-invariant `ix.avgdl` per posting;
   hoisting `invAvgdl` halves the divisions from two to one before you even get to
   precomputed impacts.
