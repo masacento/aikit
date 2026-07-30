@@ -116,7 +116,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 |---|---|---|---|---|---|
 | 35 | AVX2/VNNI int8: the unsigned-offset correction is **free here** because weights are static | linalg | 1.3–1.8× on VNNI boxes | = | M |
 | 36 | arm64 **i8mm (SMMLA)** — 2× int8, but **only for prefill/batch, and your M1 Pro can't run it** | linalg | ≤2× prefill on M2+/Graviton3+ | = | M–L |
-| 37 | Outer-product f32 microkernel via by-element `FMLA` (raw `WORD` encoding verified) — 4.0 FMLA/load vs today's 1.6 | linalg | up to ~1.45× arm64 f32 | **≠** | L |
+| ~~37~~ | ~~Outer-product f32 microkernel via by-element `FMLA` — 4.0 FMLA/load vs today's 1.6~~ — **BUILT + MEASURED ON M1 PRO, NOT WORTH IT** (§6): raw kernel only **1.10×** (not 1.45×) because `dotNEON2x8` is already **~95% of FMLA peak** here — compute-bound, not load-bound as on amd64 — and the mandatory transpose-pack of both operands made the full path **4× slower**. Reverted. | linalg | prediction was amd64-shaped; §1.11 | **≠** | L |
 | 38 | Binary/Hamming prefilter + exact rerank (composes with `embed.Truncate`) | ann | ~10× first stage | ≠ (recall) | L |
 | 39 | WAND / block-max WAND / MaxScore dynamic pruning | bm25, sparse | 2–10× **on top of** item 11 | = | L |
 | 40 | Flash-attention / online-softmax tiling | encoder, vision | 1.05–1.15× alone; 67 MB → 1 MB scratch | ≠ | L |
@@ -754,6 +754,19 @@ These came out of the refutation pass and aren't in the tables above:
   recall for a fraction of the scan — which is what HNSW already does here; PQ's
   win is memory, and int8 already took the easy 4×. Binary+rerank (item 38) is the
   one worth measuring, and only after item 12 tells you how much gap is left.
+- **Item 37 — outer-product f32 microkernel (arm64) — built, measured, reverted.**
+  The premise (`dotNEON2x8`'s 1.6 FMLA/load leaves ~2× in the microkernel) is
+  amd64-shaped and does not transfer. Built the full path — transpose-pack both
+  operands into K×8 panels + an 8×8 by-element-`FMLA` tile (raw-`WORD`-encoded,
+  bit-gated vs a scalar oracle within ULPs, mutation-checked) — and measured on the
+  M1 Pro: the **raw kernel is only 1.10×** (46.1 vs 41.7 GMAC/s), because
+  `dotNEON2x8` already runs at **~95% of single-core FMLA peak (~51 GMAC/s)** here —
+  it is *compute*-bound, so cutting loads 10→4 buys almost nothing. On amd64
+  `dotFMA8` sits at ~40% of peak (load/latency-bound), which is where the ~2× lived;
+  §1.11. And the outer product's mandatory transpose-pack of *both* a and b (the dot
+  kernel packs neither a, and b cheaply) made the full serial path **~4× slower**.
+  Net: correct but pointless on this µarch — and it is `≠` (a different f32 order),
+  so it would perturb every encoder golden for a loss. **Reverted.**
 - **AVX-512 for f32:** your deprioritization still holds, but for a *different*
   reason than the doc gives. The modern blocker isn't downclocking (Zen 4/5 have
   none) — it's that Intel client parts ship AVX-512 fused off, so the f32 win only

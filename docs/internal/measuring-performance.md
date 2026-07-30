@@ -352,6 +352,8 @@ the *axis* itself was wrong on the 3700X.
 | scalar int8→f32 widen | **0.34 ns/elem** (5× faster than amd64's 1.7) | item 22b |
 | NEON int8→f32 widen (`dequant_i8_arm64.s`) | **0.098 ns/elem** (3.43× over scalar) | item 22b |
 | `GTE.Encode` L512 profile | **`dotNEON2x8` 52%**, `memmove` 17%, `packedFill` 20% | 2026-07-30 |
+| `dotNEON2x8` f32 GEMM kernel | **~42 GMAC/s ≈ 95% of single-core FMLA peak** (compute-bound) | item 37 |
+| outer-product 8×8 kernel (item 37) | 46 GMAC/s = **1.10×** raw; 4× slower with packing → reverted | item 37 |
 | cols-first matmul axis | **correct here too** (not just amd64) | 2026-07-30 |
 | cols→rows crossover, GTE end-to-end | **M ≈ 80–96** (rows wins from L96) | BenchmarkGTEAxisProbe |
 | forced-rows penalty at small M | up to **+178%** (L32: row split → 1 worker = serial) | " |
@@ -390,6 +392,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 13 · …on SigLIP | up to 2× | 1.24× geomean (1.44× at 576 patches) | ❌ |
 | 22 · q8 weight widen | ~113 ms/fwd, L-independent | ~190 ms/fwd, L-independent | ✅ |
 | 22b · arm64 NEON widen | 6–8× kernel | 3.43× (arm64 scalar already 5× amd64's) | ❌ |
+| 37 · outer-product kernel (arm64) | ~1.45× (2× in the µkernel, amd64) | 1.10× raw / net-negative (dot2x8 at 95% peak) | ❌ |
 | 18 · Qwen ViT arena | ~15 GB/image, ~1.5 s memset | −70/−85% B/op; **~3%** of latency | ⚠️ |
 | 27 · 4-MFLOP naive threshold | 3–9% for L<250 | **up to −50.5%** | ❌ (under) |
 | 24 · packed-stride aliasing | "free" | unreachable on amd64; reverted | — |
