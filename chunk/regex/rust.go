@@ -43,4 +43,4 @@ func rustRules() LanguageRules {
 	}
 }
 
-func init() { languageRules["rust"] = rustRules() }
+func init() { register("rust", rustRules()) }

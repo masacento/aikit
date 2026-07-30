@@ -20,7 +20,9 @@ package regex
 import (
 	"bytes"
 	"regexp"
+	"regexp/syntax"
 	"sort"
+	"unicode/utf8"
 
 	"github.com/townsendmerino/aikit/chunk"
 )
@@ -52,6 +54,96 @@ type LanguageRules struct {
 	strat    strategy
 	maxDepth int        // brace strategy: a def is a boundary iff depthBefore ≤ maxDepth
 	scan     scannerCfg // brace strategy only
+
+	// Literal prefixes for the three rule sets above, one per regexp, filled by
+	// register. An empty entry means "no prescreen available, run the regexp".
+	defsPre, skipPre, attachPre [][]byte
+}
+
+// register installs a language's rules, precomputing the literal prefix of every
+// pattern (lens doc §3.2).
+//
+// WHY THIS IS SOUND. Every pattern here is ^-anchored — asserted below, because
+// the argument depends on it. Anchored means a match must begin at byte 0, so
+// "the match begins with p" and "the line begins with p" are the same statement,
+// and a line lacking the prefix provably cannot match. The prescreen therefore
+// changes which lines reach the regexp engine, never which lines match.
+//
+// WHY IT IS WORTH IT. regexp.Match is a sync.Pool round-trip plus inputs.init,
+// bitState.reset and onepass/backtrack dispatch before it looks at a single
+// byte. For `^func\b` — a pattern whose entire meaning is "does this line start
+// with func" — that is essentially all overhead: 219.3 ns/line for Go's four
+// definition patterns against 22.8 ns for the byte-prefix equivalent.
+func register(lang string, r LanguageRules) {
+	pre := func(res []*regexp.Regexp) [][]byte {
+		out := make([][]byte, len(res))
+		for i, re := range res {
+			out[i] = anchoredLiteralPrefix(re.String())
+		}
+		return out
+	}
+	r.defsPre, r.skipPre, r.attachPre = pre(r.defs), pre(r.skip), pre(r.attach)
+	languageRules[lang] = r
+}
+
+// anchoredLiteralPrefix returns the literal bytes that must begin any match of
+// pattern, or nil if there are none to be had.
+//
+// NOT regexp.LiteralPrefix, which was the obvious thing to reach for and does
+// not work here: it reads the COMPILED program's extracted prefix, and a `\b` or
+// `\s` immediately after the literal blocks that extraction. It returns "" for
+// `^func\b` and for `^class\s+\w+` — i.e. for almost every rule in this package,
+// including all four of Go's definition patterns. Only the pure-literal comment
+// rules (`^//`, `^/\*`) got a prefix from it.
+//
+// The syntax tree has what the compiled program lost. syntax.Parse(`^func\b`)
+// simplifies to a concatenation of \A, the literal "func", and a word boundary,
+// so walking the leading literals of that concatenation gives "func" directly.
+//
+// It bails to nil rather than guessing whenever the argument would not hold:
+//
+//   - no leading \A (an unanchored pattern would need a substring prescreen, and
+//     more importantly would mean the rule style changed — hence the panic);
+//   - a case-folded literal, where a byte compare is not the same test;
+//   - a non-ASCII rune, so the prefix stays a plain byte comparison;
+//   - anything that is not a literal in leading position — an optional group
+//     (TypeScript's `^(export\s+)?…`), a character class, an alternation. Those
+//     get no prescreen and run exactly as before. Bounding them needs a
+//     first-byte SET rather than a prefix, which is left undone.
+func anchoredLiteralPrefix(pattern string) []byte {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil // already compiled by the caller, so unreachable
+	}
+	re = re.Simplify()
+	subs := []*syntax.Regexp{re}
+	if re.Op == syntax.OpConcat {
+		subs = re.Sub
+	}
+	if len(subs) == 0 || subs[0].Op != syntax.OpBeginText {
+		panic("chunk/regex: pattern " + pattern + " is not ^-anchored; " +
+			"the literal-prefix prescreen assumes anchoring")
+	}
+	var out []byte
+	for _, sub := range subs[1:] {
+		if sub.Op != syntax.OpLiteral || sub.Flags&syntax.FoldCase != 0 {
+			break
+		}
+		ascii := true
+		for _, r := range sub.Rune {
+			if r >= utf8.RuneSelf {
+				ascii = false
+				break
+			}
+		}
+		if !ascii {
+			break
+		}
+		for _, r := range sub.Rune {
+			out = append(out, byte(r))
+		}
+	}
+	return out
 }
 
 // languageRules is populated by each per-language file's init().
@@ -135,7 +227,7 @@ func chunkWith(r LanguageRules, src []byte, chunkSize int) []chunk.Chunk {
 			}
 			probe = bytes.TrimLeft(line, " \t")
 		}
-		if !anyMatch(r.defs, probe) || anyMatch(r.skip, probe) {
+		if !anyMatch(r.defs, r.defsPre, probe) || anyMatch(r.skip, r.skipPre, probe) {
 			continue
 		}
 		// Snap the boundary up over a contiguous attach block (so a
@@ -199,8 +291,14 @@ func chunkWith(r LanguageRules, src []byte, chunkSize int) []chunk.Chunk {
 	return out
 }
 
-func anyMatch(res []*regexp.Regexp, line []byte) bool {
-	for _, re := range res {
+// anyMatch reports whether line matches any of res, skipping the regexp engine
+// for patterns whose literal prefix the line does not start with. See register
+// for why that is exact rather than a heuristic.
+func anyMatch(res []*regexp.Regexp, pre [][]byte, line []byte) bool {
+	for i, re := range res {
+		if p := pre[i]; len(p) > 0 && !bytes.HasPrefix(line, p) {
+			continue
+		}
 		if re.Match(line) {
 			return true
 		}
@@ -218,7 +316,7 @@ func attachMatch(r LanguageRules, line []byte) bool {
 	if len(bytes.TrimSpace(probe)) == 0 {
 		return false
 	}
-	return anyMatch(r.attach, probe)
+	return anyMatch(r.attach, r.attachPre, probe)
 }
 
 // scanDepth returns the brace depth at the START of each line, ignoring
@@ -246,32 +344,62 @@ func scanDepth(src []byte, lineStart []int, cfg scannerCfg) []int {
 	rawHashes := 0
 	cmtMark := cfg.lineComment
 
-	atLineStart := func(pos int) {
-		// `<=`, not `==`: a state handler can advance i past a byte (an escape
-		// `\<c>` in a string, `*/`, `"""`, …). If the skipped byte is a line
-		// start, `== pos` would never match it, nextLineIdx would stall, and every
-		// subsequent line's depth would be frozen at 0 for the rest of the file
-		// (e.g. a `\` followed by a newline — a legal JS/Rust line continuation).
-		// `<=` records any jumped-over line starts at the current depth.
+	// nextPos is lineStart[nextLineIdx] hoisted into a scalar, or a sentinel past
+	// the end of the input once the line starts are exhausted. It replaces a
+	// closure called once per BYTE of every indexed file whose body — a
+	// bounds-checked slice load and a compare — was false ~97% of the time
+	// (lens doc §3.1: scanDepth.func1 was 8.1% flat of chunkWith). The loop below
+	// now touches `depth` only at an actual line start.
+	nextPos := len(src) + 1
+	if n > 0 {
+		nextPos = lineStart[0]
+	}
+	// recordLineStarts is the `<=`, not `==`, rule, unchanged: a state handler can
+	// advance i past a byte (an escape `\<c>` in a string, `*/`, `"""`, …). If the
+	// skipped byte is a line start, `== pos` would never match it, nextLineIdx
+	// would stall, and every subsequent line's depth would be frozen at 0 for the
+	// rest of the file (e.g. a `\` followed by a newline — a legal JS/Rust line
+	// continuation). `<=` records any jumped-over line starts at the current depth.
+	recordLineStarts := func(pos int) {
 		for nextLineIdx < n && lineStart[nextLineIdx] <= pos {
 			depth[nextLineIdx] = cur
 			nextLineIdx++
 		}
+		if nextLineIdx < n {
+			nextPos = lineStart[nextLineIdx]
+		} else {
+			nextPos = len(src) + 1
+		}
+	}
+
+	// cmt0 is cmtMark's first byte, so the hasPrefixAt below can be gated on a
+	// byte compare. cmtMark is a string VARIABLE, so `string(src[i:i+len(s)]) == s`
+	// cannot be specialized into byte compares — it lowers to a runtime.memequal
+	// CALL, made once per byte of source in the normal state (lens doc §3.1:
+	// memeqbody 13.7% flat, hasPrefixAt 24.2% cumulative). Gating on the first
+	// byte skips the call for the ~99% of bytes that cannot possibly start the
+	// mark, and cannot change the outcome: hasPrefixAt(src, i, s) already requires
+	// src[i] == s[0].
+	var cmt0 byte
+	if cmtMark != "" {
+		cmt0 = cmtMark[0]
 	}
 
 	for i := 0; i < len(src); i++ {
-		atLineStart(i)
+		if i >= nextPos {
+			recordLineStarts(i)
+		}
 		c := src[i]
 		switch state {
 		case normal:
 			switch {
-			case cmtMark != "" && hasPrefixAt(src, i, cmtMark):
+			case c == cmt0 && cmtMark != "" && hasPrefixAt(src, i, cmtMark):
 				state = lineCmt
 				i += len(cmtMark) - 1
-			case hasPrefixAt(src, i, "/*"):
+			case c == '/' && hasPrefixAt(src, i, "/*"):
 				state = blockCmt
 				i++
-			case cfg.tripleQuote && hasPrefixAt(src, i, `"""`):
+			case c == '"' && cfg.tripleQuote && hasPrefixAt(src, i, `"""`):
 				state = inTriple
 				i += 2
 			case cfg.rustRaw && c == 'r' && (peek(src, i+1) == '"' || peek(src, i+1) == '#'):
@@ -325,7 +453,7 @@ func scanDepth(src []byte, lineStart []int, cfg scannerCfg) []int {
 				state = normal
 			}
 		case inTriple:
-			if hasPrefixAt(src, i, `"""`) {
+			if c == '"' && hasPrefixAt(src, i, `"""`) {
 				state = normal
 				i += 2
 			}
@@ -344,7 +472,7 @@ func scanDepth(src []byte, lineStart []int, cfg scannerCfg) []int {
 			}
 		}
 	}
-	atLineStart(len(src))
+	recordLineStarts(len(src))
 	return depth
 }
 

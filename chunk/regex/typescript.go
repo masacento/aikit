@@ -46,4 +46,4 @@ func typescriptRules() LanguageRules {
 	}
 }
 
-func init() { languageRules["typescript"] = typescriptRules() }
+func init() { register("typescript", typescriptRules()) }

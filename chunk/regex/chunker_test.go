@@ -1,8 +1,13 @@
 package regex
 
 import (
+	"bytes"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -108,4 +113,187 @@ func TestAttachBlockAtLine0(t *testing.T) {
 	if !strings.Contains(cs[0].Text, "def alpha") {
 		t.Errorf("first chunk lost its definition — the line-0 attach block split it off:\n%q", cs[0].Text)
 	}
+}
+
+// TestPrescreen_neverHidesAMatch is the gate for the literal-prefix prescreen
+// (lens doc §3.2). The claim is EXACT, not heuristic: a line the prescreen
+// rejects provably cannot match, so the chunker's output is unchanged.
+//
+// It is checked the strong way — for every rule of every registered language,
+// against every line of every language fixture in the package, assert that
+// skipping the regexp is only ever done when the regexp would have said no.
+// Testing it on same-language lines only would miss the case that matters, a
+// rule fed a line it was not written for.
+func TestPrescreen_neverHidesAMatch(t *testing.T) {
+	var lines [][]byte
+	for _, src := range allFixtureSources(t) {
+		for _, l := range bytes.Split(src, []byte("\n")) {
+			lines = append(lines, l, bytes.TrimLeft(l, " \t"))
+		}
+	}
+	if len(lines) < 20_000 {
+		t.Fatalf("only %d probe lines; the probe set is too small to be a gate", len(lines))
+	}
+
+	checked, screened := 0, 0
+	for lang, r := range languageRules {
+		sets := []struct {
+			name string
+			res  []*regexp.Regexp
+			pre  [][]byte
+		}{
+			{"defs", r.defs, r.defsPre},
+			{"skip", r.skip, r.skipPre},
+			{"attach", r.attach, r.attachPre},
+		}
+		for _, set := range sets {
+			if len(set.pre) != len(set.res) {
+				t.Fatalf("%s/%s: %d prefixes for %d patterns", lang, set.name, len(set.pre), len(set.res))
+			}
+			for i, re := range set.res {
+				p := set.pre[i]
+				for _, line := range lines {
+					checked++
+					if len(p) == 0 || bytes.HasPrefix(line, p) {
+						continue // reaches the regexp either way
+					}
+					screened++
+					if re.Match(line) {
+						t.Fatalf("%s/%s[%d] %q: prescreen %q rejected a line the pattern MATCHES: %q",
+							lang, set.name, i, re.String(), p, line)
+					}
+				}
+			}
+		}
+	}
+	if screened == 0 {
+		t.Fatal("the prescreen never fired — this test proves nothing")
+	}
+	t.Logf("%d (pattern, line) pairs checked; the prescreen skipped the regexp for %d (%.1f%%)",
+		checked, screened, 100*float64(screened)/float64(checked))
+}
+
+// TestPrescreen_prefixesAreWhatWeThink pins the prefixes themselves. If a rule
+// is reworded and its literal prefix silently becomes empty, the prescreen stops
+// firing for it and nothing else notices — the output stays correct and the
+// speed quietly goes away.
+func TestPrescreen_prefixesAreWhatWeThink(t *testing.T) {
+	got := map[string]int{}
+	for lang, r := range languageRules {
+		for _, pre := range [][][]byte{r.defsPre, r.skipPre, r.attachPre} {
+			for _, p := range pre {
+				if len(p) > 0 {
+					got[lang]++
+				}
+			}
+		}
+	}
+	// Measured at the time of the change; a drop means a rule lost its prefix.
+	// Measured at the time of the change. These are floors, not targets: a drop
+	// means a rule was reworded into a shape whose prefix cannot be extracted.
+	want := map[string]int{"go": 7, "java": 5, "python": 3, "rust": 8, "typescript": 6}
+	for lang, n := range want {
+		if got[lang] < n {
+			t.Errorf("%s: %d patterns have a literal prefix, want at least %d — a rule lost its prefix and its prescreen",
+				lang, got[lang], n)
+		}
+	}
+	t.Logf("patterns with a usable prefix, by language: %v", got)
+}
+
+// allFixtureSources returns probe text for the prescreen gate: the package's
+// per-language fixtures plus every .go file in the repository.
+//
+// The repository is included because the fixtures are a few hundred lines
+// between them, which is not enough to be a gate — a prescreen bug that fires on
+// one line in ten thousand would pass on them. Real source also supplies the
+// shapes nobody writes into a fixture: continuation lines, generics, struct
+// tags, strings containing keywords.
+func allFixtureSources(t *testing.T) [][]byte {
+	t.Helper()
+	out := [][]byte{}
+	for _, s := range []string{goSrc, tsSrc, pySrc, rustSrc, javaSrc} {
+		out = append(out, []byte(s))
+	}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case "benchmarks", "testdata", ".git", ".venv":
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(p, ".go") {
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		out = append(out, b)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestAnchoredLiteralPrefix covers the extraction directly, including the guards
+// that no rule in this package currently exercises.
+//
+// Those guards would otherwise be untested code: a mutation removing the
+// case-folding check survives the corpus-wide soundness gate, because no rule
+// today uses (?i). They are cheap to state and the next rule someone adds may
+// need them.
+func TestAnchoredLiteralPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		pattern string
+		want    string
+		why     string
+	}{
+		{`^func\b`, "func", "a word boundary after the literal must not block extraction — regexp.LiteralPrefix returns \"\" here"},
+		{`^class\s+\w+`, "class", "nor must a following character class"},
+		{`^//`, "//", "pure literal"},
+		{`^/\*`, "/*", "escaped metacharacter is still a literal"},
+		{`^type\b`, "type", ""},
+		{`^(export\s+)?class\s+\w+`, "", "an OPTIONAL leading group means no literal is required"},
+		{`^(if|for|while)\b`, "", "an alternation has no single literal prefix"},
+		{`^[A-Za-z_]\w*`, "", "a character class is not a literal"},
+		{`^(?i)func\b`, "", "case-folded: a byte compare is not the same test"},
+		{`^日本\b`, "", "non-ASCII: kept out so the prefix stays a byte comparison"},
+		{`^`, "", "anchor alone"},
+	} {
+		got := string(anchoredLiteralPrefix(tc.pattern))
+		if got != tc.want {
+			t.Errorf("anchoredLiteralPrefix(%q) = %q, want %q — %s", tc.pattern, got, tc.want, tc.why)
+		}
+		// Whatever it returns must be sound: a match has to start with it.
+		if got != "" {
+			re := regexp.MustCompile(tc.pattern)
+			if loc := re.FindStringIndex(got + "zzz"); loc != nil && loc[0] != 0 {
+				t.Errorf("%q: prefix %q does not begin the match", tc.pattern, got)
+			}
+		}
+	}
+}
+
+// TestAnchoredLiteralPrefix_rejectsUnanchored checks the panic. The prescreen's
+// entire soundness argument is anchoring, so an unanchored rule must stop
+// registration loudly rather than silently get no prescreen — the latter reads
+// as "this rule is just slow" forever.
+func TestAnchoredLiteralPrefix_rejectsUnanchored(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("an unanchored pattern was accepted; the prescreen assumes anchoring")
+		}
+	}()
+	anchoredLiteralPrefix(`func\b`)
 }

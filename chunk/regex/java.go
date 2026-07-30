@@ -39,4 +39,4 @@ func javaRules() LanguageRules {
 	}
 }
 
-func init() { languageRules["java"] = javaRules() }
+func init() { register("java", javaRules()) }

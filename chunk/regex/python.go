@@ -36,4 +36,4 @@ func pythonRules() LanguageRules {
 	}
 }
 
-func init() { languageRules["python"] = pythonRules() }
+func init() { register("python", pythonRules()) }

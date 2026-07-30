@@ -79,6 +79,14 @@ it.
   nothing to skip, every document is a genuine candidate) and a query of three
   rare terms (+11.2% of a 1 µs query, fixed setup cost).
 
+- **The `regex` chunker is 1.68× faster on Go source, 1.76× on a repository
+  index run** (lens scan §3.1 + §3.2). Two changes: `scanDepth`'s per-byte
+  closure became a scalar compare and its `hasPrefixAt` calls are gated on a
+  first-byte test, and definition/skip/attach patterns are prescreened by the
+  literal prefix a match must begin with, skipping the regexp engine for lines
+  that cannot match. Chunk output is unchanged; the prescreen is gated over 5.9 M
+  (pattern, line) pairs across every rule and every `.go` file in the repository.
+
 - **`bm25.Build` is 1.27–1.30× faster** (lens scan §3.7): one map from term to a
   `[]termEntry` index, where there were three (postings, document frequency, and
   the WAND bound's extrema). `m[k] = append(m[k], v)` is a mapaccess plus a

@@ -339,7 +339,57 @@ Allocation note: the W1 stage's bytes rose 2.8% (the `entries` slice), against a
 
 ---
 
-## 7 · Step 0 status
+## 7 · The chunker — 1.76×, the other item A1 promoted
+
+[`task-perf-lens-scans.md`](task-perf-lens-scans.md) §3.1 + §3.2, taken because
+A1 left `chunk.ChunkFile` at 18.7% of a batched index run.
+
+| | before | after | |
+|---|---:|---:|---:|
+| `Chunker_Go` | 510.8 µs | 304.1 µs | **1.68×** |
+| `Chunker_TypeScript` | 1.252 ms | 1.098 ms | 1.14× |
+| `Chunker_Python` | 17.82 µs | 16.01 µs | 1.11× |
+| **`W1/chunk`** | **20.87 ms** | **11.84 ms** | **1.76×** |
+
+Predicted 1.62× combined; measured 1.76× without the presized `lineStart` the
+lens doc also suggested.
+
+**§3.1, `scanDepth`.** The per-byte closure became a scalar compare against the
+next line start, and each `hasPrefixAt` is gated on its first byte. `cmtMark` is
+a string *variable*, so `string(src[i:i+len(s)]) == s` cannot be specialized into
+byte compares — it lowers to a `runtime.memequal` CALL, made once per byte of
+source. Gating cannot change the outcome, since `hasPrefixAt` already requires
+`src[i] == s[0]`.
+
+**§3.2, the literal-prefix prescreen — and the lens doc is wrong about how.**
+It says to use `regexp.LiteralPrefix()` and lists `^func\b`→`func`. It does not:
+`LiteralPrefix` reads the *compiled program's* extracted prefix, and a following
+`\b` or `\s` blocks that extraction. Measured, it returns `""` for `^func\b`,
+for `^class\s+\w+`, and for **all four of Go's definition patterns** — only the
+pure-literal comment rules got anything, 3 of 7 for Go.
+
+The syntax tree has what the compiled program lost: `syntax.Parse("^func\b")`
+simplifies to a concatenation of `\A`, the literal `func`, and a word boundary,
+so walking its leading literals gives `func` directly. That lifts coverage from
+3/4/1/6/4 patterns (go/java/python/rust/typescript) to **7/5/3/8/6**.
+
+Soundness is by anchoring: every pattern here starts with `^`, asserted at
+registration with a panic, so "the match begins with p" and "the line begins
+with p" are the same statement. Gated over **5.9 M (pattern, line) pairs** —
+every rule of every language against every line of the package fixtures *and*
+every `.go` file in the repository, checking that a rejected line never matches.
+The prescreen fires on 55.8% of pairs. A mutant that descends into an optional
+group dies; the case-folding guard needed its own unit test, since no rule today
+uses `(?i)` and the corpus-wide gate cannot see it.
+
+TypeScript gains least because its patterns lead with `(export\s+)?`, an optional
+group, which admits no literal prefix at all. Bounding those needs a first-byte
+SET computed from the syntax tree rather than a prefix — left undone, and the
+reason TypeScript is 1.14× where Go is 1.68×.
+
+---
+
+## 8 · Step 0 status
 
 | | state |
 |---|---|

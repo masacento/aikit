@@ -33,4 +33,4 @@ func golangRules() LanguageRules {
 	}
 }
 
-func init() { languageRules["go"] = golangRules() }
+func init() { register("go", golangRules()) }
