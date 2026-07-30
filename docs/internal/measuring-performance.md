@@ -382,6 +382,8 @@ been consistently right; magnitudes consistently optimistic.**
 | 17 · HNSW build batching | 1.5–2.5× build | 1.34×; allocs 225 → **89**/insert | ❌ (time) ✅ (allocs) |
 | 14 · length-bucketed batch | 1.3–2× ragged | **1.15×** ragged, neutral uniform | ❌ |
 | 28 · CrossEncoder batch API | "unlocks item 14 for rerank" | **7.56×**, but from parallelism not tokenization | ✅ (size) ❌ (cause) |
+| 9 · SpanCache eviction | "0% → max hit rate" | **0% → 10.9/45.0/88.6%**; the 0% was literal | ✅ |
+| 31 · QKV transpose | 3.3× on the transpose | **0.06%** of the forward — closed unimplemented | ❌ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the

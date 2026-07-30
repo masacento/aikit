@@ -103,14 +103,15 @@ func TestBuildUnpinsSources(t *testing.T) {
 	// H0: Index + corpus (docs + source texts) all live.
 	h0 := readHeap()
 	// Drop everything a caller would drop after Build; keep only the Index.
+	// Clearing the ELEMENTS is what releases the strings — nilling the slice
+	// variables themselves would be ineffectual (Go's liveness analysis already
+	// treats them as dead past their last use, and staticcheck says so).
 	for i := range docs {
 		docs[i] = nil
 	}
-	docs = nil
 	for i := range texts {
 		texts[i] = ""
 	}
-	texts = nil
 	// H1: Index only. The corpus must be gone — the Index must not pin it.
 	h1 := readHeap()
 	runtime.KeepAlive(ix)

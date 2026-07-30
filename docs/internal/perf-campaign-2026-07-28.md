@@ -68,7 +68,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~6~~ | ~~BERT/GTE forwards never call `enterForward()`~~ — **DONE** (§7.12) | encoder | removes oversubscription | — | — |
 | ~~7~~ | ~~SPLADE vocab matmul runs **serial**~~ — **DONE, 1.05–1.19× on `Expand`** (§7.12); needed a trunk column fan-out too, since the trunk is NOT parallel at short L | encoder | 2.3× was optimistic | = | — |
 | ~~8~~ | ~~`gte.go:230` allocates 12.6 MB/`Encode` outside the scratch arena~~ — **DONE, −12.7 MiB/call (−43%)** (§7.13) | encoder | exactly as estimated; **no latency change** | = | — |
-| 9 | `SpanCache` LRU → MRU/scan-resistant; add `MADV_WILLNEED` on map; pipeline `Touch(b+1)` | mmap | 0% → max hit rate | — | S |
+| ~~9~~ | ~~`SpanCache` LRU → MRU/scan-resistant~~ — **DONE, 0% → 10.9/45.0/88.6%** (§7.31); `Touch(b+1)` pipelining is a caller change and remains open | mmap | the "0%" was literal, even at 98% of the working set resident | — | — |
 | ~~10~~ | ~~`bm25`: hoist `1/avgdl`; precompute per-posting impact~~ — **DONE (K1/B-safe half), bit-identical** (§7.24) | bm25 | scoring did NOT move: item 11 had already taken the scan off the critical path | = | — |
 | ~~40~~ | ~~**(NEW)** intra-op matmul fans across ROWS, replicating the weights per worker~~ — **DONE, −3.9% geomean / −15.8% on `SPLADE.Expand` L=91** (§7.14) | encoder | columns beat rows at every trunk shape, up to 3.33× | = | — |
 | ~~41~~ | ~~**(NEW)** `matmulBTInto`'s 4 MFLOP naive/blocked split is not reduction-order-consistent~~ — **DONE with item 27** (§7.20) | encoder | also removes the last batch-vs-single divergence | — | — |
@@ -97,7 +97,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
 | ~~22~~ | ~~Q8 encoder path re-widens the whole int8 weight matrix to f32 **per matmul**~~ — **DONE via fix (a), −58.2% at short input** (§7.18); fix (b) (fuse into `packedFill`) still open | encoder | cost model exactly right; ~190 ms/forward measured | = | — |
-| 23 | `packedFill` lost `blockedFill`'s m-blocking; a-panel re-read per 8-column group | linalg | plausibly large at prefill | = | M |
+| 23 | `packedFill` lost `blockedFill`'s m-blocking; a-panel re-read per 8-column group | linalg | **arm64-only** — `packedFill` is gated on `has2x8Kernel` (§7.32), like item 24 | = | gate on evidence |
 | 24 | `matmul_blocked.go` packed stride is a 4096 B power-of-two | linalg | **UNREACHABLE on amd64** — `packedFill` is arm64-only (§7.21); needs an arm64 box, and the proposed `+4` pad is too small to work | = | gate on evidence |
 | 25 | arm64 `Dot2x8` has the wrong MR×NR: 4×4 needs 8 loads per 16 FMLAs vs today's 10 | linalg | 1.1–1.25× arm64 f32 GEMM | **=** | S–M |
 | 26 | `math.Round` is **not** an amd64 intrinsic (`math.Trunc` is) — verified in disassembly | linalg, encoder | ~12 int ops → 1 `ROUNDSD` | = | S |
@@ -105,7 +105,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~28~~ | ~~`CrossEncoder` has **no batch API** and re-tokenizes the query per pair~~ — **DONE, 7.56×** (§7.30) | encoder | the re-tokenization half was 0.066%; the API was everything | = | — |
 | ~~29~~ | ~~`bm25` posting is 16 B~~ — **DONE, −50% index memory (381.7→190.9 MB at 200k docs)** (§7.24) | bm25 | ~0% scoring, −16% build alloc; the Win column led with the wrong effect | = | — |
 | ~~30~~ | ~~`bm25.Tokenize` allocates a string per mixed-case token~~ — **DONE, 983 → 2 allocs, −44.7%** (§7.24) | bm25 | beat its "787 → ~10" estimate | = | — |
-| 31 | QKV split + per-head V transpose: 3 full `[L,D]` copies/layer, with a power-of-two stride pathology at exactly `DefaultMaxSeqLength=512` | encoder | 3.3× on the transpose (small absolute) | = | M |
+| 31 | QKV split + per-head V transpose | encoder | **NOT WORTH DOING** — re-profiled at 0.06% of `GTE.Encode` (§7.32) | = | closed |
 | ~~32~~ | ~~Vision preprocess: `draw.Draw` costs more than the JPEG decode~~ — **DONE, −31.4% end-to-end / 2.45× on the non-decode work** (§7.22) | vision | the 2.3× was of the convert+resize, not of Preprocess | = (tested) | — |
 | 33 | `moeMLP` is entirely M=1 — 2048 single-row GEMM calls per MoE layer at L=512 | encoder | group tokens by expert | = | M |
 | ~~34~~ | ~~`forwardBatch` double-counts `enterForward`~~ — **DONE** (§7.26); no number on this box (CodeRankEmbed takes the packed kernel, not the fallback) | encoder | removes a trap for MoE / dense-GELU / qkv-bias checkpoints | — | — |
@@ -1921,6 +1921,60 @@ Four things an earlier draft asserted that the refutation pass knocked down:
 
     Recorded in `CHANGELOG.md` under Added: this is new public API on a Hard-tier
     package.
+
+31. **Item 9 is DONE, and the "0% hit rate" in its Win column is literal.** The
+    only demand signal in the kit is a sequential scan — `FlatI8`'s paged query
+    walks blocks 0,1,2,… on every call — which is the textbook cyclic-scan
+    pathology for LRU: the member evicted to make room is precisely the one
+    wanted next time round. Measured over ten passes of a 64-block working set:
+
+    | budget | LRU (before) | scan-resistant (after) | ceiling |
+    |---|--:|--:|--:|
+    | 8/64 | **0.0%** | **10.9%** | 12.5% |
+    | 32/64 | **0.0%** | **45.0%** | 50% |
+    | 63/64 | **0.0%** | **88.6%** | ~98% |
+    | 64/64 | 90.0% | 90.0% | — |
+
+    The 63/64 row is the one worth staring at: a cache holding **98% of the
+    working set** hit **0%** of the time. That is not a tuning problem, it is the
+    wrong policy, and no budget increase short of 100% fixes it.
+
+    `Touch` now evicts the most-recently-touched OTHER member instead of the
+    least, which pins a stable prefix so the hit rate tracks budget/working-set —
+    the best any policy can do without knowing the loop length. Each measured
+    rate is within ~85% of that ceiling.
+
+    **This is a behavioural change to a public type**, so `TestSpanCache_evictsLRUTailOverBudget`
+    became `..._evictsMostRecentOverBudget` rather than being quietly relaxed,
+    and the new `TestSpanCache_cyclicScanHitRate` carries floors that a reversion
+    to LRU drives straight to zero (verified by mutating it back). A second test
+    checks the change is not pathological the other way: with the working set
+    inside the budget, nothing is evicted and every repeat hits regardless of
+    order.
+
+    The item's other two suggestions are not done and are worth separating:
+    `MADV_WILLNEED` on map is already what `Touch` issues per miss, and
+    pipelining `Touch(b+1)` is a change to the CALLER (`scorePaged`), not the
+    cache — it needs its own measurement of whether a prefetch one block ahead
+    beats the fault it replaces.
+
+32. **Items 31 and 23 re-classified after re-profiling, not implemented.**
+    Following §1.18 — an earlier item can spend a later one's win — the encoder
+    was re-profiled after ~20 items landed. `GTE.Encode` at L=690 is now **74%
+    `dotFMA8`**, the GEMM microkernel itself, with transcendentals at ~12% and
+    everything else below 2%.
+
+    - **Item 31** (QKV split + per-head V transpose, "3.3× on the transpose") —
+      the three copies total **80 ms of 126.9 s of samples, 0.06%**. The item was
+      always flagged "small absolute"; measured, it is invisible. Not worth doing.
+    - **Item 23** (`packedFill` lost `blockedFill`'s m-blocking) — `packedFill`
+      is gated on `has2x8Kernel`, i.e. **arm64 only**, exactly as item 24 turned
+      out to be. It is evidence-gated on this box, not an S/M task.
+
+    What is actually left in the encoder is the f32 microkernel: ~171 GFLOP/s
+    against a realistic ~400–500 achievable on this part, i.e. roughly 2× still
+    in `dotFMA8`. Tier 3 has item 37 for that on **arm64** (outer-product FMLA)
+    and nothing equivalent for amd64 — a gap in the doc worth naming.
 
 ---
 

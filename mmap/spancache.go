@@ -88,12 +88,40 @@ func (c *SpanCache[K]) Touch(key K) {
 	for _, s := range spans {
 		_ = c.advise(s, true) // WILLNEED: hint the fault we're about to take
 	}
-	c.pos[key] = c.lru.PushFront(key)
+	el := c.lru.PushFront(key)
+	c.pos[key] = el
 	c.resident += c.bytes[key]
+	// SCAN-RESISTANT EVICTION: release the most-recently-touched OTHER member,
+	// not the least. This is perf-campaign item 9, and the reason is measured
+	// rather than theoretical.
+	//
+	// The only demand signal in the kit is a sequential scan — FlatI8's paged
+	// query walks blocks 0,1,2,… on every call. Under LRU that is the textbook
+	// cyclic-scan pathology: the block evicted to make room is precisely the one
+	// wanted next time round, so the cache never hits. Measured over ten passes
+	// of a 64-block working set:
+	//
+	//	budget 8/64 blocks   hit rate 0.0%
+	//	budget 32/64         hit rate 0.0%
+	//	budget 63/64         hit rate 0.0%   ← 98% of the data resident, still 0%
+	//	budget 64/64         hit rate 90.0%
+	//
+	// Evicting the most-recent instead keeps a STABLE PREFIX resident, so a
+	// cyclic scan hits on roughly budget/working-set of its touches — which is
+	// the best any policy can do without knowing the loop length.
+	//
+	// The just-touched member is never the victim: it was faulted in one line
+	// ago and the caller is about to read it.
 	for c.budget > 0 && c.resident > c.budget && c.lru.Len() > 1 {
-		back := c.lru.Back()
-		victim := back.Value.(K)
-		c.lru.Remove(back)
+		victimEl := c.lru.Front()
+		if victimEl == el {
+			victimEl = victimEl.Next()
+		}
+		if victimEl == nil {
+			break
+		}
+		victim := victimEl.Value.(K)
+		c.lru.Remove(victimEl)
 		delete(c.pos, victim)
 		c.resident -= c.bytes[victim]
 		c.evictions++

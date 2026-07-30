@@ -22,7 +22,7 @@ func (f *fakeAdvise) advise(_ []byte, willNeed bool) error {
 // SpanCache only reads len(span) for accounting, so the contents don't matter here.
 func span(n int) []byte { return make([]byte, n) }
 
-func TestSpanCache_evictsLRUTailOverBudget(t *testing.T) {
+func TestSpanCache_evictsMostRecentOverBudget(t *testing.T) {
 	fa := &fakeAdvise{}
 	// Budget holds 2 of the 4 equal-sized members (100 each, budget 250).
 	c := NewSpanCache[int](250)
@@ -36,7 +36,12 @@ func TestSpanCache_evictsLRUTailOverBudget(t *testing.T) {
 	if _, _, ev := c.Stats(); ev != 0 {
 		t.Fatalf("no eviction expected yet, got %d", ev)
 	}
-	c.Touch(2) // resident would be 300 > 250 → evict LRU tail (0)
+	// Over budget → evict the MOST-recently-touched other member (1), not the
+	// least (0). This reversed with perf-campaign item 9: under LRU a cyclic
+	// scan — the only demand signal in the kit — evicts exactly the member it
+	// needs next and hits 0% of the time even at 98% of the working set
+	// resident. Keeping the older members pins a stable prefix instead.
+	c.Touch(2)
 	if got := c.Resident(); got != 200 {
 		t.Fatalf("resident = %d, want 200 (two 100-byte members)", got)
 	}
@@ -44,16 +49,16 @@ func TestSpanCache_evictsLRUTailOverBudget(t *testing.T) {
 		t.Fatalf("evictions = %d, want 1", ev)
 	}
 
-	// 0 was the LRU tail and should have been evicted; touching it again is a miss.
+	// 0 is the retained prefix and must still be resident; 1 was the victim.
 	hitsBefore, _, _ := c.Stats()
-	c.Touch(1) // 1 is still resident → hit, promotes it
+	c.Touch(0)
 	if h, _, _ := c.Stats(); h != hitsBefore+1 {
-		t.Fatalf("touching resident member should be a hit")
+		t.Fatalf("the oldest member must survive: touching 0 should be a hit")
 	}
 	_, missBefore, _ := c.Stats()
-	c.Touch(0) // evicted earlier → miss, faults back in, evicts new tail (2)
+	c.Touch(1) // evicted above → miss
 	if _, m, _ := c.Stats(); m != missBefore+1 {
-		t.Fatalf("touching evicted member should be a miss")
+		t.Fatalf("touching the evicted member should be a miss")
 	}
 	if got := c.Resident(); got > c.Budget() {
 		t.Fatalf("resident %d exceeds budget %d", got, c.Budget())
