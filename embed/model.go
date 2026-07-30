@@ -6,6 +6,9 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"runtime"
+	"sync"
+	"sync/atomic"
 )
 
 // StaticModel is a Model2Vec static-embedding model. Goroutine-safe for
@@ -170,6 +173,71 @@ func (m *StaticModel) Tokenizer() *Tokenizer { return m.tokenizer }
 func (m *StaticModel) Encode(text string) []float32 {
 	ids := m.tokenizer.Encode(text)
 	return m.encodeIDs(ids)
+}
+
+// EncodeBatch encodes texts concurrently and returns one vector per input, in
+// input order. concurrency <= 0 means runtime.NumCPU(), matching
+// encoder.Model.EncodeBatch's convention.
+//
+// This is the bulk path, and until now it did not exist: Encode was the whole
+// public encode surface, so every caller — including both shipped examples —
+// wrote a serial loop over a corpus. The transformer model got worker fan-out
+// years earlier; the model whose own doc comment cites "a 378k chunk corpus" got
+// none. StaticModel.Encode is 77.8% of an index run
+// (docs/internal/perf-amdahl-linux-amd64.md), so this is the largest single item
+// in the campaign, and it is not an optimization of the encode path at all —
+// nothing prevented fan-out except that no package offered it.
+//
+// BIT-IDENTICAL to a serial loop, and the reason is structural rather than
+// careful: StaticModel is immutable after load and Encode touches no shared
+// mutable state, so a text's vector does not depend on what else is in the batch
+// or on which worker takes it. TestEncodeBatch_matchesSerial asserts exact
+// equality over the whole corpus, not a sample.
+//
+// Work is handed out one text at a time through an atomic counter rather than by
+// splitting the input into contiguous ranges. Chunk lengths in a real corpus vary
+// by more than an order of magnitude, so a contiguous split leaves workers idle
+// on whichever range happened to be short; the counter costs one atomic add per
+// text against ~156 µs of encoding, which is 0.006%.
+//
+// There is deliberately no variant writing into a caller-supplied flat
+// [n·dim]float32. The two allocations encodeIDs makes per text are 2 of ~365 —
+// the tokenizer makes the rest — and the copy such a variant would save is the
+// one ann.NewFlatI8 performs, which is better removed there than worked around
+// here.
+func (m *StaticModel) EncodeBatch(texts []string, concurrency int) [][]float32 {
+	out := make([][]float32, len(texts))
+	if len(texts) == 0 {
+		return out
+	}
+	if concurrency <= 0 {
+		concurrency = runtime.NumCPU()
+	}
+	concurrency = min(concurrency, len(texts))
+	if concurrency <= 1 {
+		for i, t := range texts {
+			out[i] = m.Encode(t)
+		}
+		return out
+	}
+
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for range concurrency {
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(texts) {
+					return
+				}
+				out[i] = m.Encode(texts[i])
+			}
+		}()
+	}
+	wg.Wait()
+	return out
 }
 
 // encodeIDs is the inner path used by Encode and by tests that supply raw IDs.

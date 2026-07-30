@@ -173,6 +173,15 @@ func BenchmarkW1(b *testing.B) {
 			}
 		}
 	})
+	// A1: the same stage through EncodeBatch. Kept alongside the serial stage
+	// rather than replacing it, because the serial loop is what every caller
+	// wrote before EncodeBatch existed and is the baseline the ratio is against.
+	b.Run("embedEncodeBatch", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			sinkVecs = m.EncodeBatch(texts, 0)
+		}
+	})
 	b.Run("newFlatI8", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
@@ -183,6 +192,26 @@ func BenchmarkW1(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			blob, err := ix.MarshalBinary()
+			if err != nil {
+				b.Fatal(err)
+			}
+			sinkBlob = blob
+		}
+	})
+	b.Run("sumBatched", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			cs := chunkAll(b, paths, sources)
+			ts := make([]string, len(cs))
+			ds := make([][]string, len(cs))
+			for i, c := range cs {
+				ts[i] = c.Text
+				ds[i] = bm25.Tokenize(c.Text)
+			}
+			vs := m.EncodeBatch(ts, 0)
+			sinkIndex = bm25.Build(ds)
+			f := ann.NewFlatI8(vs)
+			blob, err := f.MarshalBinary()
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -285,6 +314,7 @@ var (
 	sinkTokens  []string
 	sinkIndex   *bm25.Index
 	sinkVec     []float32
+	sinkVecs    [][]float32
 	sinkFlatI8  *ann.FlatI8
 	sinkBlob    []byte
 	sinkResults []bm25.Result

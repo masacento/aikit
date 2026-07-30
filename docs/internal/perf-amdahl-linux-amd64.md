@@ -169,7 +169,75 @@ written.** Check each item against the code before pricing it.
 
 ---
 
-## 4 · Step 0 status
+## 4 · A1 — measured
+
+`StaticModel.EncodeBatch`, landed. **8.21× at NumCPU**, against a predicted
+4–6×. Sweep over the real corpus, min of 6:
+
+| concurrency | ms | speedup | % of linear |
+|---|---:|---:|---:|
+| serial `Encode` loop | 294.70 | 1.00× | — |
+| 1 | 295.03 | 1.00× | 100% |
+| 2 | 161.38 | 1.83× | 91% |
+| 3 | 111.56 | 2.64× | 88% |
+| 4 | 84.71 | 3.48× | 87% |
+| 6 | 58.50 | 5.04× | 84% |
+| **8** (physical cores) | 47.05 | **6.26×** | 78% |
+| 12 | 39.36 | 7.49× | 62% |
+| **16** (SMT threads) | 35.91 | **8.21×** | 51% |
+
+Two things the curve says that a single number would not. Scaling holds at
+84–91% of linear out to 6 workers and is still 78% at 8, so this really is
+embarrassingly parallel work rather than something bounded by shared state. And
+SMT is worth having: 8 → 16 threads buys a further **1.31×** on top of the
+physical-core figure. `c=1` matching the serial loop to 0.1% confirms the
+single-worker path costs nothing.
+
+End to end on W1:
+
+| | serial | batched | |
+|---|---:|---:|---:|
+| embed stage | 311.45 ms | 36.21 ms | **8.60×** |
+| **whole index run** | **387.78 ms** | **109.76 ms** | **3.53×** |
+
+Allocations are unchanged — 757,044 → 757,065 for the whole run, the ~20 being
+the goroutines themselves.
+
+### What A1 does to the ranking of everything after it
+
+The embed stage falls from **77.8% to 33.0%** of an index run, and the
+decomposition of the batched run is 99.6% complete:
+
+| stage | ms | % of batched run |
+|---|---:|---:|
+| `embed.EncodeBatch` | 36.21 | 33.0% |
+| **`bm25.Build`** | **30.24** | **27.6%** |
+| `chunk.ChunkFile` | 20.53 | 18.7% |
+| `bm25.Tokenize` | 18.16 | 16.5% |
+| `ann.NewFlatI8` | 4.19 | 3.8% |
+| `MarshalBinary` | 0.069 | 0.06% |
+
+**The largest remaining stage after A1 is `bm25.Build`, which is not in Phase A
+at all** — it is lens doc §3.7 (three map operations per (document, term),
+1.33×). The tokenizer items keep their share *within* the embed stage, but that
+stage is now a third of the run rather than three quarters, so measured against
+a batched index run:
+
+| item | share of a serial run | share of a **batched** run |
+|---|---:|---:|
+| A2 carve-out | 10.23% | ≈4.2% |
+| A4 `preTokenize` | 11.88% | ≈4.9% |
+| lens §3.7 `bm25.Build` | 7.90% | **27.6%** |
+| lens §3.1/§3.2 chunker | 5.36% | **18.7%** |
+
+This is [`measuring-performance.md`](measuring-performance.md) §1.18 in its
+ordinary form — an earlier item spends a later one's win — and it is worth
+deciding explicitly whether Phase A's remaining order still holds, because two
+items that were not in it now outrank two that are.
+
+---
+
+## 5 · Step 0 status
 
 | | state |
 |---|---|

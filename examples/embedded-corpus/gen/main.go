@@ -69,10 +69,13 @@ func main() {
 	if err != nil {
 		fatal("load model (run `go generate` to fetch it): %v", err)
 	}
-	vecs := make([][]float32, len(chunks))
+	// EncodeBatch fans the corpus out across cores; bit-identical to the serial
+	// Encode loop this replaced, and embedding is ~78% of a generate run.
+	texts := make([]string, len(chunks))
 	for i, c := range chunks {
-		vecs[i] = model.Encode(c.Text)
+		texts[i] = c.Text
 	}
+	vecs := model.EncodeBatch(texts, 0) // 0 ⇒ NumCPU
 	idx := ann.NewFlatI8(vecs)
 	blob, err := idx.MarshalBinary()
 	if err != nil {

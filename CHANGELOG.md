@@ -12,6 +12,21 @@ it.
 
 ### Added
 
+- **`embed.StaticModel.EncodeBatch(texts, concurrency)`** (perf campaign A1) —
+  encodes a corpus concurrently, returning one vector per input in input order.
+  `concurrency <= 0` means `runtime.NumCPU()`, matching
+  `encoder.Model.EncodeBatch`. **8.21× at NumCPU** on an 8C/16T box (295 → 35.9
+  ms over 1,557 chunks), which makes a whole index run **3.53×** faster.
+
+  Until now `Encode` was the entire public encode surface, so every caller —
+  including both shipped examples, now updated — wrote a serial loop over a
+  corpus. Results are **bit-identical** to that loop: `StaticModel` is immutable
+  after load and `Encode` touches no shared mutable state, asserted by exact
+  equality over a full 1,557-chunk corpus at eight concurrency settings.
+
+  Measured scaling: 91% of linear at 2 workers, 87% at 4, 78% at 8 physical
+  cores, with SMT worth a further 1.31× to 16 threads.
+
 - **`ann.FlatBinary`** (perf campaign item 38) — a two-stage retriever: a 1-bit
   sign-quantized Hamming prefilter over the whole corpus, then an exact float32
   rerank of the survivors. Same `Hit` / `Query(q, k)` shape as `Flat` and

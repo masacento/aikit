@@ -77,18 +77,22 @@ Without them this just prints guidance; the pipeline code below is the point.`)
 		chunks = append(chunks, cs...)
 	}
 
-	// 2) EMBED + index for dense (semantic) search. embed.Encode returns an
-	//    L2-normalized vector, which is ann's input contract.
-	vecs := make([][]float32, len(chunks))
+	// 2) EMBED + index for dense (semantic) search. EncodeBatch fans the corpus
+	//    out across cores and returns L2-normalized vectors in input order,
+	//    which is ann's input contract. Bit-identical to a serial Encode loop —
+	//    which is what this used to be, and what every caller wrote before
+	//    EncodeBatch existed. Embedding is ~78% of an index run.
+	chunkTexts := make([]string, len(chunks))
 	for i, c := range chunks {
-		vecs[i] = em.Encode(c.Text)
+		chunkTexts[i] = c.Text
 	}
+	vecs := em.EncodeBatch(chunkTexts, 0) // 0 ⇒ NumCPU
 	dense := ann.New(vecs)
 
 	// 2b) Build the BM25 lexical index over the same chunks (same order).
 	docs := make([][]string, len(chunks))
-	for i, c := range chunks {
-		docs[i] = bm25.Tokenize(c.Text)
+	for i, t := range chunkTexts {
+		docs[i] = bm25.Tokenize(t)
 	}
 	lexical := bm25.Build(docs)
 

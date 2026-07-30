@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -131,3 +132,46 @@ var (
 	sinkIDs []int32
 	sinkEmb []float32
 )
+
+// BenchmarkEncodeBatch sweeps the fan-out width over the real corpus. This is
+// A1's deliverable and the measurement this box is best placed to make: 8
+// homogeneous cores with SMT, no P/E straggler to confound the curve.
+//
+// The sweep matters more than a single number. Speedup on a memory-bound
+// workload stops tracking core count well before the core count runs out, and
+// where it stops is what tells a caller what to pass — `concurrency <= 0` means
+// NumCPU, which on a 16-thread box is a guess, not a measurement.
+func BenchmarkEncodeBatch(b *testing.B) {
+	const dir = "../testdata/model"
+	if _, err := os.Stat(filepath.Join(dir, "model.safetensors")); err != nil {
+		b.Skipf("no static model at %s — see testdata/README.md", dir)
+	}
+	m, err := LoadFromFS(os.DirFS(dir), ".")
+	if err != nil {
+		b.Fatal(err)
+	}
+	texts := goSourceChunks(b)
+	b.Logf("corpus: %d chunks", len(texts))
+
+	// The serial loop every caller writes today, as the baseline.
+	b.Run("serialLoop", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			out := make([][]float32, len(texts))
+			for i, t := range texts {
+				out[i] = m.Encode(t)
+			}
+			sinkBatch = out
+		}
+	})
+	for _, c := range []int{1, 2, 3, 4, 6, 8, 12, 16} {
+		b.Run(fmt.Sprintf("c%d", c), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				sinkBatch = m.EncodeBatch(texts, c)
+			}
+		})
+	}
+}
+
+var sinkBatch [][]float32
