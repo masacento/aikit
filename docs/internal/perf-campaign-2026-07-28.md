@@ -118,7 +118,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 36 | arm64 **i8mm (SMMLA)** — 2× int8, but **only for prefill/batch, and your M1 Pro can't run it** | linalg | ≤2× prefill on M2+/Graviton3+ | = | M–L |
 | ~~37~~ | ~~Outer-product f32 microkernel via by-element `FMLA` — 4.0 FMLA/load vs today's 1.6~~ — **BUILT + MEASURED ON M1 PRO, NOT WORTH IT** (§6): raw kernel only **1.10×** (not 1.45×) because `dotNEON2x8` is already **~95% of FMLA peak** here — compute-bound, not load-bound as on amd64 — and the mandatory transpose-pack of both operands made the full path **4× slower**. Reverted. | linalg | prediction was amd64-shaped; §1.11 | **≠** | L |
 | ~~38~~ | ~~Binary/Hamming prefilter + exact rerank~~ — **DONE, 13–26× end-to-end** (§7.36) | ann | geomean **18.6×**, recall@10 1.00 on the real corpus | ≠ (recall) | — |
-| 39 | WAND / block-max WAND / MaxScore dynamic pruning | bm25, sparse | 2–10× **on top of** item 11 | = | L |
+| ~~39~~ | ~~WAND / block-max WAND / MaxScore dynamic pruning~~ — **DONE for `bm25` (3.88×); built, measured and REVERTED for `sparse`** (§7.37) | bm25, sparse | plus a 1.40–8.47× `sparse` win from porting item 44 | = | — |
 | 40 | Flash-attention / online-softmax tiling | encoder, vision | 1.05–1.15× alone; 67 MB → 1 MB scratch | ≠ | L |
 
 ---
@@ -2202,6 +2202,97 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     exactly on identical data (an always-true filter selects the heap). Five of
     six mutants died; the survivor — `>=` → `>` in the threshold search — is
     genuinely equivalent whenever `cand < n`, which `query` guarantees.
+
+37. **Item 39 is DONE for `bm25` (3.88×) and was MEASURED OUT for `sparse` —
+    which is where most of the value turned out to be anyway.**
+
+    `bm25.Index.TopK` now uses WAND: keep the posting-list cursors ordered by
+    current document, walk them accumulating per-term upper bounds, and stop at
+    the first cursor whose running sum exceeds the k-th best score so far. Every
+    document before that cursor's position can only contain terms already
+    passed, whose bounds sum to at most the threshold, so none of them can be
+    retained and every cursor ahead skips straight there.
+
+    | query shape (200k docs) | exhaustive | WAND | |
+    |---|--:|--:|--:|
+    | head + 2 rare | 46.00 µs | 11.86 µs | **3.88×** |
+    | head + rare | 51.95 µs | 45.52 µs | 1.14× |
+    | 3 head terms | 183.6 µs | 197.8 µs | −7.8% |
+    | 3 rare terms | 973.9 ns | 1083 ns | −11.2% |
+    | geomean | | | **−27.9%** |
+
+    **Exact, not approximate** — same documents, same scores, same order, bit
+    for bit. Two properties carry that and both are gated with exact equality.
+    A skipped document could never have been retained, so pruning changes what
+    is computed and not what is selected. And candidates are summed in QUERY
+    order rather than cursor order: float addition is not associative, and
+    summing in cursor order (which is document-ordered) changes the low bits and
+    therefore which member of a tie survives. Reversing that order fails the
+    gate, as does understating the bound by 0.1%.
+
+    **The upper bound had to be K1/B-safe**, the same constraint that stopped
+    item 10 from precomputing per-posting impacts: those are exported and may be
+    retuned between queries. So `Build` stores maxTf and minNorm per term —
+    parameter-free extrema — and the bound is reconstructed in O(1) per query
+    term. Negative K1 or B breaks the monotonicity it rests on, and the path
+    declines rather than pruning wrongly.
+
+    **Three things the item as written did not say.**
+
+    *(a) The benchmark that existed measured the one shape WAND cannot help.*
+    `BenchmarkTopK/common` uses the three highest-DF terms. Every document
+    contains all three, so every document is a genuine candidate and there is
+    nothing to skip. The win needs the query to MIX selectivities — a rare term
+    lifts the threshold past anything a common term could contribute alone —
+    which is what a real keyword query looks like and what the new shapes
+    measure.
+
+    *(b) It is a SHORT-query algorithm, and that is structural.* The pivot loop
+    re-orders and re-walks every cursor on every iteration, so its per-iteration
+    cost is linear in the query length while the exhaustive scan's is constant
+    per posting. Swept at fixed selectivity: **3.98× at 2 terms, 2.83× at 3,
+    1.25× at 6, then −35% at 12 and −65% at 24.** Hence `maxWandTerms = 8`, just
+    past the last measured win. MaxScore — which partitions terms into essential
+    and non-essential and never advances the non-essential cursors — is the
+    algorithm for the long-query case, and is what remains open in this item
+    along with block-max bounds.
+
+    *(c) The first implementation was SLOWER while doing 21× less work.* On the
+    3-head shape it evaluated 680 documents against 14,228 scored and still lost
+    19%. Two causes, both in the machinery rather than the algorithm: the
+    cursors' current document was read through a closure, called O(n²) times per
+    iteration by the ordering pass, and `advanceTo` used `sort.Search`, whose
+    closure made every probe of every skip an indirect call. Caching the current
+    document on the cursor and writing out the bisection turned −19% into
+    +3.88×.
+
+    **`sparse`: built, measured, reverted.** The same algorithm ported cleanly
+    and won **4.93×** on a 3-term mixed query — but a SPLADE expansion emits
+    20–40 terms, and at 30 it ran **2.4× slower** than the scan. Behind the
+    length guard the package's only realistic shape takes the exhaustive path
+    unchanged, which means the code would have earned nothing and still had to
+    be maintained. Reverted, with the finding recorded where `Query` dispatches.
+    This is item 37's pattern on the arm64 side: the mechanism was real, the
+    shape it needed was not the shape the package sees.
+
+    **The `sparse` benchmarks found something worth more than the item.** This
+    package had NO benchmarks at all, and had therefore never received item 44:
+    `sortTouched` was still a full `slices.Sort` of the touched set, O(T log T),
+    which on a 30-term query touching ~9,200 documents cost more than scoring
+    all 9,421 of its postings. Porting bm25's run-merge:
+
+    | shape | before | after | |
+    |---|--:|--:|--:|
+    | splade30 (the real shape) | 342.3 µs | 201.8 µs | **1.70×** |
+    | head + 2 rare | 7313.7 µs | 863.4 µs | **8.47×** |
+    | 3 head | 6.894 ms | 1.555 ms | **4.43×** |
+    | 3 rare | 3.579 µs | 2.554 µs | 1.40× |
+
+    That is a larger win than item 39 delivered anywhere, and it was sitting
+    behind a missing benchmark — the same gap item 1 was about. It also flattered
+    WAND while it lasted: measured against the unfixed baseline, `sparse` WAND
+    looked like 37.5× on one shape and 3.9× on another. Fixing the baseline first
+    is what made the revert decision obvious.
 
 ---
 

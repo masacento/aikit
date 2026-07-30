@@ -12,6 +12,18 @@ it.
 
 ### Added
 
+- **`ann.FlatBinary`** (perf campaign item 38) — a two-stage retriever: a 1-bit
+  sign-quantized Hamming prefilter over the whole corpus, then an exact float32
+  rerank of the survivors. Same `Hit` / `Query(q, k)` shape as `Flat` and
+  `FlatI8`. **13–26× faster than the exact scan** (geomean 18.6×; 115.6 ms →
+  4.78 ms at dim 768, 1M vectors), with allocations down 55%.
+
+  **This is the package's first approximate index** — `Flat` and `FlatI8` both
+  score every vector. Recall@10 is 1.00 at the default `DefaultOverquery` of 16
+  on a real Model2Vec corpus, but the true top-k *can* be missed; scores are
+  exact. `k <= 0`, `k >= Len`, or `Overquery·k >= Len` are exact, hit for hit.
+  Constructors: `NewFlatBinary(vecs)` and `NewFlatBinaryOverquery(vecs, n)`.
+
 - **`encoder.CrossEncoder.ScoreBatch(query, docs, concurrency)`** (perf campaign
   item 28) — scores one query against many documents, returning label 0's logit
   per document in the caller's order. **7.56× over a `Score` loop** at 50
@@ -20,6 +32,32 @@ it.
   bit-identical to `Score`.
 
 ### Changed
+
+- **`bm25.Index.TopK` now uses WAND dynamic pruning** (perf campaign item 39)
+  for `k >= 0`: documents whose per-term upper bounds cannot beat the current
+  k-th best score are skipped instead of scored. **3.88× on a mixed-selectivity
+  query** (one common term with two rare ones, 46.0 → 11.9 µs at 200k
+  documents), geomean −27.9%.
+
+  Results are **exact and bit-identical** — same documents, same scores, same
+  order — not approximate: pruning changes what is computed, never what is
+  selected. It declines, falling back to the exhaustive scan, for `k < 0`, for
+  negative `K1`/`B` (which would invalidate the bound), and for queries longer
+  than 8 distinct terms, where the pivot loop's per-term cost overtakes the
+  scan.
+
+  Two shapes are slightly slower: a query of three equally-common terms (+7.8%,
+  nothing to skip, every document is a genuine candidate) and a query of three
+  rare terms (+11.2% of a 1 µs query, fixed setup cost).
+
+- **`sparse.Index.Query` and `Scores` are 1.40–8.47× faster** — `1.70×` on the
+  30-term SPLADE shape. The touched-set ordering was a full `slices.Sort`,
+  O(T log T), which on a 30-term query touching ~9,200 documents cost more than
+  scoring all of its postings. It is now a merge of the per-term ascending runs,
+  O(T log Q). `bm25` made this change in perf campaign item 44 and this package
+  was left behind; item 39's benchmarks — the first this package has had — put
+  it back in view. Output is unchanged, gated against a dense scan on tied
+  scores.
 
 - **`ann.Flat.Query`/`QueryFilter` now shard the scan across cores** (perf
   campaign item 16): 1.73–2.26× depending on index size, and −42% on the

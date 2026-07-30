@@ -39,6 +39,10 @@ type Index struct {
 	avgdl    float64
 	postings map[string][]posting
 	df       map[string]int
+	// stats holds the per-term extrema the WAND pruning bound is derived from
+	// (item 39). Built once, after norm; nil disables pruning and TopK falls
+	// back to the exhaustive scan.
+	stats map[string]termStat
 }
 
 // Build constructs the index from already-tokenized documents (use
@@ -103,6 +107,8 @@ func Build(docs [][]string) *Index {
 			ix.norm[d] = float64(ix.docLen[d]) / ix.avgdl
 		}
 	}
+	// Must follow norm: the per-term minimum normalization is read from it.
+	ix.buildTermStats()
 	return ix
 }
 

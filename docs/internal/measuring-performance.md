@@ -434,6 +434,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 33 · MoE expert grouping | "group tokens by expert" | **1.81×**; `moeMLP` was 48.9% of the encode | ✅ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 | 38 · binary Hamming prefilter | ~10× first stage | **13–26×** end-to-end, geomean 18.6× | ✅ |
+| 39 · WAND dynamic pruning | 2–10× on bm25 **and** sparse | **3.88×** bm25 mixed query; **reverted** on sparse | ✅ (bm25) ❌ (sparse) |
 
 Two entries were **found by measurement rather than predicted** and are the
 largest encoder wins of the campaign: the parallel axis being wrong on amd64
@@ -738,6 +739,68 @@ It also inverts the usual order. The knob's price is what decides where the
 default belongs — once raising it was nearly free, the default moved from where
 the implementation stopped hurting (8) to where the recall curve actually
 flattens (16).
+
+---
+
+### 1.29 A fixed low iteration count is not a short benchmark, it is a noisy one
+
+Item 39's first A/B ran with `-benchtime 500x` and benchstat reported spreads of
+**±44%, ±39% and ±32%** — on a box whose drift floor is ~5% (§1.6). The
+exhaustive baseline, whose code had not changed at all, moved 75% between two
+invocations. Nothing was wrong with the code; 500 iterations of a ~100 µs
+operation is a 50 ms sample, short enough that GC timing and cache state
+dominate it.
+
+Re-run with `-benchtime 1s`, the same comparison came back at **±2–6%** and the
+verdicts were stable.
+
+**Guard:** use a time-based `-benchtime` unless there is a specific reason not
+to. `Nx` is for making a slow benchmark finish, not for making a fast one
+precise — and if the spread benchstat reports is far above §3's drift floor, do
+not interpret the comparison, fix the sampling first.
+
+### 1.30 The observable has to be the quantity you are saving
+
+Item 39's pruning test measured how far each posting-list cursor had advanced,
+which is the natural thing to reach for and is exactly wrong: a SKIP advances
+the cursor index past the postings it declined to read. A query that pruned 95%
+of its work left its cursors at the end of their lists, indistinguishable from
+an exhaustive walk, and the test reported **0.0% skipped** on a change that was
+in fact working. The real observable — documents evaluated — needed a counter,
+and showed 2,171 of 47,732.
+
+The same mistake has a general shape: the metric was a PROXY (cursor position)
+for the quantity of interest (work done), and the optimization broke the
+proportionality between them. That is not incidental — an optimization that
+changes how work maps onto state is precisely the kind that invalidates proxy
+metrics.
+
+**Guard:** name the quantity the change is supposed to reduce, then check that
+the instrument measures that quantity and not a correlate of it. If measuring it
+honestly needs a counter in the shipping path, price the counter — one increment
+per candidate against a candidate's own float work is free — rather than
+accepting a proxy.
+
+### 1.31 A stale baseline flatters the thing you are measuring
+
+Item 39 measured WAND against `sparse`'s existing query path and found 37.5× on
+one shape and 3.9× on another. Both were mirages: that path still carried a full
+`slices.Sort` of the touched set, which **item 44 had removed from `bm25` two
+items earlier** and which nobody had ported, because `sparse` had no benchmarks
+to notice it. Fixing the baseline first (1.40–8.47×, and 1.70× on the shape that
+matters) left WAND winning only on a query shape the package never sees, and the
+decision flipped from ship to revert.
+
+This is §1.18's rule seen from the other side. There the risk was an earlier item
+spending a later one's win; here it was an *un*applied earlier item inflating a
+later one's. Both come from the same place: a measurement is a comparison, and
+half of it is the thing you are not thinking about.
+
+**Guard:** before crediting a change with a large win, ask what the baseline is
+carrying — particularly in a package that mirrors another one where a fix has
+already landed. Sibling packages that were written as parallel implementations
+drift apart exactly where one of them lacks the test or benchmark that would
+have kept them in step.
 
 ---
 

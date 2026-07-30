@@ -165,3 +165,107 @@ func TestScores_deterministic(t *testing.T) {
 		}
 	}
 }
+
+// TestQuery_touchedOrderMatchesDenseScan is the equivalence gate for the
+// merge in accum.orderTouched (the item-44 port). Selecting over the touched
+// set must return EXACTLY what a full-corpus scan returns — same documents in
+// the same order — not merely an equally-defensible ranking.
+//
+// The risk is entirely in the tie-break: topk keeps the FIRST-SEEN member of a
+// tie, so which document survives depends on push order. The dense scan pushes
+// in ascending document order, and the touched set only reproduces that because
+// orderTouched merges the per-term runs. Break the merge and this fails — which
+// nothing else did: the pre-existing tests use corpora whose scores rarely tie,
+// so removing the ordering entirely left every one of them green.
+//
+// The weights here are small integers so that many documents land on exactly
+// the same float64 score.
+func TestQuery_touchedOrderMatchesDenseScan(t *testing.T) {
+	const nDocs, vocab = 4000, 40
+	rng := rand.New(rand.NewPCG(44, 44))
+	docs := make([]SparseVec, nDocs)
+	for d := range docs {
+		var v SparseVec
+		for range 3 + rng.IntN(4) {
+			v.Terms = append(v.Terms, uint32(rng.IntN(vocab)))
+			v.Weights = append(v.Weights, float32(1+rng.IntN(3)))
+		}
+		docs[d] = v
+	}
+	ix := New(docs)
+
+	for qi := range 40 {
+		var q SparseVec
+		for range 2 + rng.IntN(5) {
+			q.Terms = append(q.Terms, uint32(rng.IntN(vocab)))
+			q.Weights = append(q.Weights, float32(1+rng.IntN(2)))
+		}
+		dense := ix.Scores(q)
+		// Reference selection: (score desc, doc asc) over the whole corpus.
+		type kv struct {
+			d int
+			s float64
+		}
+		var all []kv
+		for d, s := range dense {
+			if s > 0 {
+				all = append(all, kv{d, s})
+			}
+		}
+		sort.SliceStable(all, func(i, j int) bool {
+			if all[i].s != all[j].s {
+				return all[i].s > all[j].s
+			}
+			return all[i].d < all[j].d
+		})
+		for _, k := range []int{1, 5, 10, 50} {
+			want := all
+			if k < len(want) {
+				want = want[:k]
+			}
+			got := ix.Query(q, k)
+			if len(got) != len(want) {
+				t.Fatalf("query %d k=%d: %d hits, dense scan %d", qi, k, len(got), len(want))
+			}
+			for i := range want {
+				if got[i].Index != want[i].d || got[i].Score != want[i].s {
+					t.Fatalf("query %d k=%d hit %d: got {%d %v}, dense scan {%d %v}",
+						qi, k, i, got[i].Index, got[i].Score, want[i].d, want[i].s)
+				}
+			}
+		}
+	}
+}
+
+// TestQuery_tiesActuallyOccur guards the test above from silently becoming
+// vacuous: if the fixture stops producing tied scores, the ordering it checks
+// is no longer being checked.
+func TestQuery_tiesActuallyOccur(t *testing.T) {
+	const nDocs, vocab = 4000, 40
+	rng := rand.New(rand.NewPCG(44, 44))
+	docs := make([]SparseVec, nDocs)
+	for d := range docs {
+		var v SparseVec
+		for range 3 + rng.IntN(4) {
+			v.Terms = append(v.Terms, uint32(rng.IntN(vocab)))
+			v.Weights = append(v.Weights, float32(1+rng.IntN(3)))
+		}
+		docs[d] = v
+	}
+	ix := New(docs)
+	q := SparseVec{Terms: []uint32{1, 2, 3}, Weights: []float32{1, 1, 1}}
+	counts := map[float64]int{}
+	tied := 0
+	for _, s := range ix.Scores(q) {
+		if s > 0 {
+			counts[s]++
+			if counts[s] == 2 {
+				tied++
+			}
+		}
+	}
+	if tied == 0 {
+		t.Fatal("fixture produced no tied scores — the tie-break path is untested")
+	}
+	t.Logf("%d tied score groups exercised", tied)
+}

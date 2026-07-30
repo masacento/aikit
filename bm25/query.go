@@ -71,6 +71,24 @@ func (ix *Index) Scores(query []string) []float64 {
 //     with cap 0 always discards), matching the prior `k=0 → empty`
 //     behavior from the original truncation gate.
 func (ix *Index) TopK(query []string, k int) []Result {
+	// Dynamic pruning (item 39) answers the k>=0 case without scoring documents
+	// that cannot reach the top k. It is EXACT — same documents, same scores,
+	// bit for bit — so this is a pure implementation swap, not a mode. It
+	// declines for parameters that would invalidate its bound, and for k<0,
+	// which asks for every scoring document and so has nothing to prune.
+	if k >= 0 {
+		if out, ok := ix.topKWAND(query, k); ok {
+			return out
+		}
+	}
+
+	return ix.topKExhaustive(query, k)
+}
+
+// topKExhaustive is the pre-item-39 TopK: score every posting of every query
+// term, then select. It remains the reference the pruning path is gated
+// against, the answer for k<0, and the fallback whenever the bound is unusable.
+func (ix *Index) topKExhaustive(query []string, k int) []Result {
 	a := ix.scoreQuery(query)
 	defer putAccum(a)
 

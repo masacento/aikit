@@ -113,6 +113,13 @@ func (ix *Index) Scores(q SparseVec) []float64 {
 // document shares no weighted term with the query iff its score is 0, so the
 // Score > 0 filter is "retrieve only documents the query actually touches".
 func (ix *Index) Query(q SparseVec, k int) []Hit {
+	// WAND dynamic pruning (item 39) was built for this package and MEASURED
+	// OUT — see bm25/wand.go for the surviving half. The pivot loop costs
+	// O(query terms) per iteration, so it stops paying between 6 and 12 terms,
+	// and a SPLADE expansion emits 20-40: at 30 terms it ran 2.4x slower than
+	// this scan. What it did win (4.93x) was a hand-built 3-term query, which is
+	// not a shape anyone sends to a sparse index. MaxScore is the algorithm for
+	// the long-query case and remains open.
 	a := ix.scoreQuery(q)
 	defer putAccum(a)
 
