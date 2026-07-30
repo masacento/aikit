@@ -386,6 +386,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 31 · QKV transpose | 3.3× on the transpose | **0.06%** of the forward — closed unimplemented | ❌ |
 | 1 · revive dead benchmarks | "unblocks everything" | 3 files revived; harness gained allocs + QPS | ✅ |
 | 26 · `math.Round` not intrinsic | ~5% of the matmul | **0.61%**; the proposed fix is a wash — closed | ❌ |
+| 33 · MoE expert grouping | "group tokens by expert" | **1.81×**; `moeMLP` was 48.9% of the encode | ✅ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -617,6 +618,26 @@ comparison unreadable.
 opaque. Adding the guard anyway is not free and not neutral — it adds a cost to
 both arms that can exceed the effect you are measuring, which is §1.2's failure
 mode wearing §1.2's uniform.
+
+---
+
+### 1.26 "No checkpoint for that" is a claim to check
+
+Twice this campaign an item was deferred as unmeasurable for want of a model,
+and twice the model was available:
+
+- Item 13's vision half was deferred with "no vision checkpoint on this box".
+  Both fixtures were already present, and neither was a download — two scripts
+  in `scripts/` *generate* them offline (§1.13).
+- Item 33 was deferred as needing "a MoE checkpoint this box doesn't have". The
+  config fields the loader reads name `nomic-ai/nomic-embed-text-v2-moe`, a
+  1.8 GB download. It turned out to be worth **1.81×** on a path that was 48.9%
+  of the encode.
+
+**Guard:** before recording an item as blocked on a fixture, spend the two
+minutes to find out which model it needs — read the config fields the loader
+actually parses — and whether it is downloadable or generated. Both deferrals
+cost more than the check would have.
 
 ---
 

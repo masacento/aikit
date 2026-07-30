@@ -144,3 +144,23 @@ snapshot_download('nomic-ai/CodeRankEmbed',
 
 Verify with `go test ./encoder/ -run TestModelQ8_cosineMatchesF32 -v` — q8 vs f32
 cosine ≈ 0.997 on every case.
+
+## Fetching `testdata/moe-model`
+
+`nomic-ai/nomic-embed-text-v2-moe` (~1.8 GB) — the only mixture-of-experts
+checkpoint the encoder supports, and the one perf-campaign item 33 is measured
+against. 8 experts, top-k 2, an MoE layer every 2 of 12.
+
+```sh
+.venv/bin/python -c "
+from huggingface_hub import snapshot_download
+snapshot_download('nomic-ai/nomic-embed-text-v2-moe',
+    allow_patterns=['config.json', 'tokenizer.json', 'tokenizer_config.json',
+                    'special_tokens_map.json', 'model.safetensors', 'modules.json',
+                    'sentence_bert_config.json', 'config_sentence_transformers.json',
+                    '1_Pooling/config.json', 'sentencepiece.bpe.model'],
+    local_dir='testdata/moe-model')"
+```
+
+Verify with `go test ./encoder/ -run TestMoEMLP_ -v` — the grouped expert path
+must be bit-identical to the per-token reference.

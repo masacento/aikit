@@ -107,7 +107,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~30~~ | ~~`bm25.Tokenize` allocates a string per mixed-case token~~ — **DONE, 983 → 2 allocs, −44.7%** (§7.24) | bm25 | beat its "787 → ~10" estimate | = | — |
 | 31 | QKV split + per-head V transpose | encoder | **NOT WORTH DOING** — re-profiled at 0.06% of `GTE.Encode` (§7.32) | = | closed |
 | ~~32~~ | ~~Vision preprocess: `draw.Draw` costs more than the JPEG decode~~ — **DONE, −31.4% end-to-end / 2.45× on the non-decode work** (§7.22) | vision | the 2.3× was of the convert+resize, not of Preprocess | = (tested) | — |
-| 33 | `moeMLP` is entirely M=1 — 2048 single-row GEMM calls per MoE layer at L=512 | encoder | group tokens by expert | = | M |
+| ~~33~~ | ~~`moeMLP` is entirely M=1 — 2048 single-row GEMM calls per MoE layer at L=512~~ — **DONE, 1.81×** (§7.35) | encoder | `moeMLP` was 48.9% of the encode | = | — |
 | ~~34~~ | ~~`forwardBatch` double-counts `enterForward`~~ — **DONE** (§7.26); no number on this box (CodeRankEmbed takes the packed kernel, not the fallback) | encoder | removes a trap for MoE / dense-GELU / qkv-bias checkpoints | — | — |
 
 ### Tier 3 — the swings (bigger, riskier, or hardware-gated)
@@ -2052,6 +2052,52 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     difference under test and making `math.Round` look 2× faster than itself.
     §1.2's guard is for constants; applying it to ordinary data is its own
     measurement error.
+
+35. **Item 33 is DONE — 1.81×, and it was reachable all along.** I had written it
+    off as needing "a MoE checkpoint this box doesn't have". The config fields
+    the encoder reads (`num_experts`, `moe_top_k`, `moe_every_n_layers`) name
+    `nomic-ai/nomic-embed-text-v2-moe` — a real, downloadable 1.8 GB model. It
+    just needed fetching. Worth remembering as a category: "no checkpoint" is a
+    claim to check, not a conclusion (this is the second time — §7.17).
+
+    Profiled first: `moeMLP` is **48.9% of the entire encode**, with the two M=1
+    expert projections at 26.2 s and 24.5 s of 108.7 s. At L=512 with top-k 2
+    that is 2048 single-row GEMM calls per MoE layer, across 6 MoE layers.
+
+    Now the tokens routed to the same expert share one GEMM — M≈L·topK/experts
+    instead of M=1:
+
+    | input | before | after | |
+    |---|--:|--:|--:|
+    | ~22 tokens | 459.7 ms | 296.0 ms | −35.6% |
+    | ~175 tokens | 3.215 s | 1.786 s | **−44.4%** (1.80×) |
+    | ~540 tokens | 6.941 s | 3.841 s | **−44.7%** (1.81×) |
+    | geomean | | | **−41.7%** |
+
+    Allocation rises ~6.7% for the routing tables and the gather buffer, all
+    pooled in the scratch arena.
+
+    **Bit-identical, resting on two separate properties**, and the gate
+    mutation-checks both:
+
+    - `linalg`'s **M-invariance** — `dst[i,j]` does not depend on M — so batching
+      a token's projection with others gives the same bits as computing it alone.
+      This is the same contract items 14 and 16 leaned on.
+    - The **rank loop is outermost**. Each token must still accumulate its rank-0
+      contribution before its rank-1 one; grouping purely by expert would reorder
+      that sum, and float addition is not associative. Swapping the two loops
+      fails the gate — but *only* on the `topK == numExperts` shape, which is why
+      that case is in the table. With top-k 2 and 8 experts the reordering is
+      rare enough that a smaller shape table would have missed it.
+
+    The router is also batched now (one `[L,experts]` matmul instead of L
+    single-row ones), bit-identical by the same M-invariance.
+
+    **A stale comment corrected on the way through.** The old code called
+    `matmulBTBlockedInto` directly, explaining that M=1 with K·N ≈ 2.36M is under
+    `matmulBTInto`'s 4 MFLOP blocking threshold and would take the naive path.
+    That threshold no longer exists — item 27 removed it — so the justification
+    was obsolete even before this change.
 
 ---
 

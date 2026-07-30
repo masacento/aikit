@@ -1,0 +1,20 @@
+{
+  "__version__": {
+    "sentence_transformers": "3.3.0",
+    "transformers": "4.44.2",
+    "pytorch": "2.4.1+cu121"
+  },
+  "prompts": {
+    "query": "search_query: ",
+    "passage": "search_document: ",
+    "Classification": "classification: ",
+    "MultilabelClassification": "classification: ",
+    "Clustering": "clustering: ",
+    "PairClassification": "classification: ",
+    "STS": "classification: ",
+    "Summarization": "classification: ",
+    "Speed": "search_document: "
+  },
+  "default_prompt_name": null,
+  "similarity_fn_name": "cosine"
+}

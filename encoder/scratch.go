@@ -87,6 +87,16 @@ type scratch struct {
 	// forward allocate nothing after warmup (audit #10).
 	moeScores []float32
 	moeOut    []float32
+	// Expert-grouping scratch (perf-campaign item 33). moeMLP used to run both
+	// expert projections at M=1, once per (token, rank) — 2048 single-row GEMM
+	// calls per MoE layer at L=512, top-k 2. These let it batch the tokens
+	// routed to the same expert into one call instead.
+	moeAllScores []float32 // [L*numExperts] router logits for every token
+	moeExpert    []int32   // [L*topK] chosen expert per (token, rank)
+	moeWeight    []float32 // [L*topK] router weight per (token, rank)
+	moeTokens    []int32   // [L] token ids gathered for the expert in hand
+	moeGathered  []float32 // [L*D] their rows, made contiguous for the GEMM
+	moeAcc       []float32 // [L*D] combined expert output per token
 	// deqW holds one int8 weight matrix dequantized to f32 for the q8 linear path:
 	// matmulBTQ8Into widens the int8 weights here ONCE per matmul (N*K) and then runs
 	// the SIMD f32 matmulBTInto, instead of the scalar inline-widen (which redid the
@@ -112,6 +122,14 @@ func ensureF32(b []float32, n int) []float32 {
 		return b[:n]
 	}
 	return make([]float32, n, n+n/4)
+}
+
+// ensureI32 is ensureF32 for the MoE routing tables (item 33).
+func ensureI32(b []int32, n int) []int32 {
+	if cap(b) >= n {
+		return b[:n]
+	}
+	return make([]int32, n, n+n/4)
 }
 
 // ensureLayer sizes the scratch buffers for one forward pass.

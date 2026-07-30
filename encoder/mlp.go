@@ -105,55 +105,100 @@ func geluMLP(h, fc1, fc1b, fc2, fc2b []float32, D, intermediate, L int, s *scrat
 // x1 and contrib reuse val/mid (as gelu/swigluMLP do), so the MoE layers allocate
 // nothing after warmup.
 func moeMLP(h, router, w1, w2t, bias []float32, numExperts, topK, D, intermediate, L int, s *scratch) {
-	s.moeScores = ensureF32(s.moeScores, numExperts)
-	s.moeOut = ensureF32(s.moeOut, D)
-	scores := s.moeScores
-	out := s.moeOut
-	x1 := s.val[:intermediate] // W1 output (reuses the SwiGLU value buffer)
-	contrib := s.mid[:D]       // per-expert W2 output (reuses the fc2-output buffer)
+	s.moeAllScores = ensureF32(s.moeAllScores, L*numExperts)
+	s.moeWeight = ensureF32(s.moeWeight, L*topK)
+	s.moeGathered = ensureF32(s.moeGathered, L*D)
+	s.moeAcc = ensureF32(s.moeAcc, L*D)
+	s.moeExpert = ensureI32(s.moeExpert, L*topK)
+	s.moeTokens = ensureI32(s.moeTokens, L)
+	scores := s.moeAllScores[:L*numExperts]
+	acc := s.moeAcc[:L*D]
+	clear(acc)
 
+	// 1. Route every token. One [L,numExperts] matmul instead of L single-row
+	// ones; linalg's M-invariance makes it bit-identical to the per-token form.
+	s.mm(h, router, scores, L, D, numExperts)
 	for t := range L {
-		row := h[t*D : (t+1)*D]
-
-		// Router: scores over all experts, softmaxed in float32.
-		s.mm(row, router, scores, 1, D, numExperts)
-		softmaxRow(scores)
-
-		clear(out)
-		for range topK {
+		row := scores[t*numExperts : (t+1)*numExperts]
+		softmaxRow(row)
+		for r := range topK {
 			// Pick the current argmax, then mask it so the next pass finds the
 			// runner-up (topK is 2 here; a full sort would be wasted work).
 			best, bestIdx := float32(-1), -1
-			for e, sc := range scores {
+			for e, sc := range row {
 				if sc > best {
 					best, bestIdx = sc, e
 				}
 			}
 			if bestIdx < 0 {
-				break
+				s.moeExpert[t*topK+r] = -1
+				continue
 			}
-			scores[bestIdx] = -1 // consumed
+			row[bestIdx] = -1 // consumed
+			s.moeExpert[t*topK+r] = int32(bestIdx)
+			s.moeWeight[t*topK+r] = best
+		}
+	}
 
-			off := bestIdx * intermediate
+	// 2. One pass per RANK, and within it one GEMM per expert over all the
+	// tokens that chose it (perf-campaign item 33). Both projections used to run
+	// at M=1, once per (token, rank): 2048 single-row GEMM calls per MoE layer at
+	// L=512, which profiled at 47% of the whole forward.
+	//
+	// Bit-identical, on two separate grounds:
+	//   - linalg guarantees M-INVARIANCE — dst[i,j] does not depend on M — so
+	//     batching a token's projection with others produces the same bits as
+	//     computing it alone (TestMatmulBT_MConsistent).
+	//   - the rank loop is OUTERMOST, so each token still accumulates its rank-0
+	//     contribution before its rank-1 one, in the same order as before.
+	//     Grouping by expert across ranks would reorder that sum, and float
+	//     addition is not associative.
+	for r := range topK {
+		for e := range numExperts {
+			// Gather this expert's tokens for this rank.
+			m := 0
+			for t := range L {
+				if int(s.moeExpert[t*topK+r]) == e {
+					s.moeTokens[m] = int32(t)
+					copy(s.moeGathered[m*D:(m+1)*D], h[t*D:(t+1)*D])
+					m++
+				}
+			}
+			if m == 0 {
+				continue
+			}
+			in := s.moeGathered[:m*D]
+			x1 := s.val[:m*intermediate]
+			contrib := s.mid[:m*D]
+
+			off := e * intermediate
 			expW1 := w1[off*D : (off+intermediate)*D]
-			// w2t holds this expert's W2 transposed to [D, intermediate].
+			// w2t holds this expert's W2 transposed to [D, intermediate], so
+			// contrib_j = Σ_i x1_i·W2[i,j] = x1·W2ᵀ.
 			expW2t := w2t[off*D : (off+intermediate)*D]
 
-			// Both projections are M=1 (one token) with K·N ≈ 2.36M FLOPs, which is
-			// UNDER matmulBTInto's 4M blocking threshold — so matmulBTInto would run
-			// the naive dot-product, measurably slower than even the old scalar AXPY.
-			// Call the register-blocked kernel directly: at this shape it is ~3.5×
-			// faster than the AXPY and ~10× the naive path (BenchmarkMoEW2_*). W2 is
-			// pre-transposed at load so contrib_j = Σ_i x1_i·W2[i,j] = x1·W2ᵀ.
-			matmulBTBlockedInto(row, expW1, x1, 1, D, intermediate)
+			matmulBTBlockedInto(in, expW1, x1, m, D, intermediate)
 			gelu(x1)
-			matmulBTBlockedInto(x1, expW2t, contrib, 1, intermediate, D)
-			for j := range D {
-				out[j] += best * contrib[j]
+			matmulBTBlockedInto(x1, expW2t, contrib, m, intermediate, D)
+
+			for i := range m {
+				t := int(s.moeTokens[i])
+				w := s.moeWeight[t*topK+r]
+				dst := acc[t*D : (t+1)*D]
+				src := contrib[i*D : (i+1)*D]
+				for j := range D {
+					dst[j] += w * src[j]
+				}
 			}
 		}
+	}
+
+	// 3. Residual + the single shared bias, once per token.
+	for t := range L {
+		row := h[t*D : (t+1)*D]
+		a := acc[t*D : (t+1)*D]
 		for j := range D {
-			row[j] += out[j] + bias[j]
+			row[j] += a[j] + bias[j]
 		}
 	}
 }
