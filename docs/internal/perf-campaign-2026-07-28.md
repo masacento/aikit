@@ -84,7 +84,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~12~~ | ~~**(B)** Rewrite `dotI8AVX2`~~ — **DONE, 2.10× kernel / 2.02× scan** (§7.6) | linalg | measured on Zen 2; int8 now at f32 MAC-parity | = (integer) | — |
 | ~~13~~ | ~~**(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto`~~ — **DONE, all sites** (§7.16 text, §7.17 vision + cross-encoder); pure Go, no assembly | linalg→encoder, vision | text −20.1%; **cross-encoder −33.8%**; SigLIP −17.9%/−30.6% | ~ (contracts stated + gated) | — |
 | 14 | **(E)** Length-bucketed `EncodeBatch` under a token budget | encoder | 1.3–2× on ragged batches | **=** | M |
-| 15 | HNSW: batch neighbour scoring through `Dot8x4` | ann | **1.36–1.40× measured** end-to-end | ~ (1 ULP) | M |
+| ~~15~~ | ~~HNSW: batch neighbour scoring through `Dot8x4`~~ — **DONE, 1.36×/1.33×** (§7.27) | ann | matched the prototype; heap pooling (the alloc half) still open | ~ (2 ULP, 0 rank changes over 4,500 hits) | — |
 | ~~16~~ | ~~`Flat.Query` is single-threaded; shard it + per-shard selector~~ — **DONE, 1.73–2.26×; filtered path −42%** (§7.23) | ann | "4–8× typical" was never available: the scan is DRAM-bandwidth-bound at ~25 GB/s | = | — |
 | 17 | HNSW build: batch `prune`/`selectHeuristic`; kill 225 allocs/insert | ann | 1.5–2.5× build | ~ | M |
 | ~~18~~ | ~~`vision/qwen_encoder.go` has no scratch arena~~ — **DONE, −70/−85% B/op, now depth-independent** (§7.19) | vision | latency share is ~3%, not the ~1.5 s implied | **=** | — |
@@ -1721,6 +1721,48 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     and was observed failing at 1.82× and 1.97× under `go test ./...` (packages
     run concurrently) while measuring 2.6–2.8× alone. A single wall-clock ratio
     cannot test a capability claim under contention; it is now best-of-3.
+
+27. **Item 15 is DONE — 1.36×/1.33×, essentially the prototype's number.** HNSW
+    scored one neighbour per `linalg.Dot`; `Flat` had used the 8-row `Dot8x4`
+    kernel all along. The traversal now collects unseen neighbours (marking
+    visited exactly as before), scores them eight at a time, then runs the
+    unchanged push logic over them in the original order.
+
+    | | before | after | |
+    |---|--:|--:|--:|
+    | `QueryEf` n=50k d=256, ef=64 | 126.97 µs | 93.57 µs | **−26.3%** (1.36×) |
+    | `QueryEf` n=50k d=256, ef=200 | 533.2 µs | 399.9 µs | **−25.0%** (1.33×) |
+    | B/op | 13.23 / 40.60 KiB | unchanged | ~ |
+
+    The doc's prototype reported 1.40×/1.36× for *pooled + batched*; this is
+    batching alone (allocations are unchanged — the heaps are still per-call),
+    and it lands within a few points, which is consistent with the prototype's
+    own finding that pooling ALONE was slower than baseline (519.4 vs 474.7 µs).
+    Pooling the heaps remains available and is worth roughly the 19 → 1 alloc
+    reduction, not time.
+
+    **The differential gate reproduces the prototype's validation exactly:**
+    4,500 ranked hits over d∈{64,256,768} × n∈{500,5000} × ef∈{16,64,200},
+    **0 index differences**, max |Δscore| 2.00 ULP. It runs both scorers against
+    the SAME graph — a test-only `scoreUnbatched` flag — because building twice
+    would vary the graph and confound the comparison.
+
+    **What that gate does NOT establish, stated because the first version of it
+    was fooled.** The item's correctness argument is that the rewrite is
+    *order-preserving*: the push loop must see the same sequence so the evolving
+    `results.items[0].sim` threshold behaves identically. A first attempt checked
+    only the top hit and passed a mutant that **reversed the push order
+    entirely**. Strengthening it to full ranked lists did not catch that mutant
+    either — reversing within a neighbour group demonstrably does not change
+    results at these sizes. So order preservation is a stronger property than
+    any test here demonstrates. It is preserved anyway, because it is free and it
+    is what makes the transformation obviously correct rather than empirically
+    correct; the gate verifies the weaker property that callers actually depend
+    on (identical ranked results), and it does catch a genuinely wrong gathered
+    row.
+
+    The int8 path stays scalar: `linalg` has no gathered 8-row int8 kernel, and
+    `DotI8` already runs a SIMD reduction per candidate.
 
 ---
 

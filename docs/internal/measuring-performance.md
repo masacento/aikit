@@ -378,6 +378,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 44 · bm25 touched-set order | ~18% (pprof share) | **−43.5%** on the query | ❌ (under) |
 | 4 · FlatI8 query scratch | 10–25% time | −5.4% time; **−99.2% B/op** | ⚠️ |
 | 34 · double `enterForward` | correctness-ish | unmeasurable on this box's checkpoints | — |
+| 15 · HNSW batched scoring | 1.36–1.40× | **1.36×/1.33×** | ✅ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -507,6 +508,29 @@ best-of-N. Genuinely broken parallelism still fails every attempt, so the
 assertion keeps its strength; only the contention flake goes away. The same
 applies to any test with a hard floor on a speedup, a throughput, or a latency
 budget.
+
+---
+
+### 1.21 Some correctness properties are not observable at test scale
+
+Item 15's rewrite is justified by being *order-preserving*: the push loop must
+see neighbours in the same sequence, so the evolving top-k threshold behaves
+identically. Two successive gates failed to demonstrate it. A top-1 comparison
+passed a mutant that **reversed the push order entirely**; strengthening it to
+full ranked lists over 4,500 hits did not catch that mutant either — reversing
+within a neighbour group simply does not change the returned results at these
+sizes.
+
+The property is real and worth preserving; it is what makes the transformation
+obviously correct instead of empirically correct. But **no test here can
+demonstrate it**, and pretending otherwise would be worse than saying so.
+
+**Guard:** when a mutation of the exact property you claim does not fail your
+gate, do not conclude the gate is adequate — establish what it *does* test, and
+say which part of the argument rests on reasoning rather than evidence. Here the
+gate verifies the weaker property callers depend on (identical ranked results)
+and does catch a genuinely wrong gathered row; the order argument stands on
+reading the code.
 
 ---
 

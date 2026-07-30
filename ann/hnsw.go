@@ -45,6 +45,11 @@ import (
 type visitTracker struct {
 	stamp []uint32
 	gen   uint32
+	// Scratch for the batched neighbour scoring (item 15). It lives here rather
+	// than in searchLayer because this struct is already pooled per query, so
+	// batching costs no new allocation.
+	ids    []int
+	scores []float64
 }
 
 func (v *visitTracker) reset(n int) {
@@ -138,6 +143,11 @@ type HNSW struct {
 	rng            *rand.Rand
 	buildVis       visitTracker // reused across searchLayer calls during Add (single-writer)
 	queryVis       sync.Pool    // *visitTracker per concurrent Query
+	// scoreUnbatched forces the per-candidate scoring path. Test-only: it exists
+	// so the differential gate for item 15 can run the pristine and batched
+	// scorers against the SAME graph and compare full ranked result lists, which
+	// is the only way to check the transformation preserved push order.
+	scoreUnbatched bool
 }
 
 // NewHNSW creates an empty index. Add vectors with Add, or use BuildHNSW
@@ -236,6 +246,65 @@ func (h *HNSW) sim(qv queryVec, id int) float64 {
 		return float64(linalg.DotI8(qv.q8, h.code(id))) * qv.scale * float64(h.scales[id])
 	}
 	return float64(linalg.Dot(qv.f32, h.vecs[id]))
+}
+
+// scoreInto fills dst[i] with sim(qv, ids[i]).
+//
+// The f32 path scores EIGHT candidates per call through linalg.Dot8x4, which
+// holds the query strip in registers and amortizes it across the 8 rows instead
+// of re-streaming it per neighbour (perf-campaign item 15). Flat already used
+// this kernel; hnsw was calling linalg.Dot once per neighbour.
+//
+// NOT bit-identical to the per-neighbour Dot: the 8-row kernel accumulates in a
+// different order, so scores can move by ~1 float32 ULP. That is the same
+// reassociation tradeoff Flat documents, and HNSW is approximate by contract —
+// but the traversal is threshold-driven, so a moved score could in principle
+// change which nodes are explored. TestHNSW_batchedScoringMatchesPristine
+// checks it does not, over a grid of dims, sizes and ef values.
+//
+// The int8 path stays scalar: linalg has no gathered 8-row int8 kernel, and
+// DotI8 already runs a SIMD reduction per candidate.
+func (h *HNSW) scoreInto(qv queryVec, ids []int, dst []float64) []float64 {
+	dst = dst[:0]
+	if h.scoreUnbatched || h.int8 || len(h.vecs) == 0 {
+		for _, id := range ids {
+			dst = append(dst, h.sim(qv, id))
+		}
+		return dst
+	}
+	q := qv.f32
+	d := len(q)
+	n4 := d / 4
+	tailStart := n4 * 4
+	var sums [32]float32
+	i := 0
+	for ; d > 0 && i+8 <= len(ids); i += 8 {
+		v0, v1, v2, v3 := h.vecs[ids[i]], h.vecs[ids[i+1]], h.vecs[ids[i+2]], h.vecs[ids[i+3]]
+		v4, v5, v6, v7 := h.vecs[ids[i+4]], h.vecs[ids[i+5]], h.vecs[ids[i+6]], h.vecs[ids[i+7]]
+		if len(v0) != d || len(v1) != d || len(v2) != d || len(v3) != d ||
+			len(v4) != d || len(v5) != d || len(v6) != d || len(v7) != d {
+			for j := range 8 { // ragged (defensive; index vectors share one dim)
+				dst = append(dst, h.sim(qv, ids[i+j]))
+			}
+			continue
+		}
+		linalg.Dot8x4(&q[0], &v0[0], &v1[0], &v2[0], &v3[0], &v4[0], &v5[0], &v6[0], &v7[0], n4, &sums)
+		group := [8][]float32{v0, v1, v2, v3, v4, v5, v6, v7}
+		for j := range 8 {
+			// Each row's dot is spread across its 4-lane block; sum the block,
+			// then add the d%4 scalar tail — same fold Flat uses.
+			b := j * 4
+			sc := sums[b] + sums[b+1] + sums[b+2] + sums[b+3]
+			for kk := tailStart; kk < d; kk++ {
+				sc += q[kk] * group[j][kk]
+			}
+			dst = append(dst, float64(sc))
+		}
+	}
+	for ; i < len(ids); i++ {
+		dst = append(dst, h.sim(qv, ids[i]))
+	}
+	return dst
 }
 
 func (h *HNSW) randomLevel() int {
@@ -377,13 +446,23 @@ func (h *HNSW) searchLayer(qv queryVec, entryPoints []int, ef, layer int, vis *v
 		if results.len() >= ef && c.sim < results.items[0].sim {
 			break
 		}
+		// Two phases, deliberately. Collecting the unseen neighbours first (marking
+		// them exactly as before) lets them be scored eight at a time; the push
+		// logic then runs over them IN THE ORIGINAL ORDER, so the evolving
+		// results.items[0].sim threshold sees the identical sequence it saw when
+		// scoring was interleaved (item 15).
+		vis.ids = vis.ids[:0]
 		for _, nb := range h.nodes[c.id].nbrs[layer] {
 			n := int(nb)
 			if vis.seen(n) {
 				continue
 			}
 			vis.mark(n)
-			s := h.sim(qv, n)
+			vis.ids = append(vis.ids, n)
+		}
+		vis.scores = h.scoreInto(qv, vis.ids, vis.scores)
+		for i, n := range vis.ids {
+			s := vis.scores[i]
 			if results.len() < ef || s > results.items[0].sim {
 				candidates.push(cand{id: n, sim: s}) // route through it
 				if keep == nil || keep(n) {
