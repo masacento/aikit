@@ -44,7 +44,7 @@ func (w *Weights) forwardTokens(ids []int32) []float32 {
 	}
 	layerNorm(h, w.EmbLN_W, w.EmbLN_B, L, D, eps)
 
-	rope := newRopeTable(L, headDim, w.Cfg.RoPEBase)
+	rope := w.ropeCache.get(L, headDim, w.Cfg.RoPEBase)
 	for i := 0; i < w.Cfg.NumLayers; i++ {
 		l := &w.Layers[i]
 		selfAttention(h, l.Wqkv, l.WqkvB, l.OutProj, l.OutProjB, heads, headDim, D, L, rope, s)

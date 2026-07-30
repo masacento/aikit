@@ -86,7 +86,7 @@ func (w *Weights) forwardInner(ids []int32) []float32 {
 	layerNorm(h, w.EmbLN_W, w.EmbLN_B, L, D, eps)
 
 	// 3) Precompute RoPE table once for this seq length.
-	rope := newRopeTable(L, headDim, w.Cfg.RoPEBase)
+	rope := w.ropeCache.get(L, headDim, w.Cfg.RoPEBase)
 
 	// 4) Twelve transformer blocks (post-norm).
 	for i := 0; i < w.Cfg.NumLayers; i++ {

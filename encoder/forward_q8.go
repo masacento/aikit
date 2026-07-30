@@ -59,7 +59,7 @@ func (w *WeightsQ8) forwardInner(ids []int32) []float32 {
 		}
 	}
 	layerNorm(h, w.EmbLN_W, w.EmbLN_B, L, D, eps)
-	rope := newRopeTable(L, headDim, w.Cfg.RoPEBase)
+	rope := w.ropeCache.get(L, headDim, w.Cfg.RoPEBase)
 	for i := 0; i < w.Cfg.NumLayers; i++ {
 		l := &w.Layers[i]
 		selfAttentionQ8(h, &l.Wqkv, &l.OutProj,
@@ -126,7 +126,7 @@ func (w *WeightsQ8) forwardBatch(idsList [][]int32) [][]float32 {
 		}
 	}
 	layerNorm(h, w.EmbLN_W, w.EmbLN_B, BL, D, eps)
-	rope := newRopeTable(Lmax, headDim, w.Cfg.RoPEBase)
+	rope := w.ropeCache.get(Lmax, headDim, w.Cfg.RoPEBase)
 	for li := 0; li < w.Cfg.NumLayers; li++ {
 		l := &w.Layers[li]
 		selfAttentionQ8Batched(h, &l.Wqkv, &l.OutProj,

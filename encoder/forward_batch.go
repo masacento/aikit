@@ -125,7 +125,7 @@ func (w *Weights) forwardBatch(idsList [][]int32) [][]float32 {
 
 	// 3) Precompute RoPE for Lmax positions. Same table for every
 	// sequence — RoPE depends only on position, not content.
-	rope := newRopeTable(Lmax, headDim, w.Cfg.RoPEBase)
+	rope := w.ropeCache.get(Lmax, headDim, w.Cfg.RoPEBase)
 
 	// 4) Twelve batched transformer blocks (post-norm).
 	for li := 0; li < w.Cfg.NumLayers; li++ {

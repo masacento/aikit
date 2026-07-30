@@ -52,6 +52,10 @@ type WeightsQ8 struct {
 	EmbLN_B      []float32
 
 	Layers []LayerWeightsQ8
+
+	// ropeCache holds the rotary table across forwards instead of rebuilding it
+	// per call (prefix-property cache; see Weights.ropeCache). Zero value ready.
+	ropeCache ropeCache
 }
 
 // HeadDim convenience (mirrors Config.HeadDim).

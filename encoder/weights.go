@@ -200,6 +200,12 @@ type Weights struct {
 	// Retained so the alias-backed []float32 fields stay valid for the
 	// lifetime of Weights. Same lifetime contract as embed.StaticModel.
 	st *embed.SafetensorsFile
+
+	// ropeCache holds the rotary table across forwards instead of rebuilding it
+	// per call — the same prefix-property cache GTE already uses (a longer table
+	// contains every shorter one as a bit-identical prefix). Grows to the longest
+	// sequence seen; zero value ready to use; safe for concurrent forwards.
+	ropeCache ropeCache
 }
 
 // LoadWeights reads config.json + model.safetensors from a real on-disk
