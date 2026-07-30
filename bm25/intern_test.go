@@ -58,7 +58,7 @@ func TestBuildInternsKeys(t *testing.T) {
 
 	ix := Build([][]string{toks})
 
-	for term := range ix.postings {
+	for term := range ix.terms {
 		kp := strPtr(term)
 		for _, ip := range inputPtrs[term] {
 			if kp == ip {

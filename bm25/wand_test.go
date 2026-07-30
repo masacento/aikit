@@ -57,8 +57,8 @@ func TestWAND_matchesExhaustive(t *testing.T) {
 		{"long-docs", 1_000, 500, 400, 4},
 	} {
 		ix := Build(wandCorpus(corpus.nDocs, corpus.vocab, corpus.docLen, corpus.seed))
-		terms := make([]string, 0, len(ix.df))
-		for term := range ix.df {
+		terms := make([]string, 0, len(ix.terms))
+		for term := range ix.terms {
 			terms = append(terms, term)
 		}
 		for _, k1b := range []struct{ k1, b float64 }{
@@ -138,7 +138,7 @@ func TestWAND_actuallyPrunes(t *testing.T) {
 			frac := float64(evaluated) / float64(scored)
 			dfs := make([]int, len(tc.q))
 			for i, term := range tc.q {
-				dfs[i] = ix.df[term]
+				dfs[i] = ix.DF(term)
 			}
 			t.Logf("df=%v: %d documents evaluated of %d scored exhaustively (%.1f%%)",
 				dfs, evaluated, scored, 100*frac)
@@ -151,13 +151,13 @@ func TestWAND_actuallyPrunes(t *testing.T) {
 
 // termsByDF returns every term, most frequent first.
 func termsByDF(ix *Index) []string {
-	out := make([]string, 0, len(ix.df))
-	for term := range ix.df {
+	out := make([]string, 0, len(ix.terms))
+	for term := range ix.terms {
 		out = append(out, term)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if ix.df[out[i]] != ix.df[out[j]] {
-			return ix.df[out[i]] > ix.df[out[j]]
+		if ix.DF(out[i]) != ix.DF(out[j]) {
+			return ix.DF(out[i]) > ix.DF(out[j])
 		}
 		return out[i] < out[j] // deterministic across map iteration orders
 	})
@@ -185,17 +185,18 @@ func TestWAND_declinesWhenBoundUnsound(t *testing.T) {
 			}
 		}
 	}
-	// And with no stats at all — a hand-constructed or future persisted index.
+	// There is no longer a "postings but no stats" state to guard against: the
+	// bound's extrema live on termEntry, so any term Build indexed carries them.
+	// What remains is a zero-value Index, which must not panic on either path.
 	ix.K1, ix.B = DefaultK1, DefaultB
-	saved := ix.stats
-	ix.stats = nil
-	if _, ok := ix.topKWAND(q, 10); ok {
-		t.Error("pruning accepted a query on an index with no term stats")
+	var zero Index
+	zero.K1, zero.B = DefaultK1, DefaultB
+	if got := zero.TopK([]string{"anything"}, 10); len(got) != 0 {
+		t.Errorf("zero-value Index returned %d results", len(got))
 	}
-	if len(ix.TopK(q, 10)) == 0 {
-		t.Error("TopK returned nothing when it should have fallen back to the exhaustive scan")
+	if got := zero.topKExhaustive([]string{"anything"}, 10); len(got) != 0 {
+		t.Errorf("zero-value Index exhaustive scan returned %d results", len(got))
 	}
-	ix.stats = saved
 }
 
 // TestWAND_degenerateQueries covers the shapes that reach the pivot loop with

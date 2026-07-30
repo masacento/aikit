@@ -44,7 +44,7 @@ func BenchmarkWAND(b *testing.B) {
 	for _, sh := range shapes {
 		dfs := make([]int, len(sh.q))
 		for i, term := range sh.q {
-			dfs[i] = ix.df[term]
+			dfs[i] = ix.DF(term)
 		}
 		b.Run(sh.name+"/exhaustive", func(b *testing.B) {
 			b.ReportAllocs()
@@ -108,7 +108,7 @@ func BenchmarkWANDQueryLength(b *testing.B) {
 		}
 		postings := 0
 		for _, t := range q {
-			postings += len(ix.postings[t])
+			postings += len(ix.entry(t).postings)
 		}
 		b.Run(fmt.Sprintf("terms%d/exhaustive", terms), func(b *testing.B) {
 			b.Logf("%d postings", postings)

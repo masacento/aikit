@@ -136,7 +136,8 @@ func headTerms(ix *Index, n int) []string {
 		d int
 	}
 	var all []td
-	for t, d := range ix.df {
+	for t := range ix.terms {
+		d := ix.DF(t)
 		all = append(all, td{t, d})
 	}
 	for i := range all {

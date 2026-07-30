@@ -17,12 +17,21 @@ type Result struct {
 // The +1 inside the log keeps it non-negative even for terms in most docs,
 // which is the variant bm25s uses by default.
 func (ix *Index) idf(term string) float64 {
-	df := ix.df[term]
-	if df == 0 {
+	e := ix.entry(term)
+	if e == nil {
+		return 0
+	}
+	return ix.idfOf(e)
+}
+
+// idfOf is idf for a term whose entry the caller already holds — the scoring
+// paths look the term up once and would otherwise hash it a second time.
+func (ix *Index) idfOf(e *termEntry) float64 {
+	if e.df == 0 {
 		return 0
 	}
 	n := float64(ix.N())
-	return math.Log(1 + (n-float64(df)+0.5)/(float64(df)+0.5))
+	return math.Log(1 + (n-float64(e.df)+0.5)/(float64(e.df)+0.5))
 }
 
 // IDF returns the Lucene/bm25s BM25 IDF for term. Public wrapper around
@@ -37,7 +46,12 @@ func (ix *Index) IDF(term string) float64 { return ix.idf(term) }
 // documents that contain it at least once. Returns 0 for unknown terms.
 // Paired with IDF for tooling that needs to *filter* by DF (e.g. drop
 // near-hapax tokens that are too rare to predict) before ranking by IDF.
-func (ix *Index) DF(term string) int { return ix.df[term] }
+func (ix *Index) DF(term string) int {
+	if e := ix.entry(term); e != nil {
+		return e.df
+	}
+	return 0
+}
 
 // Scores returns the BM25 score of every document for query (already
 // tokenized). The result is indexed by document id; length == ix.N().

@@ -35,14 +35,58 @@ type Index struct {
 	// norm[d] is docLen[d]/avgdl, precomputed at Build. The scoring loop used to
 	// divide per POSTING; this makes it a load (item 10). Computed with exactly
 	// the expression the loop used, so scores are bit-identical.
-	norm     []float64
-	avgdl    float64
-	postings map[string][]posting
-	df       map[string]int
-	// stats holds the per-term extrema the WAND pruning bound is derived from
-	// (item 39). Built once, after norm; nil disables pruning and TopK falls
-	// back to the exhaustive scan.
-	stats map[string]termStat
+	norm  []float64
+	avgdl float64
+	// terms maps a term to its index in `entries`. ONE map, where there used to
+	// be three (postings, df, and item 39's stats).
+	//
+	// `m[k] = append(m[k], v)` is a mapaccess PLUS a mapassign — two independent
+	// hashes of the same key — and `df[k]++` was a third and fourth in a second
+	// map, and the intern check a fifth. That is five hashes of the same string
+	// per (document, term) where one will do, and Build does it 23.9 M times on
+	// the campaign's 200k-document corpus (lens doc 3.7).
+	//
+	// The indirection is through a slice rather than a map of pointers so that a
+	// corpus with 30k distinct terms does not also allocate 30k *termEntry.
+	terms   map[string]int32
+	entries []termEntry
+}
+
+// termEntry is everything the index knows about one term. Grouping them is the
+// point: a single map probe now reaches the posting list, the document
+// frequency, and the extrema WAND's upper bound is built from.
+type termEntry struct {
+	postings []posting
+	df       int
+	// maxTf and minLen are the parameter-free extrema item 39's bound is
+	// reconstructed from — see wand.go's termStat, which this absorbed. They are
+	// tracked here as Build goes rather than in a second pass over every posting
+	// list afterwards, which is where they used to come from.
+	maxTf  int32
+	minLen int32
+}
+
+// entry returns the term's data, or nil if the term is not indexed.
+func (ix *Index) entry(term string) *termEntry {
+	i, ok := ix.terms[term]
+	if !ok {
+		return nil
+	}
+	return &ix.entries[i]
+}
+
+// minNorm is the smallest length normalization over the documents containing
+// this term — the value item 39's bound needs.
+//
+// Derived from minLen rather than stored, and it is exactly ix.norm[d] for that
+// document: norm is float64(docLen[d])/avgdl, monotone in docLen for a positive
+// avgdl, so the minimum over the term's documents is reached at the shortest
+// one and the expression here is character-for-character the same.
+func (ix *Index) minNorm(e *termEntry) float64 {
+	if ix.avgdl == 0 {
+		return 0 // every document empty ⇒ norm is all zeros
+	}
+	return float64(e.minLen) / ix.avgdl
 }
 
 // Build constructs the index from already-tokenized documents (use
@@ -56,11 +100,10 @@ func Build(docs [][]string) *Index {
 		panic("bm25: corpus exceeds 2^31-1 documents")
 	}
 	ix := &Index{
-		K1:       DefaultK1,
-		B:        DefaultB,
-		docLen:   make([]int, len(docs)),
-		postings: make(map[string][]posting),
-		df:       make(map[string]int),
+		K1:     DefaultK1,
+		B:      DefaultB,
+		docLen: make([]int, len(docs)),
+		terms:  make(map[string]int32),
 	}
 	var total int
 	// One term-frequency map reused across all documents (clear per doc) instead of
@@ -87,12 +130,23 @@ func Build(docs [][]string) *Index {
 			// untouched on value update), so no view is ever retained. Byte-identical keys
 			// ⇒ identical scores. Single-threaded here, so no lock — unlike a Tokenize-side
 			// interner, this never touches the concurrent hot path.
-			key := term
-			if _, seen := ix.df[key]; !seen {
-				key = strings.Clone(term)
+			i, seen := ix.terms[term]
+			if !seen {
+				i = int32(len(ix.entries))
+				ix.terms[strings.Clone(term)] = i
+				ix.entries = append(ix.entries, termEntry{minLen: math.MaxInt32})
 			}
-			ix.postings[key] = append(ix.postings[key], posting{doc: int32(d), tf: int32(f)})
-			ix.df[key]++
+			// Indexed rather than held as a pointer: `ix.entries` may reallocate
+			// on the append above, and a pointer taken before it would dangle.
+			e := &ix.entries[i]
+			e.postings = append(e.postings, posting{doc: int32(d), tf: int32(f)})
+			e.df++
+			if tfi := int32(f); tfi > e.maxTf {
+				e.maxTf = tfi
+			}
+			if l := int32(len(toks)); l < e.minLen {
+				e.minLen = l
+			}
 		}
 	}
 	if len(docs) > 0 {
@@ -107,8 +161,6 @@ func Build(docs [][]string) *Index {
 			ix.norm[d] = float64(ix.docLen[d]) / ix.avgdl
 		}
 	}
-	// Must follow norm: the per-term minimum normalization is read from it.
-	ix.buildTermStats()
 	return ix
 }
 

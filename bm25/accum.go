@@ -157,7 +157,11 @@ func (ix *Index) scoreQuery(query []string) *accum {
 		if dupTerm(query, i) {
 			continue // term contributes once; tf is per-document, not per-query
 		}
-		idf := ix.idf(term)
+		e := ix.entry(term)
+		if e == nil {
+			continue
+		}
+		idf := ix.idfOf(e)
 		if idf == 0 {
 			continue
 		}
@@ -168,7 +172,7 @@ func (ix *Index) scoreQuery(query []string) *accum {
 		// posting loop is free and keeps them live.
 		k1, bb := ix.K1, ix.B
 		k1p1 := k1 + 1
-		for _, p := range ix.postings[term] {
+		for _, p := range e.postings {
 			tf := float64(p.tf)
 			denom := tf + k1*(1-bb+bb*ix.norm[p.doc])
 			a.add(int(p.doc), idf*(tf*k1p1)/denom)

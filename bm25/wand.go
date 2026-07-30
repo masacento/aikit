@@ -63,44 +63,11 @@ func (c *wandCursor) setPos(i int) {
 	}
 }
 
-// termStat is the per-term extremum the upper bound is derived from.
+// The per-term extrema this bound is built from — maxTf and minLen — live on
+// termEntry and are tracked as Build goes (index.go). They used to be a
+// termStat map filled by a second pass over every posting list; folding them in
+// removed both the pass and a third map probe per query term.
 //
-// It is maxTf and minNorm rather than the max impact itself because K1 and B
-// are exported and may be changed between queries. Baking the impact in at
-// Build would silently ignore a caller's retuning — the same constraint that
-// stopped item 10 from precomputing per-posting impacts. These two are
-// parameter-free, and the bound is reconstructed from them in O(1) per query
-// term.
-type termStat struct {
-	maxTf   int32
-	minNorm float64
-}
-
-// buildTermStats fills ix.stats in one pass over the posting lists.
-//
-// Done here rather than inside Build's document loop deliberately: that loop
-// already does two map operations per (document, term), and a third would slow
-// indexing to save a sequential pass that costs one read of memory the builder
-// just wrote.
-func (ix *Index) buildTermStats() {
-	ix.stats = make(map[string]termStat, len(ix.postings))
-	for term, pl := range ix.postings {
-		if len(pl) == 0 {
-			continue
-		}
-		st := termStat{maxTf: pl[0].tf, minNorm: ix.norm[pl[0].doc]}
-		for _, p := range pl[1:] {
-			if p.tf > st.maxTf {
-				st.maxTf = p.tf
-			}
-			if n := ix.norm[p.doc]; n < st.minNorm {
-				st.minNorm = n
-			}
-		}
-		ix.stats[term] = st
-	}
-}
-
 // ubSlack widens each term's upper bound by a relative 1e-12.
 //
 // The bound is derived from monotonicity in exact arithmetic: the BM25 impact
@@ -143,7 +110,7 @@ const maxWandTerms = 8
 // parameters. The bound relies on the impact being monotone in tf and in the
 // normalization, which holds for K1 >= 0 and B >= 0; a caller who sets either
 // negative gets the exhaustive path instead of a wrong answer.
-func (ix *Index) wandUsable() bool { return ix.K1 >= 0 && ix.B >= 0 && ix.stats != nil }
+func (ix *Index) wandUsable() bool { return ix.K1 >= 0 && ix.B >= 0 }
 
 // topKWAND is TopK's pruning implementation. It returns ok=false when it
 // declines, and the caller falls back to the exhaustive scan.
@@ -175,24 +142,17 @@ func (ix *Index) topKWANDState(query []string, k int, w *wandState) ([]Result, b
 		if dupTerm(query, i) {
 			continue // one contribution per distinct term, exactly as scoreQuery
 		}
-		idf := ix.idf(term)
+		e := ix.entry(term)
+		if e == nil || len(e.postings) == 0 {
+			continue
+		}
+		idf := ix.idfOf(e)
 		if idf == 0 {
 			continue
 		}
-		pl := ix.postings[term]
-		if len(pl) == 0 {
-			continue
-		}
-		st, ok := ix.stats[term]
-		if !ok {
-			// A term with postings but no stat entry means the index was built
-			// before stats existed (a persisted index, say). Rather than guess a
-			// bound, decline the whole query.
-			w.cur = cur[:0]
-			return nil, false
-		}
-		tf := float64(st.maxTf)
-		ub := idf * (tf * k1p1) / (tf + k1*(1-bb+bb*st.minNorm))
+		pl := e.postings
+		tf := float64(e.maxTf)
+		ub := idf * (tf * k1p1) / (tf + k1*(1-bb+bb*ix.minNorm(e)))
 		cur = append(cur, wandCursor{post: pl, doc: pl[0].doc, idf: idf, ub: ub * ubSlack})
 	}
 	w.cur = cur

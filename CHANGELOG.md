@@ -79,6 +79,15 @@ it.
   nothing to skip, every document is a genuine candidate) and a query of three
   rare terms (+11.2% of a 1 µs query, fixed setup cost).
 
+- **`bm25.Build` is 1.27–1.30× faster** (lens scan §3.7): one map from term to a
+  `[]termEntry` index, where there were three (postings, document frequency, and
+  the WAND bound's extrema). `m[k] = append(m[k], v)` is a mapaccess plus a
+  mapassign — two hashes of the same key — and the other two maps added three
+  more; that was five hashes per (document, term). The per-term extrema are now
+  tracked as `Build` goes, which also removes the second pass over every posting
+  list that used to compute them. Index contents are unchanged, gated against an
+  independent recount of every term's postings, frequency and extrema.
+
 - **`sparse.Index.Query` and `Scores` are 1.40–8.47× faster** — `1.70×` on the
   30-term SPLADE shape. The touched-set ordering was a full `slices.Sort`,
   O(T log T), which on a 30-term query touching ~9,200 documents cost more than

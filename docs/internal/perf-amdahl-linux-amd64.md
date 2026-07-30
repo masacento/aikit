@@ -303,7 +303,43 @@ slower beyond noise. The commit says they measured at zero.
 
 ---
 
-## 6 · Step 0 status
+## 6 · `bm25.Build` single-map — the item A1 promoted, 1.27×
+
+Not a Phase A item at all: [`task-perf-lens-scans.md`](task-perf-lens-scans.md)
+§3.7, taken next because A1 made `bm25.Build` the largest remaining stage of an
+index run (27.6%).
+
+| | before | after | |
+|---|---:|---:|---:|
+| `Build` (200k docs × 120 tokens) | 80.76 ms | 62.21 ms | **1.30×** |
+| `BuildReal` | 1214.3 µs | 954.2 µs | **1.27×** |
+| `W1/bm25Build` | 31.33 ms | 24.69 ms | **1.27×** |
+| geomean | | | **−22.2%** |
+
+Predicted 1.33×; measured in band. Allocations are unchanged (−0.3%) and bytes
+fall 3–16% on the isolated benchmarks.
+
+`m[k] = append(m[k], v)` is a mapaccess *plus* a mapassign — two independent
+hashes of the same string — and `df[k]++` was a third and fourth in a second
+map, with the intern check a fifth. Five hashes of the same key per (document,
+term), 23.9 M times on the campaign's corpus. Now one map from term to an index
+into a `[]termEntry`, so a single probe reaches the posting list, the document
+frequency, and both extrema.
+
+Two things beyond what the lens doc described. The `termStat` map item 39 added
+is **gone**, absorbed into `termEntry`: `maxTf` and `minLen` are tracked as
+`Build` goes, which also deletes the second pass over every posting list that
+built them, and removes a third map probe per query term. And the indirection is
+a slice index rather than a `map[string]*termEntry` — the lens doc's shape added
+~30k allocations for a 30k-term corpus, which is why its allocation count went
+up; this one's does not.
+
+Allocation note: the W1 stage's bytes rose 2.8% (the `entries` slice), against a
+21% time win.
+
+---
+
+## 7 · Step 0 status
 
 | | state |
 |---|---|
