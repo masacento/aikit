@@ -675,9 +675,25 @@ These came out of the refutation pass and aren't in the tables above:
   byte-identical, concurrent-parity + `-race` gated. Not previously a campaign
   item — the audit's headline win. See
   [`task-perf-memoization.md`](task-perf-memoization.md) §1.
+- ~~**`bm25.Build` map keys alias the source text / tokenizer arena**~~ — **DONE**
+  (memoization audit §1b, bc4387a): a `Tokenize` output string is a *view*, so
+  using it as an Index key pinned that whole backing array for the Index's life.
+  `Build` now `strings.Clone`s each term's first occurrence; a 356-file index then
+  reclaims **6.0 MB** of source corpus once the keys stop aliasing it. Byte-
+  identical keys ⇒ scores unchanged. This is the retained-memory complement to
+  item 30 (which cut the per-token *allocations*).
+  **Negative result worth keeping** (arbiter discipline, §9): the first cut put a
+  sharded interner in `Tokenize` — it regressed tokenize throughput **1.56×**
+  (172→110 MB/s) by adding a lock+map probe to the zero-cost fast-path view. Moved
+  to `Build`, which is single-threaded and already walks every token, so it interns
+  only the ~11k distinct keys the Index keeps: tokenize stays at baseline, `Build`
+  pays +8% (one clone per distinct key) at index time only. *Where* you memoize is
+  the whole result — the hot path was the trap.
 
   > **Memoization audit — remaining items** ([`task-perf-memoization.md`](task-perf-memoization.md) §7):
-  > §1b `bm25` interning already shipped as **item 30** (983→2 allocs); §4
+  > §1b `bm25` split in two: the per-token *allocation* half shipped as **item 30**
+  > (983→2 allocs), the *retained-memory* half as the §1b key-interning bullet above
+  > (bc4387a). §4
   > `bm25` scoring constants fold into **items 10 (`invAvgdl` hoist) + 29 (posting
   > struct)** — both DONE, the remaining precomputed-impact change stays there
   > since it mutates the posting; §5 `StaticModel` presum is **conditional**

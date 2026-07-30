@@ -334,9 +334,15 @@ The useful half of the audit. Each of these looks like a candidate and isn't:
    concurrent parity test landed together. Measured on the **real minilm vocab**
    (not the synthesized one): **4.59×** cold→memo, 96.8% repeat rate — beating the
    §1 appendix's indicative 3.75×. Byte-identical. **6b69133.**
-3. **§1b `bm25` interning — ✅ ALREADY DONE** as **[campaign #30]**
-   (`bm25.Tokenize` string-per-mixed-case-token, 983→2 allocs, −44.7%). The §1b
-   insight shipped in the campaign; no separate work here.
+3. **§1b `bm25` interning — ✅ DONE, in two halves.** The per-token *allocation*
+   half shipped earlier as **[campaign #30]** (`bm25.Tokenize`, 983→2 allocs,
+   −44.7%). The *retained-memory* half — Index map keys aliasing (and pinning) the
+   source text / arena — shipped as **bc4387a**: `Build` `strings.Clone`s each
+   term's first occurrence, so a 356-file index reclaims 6.0 MB of source corpus.
+   **Landed in `Build`, not `Tokenize`, on purpose:** a Tokenize-side interner
+   measured a **1.56× throughput regression** (172→110 MB/s) from a lock+map probe
+   on the zero-cost fast-path view; `Build` is single-threaded and interns only the
+   ~11k retained keys, so tokenize stays at baseline (+8% Build, index-time only).
 4. **§4 `bm25` constants — deferred/conditional; interim already done.** The
    `invAvgdl` hoist is **[campaign #10]** (K1/B-safe half, bit-identical); the
    16 B posting struct is **[campaign #29]** — both DONE. The remaining
