@@ -372,6 +372,9 @@ been consistently right; magnitudes consistently optimistic.**
 | 24 · packed-stride aliasing | "free" | unreachable on amd64; reverted | — |
 | 32 · vision preprocess | 2.3× | 2.45× on convert+resize; **−31.4%** end-to-end | ✅ |
 | 16 · shard `Flat.Query` | 4–8× typical | **1.73–2.26×** on 16 threads | ❌ |
+| 30 · bm25 tokenizer allocs | 787 → ~10 | **983 → 2**, −44.7% time | ✅ |
+| 29 · bm25 8-byte posting | 1.5–2× scoring | ~0% scoring; **−50% index memory** | ⚠️ |
+| 10 · bm25 precomputed norm | 1.5–2× scoring | ~0% scoring | ❌ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -435,6 +438,33 @@ compare against the machine's memory bandwidth BEFORE estimating a speedup from
 core count. If the serial number is already a large fraction of the ceiling, the
 available win is `ceiling / serial`, not `cores`. This is cheap to compute and
 would have predicted the result exactly.
+
+---
+
+### 1.18 An earlier item in the same campaign can spend a later one's win
+
+Items 10 and 29 each predicted "1.5–2× scoring" for bm25. Both landed,
+bit-identically, and scoring did not move at either corpus size (p=0.310 and
+p=0.937).
+
+Neither estimate was wrong when written. **Item 11 — in the same document —
+invalidated them before they were attempted.** Its touched-set accumulator
+replaced an O(corpus) scan with O(postings touched), which moved the bottleneck
+off the posting walk that 10 and 29 both optimize. Profiling the query loop
+afterwards shows the largest cost is now the touched-set *sort* at ~18%, with
+the posting scan not visible above GC.
+
+**Guard:** a campaign's estimates are a snapshot of one profile. After landing
+anything that changes the *shape* of a hot path, re-profile before trusting any
+remaining estimate that touches the same path — and re-read the sibling items for
+ones that were sized against the old shape. The cheap version of this is to
+re-run the profile that generated the estimate and check the line is still there.
+
+The corollary is that items 10 and 29 were still worth landing — item 29 halves
+the index's dominant storage (381.7 MB → 190.9 MB at 200k docs). Its Win column
+just led with the effect that evaporated rather than the one that survived, which
+is §1.16's lesson in a different costume: **state which quantity a claim is
+about.**
 
 ---
 

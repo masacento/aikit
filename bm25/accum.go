@@ -85,13 +85,16 @@ func (ix *Index) scoreQuery(query []string) *accum {
 		if idf == 0 {
 			continue
 		}
+		// K1/B are exported and may be tuned by the caller before querying, so
+		// they cannot be folded into the postings at Build (item 10's
+		// "precompute the impact" would bake them in). Hoisting them out of the
+		// posting loop is free and keeps them live.
+		k1, bb := ix.K1, ix.B
+		k1p1 := k1 + 1
 		for _, p := range ix.postings[term] {
-			var norm float64
-			if ix.avgdl > 0 {
-				norm = float64(ix.docLen[p.doc]) / ix.avgdl
-			}
-			denom := float64(p.tf) + ix.K1*(1-ix.B+ix.B*norm)
-			a.add(p.doc, idf*(float64(p.tf)*(ix.K1+1))/denom)
+			tf := float64(p.tf)
+			denom := tf + k1*(1-bb+bb*ix.norm[p.doc])
+			a.add(int(p.doc), idf*(tf*k1p1)/denom)
 		}
 	}
 	a.sortTouched()

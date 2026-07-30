@@ -69,10 +69,11 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~7~~ | ~~SPLADE vocab matmul runs **serial**~~ — **DONE, 1.05–1.19× on `Expand`** (§7.12); needed a trunk column fan-out too, since the trunk is NOT parallel at short L | encoder | 2.3× was optimistic | = | — |
 | ~~8~~ | ~~`gte.go:230` allocates 12.6 MB/`Encode` outside the scratch arena~~ — **DONE, −12.7 MiB/call (−43%)** (§7.13) | encoder | exactly as estimated; **no latency change** | = | — |
 | 9 | `SpanCache` LRU → MRU/scan-resistant; add `MADV_WILLNEED` on map; pipeline `Touch(b+1)` | mmap | 0% → max hit rate | — | S |
-| 10 | `bm25`: hoist `1/avgdl`; precompute per-posting impact at build time | bm25 | 1.5–2× scoring | ~ | S–M |
+| ~~10~~ | ~~`bm25`: hoist `1/avgdl`; precompute per-posting impact~~ — **DONE (K1/B-safe half), bit-identical** (§7.24) | bm25 | scoring did NOT move: item 11 had already taken the scan off the critical path | = | — |
 | ~~40~~ | ~~**(NEW)** intra-op matmul fans across ROWS, replicating the weights per worker~~ — **DONE, −3.9% geomean / −15.8% on `SPLADE.Expand` L=91** (§7.14) | encoder | columns beat rows at every trunk shape, up to 3.33× | = | — |
 | ~~41~~ | ~~**(NEW)** `matmulBTInto`'s 4 MFLOP naive/blocked split is not reduction-order-consistent~~ — **DONE with item 27** (§7.20) | encoder | also removes the last batch-vs-single divergence | — | — |
 | 43 | **(NEW)** `TestQwenVisionEncoder_parity`'s threshold accepts cosine 0.99999156 / maxΔ 6.2e-03 — a dropped attention segment passes it (§7.19) | vision | gate strength, not speed | — | S |
+| 44 | **(NEW)** `bm25` `sortTouched` is an O(T log T) sort of every touched doc id, purely to reproduce topk's first-seen tie-break — an explicit (score desc, doc asc) tie-break makes it O(T + k log k) (§7.24) | bm25 | **~18% of a common query** | = | S–M |
 | ~~42~~ | ~~**(NEW)** attention softmax + GELU/GeGLU run SERIAL and are O(L²)/O(L·I)~~ — **DONE, −31% geomean, `GTE.Encode` L=690 3.28×** (§7.15) | encoder | the elementwise stages ARE the forward once the matmuls are parallel | = | — |
 
 ### Tier 1 — the big measured wins
@@ -102,8 +103,8 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 26 | `math.Round` is **not** an amd64 intrinsic (`math.Trunc` is) — verified in disassembly | linalg, encoder | ~12 int ops → 1 `ROUNDSD` | = | S |
 | ~~27~~ | ~~Encoder's 4-MFLOP naive threshold sends **every** attention matmul at L<250 to a scalar triple loop~~ — **DONE, up to −50.5%** (§7.20) | encoder | estimated 3–9%; the first large UNDER-estimate | ~ | — |
 | 28 | `CrossEncoder` has **no batch API** and re-tokenizes the query per pair | encoder | unlocks item 14 for rerank | = | M |
-| 29 | `bm25` posting is 16 B (`sparse`'s is 8 B); build allocates 3.1× the payload | bm25 | 1.5–2× scoring, 3× build alloc | = | M |
-| 30 | `bm25.Tokenize` allocates a string per mixed-case token — 787 allocs for one 20 KB Go file | bm25 | 787 → ~10 | = | S |
+| ~~29~~ | ~~`bm25` posting is 16 B~~ — **DONE, −50% index memory (381.7→190.9 MB at 200k docs)** (§7.24) | bm25 | ~0% scoring, −16% build alloc; the Win column led with the wrong effect | = | — |
+| ~~30~~ | ~~`bm25.Tokenize` allocates a string per mixed-case token~~ — **DONE, 983 → 2 allocs, −44.7%** (§7.24) | bm25 | beat its "787 → ~10" estimate | = | — |
 | 31 | QKV split + per-head V transpose: 3 full `[L,D]` copies/layer, with a power-of-two stride pathology at exactly `DefaultMaxSeqLength=512` | encoder | 3.3× on the transpose (small absolute) | = | M |
 | ~~32~~ | ~~Vision preprocess: `draw.Draw` costs more than the JPEG decode~~ — **DONE, −31.4% end-to-end / 2.45× on the non-decode work** (§7.22) | vision | the 2.3× was of the convert+resize, not of Preprocess | = (tested) | — |
 | 33 | `moeMLP` is entirely M=1 — 2048 single-row GEMM calls per MoE layer at L=512 | encoder | group tokens by expert | = | M |
@@ -1579,6 +1580,63 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     unfiltered one: the filter interacts with the per-shard threshold, so
     `TestFlatQueryFilter_shardedMatchesSerial` runs all/none/evens/sparse/prefix/
     suffix filters across the tie-heavy inputs.
+
+24. **The bm25 batch (items 10, 29, 30): one large win, and two whose predicted
+    win had already been spent by item 11.**
+
+    **Item 30 — the tokenizer arena — beat its estimate.** `lowerString`
+    allocated one string per mixed-case token. Lowered bytes now go into a single
+    per-call arena, converted to a string ONCE at the end, with each token a
+    substring of it (Go substrings share the backing array, so carving them out
+    is free). The already-lowercase fast path still returns a view into the
+    caller's text with no copy.
+
+    | | before | after | |
+    |---|--:|--:|--:|
+    | `Tokenize`, 16 KB Go file | 263.3 µs | 145.7 µs | **−44.7%** |
+    | allocs/op | **983** | **2** | −99.8% |
+    | B/op | 160.4 KiB | 59.0 KiB | −63.2% |
+
+    Estimate was "787 → ~10"; measured 983 → 2. One retention note is documented
+    on `Tokenize`: arena-backed tokens keep the arena alive, so holding one token
+    from a huge document retains that document's lowered forms — the same
+    trade `strings.Split` makes, and the indexer consumes all tokens immediately.
+    A nil-vs-empty regression (token-free input used to return nil, `make`
+    returns non-nil) was caught by the existing tests and preserved.
+
+    **Items 29 and 10 delivered memory, not speed.** `posting` is now
+    `{doc, tf int32}` = 8 B rather than `{doc, tf int}` = 16 B, and the length
+    normalization is precomputed per document instead of divided per posting.
+    Both are bit-identical, gated against a character-for-character reference of
+    the old scoring expression at four K1/B settings.
+
+    | | before | after | |
+    |---|--:|--:|--:|
+    | postings on a 200k-doc index | 381.7 MB | **190.9 MB** | −50% |
+    | `Build` time | 1091.6 µs | 966.1 µs | −11.5% |
+    | `Build` B/op | 269.1 KiB | 224.8 KiB | −16.5% |
+    | `TopK`, common query, 200k docs | 576.9 µs | 544.7 µs | **~ (p=0.310)** |
+    | `TopK`, selective | 3.228 µs | 3.264 µs | ~ (p=0.937) |
+
+    Both items predicted "1.5–2× scoring". Scoring did not move at either scale.
+    **The reason is item 11, in this same document.** The touched-set accumulator
+    replaced an O(corpus) scan with O(postings touched), and in doing so moved
+    the bottleneck off the posting walk entirely. Profiling the query loop at 200k
+    docs, the largest identifiable cost is now
+    `slices.partitionOrdered[int32]` + `insertionSortOrdered` at **~18%** — that
+    is `sortTouched` — with the posting scan not visible above GC. Items 10 and
+    29 optimize a scan that stopped being the bottleneck two items earlier.
+
+    That does not make them wrong to land: halving the index's dominant storage
+    is worth 190 MB on a 200k-doc corpus, and item 29's Win column simply led with
+    the wrong one of its two effects ("1.5–2× scoring, 3× build alloc" — actually
+    ~0% scoring, −16% build alloc, −50% index memory).
+
+    **New item 44, found by that profile.** `sortTouched` is a full O(T log T)
+    sort of every touched doc id, and it exists ONLY to reproduce topk's
+    first-seen tie-break by visiting ids in ascending order. Selecting with an
+    explicit (score desc, doc asc) tie-break instead — exactly what §7.23's shard
+    merge does — replaces it with O(T + k log k). ~18% of a common query.
 
 ---
 

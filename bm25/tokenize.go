@@ -54,14 +54,35 @@ import (
 // cap covers typical identifier sub-token count.
 type tokBuffers struct {
 	scratch []byte
-	parts   []string
+	parts   []tokRef
+	// arena holds every lowered token of one Tokenize call back to back, so the
+	// lowercase forms cost ONE string allocation instead of one per token
+	// (perf-campaign item 30: a 16 KB Go file produced 983 allocations).
+	arena []byte
+	refs  []tokRef
+}
+
+// tokRef is a token that is not a string yet. Lowering has to be deferred
+// because appending to the arena may reallocate it, which would invalidate any
+// string already carved out of it — so runs record spans and Tokenize
+// materializes them all once, at the end.
+//
+// s is set instead when the token needed no lowering at all: that is the common
+// case for real source identifiers, and it points straight into the caller's
+// text with no copy, exactly as before.
+type tokRef struct {
+	s      string
+	lo, hi int32
+	arena  bool
 }
 
 var tokenizerPool = sync.Pool{
 	New: func() any {
 		return &tokBuffers{
 			scratch: make([]byte, 0, 256),
-			parts:   make([]string, 0, 16),
+			parts:   make([]tokRef, 0, 16),
+			arena:   make([]byte, 0, 4096),
+			refs:    make([]tokRef, 0, 256),
 		}
 	},
 }
@@ -110,10 +131,13 @@ func Tokenize(text string) []string {
 	defer func() {
 		bufs.scratch = bufs.scratch[:0]
 		bufs.parts = bufs.parts[:0]
+		bufs.arena = bufs.arena[:0]
+		bufs.refs = bufs.refs[:0]
 		tokenizerPool.Put(bufs)
 	}()
+	bufs.arena = bufs.arena[:0]
+	bufs.refs = bufs.refs[:0]
 
-	var out []string
 	runStart := -1
 	n := len(text)
 
@@ -129,11 +153,38 @@ func Tokenize(text string) []string {
 			continue
 		}
 		// Non-identifier byte ends the current run at i (exclusive).
-		out = emitRun(text[runStart:i], bufs, out)
+		emitRun(text[runStart:i], bufs)
 		runStart = -1
 	}
 	if runStart >= 0 {
-		out = emitRun(text[runStart:], bufs, out)
+		emitRun(text[runStart:], bufs)
+	}
+
+	// Materialize once. Substrings of a Go string share its backing array, so
+	// carving every lowered token out of `lowered` costs nothing beyond the one
+	// conversion — which is the whole point.
+	//
+	// Retention note: arena-backed tokens keep `lowered` alive, so holding a
+	// single token from a very large document retains that document's lowered
+	// forms. This matches strings.Split and friends, and the indexing path
+	// consumes all tokens immediately.
+	if len(bufs.refs) == 0 {
+		// Preserve the original nil-vs-empty distinction: text with no
+		// identifier runs returned a nil slice, and callers may compare against
+		// nil. make() would hand back an empty non-nil one.
+		return nil
+	}
+	var lowered string
+	if len(bufs.arena) > 0 {
+		lowered = string(bufs.arena)
+	}
+	out := make([]string, len(bufs.refs))
+	for i, r := range bufs.refs {
+		if r.arena {
+			out[i] = lowered[r.lo:r.hi]
+		} else {
+			out[i] = r.s
+		}
 	}
 	return out
 }
@@ -156,8 +207,8 @@ func Tokenize(text string) []string {
 //     — also independent of subsequent bufs mutation).
 //   - So neither out's slice nor its strings depend on bufs.parts'
 //     backing array after the append completes.
-func emitRun(run string, bufs *tokBuffers, out []string) []string {
-	compound := lowerString(run, &bufs.scratch)
+func emitRun(run string, bufs *tokBuffers) {
+	compound := lowerRef(run, bufs)
 	bufs.parts = bufs.parts[:0]
 
 	if strings.IndexByte(run, '_') >= 0 {
@@ -170,7 +221,7 @@ func emitRun(run string, bufs *tokBuffers, out []string) []string {
 		for i := 0; i <= len(run); i++ {
 			if i == len(run) || run[i] == '_' {
 				if i > start {
-					bufs.parts = append(bufs.parts, lowerString(run[start:i], &bufs.scratch))
+					bufs.parts = append(bufs.parts, lowerRef(run[start:i], bufs))
 				}
 				start = i + 1
 			}
@@ -182,13 +233,10 @@ func emitRun(run string, bufs *tokBuffers, out []string) []string {
 		camelSplitBytesInto(run, bufs)
 	}
 
+	bufs.refs = append(bufs.refs, compound)
 	if len(bufs.parts) >= 2 {
-		out = append(out, compound)
-		out = append(out, bufs.parts...)
-	} else {
-		out = append(out, compound)
+		bufs.refs = append(bufs.refs, bufs.parts...)
 	}
-	return out
 }
 
 // lowerString returns the lowercase of s. Two paths:
@@ -222,6 +270,26 @@ func lowerString(s string, scratch *[]byte) string {
 		}
 	}
 	return s
+}
+
+// lowerRef is lowerString writing into the shared arena instead of allocating a
+// string per token. Same fast path: a run with no uppercase byte is returned by
+// reference, untouched.
+func lowerRef(s string, bufs *tokBuffers) tokRef {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			lo := len(bufs.arena)
+			for j := 0; j < len(s); j++ {
+				c := s[j]
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				bufs.arena = append(bufs.arena, c)
+			}
+			return tokRef{lo: int32(lo), hi: int32(len(bufs.arena)), arena: true}
+		}
+	}
+	return tokRef{s: s}
 }
 
 // isIdentStartByte matches Python regex `[a-zA-Z_]` — ASCII only. A
@@ -277,7 +345,7 @@ func camelSplitBytesInto(run string, bufs *tokBuffers) {
 			}
 			// Alt 1: [A-Z]+(?=[A-Z][a-z]) — need ≥2 uppers and run[j] lower.
 			if j-i >= 2 && j < n && isLowerByte(run[j]) {
-				bufs.parts = append(bufs.parts, lowerString(run[i:j-1], &bufs.scratch))
+				bufs.parts = append(bufs.parts, lowerRef(run[i:j-1], bufs))
 				i = j - 1
 				continue
 			}
@@ -287,12 +355,12 @@ func camelSplitBytesInto(run string, bufs *tokBuffers) {
 				for k < n && isLowerByte(run[k]) {
 					k++
 				}
-				bufs.parts = append(bufs.parts, lowerString(run[i:k], &bufs.scratch))
+				bufs.parts = append(bufs.parts, lowerRef(run[i:k], bufs))
 				i = k
 				continue
 			}
 			// Alt 3: [A-Z]+ — pure uppercase (no lowercase follows).
-			bufs.parts = append(bufs.parts, lowerString(run[i:j], &bufs.scratch))
+			bufs.parts = append(bufs.parts, lowerRef(run[i:j], bufs))
 			i = j
 		case isLowerByte(c):
 			j := i + 1
@@ -300,14 +368,14 @@ func camelSplitBytesInto(run string, bufs *tokBuffers) {
 				j++
 			}
 			// Already lowercase — emit the view directly (fast path).
-			bufs.parts = append(bufs.parts, run[i:j])
+			bufs.parts = append(bufs.parts, tokRef{s: run[i:j]})
 			i = j
 		case isDigitByte(c):
 			j := i + 1
 			for j < n && isDigitByte(run[j]) {
 				j++
 			}
-			bufs.parts = append(bufs.parts, run[i:j])
+			bufs.parts = append(bufs.parts, tokRef{s: run[i:j]})
 			i = j
 		default:
 			// Unreachable: caller filters underscores and non-ASCII.

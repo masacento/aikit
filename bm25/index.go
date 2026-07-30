@@ -1,5 +1,10 @@
 package bm25
 
+import (
+	"math"
+	"unsafe"
+)
+
 // BM25 defaults. These are the Lucene / bm25s defaults; ken's DESIGN.md
 // Stage 1 validates ranking against semble's SearchMode.BM25, so the exact
 // variant is pinned to what bm25s uses by default (the Lucene IDF, see
@@ -9,16 +14,27 @@ const (
 	DefaultB  = 0.75
 )
 
+// posting is deliberately 8 bytes, not 16 (perf-campaign item 29). The scoring
+// scan is a linear walk over posting lists and is memory-bound, so the struct
+// width IS the scan cost: int/int made it 16 B where sparse's equivalent has
+// always been 8. int32 is ample — Build rejects a corpus that would overflow it.
 type posting struct {
-	doc int
-	tf  int
+	doc int32
+	tf  int32
 }
+
+// sizeofPosting is asserted by TestPostingWidth; see posting's comment.
+const sizeofPosting = unsafe.Sizeof(posting{})
 
 // Index is an immutable BM25 inverted index over a fixed document set.
 // Documents are referenced by their position in the slice passed to Build.
 type Index struct {
-	K1, B    float64
-	docLen   []int
+	K1, B  float64
+	docLen []int
+	// norm[d] is docLen[d]/avgdl, precomputed at Build. The scoring loop used to
+	// divide per POSTING; this makes it a load (item 10). Computed with exactly
+	// the expression the loop used, so scores are bit-identical.
+	norm     []float64
 	avgdl    float64
 	postings map[string][]posting
 	df       map[string]int
@@ -28,6 +44,12 @@ type Index struct {
 // Tokenize). docs[i] is document i's token stream; empty docs are allowed
 // and simply score zero.
 func Build(docs [][]string) *Index {
+	// posting packs doc and tf into int32s (item 29). Both bounds are far beyond
+	// any real corpus, but a silent truncation here would corrupt the index, so
+	// it panics rather than wraps.
+	if len(docs) > math.MaxInt32 {
+		panic("bm25: corpus exceeds 2^31-1 documents")
+	}
 	ix := &Index{
 		K1:       DefaultK1,
 		B:        DefaultB,
@@ -51,12 +73,21 @@ func Build(docs [][]string) *Index {
 			tf[t]++
 		}
 		for term, f := range tf {
-			ix.postings[term] = append(ix.postings[term], posting{doc: d, tf: f})
+			ix.postings[term] = append(ix.postings[term], posting{doc: int32(d), tf: int32(f)})
 			ix.df[term]++
 		}
 	}
 	if len(docs) > 0 {
 		ix.avgdl = float64(total) / float64(len(docs))
+	}
+	// Precompute the length normalization per document (item 10). The expression
+	// is character-for-character the one the scoring loop used, so every score is
+	// bit-identical; the loop just stops dividing once per posting.
+	ix.norm = make([]float64, len(docs))
+	if ix.avgdl > 0 {
+		for d := range ix.norm {
+			ix.norm[d] = float64(ix.docLen[d]) / ix.avgdl
+		}
 	}
 	return ix
 }
