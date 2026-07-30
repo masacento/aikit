@@ -37,9 +37,10 @@ package encoder
 func (w *Weights) forwardBatch(idsList [][]int32) [][]float32 {
 	// Counts as one in-flight forward so the intra-op matmul gate stays
 	// serial under EncodeBatch's per-worker parallelism (parallel.go).
-	// The B==1 fast path below nests into forward() (count→2) and so
-	// won't intra-op-parallelize; that's benign — true single-item
-	// latency is served by Encode()→forward (count=1), not batch-of-1.
+	// The delegating paths below (B==1 and the MoE/dense-GELU/qkv-bias
+	// fallback) call forwardInner, which does NOT bracket again — nesting
+	// pushed the count to 2 and made every matmul decline to parallelize
+	// (item 34).
 	enterForward()
 	defer leaveForward()
 	B := len(idsList)
@@ -58,13 +59,15 @@ func (w *Weights) forwardBatch(idsList [][]int32) [][]float32 {
 	if w.hasMoE() || !w.Cfg.gatedMLP() || w.Cfg.QKVProjBias {
 		out := make([][]float32, B)
 		for i, ids := range idsList {
-			out[i] = w.forward(ids)
+			// forwardInner, not forward: this function already holds the
+			// in-flight bracket (item 34).
+			out[i] = w.forwardInner(ids)
 		}
 		return out
 	}
 	if B == 1 {
 		// Fast path: no batching benefit, skip the padding overhead.
-		return [][]float32{w.forward(idsList[0])}
+		return [][]float32{w.forwardInner(idsList[0])}
 	}
 
 	// Find max L for padding. Track per-sequence real lengths so the

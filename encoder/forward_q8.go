@@ -26,6 +26,13 @@ import (
 func (w *WeightsQ8) forward(ids []int32) []float32 {
 	enterForward()
 	defer leaveForward()
+	return w.forwardInner(ids)
+}
+
+// forwardInner is forward without the in-flight bracket — see
+// Weights.forwardInner (item 34). WeightsQ8.forwardBatch's B==1 path delegates
+// here so the count stays at 1.
+func (w *WeightsQ8) forwardInner(ids []int32) []float32 {
 	L := len(ids)
 	D := w.Cfg.HiddenDim
 	if L == 0 {
@@ -77,7 +84,7 @@ func (w *WeightsQ8) forwardBatch(idsList [][]int32) [][]float32 {
 		return nil
 	}
 	if B == 1 {
-		return [][]float32{w.forward(idsList[0])}
+		return [][]float32{w.forwardInner(idsList[0])}
 	}
 	Lmax := 0
 	realLen := make([]int, B)

@@ -60,8 +60,17 @@ func TestQwenVisionEncoder_parity(t *testing.T) {
 	}
 	cosV, maxV := cosine(gotVit, goldVit)
 	t.Logf("Qwen2.5-VL ViT pre-merge vs HF golden (f32): cosine=%.8f max abs diff=%.3e", cosV, maxV)
-	if cosV < 0.9999 {
-		t.Errorf("vit_hidden cosine %.8f < 0.9999 — block stack diverges from HF", cosV)
+	// Thresholds tightened per perf-campaign item 43. At 0.9999 this test
+	// accepted a mutant that dropped an ENTIRE attention segment (it reported
+	// cosine 0.99999156, maxΔ 6.18e-03) — a gate loose enough to pass a missing
+	// segment is not gating the block stack. The correct run sits at cosine
+	// 1.00000000 / maxΔ 7.75e-07, so these leave ~3 orders of magnitude of
+	// headroom over f32 noise while rejecting anything structural.
+	if cosV < 0.99999_99 {
+		t.Errorf("vit_hidden cosine %.8f < 0.9999999 — block stack diverges from HF", cosV)
+	}
+	if maxV > 1e-4 {
+		t.Errorf("vit_hidden max abs diff %.3e > 1e-4 — block stack diverges from HF", maxV)
 	}
 
 	// Stage 2: merged image features (both in original patch order).
@@ -74,7 +83,10 @@ func TestQwenVisionEncoder_parity(t *testing.T) {
 	}
 	cosM, maxM := cosine(got, g.ImageFeatures)
 	t.Logf("Qwen2.5-VL merged features vs HF golden (f32): cosine=%.8f max abs diff=%.3e", cosM, maxM)
-	if cosM < 0.9999 {
-		t.Errorf("image_features cosine %.8f < 0.9999 — merger diverges from HF", cosM)
+	if cosM < 0.99999_99 {
+		t.Errorf("image_features cosine %.8f < 0.9999999 — merger diverges from HF", cosM)
+	}
+	if maxM > 1e-4 {
+		t.Errorf("image_features max abs diff %.3e > 1e-4 — merger diverges from HF", maxM)
 	}
 }

@@ -376,6 +376,8 @@ been consistently right; magnitudes consistently optimistic.**
 | 29 · bm25 8-byte posting | 1.5–2× scoring | ~0% scoring; **−50% index memory** | ⚠️ |
 | 10 · bm25 precomputed norm | 1.5–2× scoring | ~0% scoring | ❌ |
 | 44 · bm25 touched-set order | ~18% (pprof share) | **−43.5%** on the query | ❌ (under) |
+| 4 · FlatI8 query scratch | 10–25% time | −5.4% time; **−99.2% B/op** | ⚠️ |
+| 34 · double `enterForward` | correctness-ish | unmeasurable on this box's checkpoints | — |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -485,6 +487,26 @@ window is dominated by the code under test — raise `-benchtime` until the setu
 is negligible, or profile the operation directly. Cross-check the share against
 wall-clock: 18% of a 0.5 ms query is 90 µs, which was implausible next to a
 sort of ~100k int32s.
+
+---
+
+### 1.20 A timing ratio is the wrong shape for a capability claim
+
+`TestEncodeBatch_speedup` asserted that batched encoding is ≥2× a sequential
+loop, from ONE sample of each. It was observed failing at 1.82× and 1.97× while
+measuring 2.6–2.8× when run alone — because `go test ./...` runs packages
+concurrently, so it routinely shares the machine with a dozen other packages'
+tests.
+
+Nothing was wrong with the threshold. The claim is that the machine *can* reach
+2× through parallelism, and a single wall-clock ratio under unknown contention
+cannot test that: it measures the worst moment it happened to sample.
+
+**Guard:** when a test asserts a capability rather than an average, take
+best-of-N. Genuinely broken parallelism still fails every attempt, so the
+assertion keeps its strength; only the contention flake goes away. The same
+applies to any test with a hard floor on a speedup, a throughput, or a latency
+budget.
 
 ---
 

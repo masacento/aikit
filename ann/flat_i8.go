@@ -117,17 +117,35 @@ func (f *FlatI8) query(q []float32, k int, keep func(int) bool) []Hit {
 	}
 	// W8A8 at M=1: dynamically quantize q, int8-dot it against every stored
 	// vector, rescale by the query and per-vector scales. SIMD + parallel.
-	dst := make([]float32, f.n)
+	//
+	// Both the score buffer and the kernel's Workspace come from a pool
+	// (perf-campaign item 4). The in-memory fast path used to allocate a fresh
+	// []float32 of f.n per query AND go through the allocating MatmulBTW8A8
+	// wrapper, which makes a zero Workspace — so int8Buf(K) + f32Buf(1) were
+	// fresh every call too. The PAGED path had already fixed exactly this
+	// (scorePaged, with a comment naming the problem); the common path was left
+	// behind. It cannot simply reuse f.ws the way scorePaged does, because that
+	// is guarded by pagerMu and Query has no lock — hence a pool.
+	//
+	// Reuse is safe because the kernel ASSIGNS every element of dst[0:n]
+	// (w8a8Span writes dst[i,j], it does not accumulate), as do the GPU and
+	// paged paths; TestFlatI8_pooledScratchIsInert poisons the pool to check it.
+	sc := flatI8ScratchPool.Get().(*flatI8Scratch)
+	defer flatI8ScratchPool.Put(sc)
+	if cap(sc.dst) < f.n {
+		sc.dst = make([]float32, f.n)
+	}
+	dst := sc.dst[:f.n]
 	switch {
 	case f.gpu != nil:
 		// Device-resident scoring; fall back to the CPU kernel if the device errors
 		// (the scores are identical up to the int8 tolerance, so the fallback is
 		// transparent to the ranking).
 		if err := f.gpu.Score(q, dst); err != nil {
-			linalg.MatmulBTW8A8(q, f.bq, f.scales, dst, 1, f.dim, f.n)
+			linalg.MatmulBTW8A8Into(&sc.ws, q, f.bq, f.scales, dst, 1, f.dim, f.n)
 		}
 	case f.pager == nil:
-		linalg.MatmulBTW8A8(q, f.bq, f.scales, dst, 1, f.dim, f.n)
+		linalg.MatmulBTW8A8Into(&sc.ws, q, f.bq, f.scales, dst, 1, f.dim, f.n)
 	default:
 		f.scorePaged(q, dst)
 	}
@@ -181,3 +199,13 @@ func (f *FlatI8) topHits(dst []float32, k int, keep func(int) bool) []Hit {
 	}
 	return hits
 }
+
+// flatI8Scratch is the per-query scratch a FlatI8 scan needs: the score buffer
+// and the W8A8 kernel's quantization Workspace. Pooled rather than per-query —
+// see the note in query (item 4).
+type flatI8Scratch struct {
+	ws  linalg.Workspace
+	dst []float32
+}
+
+var flatI8ScratchPool = sync.Pool{New: func() any { return new(flatI8Scratch) }}

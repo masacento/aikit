@@ -37,6 +37,17 @@ func clampTokenID(id int32, vocab int) int {
 func (w *Weights) forward(ids []int32) []float32 {
 	enterForward()
 	defer leaveForward()
+	return w.forwardInner(ids)
+}
+
+// forwardInner is forward WITHOUT the in-flight bracket, for callers that
+// already hold one. forwardBatch does: it brackets once for the whole batch and
+// then delegates per sequence on the fallback and B==1 paths, which used to
+// bracket a SECOND time. The nested count of 2 made wantParallelMatmul decline,
+// so EncodeBatch(texts, …, 1) on a MoE / dense-GELU / qkv-bias checkpoint ran
+// every matmul serially and was strictly slower than a bare Encode per text
+// (perf-campaign item 34).
+func (w *Weights) forwardInner(ids []int32) []float32 {
 	L := len(ids)
 	if L == 0 {
 		// Degenerate input — return zero vector (matches the empty-input

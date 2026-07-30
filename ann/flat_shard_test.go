@@ -177,3 +177,60 @@ func hitsOf(hs []Hit) []hit {
 	}
 	return out
 }
+
+// TestFlatI8_pooledScratchIsInert guards the hazard item 4 introduces: the score
+// buffer and the kernel Workspace are now pooled, so a query receives whatever
+// the previous query left behind. Any element the kernel fails to overwrite
+// would silently score a document using a stale value.
+//
+// Poisoning the pool and comparing against a known-good result is the only way
+// to see it — running the same query twice would agree, and agree wrongly.
+func TestFlatI8_pooledScratchIsInert(t *testing.T) {
+	rng := rand.New(rand.NewSource(4))
+	const n, d = 3000, 96
+	vecs := make([][]float32, n)
+	for i := range vecs {
+		v := make([]float32, d)
+		var norm float64
+		for j := range v {
+			v[j] = float32(rng.NormFloat64())
+			norm += float64(v[j]) * float64(v[j])
+		}
+		inv := float32(1 / math.Sqrt(norm))
+		for j := range v {
+			v[j] *= inv
+		}
+		vecs[i] = v
+	}
+	f := NewFlatI8(vecs)
+	q := vecs[7]
+
+	want := f.Query(q, 10)
+
+	// Poison every scratch the pool can hand back.
+	held := make([]*flatI8Scratch, 0, 32)
+	for range 32 {
+		sc := flatI8ScratchPool.Get().(*flatI8Scratch)
+		if cap(sc.dst) < n {
+			sc.dst = make([]float32, n)
+		}
+		for i := range sc.dst[:n] {
+			sc.dst[i] = 12345
+		}
+		held = append(held, sc)
+	}
+	for _, sc := range held {
+		flatI8ScratchPool.Put(sc)
+	}
+
+	got := f.Query(q, 10)
+	if !reflect.DeepEqual(hitsOf(got), hitsOf(want)) {
+		t.Fatalf("query after a poisoned pool differs\n got %v\nwant %v", hitsOf(got), hitsOf(want))
+	}
+	// Vacuity: the poison must actually be reachable, i.e. the pool is used.
+	sc := flatI8ScratchPool.Get().(*flatI8Scratch)
+	if cap(sc.dst) == 0 {
+		t.Error("pool never received a sized scratch — the query path is not using it")
+	}
+	flatI8ScratchPool.Put(sc)
+}

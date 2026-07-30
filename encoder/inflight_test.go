@@ -98,3 +98,45 @@ func (c *countingBackend) MatmulBT(a, b, dst []float32, M, K, N int) {
 }
 
 func (c *countingBackend) Close() error { return nil }
+
+// TestForwardBatch_doesNotDoubleCount pins item 34. forwardBatch brackets once
+// for the whole batch and then delegates per sequence on the B==1 and
+// MoE/dense-GELU/qkv-bias fallback paths. Those used to call forward(), which
+// brackets AGAIN — the nested count of 2 made wantParallelMatmul decline, so
+// EncodeBatch(texts, …, 1) on such a checkpoint ran every matmul serially and
+// was strictly slower than a bare Encode per text.
+//
+// The count is observed from inside the forward, which is the only place the
+// difference is visible: the results are identical either way, just slower.
+func TestForwardBatch_doesNotDoubleCount(t *testing.T) {
+	const dir = "../testdata/encoder-model"
+	if _, err := os.Stat(dir); err != nil {
+		t.Skip("testdata/encoder-model/ not present; see scripts/README.md")
+	}
+	m, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	if got := inflightForwards.Load(); got != 0 {
+		t.Fatalf("counter not at rest: %d", got)
+	}
+	var peak, samples int32
+	m.weights.be = &countingBackend{peak: &peak, samples: &samples}
+
+	// B==1 goes through forwardBatch's delegating fast path.
+	if _, err := m.EncodeBatch([]string{"how do i parse json"}, []bool{false}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if samples == 0 {
+		t.Fatal("backend never invoked — this test observed nothing")
+	}
+	if peak != 1 {
+		t.Errorf("in-flight count during EncodeBatch(1 text, concurrency 1) = %d, want 1; "+
+			"a nested bracket makes every matmul decline to parallelize (item 34)", peak)
+	}
+	if got := inflightForwards.Load(); got != 0 {
+		t.Errorf("counter leaked: %d", got)
+	}
+}

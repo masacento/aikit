@@ -63,7 +63,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 1 | Revive the 3 dead benchmark files; add warm-up + alloc accounting + a concurrent-QPS mode to `bench/harness.go` | bench | unblocks everything | — | S |
 | ~~2~~ | ~~SPLADE: hoist `log1p` outside the L×V max-reduce~~ — **DONE** (§7.10); **measured 1.28–1.47×** on the pooling step (§7.12) | encoder | pooling is ~0.5% of `Expand`, so invisible end-to-end | **=** | — |
 | ~~3~~ | ~~`topk.Push`: hoist the threshold compare~~ — **DONE** (§7.8) | topk, ann | **1.05× end-to-end** on `Flat.Query` (the 1.43× was the selection step alone) | = | — |
-| 4 | `FlatI8.Query`: pool the score buffer; stop allocating a `Workspace` per query | ann | 10–25% now, large at N≥1M | = | S |
+| ~~4~~ | ~~`FlatI8.Query`: pool the score buffer; stop allocating a `Workspace` per query~~ — **DONE, −99.2% B/op; −5.4% time at N=100k** (§7.26) | ann | estimated 10–25% time; the win is allocation | = | — |
 | ~~5~~ | ~~Index (de)serialization: bulk `copy`~~ — **DONE, 5.14×** (§7.8) | ann | 15.6 → 3.04 ms on a 50k×384 index; the 20–30× estimate was optimistic | = | — |
 | ~~6~~ | ~~BERT/GTE forwards never call `enterForward()`~~ — **DONE** (§7.12) | encoder | removes oversubscription | — | — |
 | ~~7~~ | ~~SPLADE vocab matmul runs **serial**~~ — **DONE, 1.05–1.19× on `Expand`** (§7.12); needed a trunk column fan-out too, since the trunk is NOT parallel at short L | encoder | 2.3× was optimistic | = | — |
@@ -72,7 +72,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~10~~ | ~~`bm25`: hoist `1/avgdl`; precompute per-posting impact~~ — **DONE (K1/B-safe half), bit-identical** (§7.24) | bm25 | scoring did NOT move: item 11 had already taken the scan off the critical path | = | — |
 | ~~40~~ | ~~**(NEW)** intra-op matmul fans across ROWS, replicating the weights per worker~~ — **DONE, −3.9% geomean / −15.8% on `SPLADE.Expand` L=91** (§7.14) | encoder | columns beat rows at every trunk shape, up to 3.33× | = | — |
 | ~~41~~ | ~~**(NEW)** `matmulBTInto`'s 4 MFLOP naive/blocked split is not reduction-order-consistent~~ — **DONE with item 27** (§7.20) | encoder | also removes the last batch-vs-single divergence | — | — |
-| 43 | **(NEW)** `TestQwenVisionEncoder_parity`'s threshold accepts cosine 0.99999156 / maxΔ 6.2e-03 — a dropped attention segment passes it (§7.19) | vision | gate strength, not speed | — | S |
+| ~~43~~ | ~~`TestQwenVisionEncoder_parity`'s threshold accepts a dropped attention segment~~ — **DONE** (§7.26), tightened to cosine ≥ 0.9999999 + maxΔ ≤ 1e-4 | vision | gate strength | — | — |
 | ~~44~~ | ~~**(NEW)** `bm25` `sortTouched` is an O(T log T) sort of every touched doc id~~ — **DONE, −43.5% on a common query** (§7.25); fixed by merging the already-sorted per-term runs, not by changing the tie-break | bm25 | profile said ~18%; query-only win is 43.5% | = | — |
 | ~~42~~ | ~~**(NEW)** attention softmax + GELU/GeGLU run SERIAL and are O(L²)/O(L·I)~~ — **DONE, −31% geomean, `GTE.Encode` L=690 3.28×** (§7.15) | encoder | the elementwise stages ARE the forward once the matmuls are parallel | = | — |
 
@@ -108,7 +108,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 31 | QKV split + per-head V transpose: 3 full `[L,D]` copies/layer, with a power-of-two stride pathology at exactly `DefaultMaxSeqLength=512` | encoder | 3.3× on the transpose (small absolute) | = | M |
 | ~~32~~ | ~~Vision preprocess: `draw.Draw` costs more than the JPEG decode~~ — **DONE, −31.4% end-to-end / 2.45× on the non-decode work** (§7.22) | vision | the 2.3× was of the convert+resize, not of Preprocess | = (tested) | — |
 | 33 | `moeMLP` is entirely M=1 — 2048 single-row GEMM calls per MoE layer at L=512 | encoder | group tokens by expert | = | M |
-| 34 | `forwardBatch` silently falls back for MoE / dense-GELU / qkv-bias models, **and double-counts `enterForward`** | encoder | correctness-ish perf bug | — | S |
+| ~~34~~ | ~~`forwardBatch` double-counts `enterForward`~~ — **DONE** (§7.26); no number on this box (CodeRankEmbed takes the packed kernel, not the fallback) | encoder | removes a trap for MoE / dense-GELU / qkv-bias checkpoints | — | — |
 
 ### Tier 3 — the swings (bigger, riskier, or hardware-gated)
 
@@ -1668,6 +1668,59 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     unknown terms mixed in, so the run bookkeeping (empty runs, odd run counts,
     single-term queries) comes from real posting lists rather than a fixture, and
     comparing against `slices.Sort` of the same ids. Dropping `beginRun` fails it.
+
+26. **Items 4, 34 and 43 — the small batch.**
+
+    **Item 4 (FlatI8 per-query scratch): an allocation result, not a latency
+    one.** The in-memory fast path allocated a fresh `[]float32` of `f.n` per
+    query AND went through the allocating `MatmulBTW8A8` wrapper, which makes a
+    zero `Workspace` — so `int8Buf(K)` + `f32Buf(1)` were fresh too. The PAGED
+    path had already fixed exactly this, with a comment naming the problem; the
+    common path was left behind. It cannot reuse `f.ws` the way `scorePaged`
+    does (that is guarded by `pagerMu` and `Query` has no lock), so both come
+    from a pool.
+
+    | | before | after | |
+    |---|--:|--:|--:|
+    | B/op, N=100k | 394.3 KiB | 3.25 KiB | **−99.2%** |
+    | B/op, N=10k | 41.2 KiB | 1.01 KiB | −97.6% |
+    | sec/op, N=100k | 1.292 ms | 1.223 ms | −5.4% (p=0.002) |
+    | sec/op, N=10k | 377 µs | 204 µs | too noisy to quote (±32/52%) |
+
+    Estimated "10–25% now"; the reliable timing figure is −5.4%. The N=10k
+    timing is reported as unmeasured rather than as the −45.8% the raw numbers
+    suggest — its variance is half its value. Reuse is now load-bearing, so
+    `TestFlatI8_pooledScratchIsInert` poisons the pool and re-queries.
+
+    **Item 34 (double-counted `enterForward`): a correctness-of-mechanism fix
+    with no number attached.** `forwardBatch` brackets once for the batch and
+    then delegates per sequence on the B==1 and MoE/dense-GELU/qkv-bias fallback
+    paths; those called `forward()`, which brackets AGAIN. The nested count of 2
+    made `wantParallelMatmul` decline, so `EncodeBatch(texts, …, 1)` on such a
+    checkpoint ran every matmul serially. Fixed by splitting `forwardInner` out
+    of `forward` (both f32 and q8) so delegating callers do not re-bracket.
+    Gated by observing the counter from inside the forward — the only place the
+    difference is visible, since results are identical either way.
+
+    On CodeRankEmbed the end-to-end effect is nil, because that checkpoint takes
+    the packed batch kernel rather than the fallback. **The item is worth
+    landing anyway and worth being clear about: it removes a trap for MoE /
+    dense-GELU / qkv-bias checkpoints, none of which this box has.** A measured
+    number would need one of those.
+
+    **Item 43 (vision parity threshold) — closed.** `TestQwenVisionEncoder_parity`
+    used `cosine < 0.9999`, which accepted the §7.19 mutant that dropped an
+    entire attention segment (cosine 0.99999156, maxΔ 6.18e-03). Tightened to
+    cosine ≥ 0.9999999 plus an explicit maxΔ ≤ 1e-4 bound on both stages. The
+    correct run sits at 1.00000000 / 7.75e-07, so this leaves ~3 orders of
+    magnitude over f32 noise while rejecting anything structural — verified by
+    re-running that mutant, which now fails.
+
+    **Also fixed, not an item: a pre-existing flake.** `TestEncodeBatch_speedup`
+    compared one sequential run against one batched run with a hard 2.0× floor,
+    and was observed failing at 1.82× and 1.97× under `go test ./...` (packages
+    run concurrently) while measuring 2.6–2.8× alone. A single wall-clock ratio
+    cannot test a capability claim under contention; it is now best-of-3.
 
 ---
 
