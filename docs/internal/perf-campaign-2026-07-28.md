@@ -83,7 +83,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~11~~ | ~~**(A)** touched-set selection + pooled accumulator~~ — **DONE, bm25 + sparse** (§7.9) | bm25, sparse | 1.3–218× on bm25, selectivity-dependent | = | — |
 | ~~12~~ | ~~**(B)** Rewrite `dotI8AVX2`~~ — **DONE, 2.10× kernel / 2.02× scan** (§7.6) | linalg | measured on Zen 2; int8 now at f32 MAC-parity | = (integer) | — |
 | ~~13~~ | ~~**(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto`~~ — **DONE, all sites** (§7.16 text, §7.17 vision + cross-encoder); pure Go, no assembly | linalg→encoder, vision | text −20.1%; **cross-encoder −33.8%**; SigLIP −17.9%/−30.6% | ~ (contracts stated + gated) | — |
-| 14 | **(E)** Length-bucketed `EncodeBatch` under a token budget | encoder | 1.3–2× on ragged batches | **=** | M |
+| ~~14~~ | ~~**(E)** Length-bucketed `EncodeBatch` under a token budget~~ — **DONE, −13.0% ragged / neutral uniform** (§7.29) | encoder | estimated 1.3–2×; measured 1.15× at B=8 | **=** | — |
 | ~~15~~ | ~~HNSW: batch neighbour scoring through `Dot8x4`~~ — **DONE, 1.36×/1.33×** (§7.27) | ann | matched the prototype; heap pooling (the alloc half) still open | ~ (2 ULP, 0 rank changes over 4,500 hits) | — |
 | ~~16~~ | ~~`Flat.Query` is single-threaded; shard it + per-shard selector~~ — **DONE, 1.73–2.26×; filtered path −42%** (§7.23) | ann | "4–8× typical" was never available: the scan is DRAM-bandwidth-bound at ~25 GB/s | = | — |
 | ~~17~~ | ~~HNSW build: batch `prune`/`selectHeuristic`; kill 225 allocs/insert~~ — **DONE, 1.34× build; 225 → 89 allocs/insert** (§7.28) | ann | estimated 1.5–2.5×; allocation beat the ask | ~ (recall identical) | — |
@@ -1831,6 +1831,46 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     the only test that could have caught this** — which is an argument for
     keeping quality gates on optimization work even when the change looks
     structural rather than numerical.
+
+29. **Item 14 is DONE — −13.0% on ragged batches, neutral on uniform — and it
+    took two wrong benchmarks to measure.** `encodeBatch` tokenizes everything
+    first, sorts indices by length, buckets under a token budget, and workers
+    PULL buckets instead of taking a static index range.
+
+    | | before | after | |
+    |---|--:|--:|--:|
+    | ragged, 32 texts, B=8 | 7.085 s | 6.167 s | **−13.0%** (p=0.008) |
+    | uniform, same size (control) | 4.911 s | 5.025 s | ~ (p=0.095) |
+
+    The control is the point: bucketing helps exactly when lengths vary and does
+    nothing when they do not, which is what the mechanism predicts. Estimated
+    1.3–2×; measured 1.15×, with the gap explained by shape — the doc's scenario
+    was 50 documents on [20,512] (Lmax/mean ≈ 1.9 in tokens), this corpus is
+    smaller in both B and spread.
+
+    Bit-identical, and now provably so end-to-end: `linalg` guarantees
+    M-invariance and pad rows are never read, so changing *which* sequences share
+    a forward changes no output bit. The existing batch-vs-`Encode` test covered
+    four short similar texts; a ragged counterpart now covers the case bucketing
+    actually alters. Both pass exactly.
+
+    **Two benchmarks that measured nothing, both instructive:**
+
+    - The first ran 16 texts at `concurrency=NumCPU`. That gives one sequence per
+      forward — **B=1, no padding in EITHER version** — so it faithfully reported
+      no difference. A benchmark for a padding fix has to have padding: it now
+      pins `concurrency=4` with 32 texts to force B=8.
+    - The first *corpus* used 50 texts of up to 400 words, at ~17 s per
+      iteration, which made a before/after comparison impossible inside any
+      sensible timeout. Shrinking to 32×100 words preserves Lmax/mean ≈ 2 — the
+      property under test — at ~6 s.
+
+    **And one bound that only exists because a test failed.** Bucketing purely by
+    token budget put 8 short texts into a SINGLE bucket, leaving 15 of 16 workers
+    idle; `TestEncodeBatch_speedup` caught it at 1.13×. Bucket size is therefore
+    also capped at `ceil(n/concurrency)`, which reproduces exactly as many
+    dispatchable units as the old partition — so this item changes which
+    sequences share a forward without changing how many forwards run at once.
 
 ---
 

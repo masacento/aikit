@@ -7,7 +7,9 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/townsendmerino/aikit/embed"
 )
@@ -156,6 +158,59 @@ func (m *Model) EncodeBatch(texts []string, isQueries []bool, concurrency int) (
 // model's batched forward. It fans out over `concurrency` workers, each tokenizing
 // its chunk (query/doc prefix per isQueries), running one batched forward, and
 // scattering the vectors back; the first tokenize error wins and is returned.
+// batchTokenBudget caps B·Lmax for one forward — the quantity the padded batch
+// kernel's cost and its scratch arena both scale with. It adapts the batch size
+// to the sequence length instead of fixing a document count: 8 sequences at
+// Lmax=512, 64 at Lmax=64.
+const batchTokenBudget = 4096
+
+// maxBatchSeqs bounds B independently, so a corpus of very short texts does not
+// build a 1000-wide batch whose per-sequence bookkeeping outweighs the packing.
+const maxBatchSeqs = 64
+
+// bucketByLength groups sequence indices into batches of similar length under
+// the token budget.
+//
+// This is perf-campaign item 14. The previous partition was by INPUT ORDER —
+// worker w took a contiguous index range — so a single long document inflated
+// Lmax for its whole chunk. Attention skips pad positions, but the projections
+// and MLP do not: they run over M = B·Lmax, and attention is only ~8% of a layer
+// at L=512/D=768, so ~92% of the FLOPs are exposed to padding. For 50 documents
+// uniform on [20,512] that is 48% of all linear-layer work computed on pad.
+//
+// order must be indices sorted by ascending length; because of that, the longest
+// member of a growing bucket is always the one just added, so the budget check
+// is a single multiply.
+//
+// maxPerBucket is the third bound and it is not optional: the token budget alone
+// would put a small corpus of short texts into ONE bucket, leaving every worker
+// but one idle. Capping at ceil(n/concurrency) reproduces exactly as many
+// dispatchable units as the old index-ordered partition produced, so this item
+// changes WHICH sequences share a forward without changing how many forwards run
+// concurrently. (The existing TestEncodeBatch_speedup caught this: 8 short texts
+// collapsed to a single bucket and the measured speedup fell to 1.13×.)
+func bucketByLength(order []int, lens []int, maxPerBucket int) [][]int {
+	var buckets [][]int
+	cur := []int{}
+	curMax := 0
+	for _, idx := range order {
+		l := max(lens[idx], 1)
+		nextMax := max(curMax, l)
+		if len(cur) > 0 && ((len(cur)+1)*nextMax > batchTokenBudget ||
+			len(cur) >= maxBatchSeqs || len(cur) >= maxPerBucket) {
+			buckets = append(buckets, cur)
+			cur = []int{}
+			nextMax = l
+		}
+		cur = append(cur, idx)
+		curMax = nextMax
+	}
+	if len(cur) > 0 {
+		buckets = append(buckets, cur)
+	}
+	return buckets
+}
+
 func encodeBatch(tok *embed.Tokenizer, maxSeq int, fwd func([][]int32) [][]float32, texts []string, isQueries []bool, concurrency int) ([][]float32, error) {
 	if len(texts) != len(isQueries) {
 		return nil, fmt.Errorf("encoder: EncodeBatch len(texts)=%d != len(isQueries)=%d", len(texts), len(isQueries))
@@ -170,23 +225,23 @@ func encodeBatch(tok *embed.Tokenizer, maxSeq int, fwd func([][]int32) [][]float
 		concurrency = len(texts)
 	}
 
-	out := make([][]float32, len(texts))
+	// Tokenize everything first — bucketing needs the lengths, and this also
+	// takes tokenization off the forward workers' critical path.
+	all := make([][]int32, len(texts))
+	lens := make([]int, len(texts))
 	var firstErr error
 	var errOnce sync.Once
-
-	// Static slice: worker w gets indices [w*size, min((w+1)*size, len)].
-	chunkSize := (len(texts) + concurrency - 1) / concurrency
-	var wg sync.WaitGroup
+	var twg sync.WaitGroup
+	tokChunk := (len(texts) + concurrency - 1) / concurrency
 	for w := 0; w < concurrency; w++ {
-		start := w * chunkSize
-		end := min(start+chunkSize, len(texts))
+		start := w * tokChunk
+		end := min(start+tokChunk, len(texts))
 		if start >= end {
 			break
 		}
-		wg.Add(1)
+		twg.Add(1)
 		go func(start, end int) {
-			defer wg.Done()
-			idsList := make([][]int32, end-start)
+			defer twg.Done()
 			for i := start; i < end; i++ {
 				var (
 					ids []int32
@@ -201,18 +256,53 @@ func encodeBatch(tok *embed.Tokenizer, maxSeq int, fwd func([][]int32) [][]float
 					errOnce.Do(func() { firstErr = err })
 					return
 				}
-				idsList[i-start] = ids
-			}
-			vecs := fwd(idsList)
-			for i := start; i < end; i++ {
-				out[i] = vecs[i-start]
+				all[i], lens[i] = ids, len(ids)
 			}
 		}(start, end)
 	}
-	wg.Wait()
+	twg.Wait()
 	if firstErr != nil {
 		return nil, firstErr
 	}
+
+	order := make([]int, len(texts))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return lens[order[a]] < lens[order[b]] })
+	// Same number of dispatchable units the old partition produced, so worker
+	// occupancy is unchanged; only their CONTENTS are length-sorted.
+	perBucket := (len(texts) + concurrency - 1) / concurrency
+	buckets := bucketByLength(order, lens, perBucket)
+
+	out := make([][]float32, len(texts))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range min(concurrency, len(buckets)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Buckets vary in cost, so workers pull rather than take a static
+			// slice — the old index-ordered partition imbalanced them whenever
+			// document lengths did.
+			for {
+				b := int(next.Add(1)) - 1
+				if b >= len(buckets) {
+					return
+				}
+				idx := buckets[b]
+				idsList := make([][]int32, len(idx))
+				for i, gi := range idx {
+					idsList[i] = all[gi]
+				}
+				vecs := fwd(idsList)
+				for i, gi := range idx {
+					out[gi] = vecs[i] // scatter back to the caller's order
+				}
+			}
+		}()
+	}
+	wg.Wait()
 	return out, nil
 }
 

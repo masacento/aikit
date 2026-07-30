@@ -380,6 +380,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 34 · double `enterForward` | correctness-ish | unmeasurable on this box's checkpoints | — |
 | 15 · HNSW batched scoring | 1.36–1.40× | **1.36×/1.33×** | ✅ |
 | 17 · HNSW build batching | 1.5–2.5× build | 1.34×; allocs 225 → **89**/insert | ❌ (time) ✅ (allocs) |
+| 14 · length-bucketed batch | 1.3–2× ragged | **1.15×** ragged, neutral uniform | ❌ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -557,6 +558,26 @@ that noticed were the recall gates.
   only correctness tests; this one preserved arithmetic perfectly and still
   degraded the output, because it corrupted the data structure rather than the
   numbers.
+
+---
+
+### 1.23 Configure the benchmark so the defect can occur
+
+Item 14 removes work wasted on padding inside a multi-sequence batch. The first
+benchmark ran 16 texts at `concurrency=NumCPU`, which gives ONE sequence per
+forward — B=1, no padding in either version — and reported no difference. It was
+measuring two identical code paths.
+
+The parameter that had to be pinned was not the corpus but the *concurrency*:
+padding only exists when `len(texts) > concurrency`. Fixing it at 4 with 32 texts
+forces B=8, and the effect appears immediately (−13.0%, p=0.008).
+
+**Guard:** write down the condition under which the defect occurs, then check the
+benchmark satisfies it — as a precondition, not an afterthought. Related to §1.1
+(does the benchmark reach the code?) but distinct: here the code ran, it simply
+had nothing to do. **Pair it with a control** that should NOT improve — a uniform
+batch here — because a control that stays flat is what distinguishes a real
+effect from a lucky configuration.
 
 ---
 
