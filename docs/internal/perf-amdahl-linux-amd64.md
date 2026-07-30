@@ -1,0 +1,179 @@
+# Amdahl table — real hardware, real checkpoint (Linux/amd64)
+
+> **Step 0c of [`task-perf-handoff-linux.md`](task-perf-handoff-linux.md).** The
+> prior stage table ([`task-perf-lens-scans.md`](task-perf-lens-scans.md) §5) was
+> measured on a **2-core Xeon with a synthetic 7,857-entry vocabulary**. This is
+> the first one on the target hardware with the real Model2Vec checkpoint.
+>
+> **Box:** AMD Ryzen 7 3700X (Zen 2, 8C/16T, AVX2, no VNNI/AVX-512), Nobara
+> Linux, Go 1.26.5. **Method:** `-benchtime 2s -count=6`, **min of 6** reported;
+> observed spread ≤ 7.3%, most ≤ 6%, consistent with the box's ~5% drift floor
+> ([`measuring-performance.md`](measuring-performance.md) §1.6).
+>
+> **Absolute numbers here are not the numbers of record** — the M1 Pro is. These
+> are for ranking work, and ratios are what transfer.
+
+Reproduce with:
+
+```sh
+go test ./bench/  -run XXX -bench 'BenchmarkW1|BenchmarkW2' -benchtime 2s -count=6
+go test ./embed/  -run XXX -bench BenchmarkEncodeSplit    -benchtime 2s -count=6
+go test ./bench/  -run XXX -bench BenchmarkW1/sum -benchtime 6x -cpuprofile w1.prof
+```
+
+**Corpus:** aikit's own tree — 375 `.go` files, 2,009,777 bytes → **1,905
+chunks** at chunkSize 1500 via the `regex` chunker; `testdata/model` (Model2Vec,
+vocab 61,826, dim 256). `benchmarks/` is excluded as a separate module.
+
+---
+
+## 1 · W1 — index a repository
+
+Serially, one chunk at a time, as both shipped examples do it.
+
+| stage | call site | ms | % of run |
+|---|---|---:|---:|
+| `chunk.ChunkFile("regex", …)` ×375 | `chunk/registry.go:120` | 20.53 | 5.36% |
+| `bm25.Tokenize` ×1905 | `bm25/tokenize.go:129` | 18.16 | 4.75% |
+| `bm25.Build` | `bm25/index.go:47` | 30.24 | 7.90% |
+| **`embed.StaticModel.Encode` ×1905** | `embed/model.go:170` | **297.85** | **77.82%** |
+| ↳ `Tokenizer.Encode` | `embed/tokenize.go:218` | 181.01 | 47.30% |
+| ↳ `encodeIDs` (gather + pool + L2) | `embed/model.go:190` | 106.69 | 27.88% |
+| ↳ seam (the `ids` slice handoff) | — | 9.67 | 2.53% |
+| `ann.NewFlatI8` | `ann/flat_i8.go:68` | 4.19 | 1.10% |
+| `MarshalBinary` | `ann/flat_i8_persist.go:43` | **0.069** | **0.018%** |
+| stage sum | | 371.04 | 96.94% |
+| unattributed (GC, outer appends) | — | 11.70 | 3.06% |
+| **end-to-end (measured)** | | **382.73** | **100%** |
+
+The decomposition is 96.9% complete. The 3.1% gap is GC plus the `[][]string` /
+`[][]float32` accumulation that `sum` performs and the per-stage benchmarks reuse
+pre-built — a real cost of the pipeline that belongs to no single stage.
+
+### The tokenize / pool split — 62.9 / 37.1
+
+This is the number the handoff gates Phase A on, so it is measured **twice, by
+independent methods**, and they agree to 0.1 pp:
+
+| method | Tokenizer.Encode | encodeIDs | split |
+|---|---:|---:|---|
+| `BenchmarkEncodeSplit` (direct, `-count=6`) | 181.01 ms | 106.69 ms | **62.9 / 37.1** |
+| `pprof` cum on W1 | 46.20% | 27.39% | **62.8 / 37.2** |
+
+Predicted 63/37 (lens §5, cross-checked against memoization doc §1's 65/35). It
+has **not** moved past the ~55/45 re-rank trigger.
+
+`BenchmarkEncodeSplit` measures both halves directly rather than measuring
+`Encode` and subtracting — `encodeIDs` is unexported, which is why that benchmark
+lives in package `embed`. The alternative attributes the seam and every
+mismeasurement to whichever half you were less careful about. Here the seam is
+its own line (2.53%: the `[]int32` `Tokenizer.Encode` returns and `Encode` hands
+on).
+
+**Independent cross-check on the harnesses.** `BenchmarkEncodeSplit` uses a
+plain line-splitter (1,551 chunks) while W1 uses the real `regex` chunker (1,905
+chunks) over the same bytes. `W1/embedEncode` = 297.85 ms, `EncodeSplit/whole` =
+297.37 ms — **0.16% apart**. Embedding cost is a function of total text, not of
+chunk boundaries, and two separately-written harnesses agree on it.
+
+### Where the time goes inside the tokenizer
+
+`pprof -top -cum` on `BenchmarkW1/sum`, cumulative % of the whole run:
+
+| | cum % of W1 |
+|---|---:|
+| `StaticModel.Encode` | **73.93%** |
+| ↳ `Tokenizer.Encode` | 46.20% |
+| ↳↳ **added-token carve-out loop** (`tokenize.go:238-255`) | **10.23%** |
+| ↳↳ `encodeSegment` | 35.97% |
+| ↳↳↳ `normalize` (of which `cleanText` 7.26%) | 14.52% |
+| ↳↳↳ `preTokenize` | 11.88% |
+| ↳↳↳ `wordPiece` (**already memoized** — see §3) | 7.59% |
+| ↳ `encodeIDs` | 27.39% |
+| `bm25.Build` | 5.94% |
+| `bm25.Tokenize` | 3.96% |
+| `chunk/regex.scanDepth` | 3.30% |
+| GC (`gcBgMarkWorker`) | 6.27% |
+
+The carve-out figure is line-level, from `pprof -list`:
+
+```
+     10ms       10ms    238:	for i := 0; i < len(text); {
+     30ms       30ms    240:		for _, k := range t.addedKeys {
+     40ms      140ms    241:			if strings.HasPrefix(text[i:], k) {
+     30ms       30ms    246:		if matched != "" {
+     30ms       40ms    252:		r, size := utf8.DecodeRuneInString(text[i:])
+        .       50ms    253:		seg.WriteRune(r)
+        .      1.09s    256:	flush()          ← the actual tokenization
+```
+
+310 ms of 3.03 s. `memeqbody` is 2.64% flat with `stringslite.HasPrefix` among
+its callers, exactly the mechanism the handoff describes.
+
+---
+
+## 2 · W2 — hybrid query, retrieval only (n=1905, k=50)
+
+| stage | call site | ns | % |
+|---|---|---:|---:|
+| `bm25.Tokenize(query)` | `bm25/tokenize.go:129` | 358 | 0.3% |
+| `embed.Encode(query)` | `embed/model.go:170` | 7,667 | 6.9% |
+| `bm25.TopK` | `bm25/query.go:73` | 28,133 | 25.3% |
+| `ann.FlatI8.Query` | `ann/flat_i8.go:88` | 40,593 | 36.5% |
+| **`fuse.RRF`** | `fuse/fuse.go:56` | **25,966** | **23.3%** |
+| stage sum | | 102,718 | 92.3% |
+| **end-to-end (measured)** | | **111,230** | **100%** |
+
+The 7.7% gap is the two `fuse.Keys` projections `sum` performs, which the
+`fuseRRF` sub-benchmark hoists out of its loop.
+
+**Read W2 with the lens doc's W2R warning attached:** once a rerank is in the
+pipeline, the entire retrieval stack is between 1/500th and 1/1500th of the
+query, and every row above is noise.
+
+---
+
+## 3 · Re-ranking Phase A against these measurements
+
+| item | handoff's predicted end-to-end | **measured stage weight** | expected at the stated ratio | verdict |
+|---|---:|---:|---:|---|
+| **A1** `EncodeBatch` fan-out | 82% of run, 4–6× | **73.93%** | **−55 to −62% of W1** | **#1 by a wide margin. Confirmed.** |
+| **A4** `preTokenize` byte-slicing, 2.65× | ≈13% | **11.88%** | −7.4% | **#2. Confirmed.** |
+| **A2** carve-out rebuild, 26.5× | 6.8% | **10.23%** | −9.8% | **#3 — and LARGER than predicted.** |
+| **A5** `fuse.RRF` presize, 2.18× | 14% of a query | **23.3% of W2** | −12.6% of a retrieval query | larger than predicted; still W2-only |
+| **A6** `NewFlatI8` row-streaming, 2.02× | — | **1.10%** | −0.55% | a memory item, not a latency one |
+| ~~**A3**~~ `wordPiece` memo | ≈16% | — | — | **ALREADY LANDED** — see below |
+
+### A3 is done, and that is why the profile disagrees with the prediction
+
+`wordPiece` measures **7.59%** of a W1 run against the handoff's 22.7% stage
+weight. That is not a failed prediction: `6b69133 embed: memoize wordPiece —
+4.59× on the real vocab, byte-identical (memo §1)` is already in the tree, with
+the sharded map and the per-shard bound the memo doc asked for, and it beat its
+own 3.75× estimate on the real vocabulary. **7.59% is the post-memoization
+residual**, and `pprof -peek` shows 52% of what remains is the cache lookup
+itself.
+
+The general point, which cost nothing here only because the profile happened to
+name `wpCache.get`: **a handoff doc describes the tree as of when it was
+written.** Check each item against the code before pricing it.
+
+### What the free items look like from here
+
+- **`MarshalBinary` is 0.018% of an index run** — five times smaller even than
+  the lens doc's 0.083%, and it confirms the handoff's §4 note that
+  **[campaign #5]**'s Tier-0 placement is wrong. It is an RSS item.
+- **`bm25.TopK` is 25.3% of W2**, measured *after* item 39's WAND landed. The
+  retrieval half of a query is now split roughly evenly between the two
+  retrievers and the fusion.
+
+---
+
+## 4 · Step 0 status
+
+| | state |
+|---|---|
+| 0a · dead benchmarks revived | **already done** (campaign item 1) — verified live: `bm25`, `chunk/regex`, `chunk/treesitter` all produce numbers, none skip |
+| 0b · harness warm-up + allocs + QPS | **already done** — `warmupQueries`, `AllocsPerQuery`/`BytesPerQuery`, `QPS`/`Concurrency` |
+| 0c · W1/W2 workload benchmarks | **new** — `bench/workload_bench_test.go`, `embed/encode_split_bench_test.go` |
+| 0c · real-hardware Amdahl table | **this document** |
