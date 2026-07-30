@@ -351,6 +351,7 @@ the *axis* itself was wrong on the 3700X.
 |---|--:|---|
 | scalar int8→f32 widen | **0.34 ns/elem** (5× faster than amd64's 1.7) | item 22b |
 | NEON int8→f32 widen (`dequant_i8_arm64.s`) | **0.098 ns/elem** (3.43× over scalar) | item 22b |
+| `GTE.Encode` L512 profile | **`dotNEON2x8` 52%**, `memmove` 17%, `packedFill` 20% | 2026-07-30 |
 | cols-first matmul axis | **correct here too** (not just amd64) | 2026-07-30 |
 | cols→rows crossover, GTE end-to-end | **M ≈ 80–96** (rows wins from L96) | BenchmarkGTEAxisProbe |
 | forced-rows penalty at small M | up to **+178%** (L32: row split → 1 worker = serial) | " |
