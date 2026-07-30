@@ -24,7 +24,7 @@ func BenchmarkQ8Encode(b *testing.B) {
 	for _, words := range []int{8, 64, 256} {
 		var sb strings.Builder
 		w := []string{"func", "parse", "json", "into", "a", "generic", "struct", "with", "reflection"}
-		for i := 0; i < words; i++ {
+		for i := range words {
 			sb.WriteString(w[i%len(w)])
 			sb.WriteByte(' ')
 		}

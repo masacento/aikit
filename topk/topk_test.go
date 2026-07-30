@@ -223,7 +223,7 @@ func TestSelector_tieBreakFirstSeen(t *testing.T) {
 	// Symmetric check with more ties: offer 0..4 all at score 1, then a 9. k=3.
 	// The three survivors must be the first-seen tied items {0,1} plus the 9.
 	s2 := New[int](3)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		s2.Push(i, 1)
 	}
 	s2.Push(9, 100)

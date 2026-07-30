@@ -117,30 +117,42 @@ func TestEncodeBatch_speedup(t *testing.T) {
 	}
 	isQ := make([]bool, len(texts))
 
-	// Sequential baseline.
-	t0 := time.Now()
-	for i := range texts {
-		_, err := m.Encode(texts[i], isQ[i])
+	// BEST OF N, not a single sample. The assertion is a CAPABILITY claim — this
+	// machine can reach 2× through batch parallelism — and a single wall-clock
+	// ratio cannot test that under contention. `go test ./...` runs packages
+	// concurrently, so this test routinely shares the box with a dozen other
+	// packages' tests; observed failing at 1.82× and 1.97× that way while
+	// measuring 2.6–2.8× when run alone. Best-of-N keeps the floor meaningful
+	// (genuinely broken parallelism fails every attempt) without failing on
+	// somebody else's load.
+	const attempts = 3
+	var best float64
+	for a := range attempts {
+		t0 := time.Now()
+		for i := range texts {
+			_, err := m.Encode(texts[i], isQ[i])
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+		}
+		seq := time.Since(t0)
+
+		t1 := time.Now()
+		_, err = m.EncodeBatch(texts, isQ, 0) // 0 = NumCPU
 		if err != nil {
-			t.Fatalf("Encode: %v", err)
+			t.Fatal(err)
+		}
+		par := time.Since(t1)
+
+		speedup := float64(seq) / float64(par)
+		t.Logf("attempt %d: N=%d candidates, NumCPU=%d: sequential=%v parallel=%v -> %.2fx speedup",
+			a+1, len(texts), runtime.NumCPU(), seq, par, speedup)
+		best = max(best, speedup)
+		if best >= 2.0 {
+			return
 		}
 	}
-	seq := time.Since(t0)
-
-	// Parallel.
-	t1 := time.Now()
-	_, err = m.EncodeBatch(texts, isQ, 0) // 0 = NumCPU
-	if err != nil {
-		t.Fatal(err)
-	}
-	par := time.Since(t1)
-
-	speedup := float64(seq) / float64(par)
-	t.Logf("N=%d candidates, NumCPU=%d: sequential=%v parallel=%v -> %.2fx speedup",
-		len(texts), runtime.NumCPU(), seq, par, speedup)
-	if speedup < 2.0 {
-		t.Errorf("parallelism speedup %.2fx below floor 2.0x (machine under heavy other load?)", speedup)
-	}
+	t.Errorf("best parallelism speedup over %d attempts was %.2fx, below floor 2.0x", attempts, best)
 }
 
 // BenchmarkEncodeBatch_rerankN50 wraps the same workload as

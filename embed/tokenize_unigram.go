@@ -76,7 +76,7 @@ func (p *precompiled) firstPrefix(key []byte) (val uint32, ok bool) {
 		return 0, false
 	}
 	nodePos := int(dartsOffset(p.array[0]))
-	for i := 0; i < len(key); i++ {
+	for i := range key {
 		c := key[i]
 		if c == 0 {
 			break
@@ -232,10 +232,7 @@ func (u *unigram) viterbiIDs(sentence string) []int32 {
 		}
 		hasSingle := false
 		if reachedHere {
-			maxEnd := startAt + u.maxBytes
-			if maxEnd > size {
-				maxEnd = size
-			}
+			maxEnd := min(startAt+u.maxBytes, size)
 			for end := startAt + 1; end <= maxEnd; end++ {
 				id, ok := u.piece2id[sentence[startAt:end]]
 				if !ok {

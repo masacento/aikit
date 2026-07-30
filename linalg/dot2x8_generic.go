@@ -14,12 +14,12 @@ func dotNEON2x8(a0, a1, b0, b1, b2, b3, b4, b5, b6, b7 *float32, n4 int, sums *[
 		sums[i] = 0
 	}
 	n := n4 * 4
-	for ai := 0; ai < 2; ai++ {
+	for ai := range 2 {
 		arow := unsafe.Slice(as[ai], n)
-		for bi := 0; bi < 8; bi++ {
+		for bi := range 8 {
 			brow := unsafe.Slice(bs[bi], n)
 			var s float32
-			for k := 0; k < n; k++ {
+			for k := range n {
 				s += arow[k] * brow[k]
 			}
 			sums[(ai*8+bi)*4] = s // reduced into lane 0, like Dot8x4's contract

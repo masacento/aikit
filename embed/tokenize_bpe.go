@@ -43,7 +43,7 @@ func bytesToUnicode() [256]rune {
 	}
 	var table [256]rune
 	n := 0
-	for b := 0; b < 256; b++ {
+	for b := range 256 {
 		if printable(b) {
 			table[b] = rune(b)
 		} else {
@@ -90,7 +90,7 @@ func isAllSpaceASCII(s string) bool {
 func (b *bpeBackend) preTokenize(text string) []string {
 	matches := gpt2Pattern.FindAllString(text, -1)
 	out := make([]string, 0, len(matches))
-	for i := 0; i < len(matches); i++ {
+	for i := range matches {
 		m := matches[i]
 		if i < len(matches)-1 && isAllSpaceASCII(m) {
 			last := m[len(m)-1]

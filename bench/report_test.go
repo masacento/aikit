@@ -61,7 +61,7 @@ func TestReport_TwoMachines(t *testing.T) {
 	// HONESTY RULE: never a raw table with both a metal-q/s and a cuda-q/s absolute column
 	// side by side (two different CPUs/boxes). The per-machine headers each name exactly one
 	// gpu backend; assert no single header line contains both "metal" and "cuda".
-	for _, line := range strings.Split(out, "\n") {
+	for line := range strings.SplitSeq(out, "\n") {
 		if strings.HasPrefix(line, "|") && strings.Contains(line, "q/s") &&
 			strings.Contains(line, "metal") && strings.Contains(line, "cuda") {
 			t.Errorf("found an absolute-numbers header mixing metal and cuda columns:\n%s", line)
@@ -94,11 +94,11 @@ func TestReport_ParityFail(t *testing.T) {
 		{Workload: "ann.FlatI8.QueryBatch", Backend: "cpu-simd", Precision: "int8",
 			Device: Device{Machine: "m", GOARCH: "arm64"}, Shape: Shape{N: 1000, Batch: 8, K: 10},
 			Throughput: 1000, ThroughputUnit: "queries/s",
-			Quality: Quality{RecallAtK: f64(1.0), ParityOK: true}},
+			Quality: Quality{RecallAtK: new(1.0), ParityOK: true}},
 		{Workload: "ann.FlatI8.QueryBatch", Backend: "metal", Precision: "int8",
 			Device: Device{Machine: "m", GPU: "M1", GOARCH: "arm64"}, Shape: Shape{N: 1000, Batch: 8, K: 10},
 			Throughput: 3000, ThroughputUnit: "queries/s",
-			Quality: Quality{RecallAtK: f64(0.71), ParityOK: false}}, // a real recall gap
+			Quality: Quality{RecallAtK: new(0.71), ParityOK: false}}, // a real recall gap
 	}
 	out := Report(recs)
 	if !strings.Contains(out, "FAIL") {

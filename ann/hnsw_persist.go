@@ -227,10 +227,8 @@ func Load(data []byte) (*HNSW, error) {
 	}
 	dim := c.readLen()
 	ndocs := c.readLen()
-	m := c.cfg("m")
-	if m < 2 {
-		m = 2 // match NewHNSW's clamp; a well-formed blob already has m ≥ 2
-	}
+	// match NewHNSW's clamp; a well-formed blob already has m ≥ 2
+	m := max(c.cfg("m"), 2)
 	m0 := c.cfg("m0")
 	efc := c.cfg("efConstruction")
 	efs := c.cfg("efSearch")

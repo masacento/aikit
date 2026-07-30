@@ -26,7 +26,7 @@ func TestAVX2_dotFMA_matchesGeneric(t *testing.T) {
 	for _, n := range cases {
 		a := make([]float32, n)
 		b := make([]float32, n)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			a[i] = float32(rng.NormFloat64() * 0.1)
 			b[i] = float32(rng.NormFloat64() * 0.1)
 		}
@@ -81,7 +81,7 @@ func TestAVX2_blockedKernels_oddN4(t *testing.T) {
 		}
 		ref := func(bv []float32) float32 {
 			var s float32
-			for i := 0; i < n; i++ {
+			for i := range n {
 				s += a[i] * bv[i]
 			}
 			return s
@@ -90,7 +90,7 @@ func TestAVX2_blockedKernels_oddN4(t *testing.T) {
 
 		var s8 [32]float32
 		Dot8x4(&a[0], &b[0][0], &b[1][0], &b[2][0], &b[3][0], &b[4][0], &b[5][0], &b[6][0], &b[7][0], n4, &s8)
-		for r := 0; r < 8; r++ {
+		for r := range 8 {
 			want := ref(b[r])
 			if got := s8[r*4]; absF32(got-want) > tol(want) {
 				t.Errorf("Dot8x4 n4=%d row=%d: got=%v want=%v (Δ%v)", n4, r, got, want, absF32(got-want))
@@ -99,7 +99,7 @@ func TestAVX2_blockedKernels_oddN4(t *testing.T) {
 
 		var s4 [16]float32
 		Dot4x4(&a[0], &b[0][0], &b[1][0], &b[2][0], &b[3][0], n4, &s4)
-		for r := 0; r < 4; r++ {
+		for r := range 4 {
 			want := ref(b[r])
 			if got := s4[r*4]; absF32(got-want) > tol(want) {
 				t.Errorf("Dot4x4 n4=%d row=%d: got=%v want=%v (Δ%v)", n4, r, got, want, absF32(got-want))

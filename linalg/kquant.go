@@ -95,8 +95,8 @@ func QuantizeActQ8K(a []float32, M, K int) Q8K {
 		Qs:    make([]int8, mul(M, K)),
 		Bsums: make([]int16, mul(M, K/16)),
 	}
-	for m := 0; m < M; m++ {
-		for b := 0; b < nb; b++ {
+	for m := range M {
+		for b := range nb {
 			blk := a[m*K+b*qkK : m*K+b*qkK+qkK]
 			var maxAbs float32
 			for _, v := range blk {
@@ -117,9 +117,9 @@ func QuantizeActQ8K(a []float32, M, K int) Q8K {
 			d := maxAbs / 127
 			inv := 1.0 / d
 			q.D[bi] = d
-			for sub := 0; sub < 16; sub++ {
+			for sub := range 16 {
 				var bsum int32
-				for i := 0; i < 16; i++ {
+				for i := range 16 {
 					x := math.Round(float64(blk[sub*16+i] * inv))
 					if x > 127 {
 						x = 127
@@ -147,14 +147,14 @@ func unpackQ6K(raw []byte, sb int, codes *[qkK]int8) (scales [16]int8, d float32
 	qh := raw[base+128 : base+192]
 	sc := raw[base+192 : base+208]
 	d = f16ToF32(u16le(raw[base+208:]))
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		scales[i] = int8(sc[i])
 	}
-	for chunk := 0; chunk < 2; chunk++ {
+	for chunk := range 2 {
 		n0 := chunk * 128
 		qlo := ql[chunk*64:]
 		qho := qh[chunk*32:]
-		for l := 0; l < 32; l++ {
+		for l := range 32 {
 			q1 := int8((qlo[l]&0x0F)|(((qho[l]>>0)&3)<<4)) - 32
 			q2 := int8((qlo[l+32]&0x0F)|(((qho[l]>>2)&3)<<4)) - 32
 			q3 := int8((qlo[l]>>4)|(((qho[l]>>4)&3)<<4)) - 32
@@ -177,12 +177,12 @@ func unpackQ4K(raw []byte, sb int, codes *[qkK]int8) (scales, mins [8]uint8, d, 
 	dmin = f16ToF32(u16le(raw[base+2:]))
 	scaleBytes := raw[base+4 : base+16]
 	qs := raw[base+16 : base+144]
-	for s := 0; s < 8; s++ {
+	for s := range 8 {
 		scales[s], mins[s] = q4kScaleMin(s, scaleBytes)
 	}
-	for j := 0; j < 4; j++ { // four 64-element groups → sub-blocks 2j (low nibble) and 2j+1 (high)
+	for j := range 4 { // four 64-element groups → sub-blocks 2j (low nibble) and 2j+1 (high)
 		q := qs[j*32 : j*32+32]
-		for l := 0; l < 32; l++ {
+		for l := range 32 {
 			codes[j*64+l] = int8(q[l] & 0x0F)
 			codes[j*64+32+l] = int8(q[l] >> 4)
 		}
@@ -213,12 +213,12 @@ func dotQ6KQ8K(w []byte, q8 *Q8K, row, nb int) float32 {
 	var partials [16]int32
 	qsBase := row * q8.K
 	dBase := row * nb
-	for sb := 0; sb < nb; sb++ {
+	for sb := range nb {
 		scales, dw := unpackQ6K(w, sb, &codes)
 		qs := q8.Qs[qsBase+sb*qkK : qsBase+sb*qkK+qkK]
 		dotPartials16(codes[:], qs, partials[:]) // 16 sub-block int dots (SDOT if available)
 		var acc int32
-		for j := 0; j < 16; j++ {
+		for j := range 16 {
 			acc += int32(scales[j]) * partials[j]
 		}
 		out += dw * q8.D[dBase+sb] * float32(acc)
@@ -234,7 +234,7 @@ func dotPartials16Scalar(codes, qs []int8, out []int32) {
 		c := codes[j*16 : j*16+16]
 		a := qs[j*16 : j*16+16]
 		var p int32
-		for i := 0; i < 16; i++ {
+		for i := range 16 {
 			p += int32(c[i]) * int32(a[i])
 		}
 		out[j] = p
@@ -252,13 +252,13 @@ func dotQ4KQ8K(w []byte, q8 *Q8K, row, nb int) float32 {
 	qsBase := row * q8.K
 	dBase := row * nb
 	bBase := row * (q8.K / 16)
-	for sb := 0; sb < nb; sb++ {
+	for sb := range nb {
 		scales, mins, dw, dmin := unpackQ4K(w, sb, &codes)
 		qs := q8.Qs[qsBase+sb*qkK : qsBase+sb*qkK+qkK]
 		bsums := q8.Bsums[bBase+sb*16:]
 		dotPartials16(codes[:], qs, partials[:]) // 16 partials; a 32-wide sub-block sums an adjacent pair
 		var accScale, accMin int32
-		for s := 0; s < 8; s++ {
+		for s := range 8 {
 			p := partials[2*s] + partials[2*s+1]
 			accScale += int32(scales[s]) * p
 			accMin += int32(mins[s]) * (int32(bsums[2*s]) + int32(bsums[2*s+1]))
@@ -282,8 +282,8 @@ func MatmulBTGGUFQ6K(a []float32, w []byte, dst []float32, M, K, N int) {
 	requireExactLen("MatmulBTGGUFQ6K", "w", len(w), mul(N, rowBytes))
 	requireExactLen("MatmulBTGGUFQ6K", "dst", len(dst), mul(M, N))
 	q8 := QuantizeActQ8K(a, M, K)
-	for m := 0; m < M; m++ {
-		for n := 0; n < N; n++ {
+	for m := range M {
+		for n := range N {
 			dst[m*N+n] = dotQ6KQ8K(w[n*rowBytes:(n+1)*rowBytes], &q8, m, nb)
 		}
 	}
@@ -299,8 +299,8 @@ func MatmulBTGGUFQ4K(a []float32, w []byte, dst []float32, M, K, N int) {
 	requireExactLen("MatmulBTGGUFQ4K", "w", len(w), mul(N, rowBytes))
 	requireExactLen("MatmulBTGGUFQ4K", "dst", len(dst), mul(M, N))
 	q8 := QuantizeActQ8K(a, M, K)
-	for m := 0; m < M; m++ {
-		for n := 0; n < N; n++ {
+	for m := range M {
+		for n := range N {
 			dst[m*N+n] = dotQ4KQ8K(w[n*rowBytes:(n+1)*rowBytes], &q8, m, nb)
 		}
 	}

@@ -14,7 +14,7 @@ func spladeBenchText(n int) string {
 	var b strings.Builder
 	words := []string{"how", "do", "i", "parse", "json", "in", "go", "with", "generic", "structs",
 		"machine", "learning", "for", "semantic", "search", "over", "code", "repositories"}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		b.WriteString(words[i%len(words)])
 		b.WriteByte(' ')
 	}

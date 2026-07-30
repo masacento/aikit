@@ -246,14 +246,16 @@ func Report(recs []Record) string {
 	b.WriteString("*speedup over the CPU each GPU ships next to* does — the decision-relevant number.\n\n")
 	// collect which gpu backends exist
 	gpuBackends := gpuBackendsPresent(recs)
-	hdr := "| workload | shape | precision |"
-	sep := "|---|---|---|"
+	var hdr strings.Builder
+	hdr.WriteString("| workload | shape | precision |")
+	var sep strings.Builder
+	sep.WriteString("|---|---|---|")
 	for _, g := range gpuBackends {
-		hdr += fmt.Sprintf(" %s ×vs-cpu |", g)
-		sep += "--:|"
+		fmt.Fprintf(&hdr, " %s ×vs-cpu |", g)
+		sep.WriteString("--:|")
 	}
-	fmt.Fprintln(&b, hdr)
-	fmt.Fprintln(&b, sep)
+	fmt.Fprintln(&b, hdr.String())
+	fmt.Fprintln(&b, sep.String())
 	// index: logicalKey -> gpuBackend -> speedup (from whatever machine ran it)
 	spByKey := map[string]map[string]float64{}
 	for _, byLK := range byMachine {
@@ -275,15 +277,16 @@ func Report(recs []Record) string {
 		if !ok {
 			continue
 		}
-		row := fmt.Sprintf("| %s | %s | %s |", r.Workload, shapeStr(r.Shape), r.Precision)
+		var row strings.Builder
+		fmt.Fprintf(&row, "| %s | %s | %s |", r.Workload, shapeStr(r.Shape), r.Precision)
 		for _, g := range gpuBackends {
 			if s, ok := spByKey[lk][g]; ok && s != 0 {
-				row += fmt.Sprintf(" %.2f× |", s)
+				fmt.Fprintf(&row, " %.2f× |", s)
 			} else {
-				row += " — |"
+				row.WriteString(" — |")
 			}
 		}
-		fmt.Fprintln(&b, row)
+		fmt.Fprintln(&b, row.String())
 	}
 	b.WriteString("\n")
 

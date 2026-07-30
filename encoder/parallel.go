@@ -209,7 +209,7 @@ func parallelRows(rows, work int, fn func(start, end int)) {
 	workers := min(numCPU, rows)
 	rowsPer := (rows + workers - 1) / workers
 	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		start := w * rowsPer
 		if start >= rows {
 			break

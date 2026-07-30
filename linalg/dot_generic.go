@@ -23,7 +23,7 @@ func dotGeneric(a *float32, b *float32, n4 int) float32 {
 	aSlice := unsafe.Slice(a, n)
 	bSlice := unsafe.Slice(b, n)
 	var sum float32
-	for i := 0; i < n; i++ {
+	for i := range n {
 		sum += aSlice[i] * bSlice[i]
 	}
 	return sum
@@ -39,7 +39,7 @@ func dot4x4Generic(a, b0, b1, b2, b3 *float32, n4 int, sums *[16]float32) {
 	b2S := unsafe.Slice(b2, n)
 	b3S := unsafe.Slice(b3, n)
 	var s0, s1, s2, s3 float32
-	for i := 0; i < n; i++ {
+	for i := range n {
 		s0 += aS[i] * b0S[i]
 		s1 += aS[i] * b1S[i]
 		s2 += aS[i] * b2S[i]
@@ -68,14 +68,14 @@ func dot8x4Generic(a, b0, b1, b2, b3, b4, b5, b6, b7 *float32, n4 int, sums *[32
 		unsafe.Slice(b7, n),
 	}
 	var s [8]float32
-	for i := 0; i < n; i++ {
+	for i := range n {
 		av := aS[i]
-		for r := 0; r < 8; r++ {
+		for r := range 8 {
 			s[r] += av * bS[r][i]
 		}
 	}
 	*sums = [32]float32{}
-	for r := 0; r < 8; r++ {
+	for r := range 8 {
 		sums[r*4] = s[r]
 	}
 }

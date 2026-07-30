@@ -23,12 +23,12 @@ func refDequantQ6K(raw []byte, sb int, out []float32) {
 	qh := raw[base+128 : base+192]
 	sc := raw[base+192 : base+208]
 	d := f16ToF32(u16le(raw[base+208:]))
-	for chunk := 0; chunk < 2; chunk++ {
+	for chunk := range 2 {
 		n0 := chunk * 128
 		qlo := ql[chunk*64:]
 		qho := qh[chunk*32:]
 		sco := sc[chunk*8:]
-		for l := 0; l < 32; l++ {
+		for l := range 32 {
 			is := l / 16
 			q1 := int8((qlo[l]&0x0F)|(((qho[l]>>0)&3)<<4)) - 32
 			q2 := int8((qlo[l+32]&0x0F)|(((qho[l]>>2)&3)<<4)) - 32
@@ -49,18 +49,18 @@ func refDequantQ4K(raw []byte, sb int, out []float32) {
 	scales := raw[base+4 : base+16]
 	qs := raw[base+16 : base+144]
 	yi := 0
-	for j := 0; j < 4; j++ {
+	for j := range 4 {
 		is := 2 * j
 		sc1, m1 := q4kScaleMin(is+0, scales)
 		sc2, m2 := q4kScaleMin(is+1, scales)
 		d1, off1 := d*float32(sc1), dmin*float32(m1)
 		d2, off2 := d*float32(sc2), dmin*float32(m2)
 		q := qs[j*32 : j*32+32]
-		for l := 0; l < 32; l++ {
+		for l := range 32 {
 			out[yi] = d1*float32(q[l]&0x0F) - off1
 			yi++
 		}
-		for l := 0; l < 32; l++ {
+		for l := range 32 {
 			out[yi] = d2*float32(q[l]>>4) - off2
 			yi++
 		}
@@ -72,7 +72,7 @@ func refDequantQ4K(raw []byte, sb int, out []float32) {
 func reconstructQ6K(raw []byte, sb int, out []float32) {
 	var codes [qkK]int8
 	scales, d := unpackQ6K(raw, sb, &codes)
-	for p := 0; p < qkK; p++ {
+	for p := range qkK {
 		out[p] = d * float32(scales[p/16]) * float32(codes[p])
 	}
 }
@@ -80,7 +80,7 @@ func reconstructQ6K(raw []byte, sb int, out []float32) {
 func reconstructQ4K(raw []byte, sb int, out []float32) {
 	var codes [qkK]int8
 	scales, mins, d, dmin := unpackQ4K(raw, sb, &codes)
-	for p := 0; p < qkK; p++ {
+	for p := range qkK {
 		s := p / 32
 		out[p] = d*float32(scales[s])*float32(codes[p]) - dmin*float32(mins[s])
 	}
@@ -107,7 +107,7 @@ func putU16(b []byte, v uint16) { b[0], b[1] = byte(v), byte(v>>8) }
 // super-scales (Q6_K: d at +208; Q4_K: d at +0, dmin at +2).
 func randQ6KRow(rng *rand.Rand, nb int) []byte {
 	b := randBytes(rng, nb*210)
-	for sb := 0; sb < nb; sb++ {
+	for sb := range nb {
 		putU16(b[sb*210+208:], randF16FiniteBits(rng))
 	}
 	return b
@@ -115,7 +115,7 @@ func randQ6KRow(rng *rand.Rand, nb int) []byte {
 
 func randQ4KRow(rng *rand.Rand, nb int) []byte {
 	b := randBytes(rng, nb*144)
-	for sb := 0; sb < nb; sb++ {
+	for sb := range nb {
 		putU16(b[sb*144+0:], randF16FiniteBits(rng))
 		putU16(b[sb*144+2:], randF16FiniteBits(rng))
 	}
@@ -128,11 +128,11 @@ func randQ4KRow(rng *rand.Rand, nb int) []byte {
 func TestKQuantUnpackMatchesEmbed(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	var got, want [qkK]float32
-	for iter := 0; iter < 200; iter++ {
+	for iter := range 200 {
 		q6 := randQ6KRow(rng, 1)
 		reconstructQ6K(q6, 0, got[:])
 		refDequantQ6K(q6, 0, want[:])
-		for p := 0; p < qkK; p++ {
+		for p := range qkK {
 			if math.Float32bits(got[p]) != math.Float32bits(want[p]) {
 				t.Fatalf("Q6_K unpack drift at iter %d pos %d: got %v want %v", iter, p, got[p], want[p])
 			}
@@ -140,7 +140,7 @@ func TestKQuantUnpackMatchesEmbed(t *testing.T) {
 		q4 := randQ4KRow(rng, 1)
 		reconstructQ4K(q4, 0, got[:])
 		refDequantQ4K(q4, 0, want[:])
-		for p := 0; p < qkK; p++ {
+		for p := range qkK {
 			if math.Float32bits(got[p]) != math.Float32bits(want[p]) {
 				t.Fatalf("Q4_K unpack drift at iter %d pos %d: got %v want %v", iter, p, got[p], want[p])
 			}
@@ -164,7 +164,7 @@ func TestKQuantDotPartials_matchesScalar(t *testing.T) {
 		want := make([]int32, nsub)
 		dotPartials16(codes, qs, got)
 		dotPartials16Scalar(codes, qs, want)
-		for j := 0; j < nsub; j++ {
+		for j := range nsub {
 			if got[j] != want[j] {
 				t.Fatalf("partial[%d] (nsub=%d): dotPartials16 %d != scalar %d", j, nsub, got[j], want[j])
 			}
@@ -181,7 +181,7 @@ func TestQuantizeActQ8K(t *testing.T) {
 		a[i] = float32(rng.NormFloat64())
 	}
 	// One block deliberately all-zero to exercise d=0.
-	for i := 0; i < qkK; i++ {
+	for i := range qkK {
 		a[qkK:][i] = 0 // row 0, block 1
 	}
 	q := QuantizeActQ8K(a, M, K)
@@ -192,13 +192,13 @@ func TestQuantizeActQ8K(t *testing.T) {
 	if q.D[0*nb+1] != 0 {
 		t.Errorf("all-zero block should have d=0, got %v", q.D[1])
 	}
-	for m := 0; m < M; m++ {
-		for b := 0; b < nb; b++ {
+	for m := range M {
+		for b := range nb {
 			d := q.D[m*nb+b]
 			// bsums exact.
-			for sub := 0; sub < 16; sub++ {
+			for sub := range 16 {
 				var want int32
-				for i := 0; i < 16; i++ {
+				for i := range 16 {
 					want += int32(q.Qs[m*K+b*qkK+sub*16+i])
 				}
 				if got := int32(q.Bsums[(m*K+b*qkK)/16+sub]); got != want {
@@ -209,7 +209,7 @@ func TestQuantizeActQ8K(t *testing.T) {
 			if d == 0 {
 				continue
 			}
-			for i := 0; i < qkK; i++ {
+			for i := range qkK {
 				orig := a[m*K+b*qkK+i]
 				deq := d * float32(q.Qs[m*K+b*qkK+i])
 				if math.Abs(float64(orig-deq)) > float64(d)+1e-6 {
@@ -225,11 +225,11 @@ func TestQuantizeActQ8K(t *testing.T) {
 func oracleDotQ6K(w []byte, q8 *Q8K, row, nb int) float64 {
 	var wf [qkK]float32
 	var sum float64
-	for sb := 0; sb < nb; sb++ {
+	for sb := range nb {
 		refDequantQ6K(w, sb, wf[:])
 		da := float64(q8.D[row*nb+sb])
 		qs := q8.Qs[row*q8.K+sb*qkK:]
-		for p := 0; p < qkK; p++ {
+		for p := range qkK {
 			sum += float64(wf[p]) * da * float64(qs[p])
 		}
 	}
@@ -239,11 +239,11 @@ func oracleDotQ6K(w []byte, q8 *Q8K, row, nb int) float64 {
 func oracleDotQ4K(w []byte, q8 *Q8K, row, nb int) float64 {
 	var wf [qkK]float32
 	var sum float64
-	for sb := 0; sb < nb; sb++ {
+	for sb := range nb {
 		refDequantQ4K(w, sb, wf[:])
 		da := float64(q8.D[row*nb+sb])
 		qs := q8.Qs[row*q8.K+sb*qkK:]
-		for p := 0; p < qkK; p++ {
+		for p := range qkK {
 			sum += float64(wf[p]) * da * float64(qs[p])
 		}
 	}
@@ -316,7 +316,7 @@ func TestKQuant_edgeCases(t *testing.T) {
 
 	// Scale extremes: Q6_K int8 sub-scales at ±127, d large; must still match the oracle.
 	ext6 := randQ6KRow(rng, 1)
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		if i%2 == 0 {
 			ext6[192+i] = 127
 		} else {
@@ -329,7 +329,7 @@ func TestKQuant_edgeCases(t *testing.T) {
 
 	// Q4_K with 6-bit scales and mins at their max (63) — exercises the min-offset term hard.
 	ext4 := randQ4KRow(rng, 1)
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		ext4[4+i] = 0xFF // all 6-bit fields → 63
 	}
 	if got, want := float64(dotQ4KQ8K(ext4, &q8, 0, nb)), oracleDotQ4K(ext4, &q8, 0, nb); math.Abs(got-want) > 1e-3*(math.Abs(want)+1) {
@@ -351,8 +351,8 @@ func TestKQuantMatmulBT(t *testing.T) {
 	w6 := randQ6KRow(rng, N*nb)
 	dst6 := make([]float32, M*N)
 	MatmulBTGGUFQ6K(a, w6, dst6, M, K, N)
-	for m := 0; m < M; m++ {
-		for n := 0; n < N; n++ {
+	for m := range M {
+		for n := range N {
 			want := oracleDotQ6K(w6[n*nb*210:(n+1)*nb*210], &q8, m, nb)
 			if got := float64(dst6[m*N+n]); math.Abs(got-want) > 1e-3*(math.Abs(want)+1) {
 				t.Errorf("Q6_K GEMV [%d,%d] = %v vs oracle %v", m, n, got, want)
@@ -363,8 +363,8 @@ func TestKQuantMatmulBT(t *testing.T) {
 	w4 := randQ4KRow(rng, N*nb)
 	dst4 := make([]float32, M*N)
 	MatmulBTGGUFQ4K(a, w4, dst4, M, K, N)
-	for m := 0; m < M; m++ {
-		for n := 0; n < N; n++ {
+	for m := range M {
+		for n := range N {
 			want := oracleDotQ4K(w4[n*nb*144:(n+1)*nb*144], &q8, m, nb)
 			if got := float64(dst4[m*N+n]); math.Abs(got-want) > 1e-3*(math.Abs(want)+1) {
 				t.Errorf("Q4_K GEMV [%d,%d] = %v vs oracle %v", m, n, got, want)

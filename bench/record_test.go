@@ -6,8 +6,6 @@ import (
 	"testing"
 )
 
-func f64(v float64) *float64 { return &v }
-
 func TestRecordRoundTrip(t *testing.T) {
 	recs := []Record{
 		{
@@ -16,7 +14,7 @@ func TestRecordRoundTrip(t *testing.T) {
 			Shape:      Shape{N: 100000, Dim: 256, Batch: 64, K: 10},
 			Timing:     Timing{Compute: 3.2, Wall: 3.5},
 			Throughput: 18200, ThroughputUnit: "queries/s",
-			Quality: Quality{RecallAtK: f64(0.9997), ParityOK: true, MaxDeltaVsCPU: 1e-6},
+			Quality: Quality{RecallAtK: new(0.9997), ParityOK: true, MaxDeltaVsCPU: 1e-6},
 			Meta:    Meta{AikitCommit: "abc123", Go: "go1.26", Seed: 1, Iters: 20},
 		},
 		{
@@ -25,8 +23,8 @@ func TestRecordRoundTrip(t *testing.T) {
 			Shape:      Shape{N: 100000, Dim: 256, Batch: 64, K: 10},
 			Timing:     Timing{OneTime: 12, H2D: 0, Compute: 1.1, Wall: 1.3},
 			Throughput: 47000, ThroughputUnit: "queries/s",
-			Quality:      Quality{RecallAtK: f64(0.9997), ParityOK: true, MaxDeltaVsCPU: 1e-6},
-			SpeedupVsCPU: f64(2.58),
+			Quality:      Quality{RecallAtK: new(0.9997), ParityOK: true, MaxDeltaVsCPU: 1e-6},
+			SpeedupVsCPU: new(2.58),
 			Meta:         Meta{AikitCommit: "abc123", Go: "go1.26"},
 		},
 	}

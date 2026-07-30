@@ -57,14 +57,12 @@ func TestBERTFamily_bracketsInFlight(t *testing.T) {
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for range goroutines {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			if _, err := s.Expand("machine learning for semantic search"); err != nil {
 				t.Error(err)
 			}
-		}()
+		})
 	}
 	close(start)
 	wg.Wait()

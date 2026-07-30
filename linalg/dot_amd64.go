@@ -113,7 +113,7 @@ func dotNEON8x4(a, b0, b1, b2, b3, b4, b5, b6, b7 *float32, n4 int, sums *[32]fl
 	var out [8]float32
 	dotFMA8(a, b0, b1, b2, b3, b4, b5, b6, b7, n4*4, &out)
 	*sums = [32]float32{}
-	for r := 0; r < 8; r++ {
+	for r := range 8 {
 		sums[r*4] = out[r]
 	}
 }

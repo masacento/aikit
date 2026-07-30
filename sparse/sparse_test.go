@@ -159,7 +159,7 @@ func TestScores_deterministic(t *testing.T) {
 	ix := New([]SparseVec{{Terms: []uint32{1, 2, 3}, Weights: []float32{1, 1, 1}}}) // doc 0 in all three terms
 	q := SparseVec{Terms: []uint32{1, 2, 3}, Weights: []float32{1, 1e16, -1e16}}
 	first := ix.Scores(q)[0]
-	for i := 0; i < 500; i++ {
+	for i := range 500 {
 		if got := ix.Scores(q)[0]; got != first {
 			t.Fatalf("Scores non-deterministic: call %d = %v, first = %v (float64 sum order varied)", i, got, first)
 		}

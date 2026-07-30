@@ -191,10 +191,7 @@ func flatQueryWorkers(n, dim int) int {
 	if int64(n)*int64(dim) < flatParallelThreshold {
 		return 1
 	}
-	w := runtime.NumCPU()
-	if w > n {
-		w = n
-	}
+	w := min(runtime.NumCPU(), n)
 	return w
 }
 
