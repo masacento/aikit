@@ -385,6 +385,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 9 · SpanCache eviction | "0% → max hit rate" | **0% → 10.9/45.0/88.6%**; the 0% was literal | ✅ |
 | 31 · QKV transpose | 3.3× on the transpose | **0.06%** of the forward — closed unimplemented | ❌ |
 | 1 · revive dead benchmarks | "unblocks everything" | 3 files revived; harness gained allocs + QPS | ✅ |
+| 26 · `math.Round` not intrinsic | ~5% of the matmul | **0.61%**; the proposed fix is a wash — closed | ❌ |
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 
 Two entries were **found by measurement rather than predicted** and are the
@@ -599,6 +600,23 @@ condition. `b.Skipf` is for "this machine lacks a 4 GB checkpoint"; for
 "this file is in git", use `b.Fatalf`, so a broken path fails loudly instead of
 reporting success by omission. And periodically run `go test -bench . ./... 2>&1
 | grep -c SKIP` — a skip you did not intend is a measurement you are not taking.
+
+---
+
+### 1.25 A guard against one measurement error can cause another
+
+Item 26's first benchmark routed every value through a `//go:noinline` source,
+on §1.2's reflex of defeating constant folding. But the values came from a
+**slice**, which the compiler cannot constant-fold, so the guard defended
+against nothing — and cost a function call per element, ~2 ns, against a ~1 ns
+difference under test. It made `math.Round` appear 2× slower than it is and the
+comparison unreadable.
+
+**Guard:** `//go:noinline` sources are for values the compiler could otherwise
+*prove* constant. Slice contents, function parameters and file input are already
+opaque. Adding the guard anyway is not free and not neutral — it adds a cost to
+both arms that can exceed the effect you are measuring, which is §1.2's failure
+mode wearing §1.2's uniform.
 
 ---
 

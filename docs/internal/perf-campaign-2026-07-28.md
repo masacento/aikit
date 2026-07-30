@@ -100,7 +100,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | 23 | `packedFill` lost `blockedFill`'s m-blocking; a-panel re-read per 8-column group | linalg | **arm64-only** — `packedFill` is gated on `has2x8Kernel` (§7.32), like item 24 | = | gate on evidence |
 | 24 | `matmul_blocked.go` packed stride is a 4096 B power-of-two | linalg | **UNREACHABLE on amd64** — `packedFill` is arm64-only (§7.21); needs an arm64 box, and the proposed `+4` pad is too small to work | = | gate on evidence |
 | 25 | arm64 `Dot2x8` has the wrong MR×NR: 4×4 needs 8 loads per 16 FMLAs vs today's 10 | linalg | 1.1–1.25× arm64 f32 GEMM | **=** | S–M |
-| 26 | `math.Round` is **not** an amd64 intrinsic (`math.Trunc` is) — verified in disassembly | linalg, encoder | ~12 int ops → 1 `ROUNDSD` | = | S |
+| 26 | `math.Round` is **not** an amd64 intrinsic — premise re-verified in disassembly | linalg, encoder | **CLOSED, not worth doing** (§7.34): `math.Round` is 0.61% of the W8A8 matmul and `Trunc+Copysign` measures as a wash | = | closed |
 | ~~27~~ | ~~Encoder's 4-MFLOP naive threshold sends **every** attention matmul at L<250 to a scalar triple loop~~ — **DONE, up to −50.5%** (§7.20) | encoder | estimated 3–9%; the first large UNDER-estimate | ~ | — |
 | ~~28~~ | ~~`CrossEncoder` has **no batch API** and re-tokenizes the query per pair~~ — **DONE, 7.56×** (§7.30) | encoder | the re-tokenization half was 0.066%; the API was everything | = | — |
 | ~~29~~ | ~~`bm25` posting is 16 B~~ — **DONE, −50% index memory (381.7→190.9 MB at 200k docs)** (§7.24) | bm25 | ~0% scoring, −16% build alloc; the Win column led with the wrong effect | = | — |
@@ -2019,6 +2019,39 @@ Four things an earlier draft asserted that the refutation pass knocked down:
       concurrent pass measures **149.7k — 22%**. That gap is item 16's
       memory-bandwidth ceiling, and the harness now shows it instead of leaving
       it to be inferred.
+
+34. **Item 26 is CLOSED, not implemented — its premise is true and its conclusion
+    does not follow.** Verified both ways rather than either.
+
+    **The premise holds.** Disassembled on this toolchain (Go 1.26.5, amd64),
+    `math.Round` inlines `floor.go`'s body — `SHRQ`/`ANDL`/`CMPQ`/`MOVQ`/`ANDQ`/
+    `ORQ`/`CMOVE`, no `ROUNDSD` anywhere. Exactly as the item says.
+
+    **The proposed fix is a wash.** `math.Trunc(x + math.Copysign(0.5, x))` does
+    emit `ROUNDSD` — but `Copysign` inlines to its own `MOVQ`/`ANDQ`/`ORQ`
+    sequence, which costs about what `Round`'s extra integer ops cost. Measured
+    over five runs, `math.Round` 1.56–3.07 ns/elem versus `Trunc+Copysign`
+    1.92–2.73: overlapping, with `Round`'s best faster than `Trunc`'s best.
+
+    **And the target is far smaller than estimated.** The item sizes it at "~5%
+    of the matmul on amd64". Profiling `MatmulBTW8A8Into`, `math.Round` is
+    **0.61% flat** and the whole of `quantizeRowInt8` is 3.12% — `dotI8AVX2` is
+    **84.36%**. So even a perfect quantizer rewrite has a ~3% ceiling here, and
+    the specific rewrite proposed delivers approximately none of it.
+
+    The item's second suggestion — "vectorize the quantizers outright" — remains
+    valid and is the only version worth doing, but it is arm64-shaped as written
+    (`FRINTA` *is* round-half-away-from-zero; AVX2's `VROUNDPS` has no such mode,
+    so an amd64 version must vectorize the copysign trick). At a 3% ceiling it is
+    not the best use of assembly effort on this box while `dotI8AVX2` is 84%.
+
+    **A measurement note.** The first version of the benchmark routed every read
+    through a `//go:noinline` source, on item 19's reflex of defeating constant
+    folding. The values come from a slice, which cannot be folded, so the guard
+    bought nothing and its call-per-element cost ~2 ns — swamping the ~1 ns
+    difference under test and making `math.Round` look 2× faster than itself.
+    §1.2's guard is for constants; applying it to ordinary data is its own
+    measurement error.
 
 ---
 
