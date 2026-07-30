@@ -45,6 +45,10 @@ type Tokenizer struct {
 	// bpe is set for byte-level BPE tokenizers (GPT-2 / RoBERTa family); when
 	// non-nil, the public methods dispatch to it. See tokenize_bpe.go.
 	bpe *bpeBackend
+
+	// wp memoizes wordPiece(word) → ids (the WordPiece path only; nil for uni/bpe).
+	// Immutable vocab ⇒ pure function ⇒ safe to cache; ~98% of calls repeat.
+	wp *wpCache
 }
 
 // tokenizer.json shape — we only parse the fields we need.
@@ -195,6 +199,7 @@ func parseTokenizer(data []byte) (*Tokenizer, error) {
 		handleCJK:        raw.Normalizer.HandleChineseChars,
 		stripAccents:     stripAccents,
 		lowercase:        raw.Normalizer.Lowercase,
+		wp:               newWPCache(),
 	}, nil
 }
 
@@ -532,7 +537,27 @@ func (t *Tokenizer) wordPiece(word string) []int32 {
 	if len(chars) == 0 {
 		return nil
 	}
+	// wordPiece is a pure function of (word, vocab), and the vocab is immutable after
+	// LoadTokenizer — so identical words recompute identical ids. On real corpora ~98% of
+	// wordPiece calls are repeats (and the repeats skew LONG: unique words average ~8.8 runes
+	// vs ~2.7 overall, so the expensive quadratic probes are exactly the ones paid once). Cache
+	// the result. The returned slice is READ-ONLY — encodeSegment copies it via append(…,…) and
+	// no caller retains or mutates it, so sharing one backing array across callers is safe.
+	if t.wp != nil {
+		if ids, ok := t.wp.get(word); ok {
+			return ids
+		}
+	}
+	out := t.wordPieceCompute(chars)
+	if t.wp != nil {
+		t.wp.put(word, out)
+	}
+	return out
+}
 
+// wordPieceCompute is the uncached greedy longest-match — the exact prior wordPiece body,
+// factored out so the memo can wrap it and the differential fuzz can compare the two paths.
+func (t *Tokenizer) wordPieceCompute(chars []rune) []int32 {
 	// Build each greedy-match candidate into a pooled []byte and look it up via
 	// t.vocab[string(buf)] — the compiler elides that conversion for a map lookup,
 	// so the probe is allocation-free. The old code allocated two strings per probe
@@ -575,3 +600,57 @@ func (t *Tokenizer) wordPiece(word string) []int32 {
 // goroutine-safe, so the scratch must be per-call — a sync.Pool gives that without
 // a per-call allocation.
 var wpBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 128); return &b }}
+
+// wpCache memoizes wordPiece results. Encode is goroutine-safe and the access pattern is a
+// SHARED read-mostly set (all workers hit the same common words), so this is a sharded RWMutex
+// map — not sync.Map, which is tuned for disjoint per-goroutine key sets. Sharding keeps read
+// contention flat as workers scale; the FNV-1a shard hash is cheap next to the map probe it
+// guards. Bounded per shard so adversarial/multilingual input can't grow it without limit — a
+// word past the bound simply recomputes (correct, just uncached), which is the miss cost anyway.
+const (
+	wpShards      = 32   // power of two → shard index is a mask
+	wpCapPerShard = 8192 // ~262k words total; natural unique-word sets converge near vocab size
+)
+
+type wpCache struct {
+	shards [wpShards]struct {
+		mu sync.RWMutex
+		m  map[string][]int32
+	}
+}
+
+func newWPCache() *wpCache {
+	c := &wpCache{}
+	for i := range c.shards {
+		c.shards[i].m = make(map[string][]int32)
+	}
+	return c
+}
+
+// wpShard is FNV-1a over the word's bytes → shard index.
+func wpShard(word string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(word); i++ {
+		h = (h ^ uint32(word[i])) * 16777619
+	}
+	return h & (wpShards - 1)
+}
+
+func (c *wpCache) get(word string) ([]int32, bool) {
+	s := &c.shards[wpShard(word)]
+	s.mu.RLock()
+	ids, ok := s.m[word]
+	s.mu.RUnlock()
+	return ids, ok
+}
+
+// put stores ids for word (the caller must not mutate ids afterward). Skips storing past the
+// per-shard cap; the missed word recomputes next time, so the cache stays bounded and correct.
+func (c *wpCache) put(word string, ids []int32) {
+	s := &c.shards[wpShard(word)]
+	s.mu.Lock()
+	if len(s.m) < wpCapPerShard {
+		s.m[word] = ids
+	}
+	s.mu.Unlock()
+}
