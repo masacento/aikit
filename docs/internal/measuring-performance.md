@@ -419,6 +419,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 22b · arm64 NEON widen | 6–8× kernel | 3.43× (arm64 scalar already 5× amd64's) | ❌ |
 | 37 · outer-product kernel (arm64) | ~1.45× (2× in the µkernel, amd64) | 1.10× raw / net-negative (dot2x8 at 95% peak) | ❌ |
 | 24 · packed-stride pad (arm64) | "may be a no-op, measure first" | **−9.8% on large-encoder fc2 — real** | ✓ (rare: measured MORE than the guard expected) |
+| §5 · StaticModel word presum | ~29% pool collapse (14% of Encode) | wash serial / **+31% batch** (cache overhead + contention) | ❌ |
 | 18 · Qwen ViT arena | ~15 GB/image, ~1.5 s memset | −70/−85% B/op; **~3%** of latency | ⚠️ |
 | 27 · 4-MFLOP naive threshold | 3–9% for L<250 | **up to −50.5%** | ❌ (under) |
 | 24 · packed-stride aliasing | "free" | unreachable on amd64; reverted | — |

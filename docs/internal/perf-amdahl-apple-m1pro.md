@@ -67,10 +67,16 @@ hottest leaf on this box. Two structural reasons this lands harder on arm64 than
 on the AVX2 part: the gather+MAC is memory-and-scalar-f64 bound rather than
 vectorised, and the tokenizer's byte-scanning half (which A2/A4 already trimmed)
 is comparatively *cheaper* on the M1's wide front end. The consequence for
-sequencing is in §3: **`encodeIDs` is now as large a target as the tokenizer**,
-which is exactly the regime the memoization doc's §5 `StaticModel` presum was
-gated on (revisit note there — bit-exactness already passed; the win is a ~29%
-pool-gather collapse, worth more here than on amd64 where the pool is only 37%).
+sequencing is in §3: **`encodeIDs` is now as large a target as the tokenizer**.
+This promoted the memoization doc's §5 `StaticModel` presum (cache word→pooled
+f64 sum, collapse the repeated-word subword gather), which it flagged as worth
+more here than on amd64. **Built and measured 2026-07-31 — dead**: bit-exact
+(0/386 real docs) but a serial wash (the per-word FNV-hash + RWMutex + map probe
+costs as much as the ~0.4 gathers it collapses — the f64 gather is too cheap to
+beat with a keyed lookup) and **+30.9% under EncodeBatch** (shared-cache reader-
+atom contention across cores). See `task-perf-memoization.md` §5. The pool is a
+real target, but it wants a **vectorised f64 gather** (SIMD MAC over the embedding
+rows), not a cache — the gather itself is scalar here, which is *why* it is 49%.
 
 ### Where the time goes inside the tokenizer (pprof cum, % of W1)
 

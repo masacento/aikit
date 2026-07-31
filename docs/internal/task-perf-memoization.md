@@ -381,12 +381,24 @@ The useful half of the audit. Each of these looks like a candidate and isn't:
    16 B posting struct is **[campaign #29]** — both DONE. The remaining
    per-posting precomputed-impact change belongs there (it mutates the posting
    struct), not in this memo audit.
-5. **§5 `StaticModel` presum — gate-checked 2026-07-30, deferred.** Bit-exactness
-   PASSES (0/300 sim docs differ), but the win is weak: the pooling gather collapses
-   only ~29% (frequency-weighted 1.412 subwords/word, not the doc's assumed 3×), and
-   that costs ~29–61 MB + a hot-path rewrite for an only-empirically-bit-exact memo.
-   No live indexing-throughput need, so it doesn't clear the bar. See §5 for the
-   numbers; revisit only if StaticModel pooling becomes a measured bottleneck.
+5. **§5 `StaticModel` presum — BUILT, MEASURED, REVERTED (2026-07-31). Dead.**
+   The M1 Pro Amdahl table promoted it — the pool (`encodeIDs`) is 49% of `Encode`
+   there, co-equal with the tokenizer — so it got a full build: a sharded,
+   arena-backed word→(f64 presum, wsum) cache + an `eachWord` carve-out mirror +
+   an opt-in `EnablePresumCache`. Bit-exactness held on the **real** corpus this
+   time too (0/386 docs differ, cold + warm; mutation-checked, `-race` clean). But
+   the benchmark killed it:
+   - **serial, fully warm (all-hit): +0.4% — a wash.** The per-word cache machinery
+     (FNV hash + sharded `RLock` + map probe + arena view) costs as much as the
+     ~0.4 subword-gathers it collapses. The f64 gather is too cheap to beat with a
+     keyed lookup — the same shape as items 37 and pre-packing.
+   - **batch (EncodeBatch, 8 workers): +30.9% SLOWER.** The shared cache's RWMutex
+     reader-count atomics ping-pong across cores on the hot words. Contention on the
+     primary (batch-indexing) workload, the opposite of the intent.
+   Even a contention-free redesign only reaches the serial wash. Plus ~model-sized
+   memory. **Reverted.** The 49% pool weight is real but not addressable this way;
+   if the pool is ever the target, it wants a *vectorised gather* (SIMD f64 MAC),
+   not a word cache.
 
 §3 and §6 are **documentation-only, not doing**: §3 (Q8 dequant is a *trap* —
 caching the dequantized rows defeats int8; the real fix is fusion, tracked in
