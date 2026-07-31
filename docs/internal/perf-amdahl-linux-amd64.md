@@ -554,6 +554,34 @@ the headline, and still an API design decision rather than a perf one.
 Peak heap tells the same story: the model load alone reaches 142.4 MiB of the
 run's 148.6, so everything after it adds ~6 MiB.
 
+### `LoadMmap` — the escape hatch that existed and was unreachable
+
+`OpenSafetensorsMmap` has been in `embed` the whole time and no load path reached
+it: `LoadFromFS` goes through `fs.ReadFile`, which by definition cannot mmap, and
+`Load` is a one-line wrapper around `LoadFromFS(os.DirFS(dir), ".")` that throws
+away the one thing mmap needs — a real path. Every caller heap-read the whole
+checkpoint. (Third time this pattern has appeared: A6's `QuantizeRowInt8` and
+Phase 4's `Backend.MatmulBT` were the others.)
+
+| | time | peak MiB | MB alloc |
+|---|---:|---:|---:|
+| `loadModel` (heap) | 59.5 ms | 142.5 | 73.9 |
+| `loadModelMmap` | **48.8 ms** | **19.5** | **9.6** |
+| cold start, heap | **84.8 ms** | 75.8 | 82.4 |
+| cold start, mmap | 99.2 ms | **13.0** | **18.1** |
+
+**Both directions are real and the item is a footprint one.** Peak heap falls
+5.8× end to end and allocation 4.6×, while time-to-first-result rises **17%**:
+the load itself is faster — no 64 MB read — but mmap defers the page faults to
+the first `Encode`, and faulting 64 MB in costs more than reading it sequentially
+from a warm page cache. Shipped as an additive `LoadMmap`, so no existing caller
+changes behaviour and the trade is the caller's to make.
+
+**Caveat on `peakMiB` comparisons.** The same `sum` arm measured 148.6 MiB in one
+run and 75.8 in another, because the sampler starts from whatever heap state the
+preceding sub-benchmark left. Adjacent arms within one run are comparable; the
+same arm across runs is not. Read the pairs above, not the absolutes.
+
 ### The peak-heap instrument, and why it exists
 
 `B/op` cannot arbitrate any of the remaining footprint findings — it counts bytes

@@ -139,6 +139,15 @@ func BenchmarkW3(b *testing.B) {
 			sinkColdModel = m
 		})
 	})
+	b.Run("loadModelMmap", func(b *testing.B) {
+		withPeak(b, func() {
+			m, err := embed.LoadMmap(modelDir)
+			if err != nil {
+				b.Fatal(err)
+			}
+			sinkColdModel = m
+		})
+	})
 	b.Run("loadIndex", func(b *testing.B) {
 		withPeak(b, func() {
 			ix, err := ann.LoadFlatI8(indexBlob)
@@ -170,13 +179,20 @@ func BenchmarkW3(b *testing.B) {
 		withPeak(b, func() { sinkIndex = bm25.Build(docs) })
 	})
 	b.Run("sum", func(b *testing.B) {
-		withPeak(b, func() { coldStart(b, modelDir, indexBlob, corpusJSON) })
+		withPeak(b, func() { coldStart(b, modelDir, indexBlob, corpusJSON, false) })
+	})
+	b.Run("sumMmap", func(b *testing.B) {
+		withPeak(b, func() { coldStart(b, modelDir, indexBlob, corpusJSON, true) })
 	})
 }
 
 // coldStart is the example's startup path, start to first result.
-func coldStart(tb testing.TB, modelDir string, indexBlob, corpusJSON []byte) {
-	model, err := embed.LoadFromFS(os.DirFS(modelDir), ".")
+func coldStart(tb testing.TB, modelDir string, indexBlob, corpusJSON []byte, useMmap bool) {
+	load := func() (*embed.StaticModel, error) { return embed.LoadFromFS(os.DirFS(modelDir), ".") }
+	if useMmap {
+		load = func() (*embed.StaticModel, error) { return embed.LoadMmap(modelDir) }
+	}
+	model, err := load()
 	if err != nil {
 		tb.Fatal(err)
 	}

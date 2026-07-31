@@ -364,3 +364,48 @@ func TestEncode_carveOutPrefilterIsComplete(t *testing.T) {
 		t.Errorf("addedSingle=%v but %d distinct first bytes are admitted", tok.addedSingle, admitted)
 	}
 }
+
+// TestLoadMmap_matchesLoadFromFS gates the mmap load path: a model whose tensors
+// alias a memory mapping must behave identically to one whose tensors alias a
+// heap buffer.
+//
+// Vectors are compared bit-for-bit over the whole corpus, not sampled. The
+// failure mode of an aliasing change is not "slightly different numbers" — it is
+// a wrong offset, a truncated tensor, or memory freed underneath a live slice,
+// all of which either match exactly or are obviously broken.
+func TestLoadMmap_matchesLoadFromFS(t *testing.T) {
+	const dir = "../testdata/model"
+	if _, err := os.Stat(filepath.Join(dir, "model.safetensors")); err != nil {
+		t.Skipf("no static model at %s", dir)
+	}
+	heap, err := LoadFromFS(os.DirFS(dir), ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := LoadMmap(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mapped.VocabSize() != heap.VocabSize() || mapped.Dim() != heap.Dim() {
+		t.Fatalf("shape differs: mmap %d×%d, heap %d×%d",
+			mapped.VocabSize(), mapped.Dim(), heap.VocabSize(), heap.Dim())
+	}
+	texts := goSourceChunks(t)
+	for i, s := range texts {
+		a, b := mapped.Encode(s), heap.Encode(s)
+		for j := range b {
+			if a[j] != b[j] {
+				t.Fatalf("chunk %d component %d: mmap %v, heap %v", i, j, a[j], b[j])
+			}
+		}
+	}
+	t.Logf("%d chunks identical across both load paths", len(texts))
+
+	// The mapping must outlive the load call — a finalizer that ran early, or a
+	// Close hidden in the loader, would surface as a fault or as garbage here.
+	runtime.GC()
+	runtime.GC()
+	if v := mapped.Encode("func Encode(text string) []float32"); len(v) != mapped.Dim() {
+		t.Fatalf("post-GC encode returned %d components", len(v))
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -75,6 +76,70 @@ func LoadFromFS(fsys fs.FS, dir string) (*StaticModel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open safetensors: %w", err)
 	}
+	return buildStaticModel(tok, st, cfg)
+}
+
+// LoadMmap is Load for a real directory, memory-mapping model.safetensors
+// instead of reading it onto the heap.
+//
+// WHY THIS EXISTS. OpenSafetensorsMmap has been in this package the whole time
+// and no load path reached it: LoadFromFS goes through fs.ReadFile, which by
+// definition cannot mmap, and Load is a one-line wrapper around
+// LoadFromFS(os.DirFS(dir), ".") that throws away the one thing mmap needs — a
+// real path. So every caller heap-read the whole checkpoint.
+//
+// WHAT IT BUYS, AND WHAT IT COSTS — both measured, because they point opposite
+// ways and the choice is the caller's. On the embedded-corpus example (64 MB
+// potion-code-16M, docs/internal/perf-amdahl-linux-amd64.md W3):
+//
+//	load stage    59.5 ms → 48.8 ms   peak 142.5 → 19.5 MiB   alloc 73.9 → 9.6 MB
+//	cold start    84.8 ms → 99.2 ms   peak  75.8 → 13.0 MiB   alloc 82.4 → 18.1 MB
+//
+// Peak heap falls 5.8× end to end and allocation 4.6×, while time-to-first-result
+// rises 17%. The load itself is faster — there is no 64 MB read — but mmap defers
+// the page faults to whoever first touches the embedding table, which is the
+// first Encode, and faulting in 64 MB costs more than reading it sequentially
+// from a warm page cache. This is a FOOTPRINT option, not a speed one: take it
+// under a memory cap, leave it for a short-lived CLI.
+//
+// The tensors already alias the file's bytes rather than copying them (see
+// reinterpretLE), so the only thing standing between a caller and the page cache
+// was where those bytes came from.
+//
+// LIFETIME. The returned model holds the mapping alive, and OpenSafetensorsMmap
+// installs a finalizer that unmaps it once the model is unreachable — the same
+// discipline the heap-backed path already relies on to keep its aliased tensor
+// data valid. Do not retain a vector slice past the model itself.
+//
+// On non-unix targets mmap.MapReadOnly falls back to a heap read, so this is
+// identical to Load there rather than unavailable.
+func LoadMmap(dir string) (*StaticModel, error) {
+	tok, err := LoadTokenizerFromFS(os.DirFS(dir), "tokenizer.json")
+	if err != nil {
+		return nil, fmt.Errorf("load tokenizer: %w", err)
+	}
+	cfgBytes, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read config.json: %w", err)
+	}
+	var cfg modelConfig
+	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config.json: %w", err)
+	}
+	if cfg.EmbeddingDType != "" && cfg.EmbeddingDType != "float32" {
+		return nil, fmt.Errorf("unsupported embedding_dtype %q (only float32 supported)", cfg.EmbeddingDType)
+	}
+	st, err := OpenSafetensorsMmap(filepath.Join(dir, "model.safetensors"))
+	if err != nil {
+		return nil, fmt.Errorf("open safetensors: %w", err)
+	}
+	return buildStaticModel(tok, st, cfg)
+}
+
+// buildStaticModel is the shared tail of LoadFromFS and LoadMmap: everything
+// after the three files are open, which differs between them only in how the
+// safetensors bytes were obtained.
+func buildStaticModel(tok *Tokenizer, st *SafetensorsFile, cfg modelConfig) (*StaticModel, error) {
 
 	embT, err := st.Tensor("embeddings")
 	if err != nil {

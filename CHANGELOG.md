@@ -12,6 +12,17 @@ it.
 
 ### Added
 
+- **`embed.LoadMmap(dir)`** — loads a Model2Vec model with `model.safetensors`
+  memory-mapped instead of read onto the heap. **Peak heap falls 5.8× and
+  allocation 4.6×** on a 64 MB checkpoint (cold start 75.8 → 13.0 MiB peak, 82.4
+  → 18.1 MB allocated), while **time-to-first-result rises 17%** — mmap defers
+  the page faults to the first `Encode`, and faulting 64 MB in costs more than
+  reading it sequentially from a warm page cache.
+
+  A footprint option, not a speed one: take it under a memory cap, leave it for a
+  short-lived CLI. Additive, so no existing caller changes behaviour. Vectors are
+  bit-identical to `LoadFromFS`, gated over a full corpus.
+
 - **`embed.StaticModel.EncodeBatch(texts, concurrency)`** (perf campaign A1) —
   encodes a corpus concurrently, returning one vector per input in input order.
   `concurrency <= 0` means `runtime.NumCPU()`, matching
