@@ -24,9 +24,15 @@ import (
 // Only the input → token-IDs path is implemented. No decoding, no offsets,
 // no post-processing template wrapping (none is configured for this model).
 type Tokenizer struct {
-	vocab            map[string]int32 // string → id
-	addedTokens      map[string]int32 // [PAD], [UNK]
-	addedKeys        []string         // addedTokens keys, sorted longest-first, then lex (carve-out scan order)
+	vocab       map[string]int32 // string → id
+	addedTokens map[string]int32 // [PAD], [UNK]
+	addedKeys   []string         // addedTokens keys, sorted longest-first, then lex (carve-out scan order)
+	// addedFirst[b] is true when some added key begins with byte b, and when
+	// exactly one distinct first byte exists addedOne holds it. Both are the
+	// carve-out scan's prefilter — see Encode (perf-campaign A2).
+	addedFirst       [256]bool
+	addedOne         byte
+	addedSingle      bool
 	unkID            int32
 	continuingPrefix string // "##"
 	maxCharsPerWord  int    // 100
@@ -188,7 +194,7 @@ func parseTokenizer(data []byte) (*Tokenizer, error) {
 		maxChars = 100
 	}
 
-	return &Tokenizer{
+	tk := &Tokenizer{
 		vocab:            raw.Model.Vocab,
 		addedTokens:      added,
 		addedKeys:        addedKeys,
@@ -200,7 +206,26 @@ func parseTokenizer(data []byte) (*Tokenizer, error) {
 		stripAccents:     stripAccents,
 		lowercase:        raw.Normalizer.Lowercase,
 		wp:               newWPCache(),
-	}, nil
+	}
+	// Prefilter for Encode's carve-out scan: which bytes can begin an added key,
+	// and whether they are all the same byte. For every BERT-family tokenizer the
+	// keys are [PAD], [UNK], [CLS], [SEP], [MASK] — one distinct first byte, so
+	// the scan becomes strings.IndexByte.
+	for _, k := range addedKeys {
+		if k == "" {
+			continue
+		}
+		tk.addedFirst[k[0]] = true
+	}
+	distinct := 0
+	for b := range 256 {
+		if tk.addedFirst[b] {
+			distinct++
+			tk.addedOne = byte(b)
+		}
+	}
+	tk.addedSingle = distinct == 1
+	return tk, nil
 }
 
 // Encode tokenizes a string to WordPiece IDs. No CLS/SEP wrapping (not
@@ -225,6 +250,74 @@ func (t *Tokenizer) Encode(text string) []int32 {
 	if len(t.addedKeys) == 0 {
 		return t.encodeSegment(text)
 	}
+	if !utf8.ValidString(text) {
+		return t.encodeAddedRebuild(text)
+	}
+
+	// The carve-out used to test every added key at every BYTE of the document
+	// and rebuild the whole document through a strings.Builder on the way past.
+	// addedKeys holds variable-length strings, so strings.HasPrefix cannot be
+	// specialized into byte compares — it lowers to a runtime.memequal CALL, five
+	// per byte — and the segments it built were already contiguous ranges of
+	// `text`. Measured at 10.2% of an index run before this (perf-campaign A2,
+	// docs/internal/perf-amdahl-linux-amd64.md §1).
+	//
+	// Scanning by BYTE rather than by rune is safe here and is why ValidString
+	// gates the path. In valid UTF-8 an ASCII byte never appears inside a
+	// multi-byte rune and a lead byte never appears as a continuation, so a byte
+	// equal to some key's first byte is necessarily at a rune boundary — the only
+	// place the rune-stepping original would have tried a match.
+	var out []int32
+	start, i := 0, 0
+	for i < len(text) {
+		// Find the next byte that could begin a key.
+		if t.addedSingle {
+			j := strings.IndexByte(text[i:], t.addedOne)
+			if j < 0 {
+				break
+			}
+			i += j
+		} else {
+			for i < len(text) && !t.addedFirst[text[i]] {
+				i++
+			}
+			if i >= len(text) {
+				break
+			}
+		}
+		matched := ""
+		for _, k := range t.addedKeys {
+			if strings.HasPrefix(text[i:], k) {
+				matched = k
+				break
+			}
+		}
+		if matched == "" {
+			i++
+			continue
+		}
+		if i > start {
+			out = append(out, t.encodeSegment(text[start:i])...)
+		}
+		out = append(out, t.addedTokens[matched])
+		i += len(matched)
+		start = i
+	}
+	if start < len(text) {
+		out = append(out, t.encodeSegment(text[start:])...)
+	}
+	return out
+}
+
+// encodeAddedRebuild is the pre-A2 carve-out, kept verbatim for invalid UTF-8.
+//
+// It is not equivalent to the sliced path there, and the difference is the point:
+// DecodeRuneInString yields U+FFFD for a bad byte and WriteRune re-encodes it as
+// the three-byte replacement character, where slicing preserves the raw byte.
+// In practice encodeSegment → normalize → cleanText drops U+FFFD anyway, so the
+// two agree — but cleanText is a config flag, and this way the agreement does not
+// depend on it.
+func (t *Tokenizer) encodeAddedRebuild(text string) []int32 {
 	var (
 		out []int32
 		seg strings.Builder

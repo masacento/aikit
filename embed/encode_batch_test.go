@@ -281,3 +281,88 @@ func allRepoGoSources(tb testing.TB) [][]byte {
 	}
 	return out
 }
+
+// TestEncode_carveOutSlicedMatchesRebuilt is A2's gate: the sliced carve-out
+// must produce exactly the ids the Builder rebuild produced.
+//
+// The corpus alone would not exercise it — aikit's own source contains almost no
+// added-token literals — so the table plants `[PAD]`/`[UNK]`/`[MASK]` in every
+// position that matters: at the start, at the end, adjacent to each other, with
+// and without surrounding text, and as prefixes of one another (which is why
+// addedKeys is sorted longest-first and why the scan must take the FIRST match).
+func TestEncode_carveOutSlicedMatchesRebuilt(t *testing.T) {
+	m := loadTestStaticModel(t)
+	tok := m.Tokenizer()
+	if len(tok.addedKeys) == 0 {
+		t.Skip("checkpoint has no added tokens; the carve-out never runs")
+	}
+	t.Logf("added keys: %q (single first byte: %v)", tok.addedKeys, tok.addedSingle)
+
+	var cases []string
+	for _, k := range tok.addedKeys {
+		cases = append(cases,
+			k, k+k, " "+k+" ", k+"tail", "head"+k, "head"+k+"tail",
+			k+" "+k, "a"+k+"b"+k+"c",
+			"[", "[[", "[not-a-key]", "["+k, k+"[",
+			strings.Repeat(k, 5), strings.Repeat("x"+k, 5),
+		)
+	}
+	cases = append(cases, "", " ", "no keys at all", "brackets [ ] but no key")
+	for _, src := range allRepoGoSources(t) {
+		cases = append(cases, string(src))
+	}
+
+	planted := 0
+	for _, c := range cases {
+		if !utf8.ValidString(c) {
+			t.Fatalf("case %q is not valid UTF-8", c)
+		}
+		got, want := tok.Encode(c), tok.encodeAddedRebuild(c)
+		if !slices.Equal(got, want) {
+			t.Fatalf("sliced and rebuilt carve-outs disagree on %q:\n got %v\nwant %v", trunc(c), got, want)
+		}
+		for _, k := range tok.addedKeys {
+			planted += strings.Count(c, k)
+		}
+	}
+	if planted < 50 {
+		t.Fatalf("only %d added-token occurrences across the corpus; the carve-out is barely exercised", planted)
+	}
+	t.Logf("%d inputs, %d added-token occurrences", len(cases), planted)
+
+	// Invalid UTF-8 must route to the rebuild, so the two agree there too.
+	for _, c := range []string{"\xff", "a\xffb", tok.addedKeys[0] + "\xff", "\xff" + tok.addedKeys[0]} {
+		if got, want := tok.Encode(c), tok.encodeAddedRebuild(c); !slices.Equal(got, want) {
+			t.Fatalf("invalid-UTF-8 input %q did not take the rebuild path:\n got %v\nwant %v", c, got, want)
+		}
+	}
+}
+
+// TestEncode_carveOutPrefilterIsComplete checks the byte table against the keys
+// it is derived from. A missing entry makes the scan skip a real added token
+// silently — the ids stay valid, just wrong — which is the failure mode a
+// spot-check would not catch.
+func TestEncode_carveOutPrefilterIsComplete(t *testing.T) {
+	m := loadTestStaticModel(t)
+	tok := m.Tokenizer()
+	for _, k := range tok.addedKeys {
+		if k == "" {
+			continue
+		}
+		if !tok.addedFirst[k[0]] {
+			t.Errorf("key %q begins with %q, which the prefilter does not admit", k, k[0])
+		}
+		if tok.addedSingle && k[0] != tok.addedOne {
+			t.Errorf("addedSingle is set but key %q begins with %q, not %q", k, k[0], tok.addedOne)
+		}
+	}
+	admitted := 0
+	for b := range 256 {
+		if tok.addedFirst[b] {
+			admitted++
+		}
+	}
+	if tok.addedSingle != (admitted == 1) {
+		t.Errorf("addedSingle=%v but %d distinct first bytes are admitted", tok.addedSingle, admitted)
+	}
+}

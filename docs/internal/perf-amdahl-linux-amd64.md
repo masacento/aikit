@@ -445,7 +445,38 @@ shared scratch.
 
 ---
 
-## 10 · Where an index run stands
+## 10 · A2 — the added-token carve-out, 1.22× on the stage
+
+| | before | after | |
+|---|---:|---:|---:|
+| `Tokenizer.Encode` (stage) | 163.29 ms | 133.40 ms | **1.22×** |
+| allocations | 53,290 | 38,371 | −28% |
+| whole `StaticModel.Encode` | 281.13 ms | 253.46 ms | −9.8% |
+
+The scan tested every added key at every BYTE of the document and rebuilt the
+document through a `strings.Builder` on the way past. `addedKeys` holds
+variable-length strings, so `strings.HasPrefix` lowers to a `runtime.memequal`
+CALL — five per byte — and the segments it built were already contiguous ranges
+of the input. Now a `[256]bool` of possible first bytes gates the scan, and
+because this checkpoint's keys (`[PAD]`, `[UNK]`) share one first byte it
+collapses to `strings.IndexByte`.
+
+**Predicted 26.5×; the carve-out itself measured roughly 4× in situ.** The gap is
+what the prediction isolated: 48.42 → 1.83 ms was the loop alone, and in place
+the loop still hands its segments to `encodeSegment`, which is most of what
+remains. Measured against Step 0's profile the carve-out was 10.23% of an index
+run and is now roughly 2–3% of one.
+
+Same UTF-8 story as A4, and the same resolution: the rebuild's U+FFFD
+re-encoding differs from slicing on invalid input, so `utf8.ValidString` routes
+those to a verbatim copy of the old path. Scanning by BYTE rather than by rune is
+what that gate buys — in valid UTF-8 an ASCII byte never appears inside a
+multi-byte rune, so a byte equal to a key's first byte is necessarily at a rune
+boundary, which is the only place the rune-stepping original would have tried.
+
+---
+
+## 11 · Where an index run stands
 
 | | ms |
 |---|---:|
@@ -458,7 +489,7 @@ attached; the per-item ratios above are all same-session A/Bs.
 
 ---
 
-## 11 · Step 0 status
+## 12 · Step 0 status
 
 | | state |
 |---|---|

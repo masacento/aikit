@@ -237,3 +237,47 @@ var (
 	sinkWords []string
 	sinkValid bool
 )
+
+// BenchmarkCarveOut A/Bs A2's two paths in one binary: the sliced scan against
+// the Builder rebuild it replaced, which is still present for invalid UTF-8.
+//
+// The corpus contains essentially no added-token literals, and that is the
+// realistic case rather than a weakness of the fixture — a document containing
+// `[PAD]` is the exception. So this measures what the carve-out costs when it
+// finds nothing, which is what it does on almost every document.
+func BenchmarkCarveOut(b *testing.B) {
+	const dir = "../testdata/model"
+	if _, err := os.Stat(filepath.Join(dir, "model.safetensors")); err != nil {
+		b.Skipf("no static model at %s — see testdata/README.md", dir)
+	}
+	m, err := LoadFromFS(os.DirFS(dir), ".")
+	if err != nil {
+		b.Fatal(err)
+	}
+	tok := m.tokenizer
+	texts := goSourceChunks(b)
+	var n int
+	for _, t := range texts {
+		n += len(t)
+	}
+	b.Logf("%d chunks, %d bytes, added keys %q", len(texts), n, tok.addedKeys)
+
+	b.Run("rebuild", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(n))
+		for b.Loop() {
+			for _, t := range texts {
+				sinkIDs = tok.encodeAddedRebuild(t)
+			}
+		}
+	})
+	b.Run("sliced", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(n))
+		for b.Loop() {
+			for _, t := range texts {
+				sinkIDs = tok.Encode(t)
+			}
+		}
+	})
+}
