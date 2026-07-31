@@ -1,7 +1,7 @@
 package encoder
 
 import (
-	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -9,8 +9,11 @@ import (
 func loadMoE(tb testing.TB) *Model {
 	tb.Helper()
 	const dir = "../testdata/moe-model"
-	if _, err := os.Stat(dir); err != nil {
-		tb.Skip("testdata/moe-model/ not present; see scripts/README.md")
+	// The configs/tokenizer are committed but the weights (*.safetensors) are
+	// gitignored, so in CI the directory exists while the model file does not —
+	// stat the weights, not the directory, or Load fatals. See scripts/README.md.
+	if m, _ := filepath.Glob(filepath.Join(dir, "*.safetensors")); len(m) == 0 {
+		tb.Skip("testdata/moe-model/*.safetensors not present; see scripts/README.md")
 	}
 	m, err := Load(dir)
 	if err != nil {
