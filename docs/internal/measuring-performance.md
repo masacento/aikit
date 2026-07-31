@@ -353,6 +353,10 @@ the *axis* itself was wrong on the 3700X.
 
 | fact | value | source |
 |---|--:|---|
+| A1 `EncodeBatch` scaling knee | **near-linear to 6 workers (P-cores), then +1.04× from the 2 E-cores** | perf-amdahl-apple-m1pro §3 |
+| A1 speedup at NumCPU=8 | **5.23×** (amd64's 8C+SMT gave 8.21×) | " |
+| `StaticModel.Encode` tokenize/pool split | **50.6 / 49.4** (amd64 62.9/37.1 — pool much heavier here) | perf-amdahl-apple-m1pro §1 |
+| `utf8.ValidString` over corpus | 0.16% of the tokenize stage (amd64 1%) | " |
 | scalar int8→f32 widen | **0.34 ns/elem** (5× faster than amd64's 1.7) | item 22b |
 | NEON int8→f32 widen (`dequant_i8_arm64.s`) | **0.098 ns/elem** (3.43× over scalar) | item 22b |
 | `GTE.Encode` L512 profile | **`dotNEON2x8` 52%**, `memmove` 17%, `packedFill` 20% | 2026-07-30 |
