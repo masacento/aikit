@@ -10,6 +10,33 @@ it.
 
 ## [Unreleased]
 
+## [1.16.0] — 2026-07-31
+
+A single additive `mmap` (Experimental) knob, requested by goinfer's MoE expert
+pager. `apidiff` reports **zero incompatible changes** in every Hard-tier package
+against 1.15.0; `NewSpanCache`'s existing behaviour is unchanged.
+
+### Added
+
+- **`mmap.NewSpanCacheWithPolicy(budget, policy)` and the `mmap.EvictPolicy` knob**
+  (Experimental) — `SpanCache` can now evict by either of two policies, and the right
+  one depends on the caller's DEMAND SIGNAL:
+  - **`EvictMostRecent`** — scan-resistant, and **the default, so `NewSpanCache` is
+    unchanged**. For a cyclic scan (an ANN paged query walking blocks 0,1,2,… every
+    pass) plain LRU is pathological — the block evicted to make room is exactly the one
+    wanted next round, so the cache hits 0% even at a 63/64 budget — and this pins a
+    stable prefix instead (perf-campaign item 9).
+  - **`EvictLeastRecent`** — classic LRU tail, frequency-aware. For a skewed-frequency
+    signal (a MoE expert pager whose hottest ~10% of experts absorb ~72% of top-k picks)
+    the hot set is what must stay resident; evict-most-recent throws it out the instant
+    anything else is touched — measured up to **51 pp** of hit rate worse on a real
+    35B-A3B trace at interactive budgets — so a frequency-skewed pager must use this.
+
+  Pick the policy from the access pattern, not by default: the wrong one silently
+  regresses hit rate (see `EvictPolicy`'s doc comment). Everything else about
+  `SpanCache` — the lossless-refault contract, the resident-bytes invariant, `Stats` —
+  is unchanged.
+
 ## [1.15.0] — 2026-07-31
 
 The performance-campaign release: measured work across `ann`, `bm25`, `embed`,
@@ -1819,7 +1846,8 @@ broad slice of the open-weights ecosystem.
   golden cosine 1.000000 vs PyTorch+MPS CodeRankEmbed. See
   [README.md](README.md) for stability tiers.
 
-[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.11.0...HEAD
+[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.16.0...HEAD
+[1.16.0]: https://github.com/townsendmerino/aikit/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/townsendmerino/aikit/compare/v1.14.0...v1.15.0
 [1.14.0]: https://github.com/townsendmerino/aikit/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/townsendmerino/aikit/compare/v1.12.0...v1.13.0
