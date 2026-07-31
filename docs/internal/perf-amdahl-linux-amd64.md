@@ -476,7 +476,38 @@ boundary, which is the only place the rune-stepping original would have tried.
 
 ---
 
-## 11 · Where an index run stands
+## 11 · A6 — `NewFlatI8` row-streaming: the memory prediction was exact, the time one was not
+
+| n (d=256) | staged | streamed | time | bytes |
+|---:|---:|---:|---:|---:|
+| 2,000 | 7.576 ms | 5.978 ms | 1.27× | 2512 KiB → 512 KiB |
+| 20,000 | 50.21 ms | 39.41 ms | 1.27× | 24.49 MiB → 4.96 MiB |
+| 200,000 | 446.2 ms | 380.8 ms | 1.17× | 244.9 MiB → 49.6 MiB |
+
+Predicted **2.02× and 25.7 MB → 5.2 MB at n=20,000**. The memory figure is right
+to three digits — **−79.7% at every scale**, allocations 4 → 3 — and the time
+figure is 1.6× optimistic. That matches how this was classified at Step 0: 1.10%
+of an index run, a footprint item rather than a latency one.
+
+The staged shape allocated an n·d float32 block, copied every vector in,
+quantized it and dropped it — 387 MB discarded at the 378k×256 the package doc
+cites, to produce a 97 MB index. `QuantizeRowsInt8` is a loop over
+`QuantizeRowInt8`, and `quant.go` says as much ("exposed so a loader can quantize
+each row as it is dequantized, without buffering the whole f32 matrix"), so
+streaming is bit-identical rather than merely equivalent — asserted against the
+staged path including the ragged cases.
+
+The one-row scratch that remains exists for the ragged-row contract, not for
+speed: a short vector is zero-padded and a long one truncated, and doing that in
+place would mutate the caller's slice. A row already exactly d long skips it. A
+mutant that drops the `clear()` between ragged rows dies; one that quantizes
+short rows without padding survives and is *accidentally* equivalent, since
+`QuantizeRowInt8` leaves the destination tail untouched and it was already zero —
+undocumented behaviour the explicit padding does not rely on.
+
+---
+
+## 12 · Where an index run stands
 
 | | ms |
 |---|---:|
@@ -489,7 +520,7 @@ attached; the per-item ratios above are all same-session A/Bs.
 
 ---
 
-## 12 · Step 0 status
+## 13 · Step 0 status
 
 | | state |
 |---|---|

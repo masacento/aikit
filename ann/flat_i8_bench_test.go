@@ -1,6 +1,7 @@
 package ann
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -58,3 +59,27 @@ func itoaAnn(n int) string {
 	}
 	return string(buf[i:])
 }
+
+// BenchmarkNewFlatI8_scale prices A6 across corpus sizes, because the item's
+// claim is scale-dependent and a single n would misreport it either way.
+//
+// The staged shape allocated an n*d float32 block, copied every vector in,
+// quantized it and dropped it. That block is 1.9 MB at a repo-sized corpus and
+// 387 MB at the 378k vectors the package doc cites — the same ratio of wasted
+// bytes, but a completely different cost, since one fits in cache and the other
+// is a page-fault storm feeding an index a quarter its size.
+func BenchmarkNewFlatI8_scale(b *testing.B) {
+	const d = 256
+	for _, n := range []int{2_000, 20_000, 200_000} {
+		vecs := makeUnitVectors(n, d, uint64(n))
+		b.Run(fmt.Sprintf("n%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(n) * d * 4)
+			for b.Loop() {
+				sinkFlatI8Build = NewFlatI8(vecs)
+			}
+		})
+	}
+}
+
+var sinkFlatI8Build *FlatI8

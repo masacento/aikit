@@ -71,11 +71,34 @@ func NewFlatI8(vecs [][]float32) *FlatI8 {
 	if n > 0 {
 		d = len(vecs[0])
 	}
-	flat := make([]float32, n*d)
+	bq := make([]int8, n*d)
+	scales := make([]float32, n)
+	// One d-sized scratch row, reused, instead of an n*d f32 staging matrix
+	// (perf-campaign A6). The old shape copied every input vector into a flat
+	// [n,d] float32 block, quantized it, and dropped it: at 378k vectors of
+	// dim 256 that block is 387 MB allocated and discarded to produce a 97 MB
+	// index. linalg.QuantizeRowsInt8 is a loop over QuantizeRowInt8, and
+	// quant.go says so — "exposed so a loader can quantize each row as it is
+	// dequantized, without buffering the whole f32 matrix" — so streaming is
+	// bit-identical, not merely equivalent.
+	//
+	// The scratch exists for the ragged-row contract below, not for speed: a
+	// short vector must be zero-padded and a long one truncated, and doing that
+	// in place would mutate the caller's slice. A row that is already exactly d
+	// long skips it and quantizes straight from the input.
+	var scratch []float32
 	for i, v := range vecs {
-		copy(flat[i*d:i*d+d], v)
+		row := v
+		if len(v) != d {
+			if scratch == nil {
+				scratch = make([]float32, d)
+			}
+			clear(scratch)
+			copy(scratch, v)
+			row = scratch
+		}
+		scales[i] = linalg.QuantizeRowInt8(row, bq[i*d:(i+1)*d])
 	}
-	bq, scales := linalg.QuantizeRowsInt8(flat, n, d)
 	return &FlatI8{bq: bq, scales: scales, n: n, dim: d}
 }
 

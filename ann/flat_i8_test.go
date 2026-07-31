@@ -3,6 +3,8 @@ package ann
 import (
 	"math/rand/v2"
 	"testing"
+
+	"github.com/townsendmerino/aikit/linalg"
 )
 
 func recallAt(truth, got []Hit, k int) float64 {
@@ -100,5 +102,95 @@ func TestFlatI8_topKAndDeterminism(t *testing.T) {
 	}
 	if got := NewFlatI8(nil).Query(nil, 5); got != nil {
 		t.Errorf("empty index: got %d hits, want nil", len(got))
+	}
+}
+
+// TestNewFlatI8_streamingIsBitIdentical is A6's gate. Streaming one row at a
+// time must produce byte-for-byte the codes and scales the staged
+// QuantizeRowsInt8 produced — it is the same arithmetic, since that function is
+// a loop over QuantizeRowInt8, and this asserts it rather than assuming it.
+//
+// The ragged cases carry the real risk. A short vector must be zero-padded and a
+// long one truncated, and the streaming path does that through a reused scratch
+// row — so a missing clear() leaks the previous vector's tail into the next
+// short one, which is invisible in a uniform-dimension corpus and wrong in a
+// ragged one.
+func TestNewFlatI8_streamingIsBitIdentical(t *testing.T) {
+	rng := rand.New(rand.NewPCG(6, 6))
+	for _, tc := range []struct {
+		name string
+		vecs [][]float32
+	}{
+		{"uniform", unitVecs(200, 64, 1)},
+		{"single", unitVecs(1, 32, 2)},
+		{"all-zero rows", make([][]float32, 8)},
+	} {
+		if tc.name == "all-zero rows" {
+			for i := range tc.vecs {
+				tc.vecs[i] = make([]float32, 16)
+			}
+		}
+		t.Run(tc.name, func(t *testing.T) { assertStreamedMatchesStaged(t, tc.vecs) })
+	}
+
+	// Ragged: alternating short, exact and long rows, with large values in the
+	// long ones so a leaked tail would move the scale visibly.
+	t.Run("ragged", func(t *testing.T) {
+		d := 48
+		var vecs [][]float32
+		for i := range 60 {
+			n := d
+			switch i % 3 {
+			case 0:
+				n = d / 3 // short → zero-padded
+			case 2:
+				n = d * 2 // long → truncated
+			}
+			v := make([]float32, n)
+			for j := range v {
+				v[j] = float32(rng.NormFloat64()) * 10
+			}
+			vecs = append(vecs, v)
+		}
+		// vecs[0] sets d, so make it exactly d long.
+		vecs[0] = make([]float32, d)
+		for j := range vecs[0] {
+			vecs[0][j] = float32(rng.NormFloat64())
+		}
+		assertStreamedMatchesStaged(t, vecs)
+	})
+}
+
+// assertStreamedMatchesStaged compares NewFlatI8 against the pre-A6 shape: stage
+// every vector into one flat [n,d] float32 block, then quantize the block.
+func assertStreamedMatchesStaged(t *testing.T, vecs [][]float32) {
+	t.Helper()
+	n := len(vecs)
+	d := 0
+	if n > 0 {
+		d = len(vecs[0])
+	}
+	flat := make([]float32, n*d)
+	for i, v := range vecs {
+		copy(flat[i*d:i*d+d], v)
+	}
+	wantBq, wantScales := linalg.QuantizeRowsInt8(flat, n, d)
+
+	f := NewFlatI8(vecs)
+	if f.n != n || f.dim != d {
+		t.Fatalf("n=%d dim=%d, want %d/%d", f.n, f.dim, n, d)
+	}
+	if len(f.bq) != len(wantBq) {
+		t.Fatalf("%d codes, want %d", len(f.bq), len(wantBq))
+	}
+	for i := range wantBq {
+		if f.bq[i] != wantBq[i] {
+			t.Fatalf("code %d (row %d, dim %d): %d, staged %d", i, i/max(d, 1), i%max(d, 1), f.bq[i], wantBq[i])
+		}
+	}
+	for i := range wantScales {
+		if f.scales[i] != wantScales[i] {
+			t.Fatalf("scale %d: %v, staged %v", i, f.scales[i], wantScales[i])
+		}
 	}
 }
