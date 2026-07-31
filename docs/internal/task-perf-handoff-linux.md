@@ -360,6 +360,125 @@ most likely to look tempting from here:
 - `layerNorm` vectorization — no bit-identical variant exists, and it's ~0.5% of a
   forward.
 
-**Phase D (footprint / cold start) is deliberately deferred**, including
+~~**Phase D (footprint / cold start) is deliberately deferred**, including
 `bm25.Index` serialization — which is the library's biggest missing API (67% of the
-flagship example's cold start) but is a design decision, not a Linux-box task.
+flagship example's cold start) but is a design decision, not a Linux-box task.~~
+**Superseded — see the RESULT section below.**
+
+---
+
+## RESULT — Phase D, Linux/Zen 2 (2026-07-31)
+
+**Two items shipped, both footprint, both also faster. Two items deferred as API
+design rather than performance. One arbiter correction received from the M1 Pro
+that qualifies an earlier Phase D result of mine.**
+
+The through-line for this box: **the wins were in Go allocation, not in the
+kernel**, and every one of them was invisible to the existing test suite because
+correctness gates do not measure cost.
+
+**Read the middle column.** This is a footprint phase; a change that holds latency
+flat and halves peak RSS is a success. Two of the three shipped items happened to
+win time as well, which is a bonus and not the result.
+
+### What shipped
+
+| item | Δ footprint | Δ time | |
+|---|---|---|---|
+| §4.3 · `HNSW.WriteTo` | transient **131.0 MB → 65.5 KB** (1999×); cold-process peak RSS **181.3 → 125.5 MiB** | 1.68× f32, 8.02× int8 | ✅ |
+| §4.3 · arena `Load` | **153,396 → 8** allocations (2.164 → 0.004/doc) | flat (−5.6%, at the drift floor) | ✅ |
+| §4.3 · `MarshalBinary` capacity | **131.0 MB → 58.2 MB** allocated, 2 allocs → 1 | 1.09× | ✅ |
+| 15b · HNSW search-scratch pooling | **19 → 2** allocs/query, 13.4 KB → 1.2 KB | **−27.1%** | ✅ |
+
+Measured on a 50,000×256 index (write/load) and a 5,000×64 index (query),
+`-benchtime 2s -count=6`, min-of-6; cold-process RSS via `/usr/bin/time -v`, three
+alternating runs per arm.
+
+**The peak-RSS saving is not a constant — it is one whole copy of the index.** The
+55.8 MiB delta measured is exactly the blob size, so at the lens doc's 1M×768
+shape it is ~3.1 GB. That is the number worth quoting, and it is why this belongs
+in Phase D rather than in a latency tier.
+
+### What was deferred, and why it is not a measurement question
+
+**D1 (`bm25.Index` serialization) and D2 (the `Build` input seam) are deferred**,
+by decision, recorded at lens §5.6 N4/N6.
+
+The brief priced D1 at "67% of a 90.7 ms time-to-first-result". **W3 re-measured
+it at 21.5%** once the real 64 MB checkpoint load was in the denominator instead
+of a hand-written `model.safetensors` — eliminating the rebuild entirely takes
+82.0 ms to 64.4 ms. The remaining 17.6 ms does not buy a permanent versioned
+on-disk format, which every future `Index` field then has to carry, default for
+old files, and gate. D2 is held with it because a streaming `Builder` and a
+serialized `Index` are the same question about that package's input/output
+surface, and settling either one first constrains the other.
+
+**A perf campaign can measure an absent API's cost but cannot decide its shape.**
+N1 (`StaticModel.EncodeBatch`) shipped inside the campaign because it was additive
+and its contract was obvious from the serial loop it replaced. N4 is a format.
+
+### Negatives and corrections
+
+- **The `bytes.Buffer` wrapper for `MarshalBinary` — built, measured, replaced.**
+  Making `MarshalBinary` a thin wrapper over `WriteTo` is the obvious way to
+  guarantee a single encoder. It cost **2.6× the time** (30.6 → 80.3 ms): every
+  byte written twice, plus a space check and a sticky-error check per value, which
+  at 12.8 M floats was 2× the encode itself. The shipped form keeps one encoder but
+  lets the writer's buffer *be* the whole output in `MarshalBinary`'s case, with
+  bulk `f32s`/`i32s` entry points paying both checks once per buffer-full. **One
+  encoder, two buffer policies.**
+- **My first `TestQuery_scratchIsPooled` was a bad gate.** It asserted an absolute
+  "≤6 allocations", passed, and then failed the `-race` suite — under race
+  instrumentation the same pooled query allocates 10. Rewritten to measure both
+  arms in-process and compare (9.5× normally, 2.8× under `-race`). §1.34.
+- **My first D5 benchmark was mis-costed**, rebuilding a 50k index per arm per
+  `-count`; the A/B would have run ~20 minutes. Rebuilt around one shared 5k index:
+  ~17 seconds. Same failure shape as the N9 runaway — expensive setup inside a
+  repeatedly-invoked benchmark.
+- **CORRECTION RECEIVED — §4.5's 3.00× peak-RSS win is Linux-only.** The M1 Pro
+  arbiter measured **726.2 MiB** for the same `LoadWeightsQ8`, i.e. my *unreleased*
+  figure, because macOS does not honour `MADV_DONTNEED` for a read-only
+  file-backed mapping. The pages are clean there and still reclaimed under
+  pressure, so the "runs on a laptop" guarantee holds; it is the peak-RSS *number*
+  that is a Linux artifact. The CHANGELOG now says so (`a1e1f74`). **Nothing in
+  this Phase D section carries that caveat** — these are Go-allocation wins, not
+  `madvise` wins, so they transfer in kind.
+- **A recorded dead end that measured the other way.** This document's own
+  negatives list said "pooling HNSW's search heaps alone — slightly slower". It is
+  −27.1%. Why the readings differ is **not recoverable**, because the entry
+  recorded a conclusion with no numbers and no method. Recorded as an unexplained
+  reversal rather than explained away.
+
+### For the M1 Pro — what needs arbiter confirmation
+
+1. **The 15b query-pooling time win (−27.1%).** I attribute it to GC assist rather
+   than the allocator. Your box has a different GC/memory profile and 6P+2E
+   scheduling; if the allocation win (19 → 2) transfers but the time win does not,
+   that confirms the mechanism and the item still ships on footprint.
+2. **`HNSW.WriteTo`'s cold-process peak RSS.** Go-heap, so it should transfer, but
+   `/usr/bin/time -v` is Linux; use `getrusage` `ru_maxrss` as you did for M4. The
+   number to reproduce is *peak RSS falls by one blob size*, not the absolute
+   181.3 → 125.5 MiB.
+3. **`FlatI8` does NOT have HNSW's old capacity bug** — checked, not assumed:
+   `flat_i8_persist.go:55` reserves `16+len(f.bq)+len(f.scales)*4`, which is
+   exactly the blob length, because that format has no variable-length graph
+   section to mis-budget. It has no `blobSize`-style assertion pinning that, and I
+   did not add one; a one-line check would be worth having if you are in there.
+4. **Nothing in D1/D2.** If you disagree with the deferral, that is a conversation
+   with the user, not a measurement to run.
+
+### Suite status
+
+`go test ./...` green; `-race` green on `ann`; `-tags aikit_checks` green on `ann`;
+`gofmt -l` silent; `go vet ./...` clean; `golangci-lint run ./...` **0 issues** on
+both modules (`chunk/treesitter` run separately).
+
+**One caveat on earlier claims in this campaign:** `golangci-lint` is not on
+`PATH` in this environment — it lives at `~/go/bin/golangci-lint` — so several
+"lint clean" reports I made in earlier sessions were a masked exit 127. Every lint
+result quoted in *this* section was run with the explicit path and is real. Older
+commits' lint claims should be treated as unverified until re-run.
+
+`scripts/` parity pins unchanged — no checkpoint or golden regenerated; nothing in
+this phase touches numerics, and the pinned tests pass inside the full run. Tree
+clean.
