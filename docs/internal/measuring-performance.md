@@ -572,15 +572,48 @@ measuring 2.6–2.8× when run alone — because `go test ./...` runs packages
 concurrently, so it routinely shares the machine with a dozen other packages'
 tests.
 
-Nothing was wrong with the threshold. The claim is that the machine *can* reach
-2× through parallelism, and a single wall-clock ratio under unknown contention
-cannot test that: it measures the worst moment it happened to sample.
+That first flake was contention, not the threshold: the claim is that the machine
+*can* reach 2× through parallelism, and a single wall-clock ratio under unknown
+contention measures the worst moment it happened to sample, not the capability.
+Best-of-N fixes that one.
 
-**Guard:** when a test asserts a capability rather than an average, take
-best-of-N. Genuinely broken parallelism still fails every attempt, so the
-assertion keeps its strength; only the contention flake goes away. The same
-applies to any test with a hard floor on a speedup, a throughput, or a latency
-budget.
+**But the threshold WAS wrong in a second way, and best-of-N cannot fix it: a fixed
+bar on a host-dependent capability.** `2.0×` was absolute; the achievable speedup is
+capped by the parallel WIDTH — `min(GOMAXPROCS, batch size)` — which the test logged
+(`runtime.NumCPU()` at the call site) but never gated on. The apple-m1pro concurrency
+curve (perf-amdahl-apple-m1pro §3) makes the floor of the range exact: at **2 workers
+EncodeBatch is 1.99× (99.7% of linear)**. So on a 2-core host — a constrained
+container, a throttled laptop, a pinned `GOMAXPROCS` — the test asserts something the
+code *cannot reach*, and **retrying a measurement cannot clear a ceiling that sits
+below the bar**: best-of-N runs forever and still fails. (CI itself skips this test —
+the model is an HF-snapshot symlink — so the victim is local, not the pipeline.)
+
+**Then measure-first bent the fix, and the bending is the real lesson.** The obvious
+repair is to *scale* the floor with core count — the Amdahl §3 curve says 8 workers do
+5.23×, so demand `~4×` there. Measured on apple-m1pro, this test does **~2.0–2.3×
+(median 2.06×) on 8 cores, not 5.23×** — a `4×` floor would flake every warm run. The
+reason: §3's 5.23× is a *larger* workload, and this test is deliberately a realistic
+rerank batch of **8 short (~80-token) forwards**, so it is **overhead-bound, not
+width-bound** — its speedup saturates near 2× and does not climb with cores. (Its own
+first-run number lies the other way: a *cold* sequential baseline reads ~4×, which is
+the warmup asymmetry of §1.31, not headroom.) So the achievable ceiling here is not
+`width × efficiency`; scaling the bar to the core count asserts a capability the
+workload doesn't have.
+
+The fix that survives measurement: **gate the bar on the host, don't scale it.** Skip
+below width 4 (`min(GOMAXPROCS, batch)`), which removes the unreachable small-host case,
+then keep the honest `~2×` floor the workload actually reaches. "Derive the bar from the
+host" resolved to a *skip condition*, not a *scaled magnitude* — and which one it is
+depends on whether the workload is width-bound (scale) or overhead-bound (gate), a
+question you answer by measuring the speedup at a couple of widths, not by reading a
+core count.
+
+**Guard:** a capability floor on a speedup, throughput, or latency budget needs BOTH
+best-of-N (so contention can't sample the worst moment) AND a host gate (so it is not
+asserted where the host cannot reach it). Before scaling the bar with the core count,
+measure whether the workload is actually width-bound at that size — a small,
+overhead-bound benchmark saturates far below linear, and a core-scaled bar will flake
+on the very machine it was tuned for.
 
 ---
 

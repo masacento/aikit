@@ -88,10 +88,14 @@ func TestEncodeBatch_errorPath(t *testing.T) {
 // TestEncodeBatch_speedup: report the wall-time ratio of sequential
 // (Encode in a loop) vs parallel (EncodeBatch with NumCPU workers) on
 // a realistic rerankN=8 batch of ~80-token inputs. This is the M3
-// latency-gate input — we want >= 4× on an 8-core box (linear
-// scaling of independent forward passes with some Amdahl loss).
-// Reports timings via t.Logf; the bar is forgiving (>= 2×) so this
-// test is informative rather than flaky on machines with other load.
+// latency-gate input — independent forward passes should scale near
+// linearly with some Amdahl loss.
+// The 2× floor is GATED on the host, not asserted blindly: skipped below a
+// parallel width of 4 (min(GOMAXPROCS, batch)), because a fixed 2× is
+// unreachable on a 2-core box where the batch tops out at ~1.99×. It is not
+// scaled UP with core count — this 8-short-text batch is overhead-bound and
+// saturates at ~2× even on 8 cores (measured), so the Amdahl-curve speedup does
+// not apply. See §1.20 in docs/internal/measuring-performance.md.
 func TestEncodeBatch_speedup(t *testing.T) {
 	if testing.Short() {
 		t.Skip("speedup measurement runs ~50s; skipped under -short")
@@ -117,14 +121,37 @@ func TestEncodeBatch_speedup(t *testing.T) {
 	}
 	isQ := make([]bool, len(texts))
 
-	// BEST OF N, not a single sample. The assertion is a CAPABILITY claim — this
-	// machine can reach 2× through batch parallelism — and a single wall-clock
-	// ratio cannot test that under contention. `go test ./...` runs packages
-	// concurrently, so this test routinely shares the box with a dozen other
-	// packages' tests; observed failing at 1.82× and 1.97× that way while
-	// measuring 2.6–2.8× when run alone. Best-of-N keeps the floor meaningful
-	// (genuinely broken parallelism fails every attempt) without failing on
-	// somebody else's load.
+	// The assertion is a CAPABILITY claim — this machine reaches the parallel speedup
+	// it CAN — so the bar must account for the host, not be a bare constant. Two
+	// separate failure modes (§1.20):
+	//
+	//  - CONTENTION → best-of-N. `go test ./...` runs packages concurrently, so this
+	//    routinely shares the box with a dozen other tests; observed failing at 1.82×
+	//    and 1.97× that way while measuring 2.6–2.8× alone. Best-of-N clears the flake;
+	//    genuinely broken parallelism still fails every attempt.
+	//  - A HOST THAT CANNOT REACH THE BAR → skip, don't assert. The achievable speedup
+	//    is capped by the parallel WIDTH — min(GOMAXPROCS, batch size). At 2 effective
+	//    cores EncodeBatch tops out near ~1.9–2.0× (apple-m1pro Amdahl §3: 2 workers =
+	//    99.7% of linear), so a fixed 2.0× floor sits AT/ABOVE the ceiling and no retry
+	//    count can clear it — the victim is a constrained container, a throttled laptop,
+	//    or a pinned GOMAXPROCS, not CI (which skips this: the model is an HF-snapshot
+	//    symlink). Use GOMAXPROCS, not NumCPU: a pinned GOMAXPROCS is exactly the case,
+	//    and EncodeBatch's fan-out can only run as wide as the OS threads it gets.
+	//
+	// The floor is NOT scaled up with core count, deliberately. This realistic rerank
+	// batch is 8 SHORT (~80-token) forwards, so it is OVERHEAD-bound, not width-bound:
+	// measured on apple-m1pro it saturates at ~2.0–2.3× steady-state (median 2.06×) on
+	// 8 cores, NOT the 5.23× the Amdahl §3 curve records — that curve is a larger
+	// workload. A core-count-scaled bar (e.g. 0.5×width = 4× at 8 cores) would flake
+	// here every warm run. So gate on whether the host can parallelize at all (width ≥
+	// 4), then keep the honest ~2× floor that the workload actually reaches.
+	width := min(runtime.GOMAXPROCS(0), len(texts))
+	if width < 4 {
+		t.Skipf("parallel width %d (min(GOMAXPROCS=%d, batch=%d)) is below 4 — this "+
+			"overhead-bound batch cannot clear a 2× floor with so few effective cores, "+
+			"and no retry count changes that", width, runtime.GOMAXPROCS(0), len(texts))
+	}
+	const floor = 2.0 // the ~2× this overhead-bound workload reaches when fan-out works.
 	const attempts = 3
 	var best float64
 	for a := range attempts {
@@ -145,14 +172,15 @@ func TestEncodeBatch_speedup(t *testing.T) {
 		par := time.Since(t1)
 
 		speedup := float64(seq) / float64(par)
-		t.Logf("attempt %d: N=%d candidates, NumCPU=%d: sequential=%v parallel=%v -> %.2fx speedup",
-			a+1, len(texts), runtime.NumCPU(), seq, par, speedup)
+		t.Logf("attempt %d: N=%d candidates, width=%d (GOMAXPROCS=%d, NumCPU=%d): sequential=%v parallel=%v -> %.2fx (floor %.1fx)",
+			a+1, len(texts), width, runtime.GOMAXPROCS(0), runtime.NumCPU(), seq, par, speedup, floor)
 		best = max(best, speedup)
-		if best >= 2.0 {
+		if best >= floor {
 			return
 		}
 	}
-	t.Errorf("best parallelism speedup over %d attempts was %.2fx, below floor 2.0x", attempts, best)
+	t.Errorf("best parallelism speedup over %d attempts was %.2fx, below floor %.1fx "+
+		"(width %d — genuine fan-out failure, not a small host)", attempts, best, floor, width)
 }
 
 // BenchmarkEncodeBatch_rerankN50 wraps the same workload as
