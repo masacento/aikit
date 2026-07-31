@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -114,22 +115,43 @@ func (b *bpeBackend) preTokenize(text string) []string {
 	return out
 }
 
-// bpe applies the ranked merges to one byte-mapped piece: repeatedly find the
-// adjacent symbol pair with the lowest merge rank and merge every occurrence of
-// it, until no adjacent pair is a known merge. Matches GPT-2 bpe() / HF Rust BPE.
-func (b *bpeBackend) bpe(mapped string) []string {
-	symbols := make([]string, 0, len(mapped))
-	for _, r := range mapped {
-		symbols = append(symbols, string(r))
+// bpeSpan is a symbol as a [lo,hi) byte range of the byte-mapped piece. Every BPE
+// symbol is, by induction, a CONTIGUOUS substring of `mapped`: the initial symbols
+// are its runes in order, and a merge joins two adjacent ranges. So the whole merge
+// loop runs on offsets — the rank-map keys and the final vocab lookups take free
+// sub-slices of `mapped`, and a merge is just span{lo1, hi2} (lens §3.3).
+type bpeSpan struct{ lo, hi int }
+
+// bpeScratch is the per-segment scratch bpeInto reuses across a segment's pieces:
+// mapped holds the current piece's byte-mapped bytes (so no strings.Builder alloc
+// per piece), and cur/nxt are the merge loop's double buffer (so no fresh backing
+// per merge round).
+type bpeScratch struct {
+	mapped   []byte
+	cur, nxt []bpeSpan
+}
+
+// bpeInto applies the ranked merges to one byte-mapped piece — repeatedly find the
+// adjacent symbol pair with the lowest merge rank and merge every occurrence, until
+// no adjacent pair is a known merge — and appends the resulting symbol ids to ids.
+// Matches GPT-2 bpe() / HF Rust BPE. Bit-identical to the prior string-based bpe
+// (same greedy lowest-rank merges, same symbols); the only change is that it works
+// on spans, so there is no per-rune string(r), no fresh backing per merge, and no
+// a+c concat (lens §3.3: 4.78 M allocs → ~0, 2.83×).
+func (b *bpeBackend) bpeInto(mapped string, sc *bpeScratch, ids []int32) []int32 {
+	cur := sc.cur[:0]
+	for i := 0; i < len(mapped); {
+		_, size := utf8.DecodeRuneInString(mapped[i:])
+		cur = append(cur, bpeSpan{i, i + size})
+		i += size
 	}
-	if len(symbols) < 2 {
-		return symbols
-	}
-	for {
+	nxt := sc.nxt[:0]
+	for len(cur) >= 2 {
 		bestRank := int(^uint(0) >> 1)
 		bestI := -1
-		for i := 0; i < len(symbols)-1; i++ {
-			if r, ok := b.rank[[2]string{symbols[i], symbols[i+1]}]; ok && r < bestRank {
+		for i := 0; i < len(cur)-1; i++ {
+			key := [2]string{mapped[cur[i].lo:cur[i].hi], mapped[cur[i+1].lo:cur[i+1].hi]}
+			if r, ok := b.rank[key]; ok && r < bestRank {
 				bestRank = r
 				bestI = i
 			}
@@ -137,20 +159,29 @@ func (b *bpeBackend) bpe(mapped string) []string {
 		if bestI < 0 {
 			break
 		}
-		a, c := symbols[bestI], symbols[bestI+1]
-		merged := symbols[:0:0] // fresh backing so we don't clobber while scanning
-		for i := 0; i < len(symbols); {
-			if i < len(symbols)-1 && symbols[i] == a && symbols[i+1] == c {
-				merged = append(merged, a+c)
+		aS := mapped[cur[bestI].lo:cur[bestI].hi]
+		cS := mapped[cur[bestI+1].lo:cur[bestI+1].hi]
+		nxt = nxt[:0]
+		for i := 0; i < len(cur); {
+			if i < len(cur)-1 && mapped[cur[i].lo:cur[i].hi] == aS && mapped[cur[i+1].lo:cur[i+1].hi] == cS {
+				nxt = append(nxt, bpeSpan{cur[i].lo, cur[i+1].hi})
 				i += 2
 			} else {
-				merged = append(merged, symbols[i])
+				nxt = append(nxt, cur[i])
 				i++
 			}
 		}
-		symbols = merged
+		cur, nxt = nxt, cur // swap; nxt is reset to [:0] at the top of the next round
 	}
-	return symbols
+	for _, s := range cur {
+		id, ok := b.vocab[mapped[s.lo:s.hi]]
+		if !ok {
+			id = b.unkID // unreachable: every byte-symbol is in the vocab
+		}
+		ids = append(ids, id)
+	}
+	sc.cur, sc.nxt = cur, nxt // retain both grown backings for the next piece
+	return ids
 }
 
 // encode runs the added-token carve-out, then byte-level BPE over each segment,
@@ -194,19 +225,18 @@ func (b *bpeBackend) encode(text string) []int32 {
 
 func (b *bpeBackend) encodeSegment(text string) []int32 {
 	var ids []int32
+	var sc bpeScratch // reused across this segment's pieces
 	for _, piece := range b.preTokenize(text) {
-		var sb strings.Builder
-		sb.Grow(len(piece))
+		m := sc.mapped[:0]
 		for i := 0; i < len(piece); i++ { // map each RAW byte to its GPT-2 rune
-			sb.WriteRune(b.byte2rune[piece[i]])
+			m = utf8.AppendRune(m, b.byte2rune[piece[i]])
 		}
-		for _, sym := range b.bpe(sb.String()) {
-			id, ok := b.vocab[sym]
-			if !ok {
-				id = b.unkID // unreachable: every byte-symbol is in the vocab
-			}
-			ids = append(ids, id)
-		}
+		sc.mapped = m
+		// A string VIEW of the reused buffer: bpeInto only slices it and probes the
+		// read-only rank/vocab maps (which never retain a key), and never keeps the
+		// string past the call, so reusing m for the next piece is safe.
+		mapped := unsafe.String(unsafe.SliceData(m), len(m))
+		ids = b.bpeInto(mapped, &sc, ids)
 	}
 	return ids
 }
