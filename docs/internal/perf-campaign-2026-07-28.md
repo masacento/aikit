@@ -64,7 +64,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~2~~ | ~~SPLADE: hoist `log1p` outside the L×V max-reduce~~ — **DONE** (§7.10); **measured 1.28–1.47×** on the pooling step (§7.12) | encoder | pooling is ~0.5% of `Expand`, so invisible end-to-end | **=** | — |
 | ~~3~~ | ~~`topk.Push`: hoist the threshold compare~~ — **DONE** (§7.8) | topk, ann | **1.05× end-to-end** on `Flat.Query` (the 1.43× was the selection step alone) | = | — |
 | ~~4~~ | ~~`FlatI8.Query`: pool the score buffer; stop allocating a `Workspace` per query~~ — **DONE, −99.2% B/op; −5.4% time at N=100k** (§7.26) | ann | estimated 10–25% time; the win is allocation | = | — |
-| ~~5~~ | ~~Index (de)serialization: bulk `copy`~~ — **DONE, 5.14×** (§7.8) | ann | 15.6 → 3.04 ms on a 50k×384 index; the 20–30× estimate was optimistic | = | — |
+| ~~5~~ | ~~Index (de)serialization: bulk `copy`~~ — **DONE, 5.14×** (§7.8). **Its Tier-0 placement was wrong: 0.018% of an index run — see the note below the table.** | ann | 15.6 → 3.04 ms on a 50k×384 index; the 20–30× estimate was optimistic | = | — |
 | ~~6~~ | ~~BERT/GTE forwards never call `enterForward()`~~ — **DONE** (§7.12) | encoder | removes oversubscription | — | — |
 | ~~7~~ | ~~SPLADE vocab matmul runs **serial**~~ — **DONE, 1.05–1.19× on `Expand`** (§7.12); needed a trunk column fan-out too, since the trunk is NOT parallel at short L | encoder | 2.3× was optimistic | = | — |
 | ~~8~~ | ~~`gte.go:230` allocates 12.6 MB/`Encode` outside the scratch arena~~ — **DONE, −12.7 MiB/call (−43%)** (§7.13) | encoder | exactly as estimated; **no latency change** | = | — |
@@ -80,7 +80,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
-| ~~11~~ | ~~**(A)** touched-set selection + pooled accumulator~~ — **DONE, bm25 + sparse** (§7.9) | bm25, sparse | 1.3–218× on bm25, selectivity-dependent | = | — |
+| ~~11~~ | ~~**(A)** touched-set selection + pooled accumulator~~ — **DONE, bm25 + sparse** (§7.9). **The "10–50×" framing was wrong about the cause — see the note below the table.** | bm25, sparse | 1.3–218× on bm25, selectivity-dependent | = | — |
 | ~~12~~ | ~~**(B)** Rewrite `dotI8AVX2`~~ — **DONE, 2.10× kernel / 2.02× scan** (§7.6) | linalg | measured on Zen 2; int8 now at f32 MAC-parity | = (integer) | — |
 | ~~13~~ | ~~**(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto`~~ — **DONE, all sites** (§7.16 text, §7.17 vision + cross-encoder); pure Go, no assembly | linalg→encoder, vision | text −20.1%; **cross-encoder −33.8%**; SigLIP −17.9%/−30.6% | ~ (contracts stated + gated) | — |
 | ~~14~~ | ~~**(E)** Length-bucketed `EncodeBatch` under a token budget~~ — **DONE, −13.0% ragged / neutral uniform** (§7.29) | encoder | estimated 1.3–2×; measured 1.15× at B=8 | **=** | — |
@@ -120,6 +120,29 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~38~~ | ~~Binary/Hamming prefilter + exact rerank~~ — **DONE, 13–26× end-to-end** (§7.36) | ann | geomean **18.6×**, recall@10 1.00 on the real corpus | ≠ (recall) | — |
 | ~~39~~ | ~~WAND / block-max WAND / MaxScore dynamic pruning~~ — **DONE for `bm25` (3.88×); built, measured and REVERTED for `sparse`** (§7.37) | bm25, sparse | plus a 1.40–8.47× `sparse` win from porting item 44 | = | — |
 | 40 | Flash-attention / online-softmax tiling | encoder, vision | 1.05–1.15× alone; 67 MB → 1 MB scratch | ≠ | L |
+
+### Two entries above are annotated, and this is why
+
+Both landed and both are real. What was wrong in each case is the *reason* given
+for caring, which is the part that gets quoted downstream.
+
+**Item 11's "10–50×, >99% waste" was right about the win and wrong about the
+mechanism.** The framing was selectivity: a query touches a tiny fraction of the
+corpus, so scanning all of it is waste. Measured, real queries touch a **median
+12% and worst 81%** of the corpus — not 1.2% — because `bm25/tokenize.go` emits
+the compound token *and* every sub-token, so a query fans out far wider than its
+word count suggests (lens doc §5.6, N7). The win is the **allocation**: the old
+shape allocated and zeroed an N-element score array per query and then re-read
+all N to select. That is why it still pays at 81% selectivity, and why the
+follow-on items that optimized the posting *scan* (10 and 29) measured at zero —
+they were optimizing something that had stopped being the bottleneck.
+
+**Item 5 is not a latency item and should not have been Tier 0.** `MarshalBinary`
+is **0.018% of an index run** on real hardware — five times smaller even than the
+lens doc's 0.083% estimate (`docs/internal/perf-amdahl-linux-amd64.md` §1). Its
+5.14× is a genuine 5.14× on a stage that rounds to nothing. What it *is* worth is
+peak RSS: the serializer doubles the resident index while it runs, which is the
+§4.3 finding, and that is where it belongs.
 
 ---
 

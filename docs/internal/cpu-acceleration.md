@@ -160,8 +160,11 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
    cosine 1.0, batch==single, `-race` clean). The win is the L² term, so it scales
    with sequence length: **~2.85× single `Encode`** at ~500 tokens, neutral (no
    regression) at ~80-token rerank passages where scores·V is a small share.
-   *Follow-up:* the dormant int8 sibling `forward_q8.go` has the same scalar loop
-   (left untouched — off the default path, not model-test-covered).
+   *Follow-up — DONE, and this line was stale:* `forward_q8.go` no longer has the
+   scalar scores·V loop. Both its attention paths route QKᵀ and scores·V through
+   `s.mm` — `forward_q8.go:180,185` (single) and `:247,253` (batched) — which
+   dispatches to `matmulBTInto` or an attached backend, exactly as the f32 sibling
+   does.
 4. **amd64 AVX2 `MatmulBTW4A8` kernel** — ✅ **DONE** (`dot_w4a8_amd64.s`,
    `quant_w4a8_amd64.go`). The fused int4×int8 decode kernel now exists for amd64
    too: the same nibble-unpack prologue feeding the proven `dotI8AVX2`

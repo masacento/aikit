@@ -253,6 +253,34 @@ func (h *HNSW) code(id int) []int8 { return h.bq[id*h.dim : id*h.dim+h.dim] }
 // and indexed vector id — the SIMD f32 dot (float32 mode) or the int8 dot rescaled
 // by the query and per-vector scales (int8 mode). HNSW is approximate by contract,
 // so the sub-ULP difference from a float64 scalar sum is immaterial to recall.
+//
+// ⚠ MATCHING-UNITS INVARIANT — sim and simIDs must stay on the same scale.
+//
+// selectHeuristic cross-compares the two: it tests a node–node similarity from
+// simIDs against `e.sim`, which came from sim(qv, ·). In the int8 mode those are
+// only comparable because of an equality that nothing in the type system
+// enforces — in Add, `qv = h.prepare(vec)` and `h.bq[id]` are quantized from the
+// SAME row by the same pure function, so `qv.scale == h.scales[id]` exactly and
+// sim(qv, c) ≡ simIDs(id, c).
+//
+// The consequence is worth stating plainly because it is the kind of change that
+// looks obviously safe: `qv.scale` is loop-invariant inside sim, so hoisting it
+// out is a textbook optimization — and hoisting it out of sim ALONE changes the
+// units of one side of that comparison only. The result is a DIFFERENT GRAPH.
+//
+// It is worse than "no test failure" — that was measured. Dropping `qv.scale`
+// here passes the whole ann suite AND an int8-mode recall gate built for it,
+// scoring 0.978 on clustered data, because on L2-normalized vectors every
+// per-vector scale is nearly the same number and the mutation is close to a
+// uniform rescale of one side. The gate that does catch it,
+// TestHNSW_simAndSimIDsAgree, asserts the invariant itself: sim(prepare(v), c)
+// and simIDs(id, c) must be the SAME NUMBER for the node built from v. If you
+// factor a scale out of one of these, factor it out of both, and run that test.
+//
+// (The related simplification is sound and is the right way to read the test:
+// h.scales[e.id] appears as a positive factor on BOTH sides and cancels exactly.
+// It has also been measured, at three dimensions, at 0% — see the lens doc's
+// dead ends.)
 func (h *HNSW) sim(qv queryVec, id int) float64 {
 	if h.int8 {
 		return float64(linalg.DotI8(qv.q8, h.code(id))) * qv.scale * float64(h.scales[id])
@@ -611,6 +639,10 @@ func (h *HNSW) selectNeighbors(w []cand, m int) []cand {
 
 // simIDs is the cosine similarity (dot product on unit vectors) between two
 // indexed vectors — the heuristic's candidate-vs-candidate comparison.
+//
+// ⚠ Its result is compared directly against sim's in selectHeuristic. See the
+// matching-units invariant on sim: the two must stay on the same scale, and
+// changing either one alone silently produces a different graph.
 func (h *HNSW) simIDs(a, b int) float64 {
 	if h.int8 {
 		return float64(linalg.DotI8(h.code(a), h.code(b))) * float64(h.scales[a]) * float64(h.scales[b])
@@ -656,6 +688,11 @@ func (h *HNSW) selectHeuristic(w []cand, m int) []cand {
 		// neighbours at a time, with the early exit kept between groups so a
 		// candidate rejected by its first comparison still costs at most one
 		// group instead of the whole of r (item 17).
+		// `s` here is a node–node similarity and `e.sim` is a node–query one.
+		// They are comparable only under the matching-units invariant documented
+		// on sim — in Add the query and the base node are quantized from the same
+		// row, so the two scales are equal. This is THE line that invariant
+		// exists for.
 		keep := true
 		for j := 0; j < len(rIDs) && keep; j += 8 {
 			end := min(j+8, len(rIDs))
