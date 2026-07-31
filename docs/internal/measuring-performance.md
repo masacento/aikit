@@ -449,6 +449,9 @@ been consistently right; magnitudes consistently optimistic.**
 | 19 · `DequantizeRowInt4` | 2–4× | 4.93× | ✅ |
 | 38 · binary Hamming prefilter | ~10× first stage | **13–26×** end-to-end, geomean 18.6× | ✅ |
 | 39 · WAND dynamic pruning | 2–10× on bm25 **and** sparse | **3.88×** bm25 mixed query; **reverted** on sparse | ✅ (bm25) ❌ (sparse) |
+| §4.3 · `HNSW.WriteTo` | full copy → 1 MB staging | **131.0 MB → 65.5 KB** transient; peak RSS 181.3 → 125.5 MiB | ✅ |
+| §4.3 · HNSW arena `Load` | ">2.1 M allocs → 2" | **153,396 → 8** (2.164 → 0.004 per doc) | ✅ |
+| §4.3 · the baseline itself | "MarshalBinary allocates the blob once" | it allocated it **twice** — 131.0 MB for a 58.3 MB blob (bad capacity estimate) | ✓ (worse than predicted) |
 
 Two entries were **found by measurement rather than predicted** and are the
 largest encoder wins of the campaign: the parallel axis being wrong on amd64
@@ -840,6 +843,31 @@ allocated bytes, live heap, or resident set — and sample the one the mechanism
 actually moves. If the mechanism is mmap, page cache or a syscall, heap
 instruments are blind to it by construction and their silence is not evidence.
 Report both when they disagree; the disagreement is the finding.
+
+### 1.33 A fully-tested function can still allocate twice what it needs
+
+`HNSW.MarshalBinary` had a round-trip test, a determinism test, a stability test,
+a hostile-input test and an over-allocation guard test. It also allocated
+**131.0 MB to produce a 58.3 MB blob** — the capacity estimate budgeted 8 bytes of
+graph header per node where a node with L layers needs 4+4L, so `append` doubled
+mid-write. That had been true since the function was written.
+
+Every one of those tests asks *what bytes came out*. None asks *what it cost to
+produce them*, and no benchmark existed for the function at all, so there was no
+`B/op` column for anyone to notice. The defect was invisible to a green suite by
+construction.
+
+It surfaced only because lens §4.3 predicted a doubling and the A/B measured a
+**tripling** — the "before" number was worse than the finding claimed. That is the
+tell: when a baseline measures worse than a pessimistic prediction, the baseline
+has a second bug in it, and it is worth finding before crediting the fix.
+
+**Guard:** for any function whose cost is proportional to the data (serializers,
+loaders, encoders), have at least one benchmark with `ReportAllocs`, and assert
+the size estimate against the actual output where one exists —
+`TestHNSW_WriteToMatchesMarshal` now checks `blobSize() == len(blob)`, which is
+the single line that would have caught this years earlier. Correctness gates and
+cost gates are different gates; passing the first says nothing about the second.
 
 ---
 

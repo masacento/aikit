@@ -712,11 +712,17 @@ would be 2. (The campaign's recorded dead end — "contiguous vs scattered doesn
 speed up the *scan*" — explicitly leaves GC mark cost and allocation open. Load is
 where they land.)
 
-> **DONE (2026-07-31, M1 Pro):** `residentQ8` now `NewBufferLen(N*K)` then
-> dequantizes straight into `buf.Floats()` — no host staging. **Measured 37.76 MB
-> → 0.00 MB Go-heap per weight** (× 12 layers = the 453 MB, gone from the first
-> forward). Bit-identical: `TestEncMetal_q8Parity` green; builds `CGO_ENABLED=0`
-> (`cgo=0`, the native-Metal path is cgo-free). Two lines, as predicted.
+> **DONE, both halves.** `FlatI8.WriteTo` landed in `b2a3cb9` (transient 52.0 MB →
+> 4.1 KB on a 200k×256 index; peak heap 100.0 → 50.4 MiB). `HNSW.WriteTo` plus the
+> load-side arenas landed in Phase D — on a 50k×256 index, **transient 131.0 MB →
+> 65.5 KB** on the write path and **153,396 → 8 allocations** on the load path;
+> cold-process peak RSS **181.3 → 125.5 MiB**, the delta being exactly one blob.
+> Serialized bytes are unchanged (SHA-256 gated, both storage modes).
+>
+> **The prediction under-stated the baseline.** §4.3 assumed `MarshalBinary`
+> allocated the blob once; it allocated it twice, because the capacity estimate
+> budgeted 8 bytes of graph header per node where a node with L layers needs 4+4L.
+> See campaign §7.40 and §1.33 of the measuring doc.
 
 ## 4.4 · `encmetal` stages 453 MB on the Go heap to copy it into host memory
 
@@ -731,6 +737,15 @@ dequantize straight into `buf.Floats()`. **Two lines.** Bit-identical.
 
 (`gpu/enccuda/backend.go:223` is identical code, but there the host buffer is a
 genuine PCIe staging requirement — the fix is a *reused* scratch, not removal.)
+
+> **DONE (2026-07-31, M1 Pro):** `residentQ8` now `NewBufferLen(N*K)` then
+> dequantizes straight into `buf.Floats()` — no host staging. **Measured 37.76 MB
+> → 0.00 MB Go-heap per weight** (× 12 layers = the 453 MB, gone from the first
+> forward). Bit-identical: `TestEncMetal_q8Parity` green; builds `CGO_ENABLED=0`
+> (`cgo=0`, the native-Metal path is cgo-free). Two lines, as predicted.
+>
+> *(Filed under §4.3 by `20210f8` and moved here — it describes this finding, not
+> that one. §4.3's own status is the annotation at the end of §4.3.)*
 
 ## 4.5 · `LoadWeightsQ8` materializes the whole f32 model before quantizing
 

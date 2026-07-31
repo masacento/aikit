@@ -64,7 +64,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~2~~ | ~~SPLADE: hoist `log1p` outside the L×V max-reduce~~ — **DONE** (§7.10); **measured 1.28–1.47×** on the pooling step (§7.12) | encoder | pooling is ~0.5% of `Expand`, so invisible end-to-end | **=** | — |
 | ~~3~~ | ~~`topk.Push`: hoist the threshold compare~~ — **DONE** (§7.8) | topk, ann | **1.05× end-to-end** on `Flat.Query` (the 1.43× was the selection step alone) | = | — |
 | ~~4~~ | ~~`FlatI8.Query`: pool the score buffer; stop allocating a `Workspace` per query~~ — **DONE, −99.2% B/op; −5.4% time at N=100k** (§7.26) | ann | estimated 10–25% time; the win is allocation | = | — |
-| ~~5~~ | ~~Index (de)serialization: bulk `copy`~~ — **DONE, 5.14×** (§7.8). **Its Tier-0 placement was wrong: 0.018% of an index run — see the note below the table.** | ann | 15.6 → 3.04 ms on a 50k×384 index; the 20–30× estimate was optimistic | = | — |
+| ~~5~~ | ~~Index (de)serialization: bulk `copy`~~ — **DONE, 5.14×** (§7.8). **Its Tier-0 placement was wrong: 0.018% of an index run — see the note below the table.** **Re-filed as a footprint item and now CLOSED: `HNSW.WriteTo` + arena `Load`, 1999× fewer transient bytes, 153,396 → 8 allocations** (§7.40) | ann | 15.6 → 3.04 ms on a 50k×384 index; the 20–30× estimate was optimistic | = | — |
 | ~~6~~ | ~~BERT/GTE forwards never call `enterForward()`~~ — **DONE** (§7.12) | encoder | removes oversubscription | — | — |
 | ~~7~~ | ~~SPLADE vocab matmul runs **serial**~~ — **DONE, 1.05–1.19× on `Expand`** (§7.12); needed a trunk column fan-out too, since the trunk is NOT parallel at short L | encoder | 2.3× was optimistic | = | — |
 | ~~8~~ | ~~`gte.go:230` allocates 12.6 MB/`Encode` outside the scratch arena~~ — **DONE, −12.7 MiB/call (−43%)** (§7.13) | encoder | exactly as estimated; **no latency change** | = | — |
@@ -143,6 +143,12 @@ lens doc's 0.083% estimate (`docs/internal/perf-amdahl-linux-amd64.md` §1). Its
 5.14× is a genuine 5.14× on a stage that rounds to nothing. What it *is* worth is
 peak RSS: the serializer doubles the resident index while it runs, which is the
 §4.3 finding, and that is where it belongs.
+
+**That re-filing is now closed out — see §7.40.** `HNSW.WriteTo` takes the write
+path's transient cost from a full second copy of the index to one 64 KiB buffer
+(**1999× fewer transient bytes**, cold-process peak RSS **181.3 → 125.5 MiB**),
+and the load path from **153,396 allocations to 8**. Both were footprint items
+that also happened to be faster, which is not the usual direction.
 
 ---
 
@@ -2398,6 +2404,75 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     may still ship it. Recorded in lens §4.2, measuring-performance §4, and amdahl §5.
     (Its subsumed sibling — GTE's `upGate` [L,2I], campaign #8 — was not attempted once
     the base transform measured out; same fork/join structure, same expected result.)
+
+40. **Phase D · `HNSW.WriteTo` + arena `Load` — a FOOTPRINT item, and it also got
+    faster.** Lens §4.3's HNSW half: `MarshalBinary` was the only serialization
+    surface, so saving an index held a full second copy of it, and `Load`
+    allocated per doc and per node. Both are now fixed. Read the middle column,
+    not the right one — this phase is judged on bytes.
+
+    Measured on a 50,000×256 index (58.2 MB blob), `-benchtime 2s -count=6`,
+    min-of-6:
+
+    | | transient B/op | allocs/op | time |
+    |---|--:|--:|--:|
+    | `MarshalBinary` (before) | 130,998,274 | 2 | 29.76 ms |
+    | `MarshalBinary` (after) | 58,236,928 | **1** | 27.25 ms |
+    | **`WriteTo`** | **65,536** | **1** | **17.76 ms** |
+    | int8 `MarshalBinary` (before) | 45,047,811 | 2 | 22.11 ms |
+    | int8 **`WriteTo`** | **65,536** | 1 | **2.76 ms** |
+    | `Load` (before) | 61,910,360 | **153,396** | 78.20 ms |
+    | `Load` (after) | 61,915,680 | **8** | 73.83 ms |
+
+    **1999× fewer transient bytes** on the f32 write path and **19,175× fewer
+    allocations** on the load path. Cold process, `/usr/bin/time -v`, three
+    alternating runs each: peak RSS **181.3 → 125.5 MiB**, and the 55.8 MiB delta
+    is *exactly the blob size* — which is the point. The saving is not a constant;
+    it is one whole copy of the index, so at the lens doc's 1M×768 shape it is
+    ~3.1 GB.
+
+    **THE PREDICTION WAS RIGHT AND THE BASELINE WAS WORSE THAN THE PREDICTION
+    SAID.** §4.3 assumed `MarshalBinary` allocated the blob once. It allocated it
+    *twice*: the capacity estimate budgeted 8 bytes of graph header per node when a
+    node with L layers needs 4+4L, so `append` doubled — **131.0 MB for a 58.3 MB
+    blob**. Nothing measured that, because `B/op` was never looked at for a
+    serializer and the round-trip tests only care about bytes out. Sizing the
+    allocation from the same function that walks the graph (`blobSize`) fixes it,
+    and a test now asserts `blobSize() == len(blob)` — the one thing that can drift
+    silently.
+
+    **Time moved too, and in the good direction:** f32 `WriteTo` is **1.68×** the
+    old `MarshalBinary`+write and int8 is **8.02×**, because the int8 code block
+    goes out in one `Write` through the existing int8/byte alias instead of a
+    byte-at-a-time append. That is a bonus, not the result. §1.8's rule applies in
+    reverse here: the allocation win is the finding, and the latency win is the one
+    that would evaporate on different hardware.
+
+    **A dead end inside the item, recorded:** the first version made
+    `MarshalBinary` a `bytes.Buffer` wrapper around `WriteTo`, which is the obvious
+    way to guarantee one encoder. It cost **2.6× the time** (30.6 → 80.3 ms):
+    every byte was written twice (staging buffer → Buffer) and the per-value
+    encoder paid a space check and a sticky-error check per element, which at
+    12.8 M floats was 2× the encode itself. The fix keeps one encoder but lets the
+    writer's buffer *be* the whole output in `MarshalBinary`'s case, plus bulk
+    `f32s`/`i32s` entry points that pay both checks once per buffer-full. **One
+    encoder, two buffer policies** — the deduplication was worth having, the
+    obvious implementation of it was not.
+
+    **Format unchanged, proven by hash.** SHA-256 of the serialized bytes for a
+    fixed fixture is identical before and after, both storage modes
+    (`da3e6b8a…` f32, `149151cf…` int8), and those hashes are now frozen in
+    `TestHNSW_formatGolden`. That gate did not exist: every round-trip test
+    marshals and loads with the same code, so a self-consistent format change
+    passes all of them while every already-written blob becomes unreadable.
+
+    **Gates, all mutation-checked.** Dropping the three-index cap on the arena
+    sub-slices fails `TestLoad_arenaSubSlicesDoNotAlias`; forcing `scanGraph` to
+    report failure takes `Load` back to **2.164 allocations per doc** and fails the
+    rate assertion; under-counting `blobSize` by one byte fails the identity test.
+    The write-error test uses a fixture *larger than the 64 KiB buffer* on purpose —
+    at the original 38 KB fixture the encode was a single `Write`, so the
+    "fail at write 2" case never fired and proved nothing (§1.29's shape again).
 
 ---
 
