@@ -353,6 +353,8 @@ the *axis* itself was wrong on the 3700X.
 
 | fact | value | source |
 |---|--:|---|
+| item 24 power-of-two packed stride | **REAL here** — 4096 B `kSpan`=1024 stride costs 8% in the kernel / **−9.8% on large-encoder fc2** (K=4096); 16-f32 pad fixes it | campaign item 24 |
+| serial `packedFill` fraction of kernel peak | 75–81% of ~42 GMAC/s (fc2 M512/M690) — item 23's a-re-read gap | campaign item 23 |
 | A1 `EncodeBatch` scaling knee | **near-linear to 6 workers (P-cores), then +1.04× from the 2 E-cores** | perf-amdahl-apple-m1pro §3 |
 | A1 speedup at NumCPU=8 | **5.23×** (amd64's 8C+SMT gave 8.21×) | " |
 | `StaticModel.Encode` tokenize/pool split | **50.6 / 49.4** (amd64 62.9/37.1 — pool much heavier here) | perf-amdahl-apple-m1pro §1 |
@@ -416,6 +418,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 22 · q8 weight widen | ~113 ms/fwd, L-independent | ~190 ms/fwd, L-independent | ✅ |
 | 22b · arm64 NEON widen | 6–8× kernel | 3.43× (arm64 scalar already 5× amd64's) | ❌ |
 | 37 · outer-product kernel (arm64) | ~1.45× (2× in the µkernel, amd64) | 1.10× raw / net-negative (dot2x8 at 95% peak) | ❌ |
+| 24 · packed-stride pad (arm64) | "may be a no-op, measure first" | **−9.8% on large-encoder fc2 — real** | ✓ (rare: measured MORE than the guard expected) |
 | 18 · Qwen ViT arena | ~15 GB/image, ~1.5 s memset | −70/−85% B/op; **~3%** of latency | ⚠️ |
 | 27 · 4-MFLOP naive threshold | 3–9% for L<250 | **up to −50.5%** | ❌ (under) |
 | 24 · packed-stride aliasing | "free" | unreachable on amd64; reverted | — |

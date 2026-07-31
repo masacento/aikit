@@ -198,9 +198,21 @@ func packKBlockFor(K int) int {
 	return 1024
 }
 
-// packBufPool recycles the 8×kBlock pack buffer (≤ 8·1024 f32 = 32 KB). MatmulBT fans
-// packedFill across goroutines; each gets its own buffer from the pool.
-var packBufPool = sync.Pool{New: func() any { s := make([]float32, 8*1024); return &s }}
+// packStridePad spaces the 8 packed b-rows apart by an extra 16 f32 (64 B, one
+// cache line) WHEN the natural stride kSpan is a power of two (perf-campaign item
+// 24). A power-of-two kSpan makes the 8 rows' same-k lines land in too few L1 sets
+// on the M1 P-core (128 KB L1D, 256 sets: a 4096 B stride = 1024 f32 wraps 8 rows
+// onto 2 sets, a 4-way conflict). This is REACHABLE — packKBlockFor returns 1024
+// for K%768≠0, i.e. every large encoder's fc2 (hidden 1024 → K=4096: bge-large,
+// mxbai-large). Measured 8% on the isolated 2×8 kernel at kSpan=1024; padding to
+// 65 lines makes all 8 rows distinct. A 4-float pad is too small (<1 line, can't
+// move a row to a new set). The pad is unused space between rows, never read — so
+// this is bit-identical to the unpadded pack (TestMatmulBT_matchesNaive at K=4096).
+const packStridePad = 16
+
+// packBufPool recycles the 8×(kBlock+pad) pack buffer (≤ 8·(1024+16) f32 = 32.5 KB).
+// MatmulBT fans packedFill across goroutines; each gets its own buffer from the pool.
+var packBufPool = sync.Pool{New: func() any { s := make([]float32, 8*(1024+packStridePad)); return &s }}
 
 // packedFill is blockedFill's large-K path: for each contiguous group of 8 output columns
 // it copies those 8 b-rows' k-strip into a low-stride buffer (rows kBlock apart, not K
@@ -211,7 +223,7 @@ var packBufPool = sync.Pool{New: func() any { s := make([]float32, 8*1024); retu
 func packedFill(a, b, dst []float32, M, K, N, nStart, nEnd, kBlock int) {
 	bufp := packBufPool.Get().(*[]float32)
 	defer packBufPool.Put(bufp)
-	bPack := (*bufp)[:8*kBlock]
+	bPack := *bufp
 
 	n0 := nStart
 	for ; n0+8 <= nEnd; n0 += 8 {
@@ -219,11 +231,16 @@ func packedFill(a, b, dst []float32, M, K, N, nStart, nEnd, kBlock int) {
 			kEnd := min(k0+kBlock, K)
 			kSpan := kEnd - k0
 			k4 := kSpan / 4
-			for bi := range 8 {
-				copy(bPack[bi*kSpan:bi*kSpan+kSpan], b[(n0+bi)*K+k0:(n0+bi)*K+kEnd])
+			// Space the rows by a cache line when kSpan is a power of two (item 24).
+			stride := kSpan
+			if kSpan&(kSpan-1) == 0 {
+				stride += packStridePad
 			}
-			p0, p1, p2, p3 := &bPack[0], &bPack[kSpan], &bPack[2*kSpan], &bPack[3*kSpan]
-			p4, p5, p6, p7 := &bPack[4*kSpan], &bPack[5*kSpan], &bPack[6*kSpan], &bPack[7*kSpan]
+			for bi := range 8 {
+				copy(bPack[bi*stride:bi*stride+kSpan], b[(n0+bi)*K+k0:(n0+bi)*K+kEnd])
+			}
+			p0, p1, p2, p3 := &bPack[0], &bPack[stride], &bPack[2*stride], &bPack[3*stride]
+			p4, p5, p6, p7 := &bPack[4*stride], &bPack[5*stride], &bPack[6*stride], &bPack[7*stride]
 			i := 0
 			var s [64]float32
 			for ; i+1 < M; i += 2 {
