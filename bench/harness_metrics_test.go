@@ -49,9 +49,8 @@ func TestHarness_reportsAllocsAndQPS(t *testing.T) {
 		t.Fatal("no results")
 	}
 	for _, r := range results {
-		if r.QPS <= 0 {
-			t.Errorf("%s: QPS = %v, want > 0 — the concurrent pass did not run", r.Name, r.QPS)
-		}
+		// TIMER-INDEPENDENT metrics — populated regardless of clock resolution, so
+		// asserted on every platform.
 		if r.Concurrency < 1 {
 			t.Errorf("%s: Concurrency = %d, want >= 1", r.Name, r.Concurrency)
 		}
@@ -62,23 +61,27 @@ func TestHarness_reportsAllocsAndQPS(t *testing.T) {
 		if r.AllocsPerQuery <= 0 {
 			t.Errorf("%s: AllocsPerQuery = %v, want > 0", r.Name, r.AllocsPerQuery)
 		}
-		// Throughput must not be a restatement of serial latency: with several
-		// cores it should beat 1/Mean, and it must not exceed cores/Mean.
-		//
-		// This compares two INDEPENDENTLY-timed quantities — the serial per-query
-		// Mean and the concurrent pass's aggregate QPS. On a platform whose monotonic
-		// clock cannot resolve a sub-millisecond query (p50 rounds to 0.000 ms — the
-		// virtualized Windows CI runner does this) the two round differently and their
-		// ratio is noise, not a result: it has spuriously reported QPS "implausibly"
-		// above the serial-derived ceiling. So only assert it when the timer actually
-		// resolved the per-query work. The allocation/QPS>0/Concurrency checks above
-		// are timer-independent and still run everywhere. (Sibling of the degenerate-
-		// latency skip in TestHarness_warmupExcluded.)
-		if r.Mean > 0 && r.P50 > 0 {
-			serial := 1000 / r.Mean // queries/s from mean ms
-			if ceil := serial * float64(r.Concurrency) * 1.5; r.QPS > ceil {
-				t.Errorf("%s: QPS %.0f exceeds %.0f (cores × serial rate × 1.5) — implausible",
-					r.Name, r.QPS, ceil)
+		// TIMER-DERIVED metrics — only assert where the monotonic clock resolved the
+		// work (§1.37). QPS is a RATE: concurrentQPS returns 0 when its window
+		// underflows the clock (elapsed<=0), so "QPS>0" flakes to a spurious failure
+		// on the virtualized Windows CI runner exactly as the plausibility ratio does.
+		// The plausibility check additionally compares two INDEPENDENTLY-timed
+		// quantities (serial Mean vs concurrent QPS), which round differently and
+		// whose ratio is noise, not a result, when the clock can't resolve a sub-ms
+		// query. p50 rounding to 0.000 ms is the tell; gate both on it. (Sibling of
+		// the degenerate-latency skip in TestHarness_warmupExcluded.)
+		if r.P50 > 0 {
+			if r.QPS <= 0 {
+				t.Errorf("%s: QPS = %v, want > 0 — the concurrent pass did not run", r.Name, r.QPS)
+			}
+			// Throughput must not be a restatement of serial latency: with several
+			// cores it should beat 1/Mean, and it must not exceed cores/Mean.
+			if r.Mean > 0 {
+				serial := 1000 / r.Mean // queries/s from mean ms
+				if ceil := serial * float64(r.Concurrency) * 1.5; r.QPS > ceil {
+					t.Errorf("%s: QPS %.0f exceeds %.0f (cores × serial rate × 1.5) — implausible",
+						r.Name, r.QPS, ceil)
+				}
 			}
 		}
 		t.Logf("%-7s p50=%.3fms QPS×%d=%.0f allocs/q=%.0f B/q=%.0f",
@@ -96,12 +99,14 @@ func TestHarness_warmupExcluded(t *testing.T) {
 	corpus, queries := metricsCorpus(1000, 64)
 	results := Run(corpus, queries, 10, ann.Config{})
 	for _, r := range results {
-		if r.P50 <= 0 && r.P99 <= 0 {
-			// Every per-query sample rounded to zero: the platform's monotonic
-			// clock can't resolve sub-millisecond work (GitHub's virtualized
-			// Windows runner ticks at ~1ms). The warm-up-exclusion path is
-			// platform-independent and covered on the higher-resolution runners,
-			// so skip rather than fail on an untimeable micro-benchmark.
+		if r.P50 <= 0 {
+			// p50 rounds to 0: the platform's monotonic clock can't resolve
+			// sub-millisecond work (GitHub's virtualized Windows runner ticks at
+			// ~1ms). The ratio check below divides by p50, so it is meaningless once
+			// p50 is unresolved — gate on the DENOMINATOR quantity, not on both being
+			// zero (a coarse timer that gives p50=0, p99=1ms would otherwise fail it
+			// spuriously). §1.37. The warm-up path is platform-independent and
+			// covered on the higher-resolution runners, so skip.
 			t.Skipf("%s: timer resolution too coarse to measure sub-ms queries "+
 				"(p50=%v p99=%v); warm-up exclusion is covered on higher-res runners",
 				r.Name, r.P50, r.P99)

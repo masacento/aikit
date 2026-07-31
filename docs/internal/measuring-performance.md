@@ -946,6 +946,42 @@ gets wrong about *what to work on*; the third catches what it gets wrong about
 *whether the work is even visible to the user it is for*. An arbiter box is not a
 second opinion, it is a different set of blind spots.
 
+### 1.37 A timing assertion is only valid where the clock resolves the quantity timed
+
+`TestHarness_reportsAllocsAndQPS` asserted `QPS > 0` and that concurrent QPS did not
+implausibly exceed the serial rate. Both passed everywhere for months and then flaked
+red on the **virtualized Windows CI runner**, whose monotonic clock ticks at ~1 ms —
+too coarse to resolve a sub-millisecond query, so `p50` rounds to `0.000 ms`. Two
+different symptoms, one cause: `concurrentQPS` returns 0 when its window underflows
+the clock (`elapsed <= 0`), tripping "QPS did not run"; and the serial `Mean` and the
+concurrent `QPS` round *differently*, so their ratio jumped a `1.5×` plausibility
+ceiling that means nothing when neither input was measured.
+
+This is distinct from §1.1's "the benchmark measures something you did not change" and
+from the "check that cannot fail" family: those **pass vacuously**. A timing assertion
+on an unresolved clock **fails spuriously** — worse, because a red CI has to be chased.
+It is the mirror image, and it belongs in the same catalogue.
+
+The rule, and it is structural — apply it at every site at once, not at whichever one
+goes red next:
+
+> **Split a metrics test's assertions into timer-independent and timer-derived.**
+> Allocations (`B/op`, `allocs/op`), counts, concurrency, output-format — assert
+> unconditionally; they don't depend on the clock. Anything that is a **rate, a
+> latency, or an inequality between two timed quantities** — QPS, ns/op, a p99/p50
+> ratio, a speedup — assert ONLY when the clock resolved the quantity it divides by
+> (guard on `p50 > 0`, or on the specific timed input being non-zero). Gate on the
+> **denominator**, not on "everything rounded to zero": a coarse timer that yields
+> `p50 = 0, p99 = 1 ms` still makes `p99/p50` meaningless, and a both-zero guard would
+> miss it. Where the whole test is timing-derived, `t.Skip` with the resolution as the
+> reason; where only some assertions are, keep the rest running so the platform still
+> gets the coverage it can give.
+
+**Guard:** before asserting on any duration-derived value, ask "did the clock this ran
+on resolve it?" On a ~1 ms-tick CI runner a µs-scale micro-benchmark did not, and the
+assertion is measuring the timer, not the code. `p50 == 0.000 ms` in the failure log is
+the fingerprint.
+
 ---
 
 ## 5 · Keeping this current
