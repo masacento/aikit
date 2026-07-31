@@ -650,6 +650,18 @@ over all L ⇒ neither applies.
 
 ## 4.2 · `swigluMLP`'s `gate` is 47% of the 190 MB/worker arena
 
+> **ARM64 ARBITER (2026-07-31): DOES NOT TRANSFER — built, measured +3.5–6.9%, reverted.**
+> Column-blocking bit-identically drops the gate scratch 44.0 → 3.67 MB/worker (jb=256,
+> measured on this box), exactly the footprint win below. But it is **not latency-neutral
+> on arm64**: the isolated `swigluMLP` at L=3584 measures **+5.6% (jb=256), +3.5% (jb=512,
+> best), +6.9% (jb=768), +5.4% (jb=1024)**, min-of-8. The amd64 "free" reading is spent by
+> the 6P+2E fork/join: the full gate is one parallel matmul, the column-blocked gate is
+> I/jb of them, and each barrier pays the E-core straggler tax (Amdahl §3). That is the
+> **same tradeoff profile as the row-tile variant this section rejected for costing 6%**,
+> so by the section's own bar it does not ship on arm64. Gate + mutation test written and
+> green (bit-identity holds); reverted for latency. See perf-amdahl-apple-m1pro §5 and
+> task-perf-handoff-macos. The amd64 box may still ship it (latency-neutral there).
+
 `encoder/mlp.go:30-37` — `gate` is `[L, I]`, written by one matmul, read by
 exactly one sequential loop. At `B*Lmax = 3584`: **44.0 MB**, and `val`+`gate`
 together are **88.1 MB of a 188.7 MB arena.**

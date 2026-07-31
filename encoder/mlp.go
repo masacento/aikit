@@ -40,6 +40,11 @@ func swigluMLP(h []float32, Fc11, Fc12, Fc2 []float32, D, intermediate, L int, s
 	for i := range h {
 		h[i] += mid[i]
 	}
+	// Lens §4.2 (column-block gate into val[:, j0:j1], dropping the [L,I] gate buffer
+	// to one jb-wide tile) was built and measured out on arm64: latency-neutral on
+	// amd64 but +3.5–6.9% to this stage here (the 12× extra parallel fork/joins bite
+	// the 6P+2E barrier). A footprint-only win that fails the "free" bar the lens set
+	// when it chose column-block over row-tiling — see the perf-campaign note.
 }
 
 // addRowBias adds a [N] bias row to every row of a [M, N] matrix, in place.

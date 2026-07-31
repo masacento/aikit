@@ -2381,6 +2381,24 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     dead on arm64 (the wrapper skips its allocation); reclaiming the pooled 9.4 MB is
     a trivial follow-up left for when a non-`N%8==0` shape can't reach the fallback.
 
+39. **Lens §4.2 (gate column-blocking) DID NOT TRANSFER to arm64 — built, measured
+    +3.5–6.9%, reverted (2026-07-31, M1 Pro arbiter).** The transform is bit-identical
+    (gate computed a jb-wide column tile at a time, SiLU-folded into `val[:, j0:j1]`;
+    `TestSwigluMLP_colBlockBitIdentical` over I∈{256,3072,3080,128} × L∈{1,7,32,80}
+    green, mutation-checked) and the footprint win is real and measured here — gate
+    scratch **44.0 → 3.67 MB/worker** (jb=256), the §4.2 story exactly. But on arm64 it
+    is **not latency-neutral**: the isolated `swigluMLP` at L=3584 (the arena shape)
+    measures **+5.6% jb=256 / +3.5% jb=512 (best) / +6.9% jb=768 / +5.4% jb=1024**,
+    min-of-8; the full batch forward is +0–6%, too noisy to resolve below that. The
+    amd64 "free" reading is spent by the **6P+2E fork/join**: the full gate is one
+    parallel matmul, the column-blocked gate is I/jb of them, and every extra barrier
+    pays the E-core straggler tax (Amdahl §3). That is the SAME latency-for-footprint
+    tradeoff §4.2 rejected the row-tile variant for (6%), so by the lens's own bar it
+    does not ship here. Reverted; the gate/mutation tests were removed with it. amd64
+    may still ship it. Recorded in lens §4.2, measuring-performance §4, and amdahl §5.
+    (Its subsumed sibling — GTE's `upGate` [L,2I], campaign #8 — was not attempted once
+    the base transform measured out; same fork/join structure, same expected result.)
+
 ---
 
 ## 8. Suggested sequencing

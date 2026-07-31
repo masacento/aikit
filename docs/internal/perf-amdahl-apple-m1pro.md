@@ -229,6 +229,8 @@ single most valuable remaining index-time work on the M1 Pro is inside
 | `wordPiece` residual | 7.59% | 7.56% | **yes** (map probe, not arithmetic) |
 | `utf8.ValidString` cost | 1% | 0.16% | cheaper here |
 | A5 sort mechanism (n=50) | 2.95× | 2.53× | yes |
+| §4.2 gate col-block | latency-neutral (2126→2123 ms) | **+3.5–6.9% (swigluMLP L=3584)** | **no** — 6P+2E fork/join tax on I/jb barriers |
+| 22b Q8 widen fusion | (amd64: fix a only) | **−28%/−10%/−4.8% L=8/64/256** | n/a — arm64-only (packed path gated on `has2x8Kernel`) |
 
 The scoreboard pattern from Phase A holds in reverse here: the quantities set by
 *structure* (the `wordPiece` residual, the sort mechanism) transferred; the ones

@@ -418,6 +418,8 @@ been consistently right; magnitudes consistently optimistic.**
 | 13 · …on SigLIP | up to 2× | 1.24× geomean (1.44× at 576 patches) | ❌ |
 | 22 · q8 weight widen | ~113 ms/fwd, L-independent | ~190 ms/fwd, L-independent | ✅ |
 | 22b · arm64 NEON widen | 6–8× kernel | 3.43× (arm64 scalar already 5× amd64's) | ❌ |
+| 22(b) · fuse widen into pack | remaining ~33 ms + 0.9 GB round-trip | **−28%/−10%/−4.8% fwd at L=8/64/256** | ✅ |
+| §4.2 · gate col-block (arm64) | latency-neutral footprint win (amd64) | **+3.5–6.9% swigluMLP; reverted (6P+2E fork/join)** | ❌ |
 | 37 · outer-product kernel (arm64) | ~1.45× (2× in the µkernel, amd64) | 1.10× raw / net-negative (dot2x8 at 95% peak) | ❌ |
 | 24 · packed-stride pad (arm64) | "may be a no-op, measure first" | **−9.8% on large-encoder fc2 — real** | ✓ (rare: measured MORE than the guard expected) |
 | §5 · StaticModel word presum | ~29% pool collapse (14% of Encode) | wash serial / **+31% batch** (cache overhead + contention) | ❌ |
