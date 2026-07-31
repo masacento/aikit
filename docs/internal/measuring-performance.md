@@ -452,6 +452,7 @@ been consistently right; magnitudes consistently optimistic.**
 | §4.3 · `HNSW.WriteTo` | full copy → 1 MB staging | **131.0 MB → 65.5 KB** transient; peak RSS 181.3 → 125.5 MiB | ✅ |
 | §4.3 · HNSW arena `Load` | ">2.1 M allocs → 2" | **153,396 → 8** (2.164 → 0.004 per doc) | ✅ |
 | §4.3 · the baseline itself | "MarshalBinary allocates the blob once" | it allocated it **twice** — 131.0 MB for a 58.3 MB blob (bad capacity estimate) | ✓ (worse than predicted) |
+| 15b · HNSW search-heap pooling | campaign recorded it as "slightly SLOWER"; expect allocs only | **19 → 2 allocs, 13.4 KB → 1.2 KB, and −27.1% time** | ✅ (reverses a recorded dead end) |
 
 Two entries were **found by measurement rather than predicted** and are the
 largest encoder wins of the campaign: the parallel axis being wrong on amd64
@@ -868,6 +869,28 @@ the size estimate against the actual output where one exists —
 `TestHNSW_WriteToMatchesMarshal` now checks `blobSize() == len(blob)`, which is
 the single line that would have caught this years earlier. Correctness gates and
 cost gates are different gates; passing the first says nothing about the second.
+
+### 1.34 An absolute allocation bound is not portable across build modes
+
+`TestQuery_scratchIsPooled` first asserted "≤6 allocations per `Query`", tuned to
+an observed 2. It passed, and then **failed the `-race` suite**: under race
+instrumentation the same pooled query allocates **10**, and the unpooled one 25.
+Nothing was wrong with the code — the gate had baked in a constant that only holds
+in one build mode.
+
+Rewritten to measure *both* arms in the same process and compare them, it reads
+9.5× normally and 2.8× under `-race`, and passes in both because the ratio is what
+the change controls. The absolute count is a property of the toolchain; the ratio
+is a property of the pool.
+
+The same argument applies to GC settings, Go version and fixture size, all of
+which move an absolute count and none of which move the ratio.
+
+**Guard:** when gating a resource (allocations, bytes, syscalls), measure the
+baseline in the same run rather than hard-coding it. If a second arm is genuinely
+impossible, state the build mode the constant was measured in and expect to
+revisit it. A gate that only holds under `go test` with no flags is a gate that
+will fail someone else's CI for the wrong reason.
 
 ---
 

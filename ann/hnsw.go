@@ -73,15 +73,27 @@ func (v *visitTracker) reset(n int) {
 func (v *visitTracker) seen(id int) bool { return v.stamp[id] == v.gen }
 func (v *visitTracker) mark(id int)      { v.stamp[id] = v.gen }
 
-// getVis / putVis lend a visitTracker to a Query from the per-index pool, so
-// concurrent queries don't share state and don't each allocate an N-sized buffer.
-func (h *HNSW) getVis() *visitTracker {
-	if v, ok := h.queryVis.Get().(*visitTracker); ok {
+// searchScratch is everything one searchLayer call needs to scribble on: the
+// visited-set stamps and the two heaps. They are pooled together because they
+// have the same lifetime and the same sharing rule — one per in-flight search —
+// and because the heaps' backing arrays were the bulk of a query's allocations
+// (they grow by append from nil to ef on every call, ~7 doublings each).
+type searchScratch struct {
+	vis     visitTracker
+	cands   candHeap // frontier, max-heap
+	results candHeap // bounded result set, min-heap
+}
+
+// getScratch / putScratch lend a searchScratch to a Query from the per-index
+// pool, so concurrent queries don't share state and don't each re-grow an
+// N-sized stamp buffer and two ef-sized heaps.
+func (h *HNSW) getScratch() *searchScratch {
+	if v, ok := h.queryVis.Get().(*searchScratch); ok {
 		return v
 	}
-	return &visitTracker{}
+	return &searchScratch{}
 }
-func (h *HNSW) putVis(v *visitTracker) { h.queryVis.Put(v) }
+func (h *HNSW) putScratch(v *searchScratch) { h.queryVis.Put(v) }
 
 // Config tunes the graph. Zero values fall back to the documented
 // defaults, so Config{} is a sensible build.
@@ -141,8 +153,8 @@ type HNSW struct {
 	seed           uint64 // Config.Seed, retained so a loaded index re-seeds rng
 	heuristic      bool   // !Config.SimpleNeighbors — Alg-4 diversity neighbor selection
 	rng            *rand.Rand
-	buildVis       visitTracker // reused across searchLayer calls during Add (single-writer)
-	queryVis       sync.Pool    // *visitTracker per concurrent Query
+	buildScratch   searchScratch // reused across searchLayer calls during Add (single-writer)
+	queryVis       sync.Pool     // *searchScratch per concurrent Query
 	// scoreUnbatched forces the per-candidate scoring path. Test-only: it exists
 	// so the differential gate for item 15 can run the pristine and batched
 	// scorers against the SAME graph and compare full ranked result lists, which
@@ -417,7 +429,7 @@ func (h *HNSW) Add(vec []float32) int {
 	// Insert layers min(l, maxLayer) … 0.
 	start := min(h.maxLayer, l)
 	for layer := start; layer >= 0; layer-- {
-		w := h.searchLayer(qv, []int{ep}, h.efConstruction, layer, &h.buildVis, nil)
+		w := h.searchLayer(qv, []int{ep}, h.efConstruction, layer, &h.buildScratch, nil)
 		neighbors := h.selectNeighbors(w, h.mmax(layer))
 		// Link id → neighbors.
 		ids := make([]int32, len(neighbors))
@@ -507,13 +519,17 @@ func (h *HNSW) greedyClosest(qv queryVec, ep, layer int) int {
 // keep, if non-nil, restricts the COLLECTED results to ids where keep(id) is
 // true. Filtered-out nodes still route the search (pushed to the frontier) — graph
 // connectivity is preserved — they're just not added to the result set.
-func (h *HNSW) searchLayer(qv queryVec, entryPoints []int, ef, layer int, vis *visitTracker, keep func(int) bool) []cand {
+func (h *HNSW) searchLayer(qv queryVec, entryPoints []int, ef, layer int, sc *searchScratch, keep func(int) bool) []cand {
+	vis := &sc.vis
 	vis.reset(h.count())
 	// candidates: max-heap on sim (expand the closest-to-q first).
-	candidates := &candHeap{min: false}
-	// results: min-heap on sim (the worst of the ef-best sits on top for
-	// O(1) eviction / comparison).
-	results := &candHeap{min: true}
+	// results:    min-heap on sim (the worst of the ef-best sits on top for
+	//             O(1) eviction / comparison).
+	// Both reuse the scratch's backing arrays: truncating to [:0] keeps the
+	// capacity a previous search grew, so a warm scratch allocates nothing here.
+	candidates, results := &sc.cands, &sc.results
+	candidates.items, candidates.min = candidates.items[:0], false
+	results.items, results.min = results.items[:0], true
 
 	for _, ep := range entryPoints {
 		s := h.sim(qv, ep)
@@ -610,9 +626,9 @@ func (h *HNSW) queryEf(q []float32, k, ef int, keep func(int) bool) []Hit {
 	for layer := h.maxLayer; layer >= 1; layer-- {
 		ep = h.greedyClosest(qv, ep, layer)
 	}
-	vis := h.getVis()
-	found := h.searchLayer(qv, []int{ep}, ef, 0, vis, keep)
-	h.putVis(vis)
+	sc := h.getScratch()
+	found := h.searchLayer(qv, []int{ep}, ef, 0, sc, keep)
+	h.putScratch(sc)
 	if len(found) > k {
 		found = found[:k]
 	}

@@ -84,7 +84,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 | ~~12~~ | ~~**(B)** Rewrite `dotI8AVX2`~~ — **DONE, 2.10× kernel / 2.02× scan** (§7.6) | linalg | measured on Zen 2; int8 now at f32 MAC-parity | = (integer) | — |
 | ~~13~~ | ~~**(C)** SIMD `expF32`/`erfF32`/`tanhF32` + `SoftmaxRowsInto`/`GELUInto`~~ — **DONE, all sites** (§7.16 text, §7.17 vision + cross-encoder); pure Go, no assembly | linalg→encoder, vision | text −20.1%; **cross-encoder −33.8%**; SigLIP −17.9%/−30.6% | ~ (contracts stated + gated) | — |
 | ~~14~~ | ~~**(E)** Length-bucketed `EncodeBatch` under a token budget~~ — **DONE, −13.0% ragged / neutral uniform** (§7.29) | encoder | estimated 1.3–2×; measured 1.15× at B=8 | **=** | — |
-| ~~15~~ | ~~HNSW: batch neighbour scoring through `Dot8x4`~~ — **DONE, 1.36×/1.33×** (§7.27) | ann | matched the prototype; heap pooling (the alloc half) still open | ~ (2 ULP, 0 rank changes over 4,500 hits) | — |
+| ~~15~~ | ~~HNSW: batch neighbour scoring through `Dot8x4`~~ — **DONE, 1.36×/1.33×** (§7.27). **Alloc half now DONE too: search-scratch pooling, 19 → 2 allocs/query, −27.1% time** (§7.41) | ann | matched the prototype; the heap-pooling half was a recorded dead end and measured the other way | ~ (2 ULP, 0 rank changes over 4,500 hits) | — |
 | ~~16~~ | ~~`Flat.Query` is single-threaded; shard it + per-shard selector~~ — **DONE, 1.73–2.26×; filtered path −42%** (§7.23) | ann | "4–8× typical" was never available: the scan is DRAM-bandwidth-bound at ~25 GB/s | = | — |
 | ~~17~~ | ~~HNSW build: batch `prune`/`selectHeuristic`; kill 225 allocs/insert~~ — **DONE, 1.34× build; 225 → 89 allocs/insert** (§7.28) | ann | estimated 1.5–2.5×; allocation beat the ask | ~ (recall identical) | — |
 | ~~18~~ | ~~`vision/qwen_encoder.go` has no scratch arena~~ — **DONE, −70/−85% B/op, now depth-independent** (§7.19) | vision | latency share is ~3%, not the ~1.5 s implied | **=** | — |
@@ -2473,6 +2473,47 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     The write-error test uses a fixture *larger than the 64 KiB buffer* on purpose —
     at the original 38 KB fixture the encode was a single `Write`, so the
     "fail at write 2" case never fired and proved nothing (§1.29's shape again).
+
+
+41. **Phase D · item 15's allocation half — HNSW search-scratch pooling. A
+    RECORDED DEAD END THAT MEASURED THE OTHER WAY.** The campaign's negatives list
+    says "pooling HNSW's search heaps alone — slightly *slower*". Rebuilt and
+    re-measured with an in-process A/B, it is **−27.1% time and 11.3× less
+    allocation**.
+
+    `searchLayer` allocated both heaps fresh per call: `candHeap.items` grows by
+    `append` from nil to `ef`, ~7 doublings each. The `visitTracker` next to them
+    was already pooled — so the fix is to widen that pool's element from
+    `visitTracker` to a `searchScratch` holding the tracker *and* both heaps, which
+    have identical lifetime and the same one-per-in-flight-search sharing rule.
+
+    In-process A/B, one shared 5,000×64 index, `-count=6`, min-of-6 (the arms
+    differ only in whether the heap arrays keep their capacity):
+
+    | | ns/op | B/op | allocs/op |
+    |---|--:|--:|--:|
+    | cold heaps | 55,631 | 13,455 | 19 |
+    | pooled | **40,567** | **1,187** | **2** |
+
+    **The time win is almost certainly GC assist, not the allocator.** At ~25k
+    queries/s, 12.3 KB of garbage per query is ~300 MB/s of allocation, and the
+    assist cost is charged to the goroutine doing the allocating — i.e. it lands
+    inside `Query`. That is the mechanism the brief predicted would show up only
+    under sustained QPS; it shows up in the serial number for the same reason.
+
+    **Why the earlier reading differed is not recoverable** — the negatives list
+    records the conclusion, not the method or the numbers. Recorded as an
+    unexplained reversal rather than explained away. The lesson is on the doc, not
+    the measurement: **a negative result needs its numbers written down as fully as
+    a positive one**, or a later session cannot tell whether it was wrong or
+    whether the tree moved underneath it.
+
+    **Gate mutation-checked.** `TestQuery_scratchIsPooled` compares both arms in
+    one process; the cold arm independently reproduces **19.0** allocations,
+    cross-checking the benchmark from a second instrument. Restoring the per-call
+    heaps drops the ratio to 1.0 and fails it. Its first form asserted an absolute
+    "≤6 allocations" and passed — then failed under `-race`, where the same pooled
+    query allocates 10. Recorded as §1.34.
 
 ---
 

@@ -351,7 +351,12 @@ most likely to look tempting from here:
 - Overlapping `ann.Query` with `bm25.TopK` — **21% slower** (may flip at ~10×
   corpus; it does not flip at repo scale).
 - Contiguous vs scattered vector storage — identical within noise.
-- Pooling HNSW's search heaps alone — slightly *slower*.
+- ~~Pooling HNSW's search heaps alone — slightly *slower*.~~ **OVERTURNED
+  2026-07-31: −27.1% time and 19 → 2 allocations per query** when rebuilt and
+  measured with an in-process A/B (campaign §7.41). This entry recorded a
+  conclusion with no numbers and no method, so why the two readings differ cannot
+  be reconstructed. **That is the lesson: a negative needs its numbers written
+  down as fully as a positive**, or it becomes an unfalsifiable "don't bother".
 - `layerNorm` vectorization — no bit-identical variant exists, and it's ~0.5% of a
   forward.
 

@@ -256,3 +256,36 @@ func TestScanGraph_truncatedIsNotFatal(t *testing.T) {
 		}
 	}
 }
+
+// TestQuery_scratchIsPooled gates the search scratch. searchLayer's two heaps
+// grow by append from nil to ef — about 7 doublings each — so an unpooled query
+// allocates ~19 times and ~13.4 KB where a pooled one allocates twice. Nothing
+// else in the suite can see that: the results are identical either way, which is
+// the whole point of a pool.
+//
+// It measures BOTH arms in this process and compares them, rather than asserting
+// an absolute count. An absolute bound is not portable across build modes: under
+// -race the same pooled query allocates 10 times, not 2, and a bound tuned to the
+// normal build fails a race run for no reason (it did). A ratio is immune to that
+// and to GC settings, Go version, and this fixture's size.
+func TestQuery_scratchIsPooled(t *testing.T) {
+	h := BuildHNSW(randUnitSet(rand.New(rand.NewPCG(21, 22)), 3000, 32),
+		Config{M: 16, EfConstruction: 100, EfSearch: 64, Seed: 8})
+	q := randUnit(rand.New(rand.NewPCG(23, 24)), 32)
+	h.Query(q, 10) // warm the pool: the first query legitimately grows the heaps
+
+	// Cold arm: hand the pool a scratch with no heap capacity, reproducing the
+	// pre-change behaviour where every searchLayer re-grew both heaps from nil.
+	cold := testing.AllocsPerRun(200, func() {
+		sc := h.getScratch()
+		sc.cands.items, sc.results.items = nil, nil
+		h.putScratch(sc)
+		h.Query(q, 10)
+	})
+	warm := testing.AllocsPerRun(200, func() { h.Query(q, 10) })
+	t.Logf("Query allocations: %.1f cold heaps, %.1f pooled (%.1f×)", cold, warm, cold/warm)
+	if warm*2 > cold {
+		t.Errorf("pooled query allocates %.1f per call against %.1f with cold heaps — "+
+			"less than a 2× saving means the search heaps are not being reused", warm, cold)
+	}
+}

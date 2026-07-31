@@ -75,6 +75,13 @@ it.
   It is also faster — **1.68×** f32, **8.02×** int8 — but this is a footprint
   change; the allocation figure is the one that transfers across machines.
 
+- **`ann.HNSW.Query` allocates 2 times instead of 19** (13.4 KB → 1.2 KB per
+  query), and is **−27.1%** faster on a 5k×64 index. The two search heaps grew by
+  `append` from nil on every query; they are now pooled alongside the
+  visited-set tracker that was already pooled. Results are unchanged. The time
+  win is GC assist rather than the allocator — 12.3 KB of garbage per query at
+  ~25k queries/s is ~300 MB/s, charged to the querying goroutine.
+
 - **`ann.Load` allocates 8 times instead of 153,396** on a 50k-doc HNSW index
   (2.164 → 0.004 per doc). The graph and vectors are read into flat arenas and
   sub-sliced rather than allocated per doc and per node. No API change, no format
