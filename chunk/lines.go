@@ -1,5 +1,7 @@
 package chunk
 
+import "bytes"
+
 // LineChunker is the language-agnostic fallback: fixed-size line windows
 // with a small overlap so a match straddling a window boundary still lands
 // wholly inside at least one chunk. ken's DESIGN.md §1 pins the defaults at a
@@ -37,7 +39,9 @@ func (lc *LineChunker) Chunk(file string, source []byte) []Chunk {
 
 	// Byte offset where each content line begins. A trailing '\n' does not
 	// start a new line (no empty phantom line at EOF).
-	lineStart := []int{0}
+	// Presized from a SIMD bytes.Count rather than grown by append — see the
+	// same change in chunk/regex/chunker.go (lens doc §4.8).
+	lineStart := make([]int, 1, bytes.Count(source, []byte{'\n'})+1)
 	for i := range source {
 		if source[i] == '\n' && i+1 < len(source) {
 			lineStart = append(lineStart, i+1)

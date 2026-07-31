@@ -327,7 +327,10 @@ func chunkWith(r LanguageRules, src []byte, chunkSize int) []chunk.Chunk {
 
 	// lineStart[i] = byte offset of line i. A trailing '\n' does not start
 	// a phantom empty line (matches the Stage 1 line chunker).
-	lineStart := []int{0}
+	// Presized: the line count is one bytes.Count away, and that scan is an
+	// assembly SIMD one — nearly free next to the 21 reallocating appends the
+	// grow-by-append version paid on a 643 KB file (lens doc §4.8).
+	lineStart := make([]int, 1, bytes.Count(src, []byte{'\n'})+1)
 	for i := range src {
 		if src[i] == '\n' && i+1 < len(src) {
 			lineStart = append(lineStart, i+1)
@@ -344,7 +347,7 @@ func chunkWith(r LanguageRules, src []byte, chunkSize int) []chunk.Chunk {
 
 	// Per-line "is this the start of a definition?" with attachment of the
 	// preceding doc-comment / annotation / decorator block.
-	var depth []int
+	var depth []int32
 	if r.strat == braceStrategy {
 		depth = scanDepth(src, lineStart, r.scan)
 	}
@@ -360,7 +363,7 @@ func chunkWith(r LanguageRules, src []byte, chunkSize int) []chunk.Chunk {
 			}
 			probe = line
 		default: // braceStrategy
-			if r.maxDepth < 0 || depth[i] > r.maxDepth {
+			if r.maxDepth < 0 || int(depth[i]) > r.maxDepth {
 				continue
 			}
 			probe = bytes.TrimLeft(line, " \t")
@@ -399,6 +402,14 @@ func chunkWith(r LanguageRules, src []byte, chunkSize int) []chunk.Chunk {
 		return -1
 	}
 
+	// NOT DONE, deliberately: lens §4.8's third part proposes one `string(src)`
+	// plus substrings in place of the K per-chunk copies — 430 allocations to 2,
+	// latency-neutral, since the package guarantees a contiguous non-overlapping
+	// partition so the copies already sum to len(src). It is left alone because
+	// it changes RETENTION, not cost: every chunk would pin the whole source
+	// string, which is right for index-everything and wrong for
+	// filter-then-keep-a-few, and no test or benchmark here can tell those apart.
+	// A caller holding three chunks of a 100 MB file would silently hold 100 MB.
 	var out []chunk.Chunk
 	emit := func(a, b int) {
 		out = append(out, chunk.Chunk{
@@ -469,10 +480,13 @@ func attachMatch(r LanguageRules, line []byte) bool {
 // braces inside comments and string/char literals. Best-effort: an
 // undercount inside an exotic literal only yields a suboptimal boundary,
 // never data loss (chunks are always a contiguous byte partition).
-func scanDepth(src []byte, lineStart []int, cfg scannerCfg) []int {
+func scanDepth(src []byte, lineStart []int, cfg scannerCfg) []int32 {
 	n := len(lineStart)
-	depth := make([]int, n)
-	cur := 0
+	// int32, not int: this is compared against maxDepth ∈ {-1, 0, 1} and a brace
+	// nesting level that no real source approaches, so 8 B/line was twice what
+	// the value needs (lens doc §4.8).
+	depth := make([]int32, n)
+	cur := int32(0)
 	nextLineIdx := 0 // next line whose start we still need to record
 
 	type st int
