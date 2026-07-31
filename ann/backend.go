@@ -1,5 +1,7 @@
 package ann
 
+import "sync"
+
 // Backend is a device accelerator for FlatI8 scoring. It is registered by an
 // aikit/gpu build (native Metal today, CUDA later) via RegisterBackend in an
 // init(); the default pure-Go build registers none, and FlatI8 scores on the CPU
@@ -73,7 +75,25 @@ func (f *FlatI8) QueryBatch(queries [][]float32, k int) [][]Hit {
 	}
 	// Device batched path: one GEMM for the whole batch, then top-k on the host.
 	if bi, ok := f.gpu.(I8BatchIndex); ok && allDim {
-		dst := make([]float32, len(queries)*f.n)
+		// The M×N score matrix is POOLED, not allocated per call (lens doc §4.7).
+		// It is genuinely needed here — unlike the device top-k path above, which
+		// never materializes it — because ScoreBatch's contract is to fill a host
+		// buffer, and on a PCIe device that buffer is the staging area. What was
+		// wasteful was allocating a fresh one on every call: at 256 queries over a
+		// 1M-row index that is a 1 GB allocation per batch, handed straight to the
+		// GC. So the fix is a reused scratch rather than removal, exactly as the
+		// finding says of the identical code in gpu/enccuda.
+		//
+		// Reuse is safe because ScoreBatch ASSIGNS every element of dst[0:M*N] —
+		// that is its documented contract — and topHits reads only what was just
+		// written. TestQueryBatch_pooledScratchIsInert poisons the pool to check it.
+		sc := batchScratchPool.Get().(*batchScratch)
+		defer batchScratchPool.Put(sc)
+		need := len(queries) * f.n
+		if cap(sc.dst) < need {
+			sc.dst = make([]float32, need)
+		}
+		dst := sc.dst[:need]
 		if err := bi.ScoreBatch(queries, dst); err == nil {
 			for m := range queries {
 				out[m] = f.topHits(dst[m*f.n:(m+1)*f.n], k, nil)
@@ -87,6 +107,14 @@ func (f *FlatI8) QueryBatch(queries [][]float32, k int) [][]Hit {
 	}
 	return out
 }
+
+// batchScratch is the pooled M×N host score matrix for the device batched path.
+// Separate from flatI8ScratchPool because that one is sized N per query and this
+// one is M·N per batch — sharing would inflate every single-query scratch to a
+// batch-sized buffer for the rest of the process.
+type batchScratch struct{ dst []float32 }
+
+var batchScratchPool = sync.Pool{New: func() any { return new(batchScratch) }}
 
 var backend Backend
 
