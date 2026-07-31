@@ -135,32 +135,44 @@ func TestPrescreen_neverHidesAMatch(t *testing.T) {
 		t.Fatalf("only %d probe lines; the probe set is too small to be a gate", len(lines))
 	}
 
-	checked, screened := 0, 0
+	checked, screened, screenedFB := 0, 0, 0
 	for lang, r := range languageRules {
 		sets := []struct {
 			name string
 			res  []*regexp.Regexp
 			pre  [][]byte
+			fb   []*[256]bool
 		}{
-			{"defs", r.defs, r.defsPre},
-			{"skip", r.skip, r.skipPre},
-			{"attach", r.attach, r.attachPre},
+			{"defs", r.defs, r.defsPre, r.defsFB},
+			{"skip", r.skip, r.skipPre, r.skipFB},
+			{"attach", r.attach, r.attachPre, r.attachFB},
 		}
 		for _, set := range sets {
-			if len(set.pre) != len(set.res) {
-				t.Fatalf("%s/%s: %d prefixes for %d patterns", lang, set.name, len(set.pre), len(set.res))
+			if len(set.pre) != len(set.res) || len(set.fb) != len(set.res) {
+				t.Fatalf("%s/%s: %d prefixes / %d fb for %d patterns", lang, set.name, len(set.pre), len(set.fb), len(set.res))
 			}
 			for i, re := range set.res {
-				p := set.pre[i]
+				p, s := set.pre[i], set.fb[i]
 				for _, line := range lines {
 					checked++
-					if len(p) == 0 || bytes.HasPrefix(line, p) {
-						continue // reaches the regexp either way
+					// Mirror anyMatch's screen decision exactly.
+					reject := false
+					switch {
+					case len(p) > 0:
+						reject = !bytes.HasPrefix(line, p)
+					case s != nil:
+						reject = len(line) == 0 || !s[line[0]]
+						if reject {
+							screenedFB++
+						}
+					}
+					if !reject {
+						continue // reaches the regexp
 					}
 					screened++
 					if re.Match(line) {
-						t.Fatalf("%s/%s[%d] %q: prescreen %q rejected a line the pattern MATCHES: %q",
-							lang, set.name, i, re.String(), p, line)
+						t.Fatalf("%s/%s[%d] %q: prescreen rejected a line the pattern MATCHES: %q",
+							lang, set.name, i, re.String(), line)
 					}
 				}
 			}
@@ -169,8 +181,11 @@ func TestPrescreen_neverHidesAMatch(t *testing.T) {
 	if screened == 0 {
 		t.Fatal("the prescreen never fired — this test proves nothing")
 	}
-	t.Logf("%d (pattern, line) pairs checked; the prescreen skipped the regexp for %d (%.1f%%)",
-		checked, screened, 100*float64(screened)/float64(checked))
+	if screenedFB == 0 {
+		t.Fatal("the first-byte-set screen never fired — the FB path is untested")
+	}
+	t.Logf("%d (pattern, line) pairs checked; prescreen skipped the regexp for %d (%.1f%%), of which %d via first-byte set",
+		checked, screened, 100*float64(screened)/float64(checked), screenedFB)
 }
 
 // TestPrescreen_prefixesAreWhatWeThink pins the prefixes themselves. If a rule

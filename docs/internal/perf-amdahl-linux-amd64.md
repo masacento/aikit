@@ -384,8 +384,24 @@ uses `(?i)` and the corpus-wide gate cannot see it.
 
 TypeScript gains least because its patterns lead with `(export\s+)?`, an optional
 group, which admits no literal prefix at all. Bounding those needs a first-byte
-SET computed from the syntax tree rather than a prefix — left undone, and the
-reason TypeScript is 1.14× where Go is 1.68×.
+SET computed from the syntax tree rather than a prefix — ~~left undone, and the
+reason TypeScript is 1.14× where Go is 1.68×~~.
+
+**DONE (2026-07-31, on the M1 Pro but architecture-neutral): `anchoredFirstByteSet`.**
+It computes FIRST(pattern) — the bytes a match can begin with — over the syntax
+tree with nullability, so an optional leading group contributes its first byte
+*and* lets the next element contribute (`(export\s+)?…class` → {e,d,a,c,…}). Used
+as the fallback screen where the literal prefix is empty; a match is ^-anchored so
+a first byte outside the set provably can't match. Bail-safe (non-ASCII / `.` /
+case-fold → no screen), and the set is always a SUPERSET so an imprecise walk only
+screens less. Soundness gated the same way as the prefix — **6.02 M (pattern,
+line) pairs, the FB screen firing on 2.11 M of them, none a real match** — and
+mutation-checked (an under-approximating FIRST is caught). **TypeScript −28.4%
+(1.40×), Python −12.7%**; Go unchanged (all-literal prefixes, never reaches the
+set). It also caught Rust/Java, whose modifier-led patterns have the same shape.
+The one pattern still unscreened is TS's method-modifier rule
+(`^(public|private|…|\*|\s)*[A-Za-z_$]…`), whose set is near-universal — correctly
+returned nil rather than shipped as a no-op screen.
 
 ---
 

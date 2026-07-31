@@ -58,6 +58,10 @@ type LanguageRules struct {
 	// Literal prefixes for the three rule sets above, one per regexp, filled by
 	// register. An empty entry means "no prescreen available, run the regexp".
 	defsPre, skipPre, attachPre [][]byte
+	// First-byte sets, the weaker fallback screen for patterns with no literal
+	// prefix (TypeScript's optional-group-led rules). One per regexp, nil when the
+	// literal prefix already screens it or no useful set exists.
+	defsFB, skipFB, attachFB []*[256]bool
 }
 
 // register installs a language's rules, precomputing the literal prefix of every
@@ -83,6 +87,18 @@ func register(lang string, r LanguageRules) {
 		return out
 	}
 	r.defsPre, r.skipPre, r.attachPre = pre(r.defs), pre(r.skip), pre(r.attach)
+	// First-byte sets only where the literal prefix gave nothing (so the stronger
+	// multi-byte screen always wins when it exists).
+	fb := func(res []*regexp.Regexp, pre [][]byte) []*[256]bool {
+		out := make([]*[256]bool, len(res))
+		for i, re := range res {
+			if len(pre[i]) == 0 {
+				out[i] = anchoredFirstByteSet(re.String())
+			}
+		}
+		return out
+	}
+	r.defsFB, r.skipFB, r.attachFB = fb(r.defs, r.defsPre), fb(r.skip, r.skipPre), fb(r.attach, r.attachPre)
 	languageRules[lang] = r
 }
 
@@ -144,6 +160,128 @@ func anchoredLiteralPrefix(pattern string) []byte {
 		}
 	}
 	return out
+}
+
+// anchoredFirstByteSet is the weaker prescreen for the ^-anchored patterns that
+// anchoredLiteralPrefix can't handle because their leading element is an optional
+// group or alternation, not a plain literal — TypeScript's `^(export\s+)?…`, where
+// a match can begin with e/d/a/c/… (export/default/abstract/class). It returns the
+// set of bytes any match can START with, so a line whose first byte is not in the
+// set provably cannot match (same anchoring soundness as the literal prefix, one
+// byte wide). nil ⇒ no useful screen: an all-nullable/`.`-leading pattern, anything
+// non-ASCII or case-folded (a byte compare wouldn't be exact — bail rather than
+// guess), or a set so large the prescreen would filter almost nothing (the method-
+// modifier pattern, which can start with any identifier byte). The set is always a
+// SUPERSET of the true first bytes, so an imprecise walk only screens less, never
+// wrong.
+func anchoredFirstByteSet(pattern string) *[256]bool {
+	re, err := syntax.Parse(pattern, syntax.Perl)
+	if err != nil {
+		return nil
+	}
+	re = re.Simplify()
+	subs := []*syntax.Regexp{re}
+	if re.Op == syntax.OpConcat {
+		subs = re.Sub
+	}
+	if len(subs) == 0 || subs[0].Op != syntax.OpBeginText {
+		return nil // anchoredLiteralPrefix already panics on a non-anchored rule
+	}
+	var set [256]bool
+	if _, ok := firstBytesConcat(subs[1:], &set); !ok {
+		return nil
+	}
+	n := 0
+	for _, b := range set {
+		if b {
+			n++
+		}
+	}
+	// Empty ⇒ nothing to screen. >96 (past the ASCII printable span) ⇒ the screen
+	// would reject almost no lines, so it is pure overhead — run unscreened.
+	if n == 0 || n > 96 {
+		return nil
+	}
+	return &set
+}
+
+// firstBytes adds re's possible first bytes to set and reports whether re can
+// match the empty string (nullable). ok is false for a construct that cannot be
+// safely reduced to an ASCII byte set (non-ASCII, `.`, case-folded) — the caller
+// then bails to no prescreen.
+func firstBytes(re *syntax.Regexp, set *[256]bool) (nullable, ok bool) {
+	switch re.Op {
+	case syntax.OpEmptyMatch, syntax.OpBeginLine, syntax.OpEndLine,
+		syntax.OpBeginText, syntax.OpEndText, syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+		return true, true // zero-width: contributes no bytes, matches empty
+	case syntax.OpLiteral:
+		if re.Flags&syntax.FoldCase != 0 {
+			return false, false
+		}
+		if len(re.Rune) == 0 {
+			return true, true
+		}
+		if re.Rune[0] >= utf8.RuneSelf {
+			return false, false
+		}
+		set[byte(re.Rune[0])] = true
+		return false, true
+	case syntax.OpCharClass:
+		if re.Flags&syntax.FoldCase != 0 {
+			return false, false
+		}
+		for i := 0; i+1 < len(re.Rune); i += 2 {
+			if re.Rune[i] >= utf8.RuneSelf || re.Rune[i+1] >= utf8.RuneSelf {
+				return false, false // a non-ASCII first byte we can't enumerate as bytes
+			}
+			for r := re.Rune[i]; r <= re.Rune[i+1]; r++ {
+				set[byte(r)] = true
+			}
+		}
+		return false, true
+	case syntax.OpAnyChar, syntax.OpAnyCharNotNL:
+		return false, false // any byte → useless set
+	case syntax.OpStar, syntax.OpQuest:
+		_, ok := firstBytes(re.Sub[0], set)
+		return true, ok
+	case syntax.OpPlus:
+		_, ok := firstBytes(re.Sub[0], set)
+		return false, ok
+	case syntax.OpRepeat:
+		_, ok := firstBytes(re.Sub[0], set)
+		return re.Min == 0, ok
+	case syntax.OpCapture:
+		return firstBytes(re.Sub[0], set)
+	case syntax.OpConcat:
+		return firstBytesConcat(re.Sub, set)
+	case syntax.OpAlternate:
+		anyNull := false
+		for _, s := range re.Sub {
+			n, ok := firstBytes(s, set)
+			if !ok {
+				return false, false
+			}
+			anyNull = anyNull || n
+		}
+		return anyNull, true
+	default:
+		return false, false
+	}
+}
+
+// firstBytesConcat walks a concatenation: each element contributes its first
+// bytes until the first non-nullable one, which closes the set.
+func firstBytesConcat(subs []*syntax.Regexp, set *[256]bool) (nullable, ok bool) {
+	for _, s := range subs {
+		n, ok := firstBytes(s, set)
+		if !ok {
+			return false, false
+		}
+		if !n {
+			return false, true
+		}
+	}
+	return true, true
 }
 
 // languageRules is populated by each per-language file's init().
@@ -227,7 +365,7 @@ func chunkWith(r LanguageRules, src []byte, chunkSize int) []chunk.Chunk {
 			}
 			probe = bytes.TrimLeft(line, " \t")
 		}
-		if !anyMatch(r.defs, r.defsPre, probe) || anyMatch(r.skip, r.skipPre, probe) {
+		if !anyMatch(r.defs, r.defsPre, r.defsFB, probe) || anyMatch(r.skip, r.skipPre, r.skipFB, probe) {
 			continue
 		}
 		// Snap the boundary up over a contiguous attach block (so a
@@ -294,10 +432,18 @@ func chunkWith(r LanguageRules, src []byte, chunkSize int) []chunk.Chunk {
 // anyMatch reports whether line matches any of res, skipping the regexp engine
 // for patterns whose literal prefix the line does not start with. See register
 // for why that is exact rather than a heuristic.
-func anyMatch(res []*regexp.Regexp, pre [][]byte, line []byte) bool {
+func anyMatch(res []*regexp.Regexp, pre [][]byte, fb []*[256]bool, line []byte) bool {
 	for i, re := range res {
-		if p := pre[i]; len(p) > 0 && !bytes.HasPrefix(line, p) {
-			continue
+		if p := pre[i]; len(p) > 0 {
+			if !bytes.HasPrefix(line, p) {
+				continue
+			}
+		} else if s := fb[i]; s != nil {
+			// First-byte screen: an ^-anchored match starts at line[0], so a first
+			// byte outside the set (or an empty line) provably cannot match.
+			if len(line) == 0 || !s[line[0]] {
+				continue
+			}
 		}
 		if re.Match(line) {
 			return true
@@ -316,7 +462,7 @@ func attachMatch(r LanguageRules, line []byte) bool {
 	if len(bytes.TrimSpace(probe)) == 0 {
 		return false
 	}
-	return anyMatch(r.attach, r.attachPre, probe)
+	return anyMatch(r.attach, r.attachPre, r.attachFB, probe)
 }
 
 // scanDepth returns the brace depth at the START of each line, ignoring
