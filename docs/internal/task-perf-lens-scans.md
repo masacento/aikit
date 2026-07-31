@@ -409,6 +409,15 @@ unexported — **no API change.**
 > ns/line, TS 5,643 ns/line): the union defeats onepass and literal-prefix
 > optimizations. **Prescreen, don't union.**
 
+> **DONE (2026-07-31, M1 Pro):** span-based `bpeInto` shipped — symbols are
+> `[lo,hi)` offsets into the byte-mapped piece, the merge loop reuses a double
+> buffer, the per-piece mapping reuses one byte buffer (`unsafe.String` view; the
+> read-only rank/vocab maps never retain the key). Bit-identical (differential fuzz
+> vs the string algorithm over 386 files, mutation-checked, granite golden green).
+> **44688 → 3244 B/op (13.8×)** and **1.47×** on a real file — the time win is under
+> the alloc-micro's 2.83× because a realistic file is dominated by the O(n²) merge
+> scan, not allocation. Unigram (§3.4) still open.
+
 ## 3.3 · `bpeBackend.bpe` allocates three times per merge step — 2.83×
 
 `embed/tokenize_bpe.go:120-154` (granite-embedding-english / RoBERTa family).
@@ -470,6 +479,13 @@ scratch, ~65 ms/corpus). **All three tokenizer backends allocate a per-word resu
 slice the caller immediately copies away** — one scratch threaded through
 `encodeSegment` fixes all three.
 
+> **DONE (2026-07-31, M1 Pro):** additive `linalg.Workspace.QuantizeActivations` +
+> `MatmulBTW8A8Pre` (matmul with activations pre-quantized); `MatmulBTW8A8Into` now
+> routes through both, bit-identical. `scorePaged` quantizes q once. Gated by the
+> existing paged==resident test (Query identical over 30 queries, k=10 and k=0),
+> -race clean. **−65.2% (2.88×)** on a 3750-block paged Query at dim=768 — the
+> requantization was two-thirds of the paged scan.
+
 ## 3.5 · `scorePaged` re-quantizes the query once per paging block
 
 `ann/flat_i8_mmap.go:113-124` calls `MatmulBTW8A8Into` per block, and
@@ -522,6 +538,15 @@ Build one-map    6.89 s   1.233 GB   349,487 allocs     1.33×
 
 `map[string]*termEntry{postings, df}`. Postings and `df` verified identical for
 every term. Compose with **[campaign #29]**'s posting-struct redesign — same file.
+
+> **VERIFIED NEAR-ZERO, not shipped (2026-07-31, M1 Pro):** confirmed in situ. In
+> `scanTopK` the test is `score > th && (keep == nil || keep(gi))` — behind campaign
+> #3's threshold hoist (already shipped), so `keep == nil` evaluates only for the few
+> threshold-passing candidates, each of which runs a dim-768 dot. One predictable
+> branch vs ~768 ops/candidate is **<0.2%**; the doc's 1.23× was the isolated branch.
+> The full-sort (k≤0) path runs it per candidate but is still <0.2% next to the dot,
+> and hoisting the common heap path means threading a variant through `scanTopK` /
+> `queryShards`. Not worth the two-loop code across two files for sub-noise.
 
 ## 3.8 · `keep == nil` re-tested per candidate — 1.23× on top of [campaign #3]
 
