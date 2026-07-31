@@ -2,12 +2,37 @@ package mmap
 
 import "container/list"
 
+// EvictPolicy selects which resident member a SpanCache releases when a fault pushes
+// it over budget. The right choice depends on the caller's DEMAND SIGNAL, and the two
+// signals in the kit want opposite policies:
+//
+//   - EvictMostRecent (scan-resistant, the default). For a cyclic SCAN — an ANN paged
+//     query walking blocks 0,1,2,… every pass — plain LRU is pathological: the block
+//     evicted to make room is exactly the one wanted next round, so the cache hits 0%
+//     even at a 63/64 budget. Evicting the most-recent instead pins a stable prefix,
+//     recovering ~budget/working-set of the touches (perf-campaign item 9, 6c0483f).
+//
+//   - EvictLeastRecent (classic LRU tail, frequency-aware). For a skewed-FREQUENCY
+//     signal — a MoE router whose hottest 10% of experts absorb ~72% of top-k picks —
+//     the hot set is what must stay resident. Evict-most-recent throws the hot set out
+//     the instant anything else is touched and pins the cold prefix; on a real 35B-A3B
+//     trace that cost up to 51 pp of hit rate vs the LRU tail at interactive budgets.
+//     A frequency-skewed pager (expertPager) must use this.
+type EvictPolicy uint8
+
+const (
+	EvictMostRecent  EvictPolicy = iota // scan-resistant (default): release the most-recently-touched OTHER member
+	EvictLeastRecent                    // classic LRU: release the least-recently-touched (budget tail)
+)
+
 // SpanCache bounds the resident RAM of a read-only mapping by paging spans of it in
 // and out under a byte budget. It is the generic, demand-signal-agnostic core of a
 // weight/index pager: the caller registers each member's page-aligned spans with
 // Add and calls Touch(key) when a member is needed now. Touch faults the member in
-// (Advise WILLNEED) and, if that pushes resident bytes over budget, releases the
-// least-recently-touched members (Advise DONTNEED) until back under it.
+// (Advise WILLNEED) and, if that pushes resident bytes over budget, releases members
+// (Advise DONTNEED) per the configured EvictPolicy — the most-recently-touched other
+// member (scan-resistant, the default) or the least-recently-touched (classic LRU) —
+// until back under it.
 //
 // Releasing is lossless: a MapReadOnly mapping is read-only and file-backed, so an
 // evicted-then-reused member merely re-faults from the file — its bytes are
@@ -28,14 +53,26 @@ type SpanCache[K comparable] struct {
 	lru      *list.List               // K, most-recently-touched at front
 	pos      map[K]*list.Element      // resident membership + O(1) promotion
 	advise   func([]byte, bool) error // residency hint; Advise in production, a fake in tests
+	policy   EvictPolicy              // which member to release over budget (see EvictPolicy)
 
 	hits, misses, evictions int64
 }
 
-// NewSpanCache returns a cache that caps resident registered spans at budget bytes.
-// A budget ≤ 0 means unbounded: members are still tracked and prefetched on Touch,
-// but nothing is ever evicted. Register members with Add before touching them.
+// NewSpanCache returns a cache that caps resident registered spans at budget bytes,
+// with the default scan-resistant EvictMostRecent policy. A budget ≤ 0 means
+// unbounded: members are still tracked and prefetched on Touch, but nothing is ever
+// evicted. Register members with Add before touching them. Callers whose demand
+// signal is skewed-frequency rather than a scan (a MoE expert pager) should use
+// NewSpanCacheWithPolicy(budget, EvictLeastRecent) — see EvictPolicy.
 func NewSpanCache[K comparable](budget int64) *SpanCache[K] {
+	return NewSpanCacheWithPolicy[K](budget, EvictMostRecent)
+}
+
+// NewSpanCacheWithPolicy is NewSpanCache with an explicit eviction policy. Pick the
+// policy from your demand signal, not by default: EvictMostRecent for a cyclic scan,
+// EvictLeastRecent for a skewed-frequency access pattern (see EvictPolicy for why the
+// wrong one silently regresses hit rate).
+func NewSpanCacheWithPolicy[K comparable](budget int64, policy EvictPolicy) *SpanCache[K] {
 	return &SpanCache[K]{
 		budget: budget,
 		spans:  map[K][][]byte{},
@@ -43,6 +80,7 @@ func NewSpanCache[K comparable](budget int64) *SpanCache[K] {
 		lru:    list.New(),
 		pos:    map[K]*list.Element{},
 		advise: Advise,
+		policy: policy,
 	}
 }
 
@@ -72,8 +110,8 @@ func (c *SpanCache[K]) Add(key K, spans [][]byte) {
 }
 
 // Touch records that key is needed now: it becomes most-recently-touched and, if it
-// wasn't resident, is faulted in (Advise WILLNEED) and the LRU tail released to stay
-// within budget. A no-op for keys that were never Added.
+// wasn't resident, is faulted in (Advise WILLNEED) and members are released per the
+// EvictPolicy to stay within budget. A no-op for keys that were never Added.
 func (c *SpanCache[K]) Touch(key K) {
 	spans, managed := c.spans[key]
 	if !managed {
@@ -91,31 +129,19 @@ func (c *SpanCache[K]) Touch(key K) {
 	el := c.lru.PushFront(key)
 	c.pos[key] = el
 	c.resident += c.bytes[key]
-	// SCAN-RESISTANT EVICTION: release the most-recently-touched OTHER member,
-	// not the least. This is perf-campaign item 9, and the reason is measured
-	// rather than theoretical.
-	//
-	// The only demand signal in the kit is a sequential scan — FlatI8's paged
-	// query walks blocks 0,1,2,… on every call. Under LRU that is the textbook
-	// cyclic-scan pathology: the block evicted to make room is precisely the one
-	// wanted next time round, so the cache never hits. Measured over ten passes
-	// of a 64-block working set:
-	//
-	//	budget 8/64 blocks   hit rate 0.0%
-	//	budget 32/64         hit rate 0.0%
-	//	budget 63/64         hit rate 0.0%   ← 98% of the data resident, still 0%
-	//	budget 64/64         hit rate 90.0%
-	//
-	// Evicting the most-recent instead keeps a STABLE PREFIX resident, so a
-	// cyclic scan hits on roughly budget/working-set of its touches — which is
-	// the best any policy can do without knowing the loop length.
-	//
-	// The just-touched member is never the victim: it was faulted in one line
-	// ago and the caller is about to read it.
+	// Release members over budget per the configured policy (see EvictPolicy). The
+	// just-touched member is never the victim: it was faulted in one line ago and the
+	// caller is about to read it — under EvictMostRecent it is skipped explicitly;
+	// under EvictLeastRecent it sits at the front and the tail is taken.
 	for c.budget > 0 && c.resident > c.budget && c.lru.Len() > 1 {
-		victimEl := c.lru.Front()
-		if victimEl == el {
-			victimEl = victimEl.Next()
+		var victimEl *list.Element
+		if c.policy == EvictLeastRecent {
+			victimEl = c.lru.Back() // classic LRU tail (never el, which is at the front)
+		} else {
+			victimEl = c.lru.Front() // scan-resistant: the most-recent OTHER member
+			if victimEl == el {
+				victimEl = victimEl.Next()
+			}
 		}
 		if victimEl == nil {
 			break

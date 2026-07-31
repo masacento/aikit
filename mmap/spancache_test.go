@@ -74,6 +74,42 @@ func TestSpanCache_evictsMostRecentOverBudget(t *testing.T) {
 	}
 }
 
+func TestSpanCache_evictsLeastRecentWithPolicy(t *testing.T) {
+	fa := &fakeAdvise{}
+	// EvictLeastRecent (frequency-aware): the classic LRU tail, the opposite victim to
+	// the scan-resistant default — what a MoE expert pager needs so its hot set survives.
+	c := NewSpanCacheWithPolicy[int](250, EvictLeastRecent)
+	c.advise = fa.advise
+	for i := range 4 {
+		c.Add(i, [][]byte{span(100)})
+	}
+
+	c.Touch(0)
+	c.Touch(1) // resident {1,0}, 200 ≤ 250, no eviction
+	c.Touch(2) // over budget → evict the LEAST-recent (0), keep the more-recent (1)
+	if got := c.Resident(); got != 200 {
+		t.Fatalf("resident = %d, want 200", got)
+	}
+	if _, _, ev := c.Stats(); ev != 1 {
+		t.Fatalf("evictions = %d, want 1", ev)
+	}
+	// 1 is the more-recent member and must survive; 0 was the LRU victim.
+	hitsBefore, _, _ := c.Stats()
+	c.Touch(1)
+	if h, _, _ := c.Stats(); h != hitsBefore+1 {
+		t.Fatalf("the more-recent member must survive under EvictLeastRecent: touching 1 should hit")
+	}
+	_, missBefore, _ := c.Stats()
+	c.Touch(0) // LRU-evicted above → miss
+	if _, m, _ := c.Stats(); m != missBefore+1 {
+		t.Fatalf("touching the LRU-evicted member should be a miss")
+	}
+	// The default constructor stays scan-resistant (EvictMostRecent) — regression guard.
+	if NewSpanCache[int](0).policy != EvictMostRecent {
+		t.Fatal("NewSpanCache must default to EvictMostRecent (scan-resistant)")
+	}
+}
+
 func TestSpanCache_alwaysKeepsTouchedMember(t *testing.T) {
 	fa := &fakeAdvise{}
 	// Budget (50) is smaller than a single member (100): the just-touched member
