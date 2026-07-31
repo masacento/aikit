@@ -129,9 +129,7 @@ func TestEncodeBatch_concurrentCallers(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]string, 4)
 	for w := range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			got := m.EncodeBatch(texts, runtime.NumCPU())
 			for i := range want {
 				for j := range want[i] {
@@ -141,7 +139,7 @@ func TestEncodeBatch_concurrentCallers(t *testing.T) {
 					}
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	for _, e := range errs {

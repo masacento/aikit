@@ -127,7 +127,7 @@ func TestAttachBlockAtLine0(t *testing.T) {
 func TestPrescreen_neverHidesAMatch(t *testing.T) {
 	var lines [][]byte
 	for _, src := range allFixtureSources(t) {
-		for _, l := range bytes.Split(src, []byte("\n")) {
+		for l := range bytes.SplitSeq(src, []byte("\n")) {
 			lines = append(lines, l, bytes.TrimLeft(l, " \t"))
 		}
 	}

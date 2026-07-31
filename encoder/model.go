@@ -279,9 +279,7 @@ func encodeBatch(tok *embed.Tokenizer, maxSeq int, fwd func([][]int32) [][]float
 	var next atomic.Int64
 	var wg sync.WaitGroup
 	for range min(concurrency, len(buckets)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			// Buckets vary in cost, so workers pull rather than take a static
 			// slice — the old index-ordered partition imbalanced them whenever
 			// document lengths did.
@@ -300,7 +298,7 @@ func encodeBatch(tok *embed.Tokenizer, maxSeq int, fwd func([][]int32) [][]float
 					out[gi] = vecs[i] // scatter back to the caller's order
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	return out, nil

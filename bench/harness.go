@@ -161,9 +161,7 @@ func concurrentQPS(query func([]float32, int) []ann.Hit, queries [][]float32, k,
 	var wg sync.WaitGroup
 	t0 := time.Now()
 	for range conc {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				i := int(next.Add(1)) - 1
 				if i >= total {
@@ -171,7 +169,7 @@ func concurrentQPS(query func([]float32, int) []ann.Hit, queries [][]float32, k,
 				}
 				_ = query(queries[i%len(queries)], k)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	elapsed := time.Since(t0).Seconds()

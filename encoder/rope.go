@@ -130,7 +130,7 @@ func (t *ropeTable) applyRows(x []float32, heads, rows int) {
 	half := t.halfDim
 	hd := t.headDim
 	stride := heads * hd // per-position stride
-	for m := 0; m < rows; m++ {
+	for m := range rows {
 		cosRow := t.cos[m*half : (m+1)*half]
 		sinRow := t.sin[m*half : (m+1)*half]
 		base := m * stride

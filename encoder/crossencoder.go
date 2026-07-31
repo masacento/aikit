@@ -158,9 +158,7 @@ func (ce *CrossEncoder) ScoreBatch(query string, docs []string, concurrency int)
 	var next atomic.Int64
 	var wg sync.WaitGroup
 	for range concurrency {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				k := int(next.Add(1)) - 1
 				if k >= len(order) {
@@ -169,7 +167,7 @@ func (ce *CrossEncoder) ScoreBatch(query string, docs []string, concurrency int)
 				i := order[k]
 				out[i] = ce.scoreIDs(pairs[i].ids, pairs[i].segs)[0]
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	return out, nil
