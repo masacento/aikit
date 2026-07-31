@@ -222,8 +222,11 @@ func (ce *CrossEncoder) pairIDsFrom(qTok []int32, doc string) (ids, segs []int32
 // classification head: classifier(tanh(pooler(CLS))).
 func (ce *CrossEncoder) scoreIDs(ids, segs []int32) []float32 {
 	D := ce.bert.cfg.Hidden
-	h := ce.bert.hiddenStates(ids, segs)
-	cls := h[0:D] // the [CLS] token's final hidden state
+	// The pooler reads row 0 and nothing else, so the trunk's final layer is run
+	// at M=1 (lens doc §4.1). This is the rerank path, where W2R puts 99.8%+ of a
+	// query, and the ONE call site that qualifies unconditionally — a
+	// cross-encoder is CLS-pooled by construction.
+	cls := ce.bert.clsHiddenState(ids, segs) // the [CLS] token's final hidden state
 
 	pooled := matmulBT(cls, ce.poolerW, 1, D, D) // CLS · poolerWᵀ
 	addBias(pooled, ce.poolerB, 1, D)

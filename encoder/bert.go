@@ -229,6 +229,36 @@ func (b *BERT) Encode(text string) ([]float32, error) {
 // token-type (segment) id per position; nil means a single segment (all 0), as the
 // embedder uses — a cross-encoder passes two segments for the query/document pair.
 func (b *BERT) hiddenStates(ids, segs []int32) []float32 {
+	return b.forward(ids, segs, false)
+}
+
+// clsHiddenState is hiddenStates for a caller that reads only row 0, returning
+// just that row — the [CLS] vector, [hidden] long rather than [L, hidden].
+//
+// The last transformer layer's other L−1 output rows exist to feed layer N+1's
+// K and V, and there is no layer N+1. At L=512, D=768, I=3072 that layer writes
+// 31.5 MB to have 1.5 KB read (lens doc §4.1). This runs its Q projection,
+// attention output, both LayerNorms and the whole MLP at M=1, keeping only K and
+// V at full L because attention genuinely reads every position.
+//
+// BIT-IDENTICAL to hiddenStates()[0:D], and the reason is the M-invariance
+// contract the blocked matmul already owes item 14: dst[i,j] reduces over k-tiles
+// fixed by kBlock and K, and M only chooses the m-block boundary. Everything else
+// the layer does — addBias, gelu, the residual, layerNorm, softmaxRows — is
+// per-row by construction. TestCLSHiddenState_matchesFullRow0 asserts it exactly.
+//
+// (The lens doc warns that encoder/linalg.go's 4-MFLOP naive/blocked threshold
+// would break this at M=1, since 1·768·3072 = 2.36 M falls under it and the naive
+// path accumulates in a different order. That threshold no longer exists —
+// perf-campaign item 27 deleted it — so the caveat is moot. Do not reintroduce a
+// shape-dependent kernel switch without revisiting this.)
+func (b *BERT) clsHiddenState(ids, segs []int32) []float32 {
+	return b.forward(ids, segs, true)
+}
+
+// forward runs the transformer. clsOnly trims the final layer to row 0 — see
+// clsHiddenState.
+func (b *BERT) forward(ids, segs []int32, clsOnly bool) []float32 {
 	// The whole BERT family — BERT.Embed, CrossEncoder.Score, SPLADE.Expand —
 	// enters the transformer here, so this is where the in-flight accounting
 	// parallel.go:37-40 requires has to happen. Without it that counter stayed
@@ -303,59 +333,72 @@ func (b *BERT) hiddenStates(ids, segs []int32) []float32 {
 	for li := range b.layers {
 		l := &b.layers[li]
 
+		// mOut is how many rows of this layer's OUTPUT are needed. It is L
+		// everywhere except the final layer of a CLS-only forward, where only row
+		// 0 is ever read. K and V stay at full L regardless: attention reads every
+		// position, and trimming them would change the result rather than skip
+		// unused work.
+		mOut := L
+		if clsOnly && li == len(b.layers)-1 {
+			mOut = 1
+		}
+
 		// Self-attention (no RoPE): Q,K,V = hWᵀ + b, into scratch.
-		Q, K, V := s.Q[:L*D], s.K[:L*D], s.V[:L*D]
-		s.mm(h, l.Wq, Q, L, D, D)
+		Q, K, V := s.Q[:mOut*D], s.K[:L*D], s.V[:L*D]
+		s.mm(h, l.Wq, Q, mOut, D, D)
 		s.mm(h, l.Wk, K, L, D, D)
 		s.mm(h, l.Wv, V, L, D, D)
-		addBias(Q, l.Bq, L, D)
+		addBias(Q, l.Bq, mOut, D)
 		addBias(K, l.Bk, L, D)
 		addBias(V, l.Bv, L, D)
 
-		ctx := s.ctx[:L*D]
-		qH, kH := s.qH[:L*headDim], s.kH[:L*headDim]
+		ctx := s.ctx[:mOut*D]
+		qH, kH := s.qH[:mOut*headDim], s.kH[:L*headDim]
 		vHT := s.vH[:headDim*L]
-		ctxHead := s.ctxHead[:L*headDim]
-		scores := s.scores[:L*L]
+		ctxHead := s.ctxHead[:mOut*headDim]
+		scores := s.scores[:mOut*L]
 		for headIdx := 0; headIdx < c.Heads; headIdx++ {
 			for i := range L {
 				src := i*D + headIdx*headDim
-				copy(qH[i*headDim:(i+1)*headDim], Q[src:src+headDim])
+				if i < mOut {
+					copy(qH[i*headDim:(i+1)*headDim], Q[src:src+headDim])
+				}
 				copy(kH[i*headDim:(i+1)*headDim], K[src:src+headDim])
 				for d := range headDim {
 					vHT[d*L+i] = V[src+d]
 				}
 			}
-			s.mm(qH, kH, scores, L, headDim, L)
+			s.mm(qH, kH, scores, mOut, headDim, L)
 			for i := range scores {
 				scores[i] *= scale
 			}
-			softmaxRows(scores, L, L)
-			s.mm(scores, vHT, ctxHead, L, L, headDim)
-			for i := range L {
+			softmaxRows(scores, mOut, L)
+			s.mm(scores, vHT, ctxHead, mOut, L, headDim)
+			for i := range mOut {
 				copy(ctx[i*D+headIdx*headDim:i*D+headIdx*headDim+headDim], ctxHead[i*headDim:(i+1)*headDim])
 			}
 		}
-		attnOut := s.out[:L*D]
-		s.mm(ctx, l.Wo, attnOut, L, D, D)
-		addBias(attnOut, l.Bo, L, D)
+		attnOut := s.out[:mOut*D]
+		s.mm(ctx, l.Wo, attnOut, mOut, D, D)
+		addBias(attnOut, l.Bo, mOut, D)
+		h = h[:mOut*D]
 		for i := range h {
 			h[i] += attnOut[i] // residual
 		}
-		layerNorm(h, l.AttnLNW, l.AttnLNB, L, D, eps)
+		layerNorm(h, l.AttnLNW, l.AttnLNB, mOut, D, eps)
 
 		// GELU FFN: intermediate → gelu → output, residual, LayerNorm.
-		inter := s.val[:L*c.Intermediate]
-		s.mm(h, l.Wi, inter, L, D, c.Intermediate)
-		addBias(inter, l.Bi, L, c.Intermediate)
+		inter := s.val[:mOut*c.Intermediate]
+		s.mm(h, l.Wi, inter, mOut, D, c.Intermediate)
+		addBias(inter, l.Bi, mOut, c.Intermediate)
 		gelu(inter)
-		ffn := s.mid[:L*D]
-		s.mm(inter, l.Wd, ffn, L, c.Intermediate, D)
-		addBias(ffn, l.Bd, L, D)
+		ffn := s.mid[:mOut*D]
+		s.mm(inter, l.Wd, ffn, mOut, c.Intermediate, D)
+		addBias(ffn, l.Bd, mOut, D)
 		for i := range h {
 			h[i] += ffn[i] // residual
 		}
-		layerNorm(h, l.OutLNW, l.OutLNB, L, D, eps)
+		layerNorm(h, l.OutLNW, l.OutLNB, mOut, D, eps)
 	}
 	return h
 }
@@ -364,6 +407,11 @@ func (b *BERT) hiddenStates(ids, segs []int32) []float32 {
 // L2-normalized sentence embedding for token ids.
 func (b *BERT) Embed(ids []int32) []float32 {
 	D := b.cfg.Hidden
+	if b.pool == poolCLS {
+		// Only row 0 is read, so the last layer need not produce the rest
+		// (lens doc §4.1). poolOne(h, 1, D, poolCLS) is a copy of h[0:D].
+		return l2norm(poolOne(b.clsHiddenState(ids, nil), 1, D, poolCLS))
+	}
 	h := b.hiddenStates(ids, nil)
 	// L = len(h)/D is the token count hiddenStates actually produced — it
 	// truncates ids to maxSeq, so len(ids) can be larger and would over-read.

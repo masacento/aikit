@@ -123,3 +123,76 @@ func TestBERT_encodeEndToEnd(t *testing.T) {
 		t.Errorf("%d/%d cases: aikit WordPiece ids differ from the HF golden", tokMismatch, len(g.Cases))
 	}
 }
+
+// TestCLSHiddenState_matchesFullRow0 is §4.1's gate: trimming the last layer to
+// row 0 must give bit-for-bit what the full forward's row 0 gives.
+//
+// Exact equality, not a tolerance. The claim rests on M-invariance — the blocked
+// matmul's dst[i,j] reduces over k-tiles fixed by kBlock and K, with M choosing
+// only the m-block boundary — and a tolerance would accept a reassociated sum,
+// which is precisely the failure this has to exclude. Everything else the layer
+// does (addBias, gelu, residual, layerNorm, softmaxRows) is per-row already.
+//
+// Both segment shapes are covered because the cross-encoder passes two and the
+// embedder passes none, and the segment embedding is added before the trunk.
+func TestCLSHiddenState_matchesFullRow0(t *testing.T) {
+	b := loadTestBERT(t)
+	D := b.cfg.Hidden
+
+	for _, n := range []int{1, 2, 7, 64, 200} {
+		ids := make([]int32, n)
+		for i := range ids {
+			ids[i] = int32((i*7919 + 13) % 1000)
+		}
+		for _, withSegs := range []bool{false, true} {
+			var segs []int32
+			if withSegs {
+				segs = make([]int32, n)
+				for i := range segs {
+					if i > n/2 {
+						segs[i] = 1
+					}
+				}
+			}
+			full := b.hiddenStates(ids, segs)
+			trimmed := b.clsHiddenState(ids, segs)
+			if len(trimmed) != D {
+				t.Fatalf("n=%d segs=%v: trimmed length %d, want %d", n, withSegs, len(trimmed), D)
+			}
+			for j := range D {
+				if trimmed[j] != full[j] {
+					t.Fatalf("n=%d segs=%v component %d: trimmed %v, full row 0 %v",
+						n, withSegs, j, trimmed[j], full[j])
+				}
+			}
+		}
+	}
+}
+
+// loadTestBERT opens whichever BERT-family checkpoint this machine has.
+//
+// It tries several rather than pinning one because the fixtures differ per box —
+// the amd64 machine has the cross-encoder and SPLADE checkpoints but not MiniLM —
+// and a structural test that skips everywhere is worth nothing. Any BERT trunk
+// exercises the same forward.
+func loadTestBERT(tb testing.TB) *BERT {
+	tb.Helper()
+	var tried []string
+	for _, dir := range []string{
+		"../testdata/minilm-model",
+		"../testdata/crossencoder-model",
+		"../testdata/splade-model",
+	} {
+		if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+			tried = append(tried, dir)
+			continue
+		}
+		b, err := LoadBERT(dir)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		return b
+	}
+	tb.Skipf("no BERT checkpoint in any of %v — fetch via scripts/README.md", tried)
+	return nil
+}
