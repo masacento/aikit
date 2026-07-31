@@ -64,7 +64,17 @@ func TestHarness_reportsAllocsAndQPS(t *testing.T) {
 		}
 		// Throughput must not be a restatement of serial latency: with several
 		// cores it should beat 1/Mean, and it must not exceed cores/Mean.
-		if r.Mean > 0 {
+		//
+		// This compares two INDEPENDENTLY-timed quantities — the serial per-query
+		// Mean and the concurrent pass's aggregate QPS. On a platform whose monotonic
+		// clock cannot resolve a sub-millisecond query (p50 rounds to 0.000 ms — the
+		// virtualized Windows CI runner does this) the two round differently and their
+		// ratio is noise, not a result: it has spuriously reported QPS "implausibly"
+		// above the serial-derived ceiling. So only assert it when the timer actually
+		// resolved the per-query work. The allocation/QPS>0/Concurrency checks above
+		// are timer-independent and still run everywhere. (Sibling of the degenerate-
+		// latency skip in TestHarness_warmupExcluded.)
+		if r.Mean > 0 && r.P50 > 0 {
 			serial := 1000 / r.Mean // queries/s from mean ms
 			if ceil := serial * float64(r.Concurrency) * 1.5; r.QPS > ceil {
 				t.Errorf("%s: QPS %.0f exceeds %.0f (cores × serial rate × 1.5) — implausible",
