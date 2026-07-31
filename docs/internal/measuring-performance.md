@@ -440,6 +440,8 @@ been consistently right; magnitudes consistently optimistic.**
 | 14 · length-bucketed batch | 1.3–2× ragged | **1.15×** ragged, neutral uniform | ❌ |
 | 28 · CrossEncoder batch API | "unlocks item 14 for rerank" | **7.56×**, but from parallelism not tokenization | ✅ (size) ❌ (cause) |
 | 9 · SpanCache eviction | "0% → max hit rate" | **0% → 10.9/45.0/88.6%**; the 0% was literal | ✅ |
+| 9(b) · Touch(b+1) prefetch (arm64) | overlap fault with compute | **+12%**; darwin DONTNEED no-op, no fault to hide — reverted | ❌ |
+| §4.5 · Q8 release peak RSS (arbiter) | 727→242 MiB (amd64) | **726.2 MiB on M1 Pro — no change** (DONTNEED inert) | ❌ (does not transfer) |
 | 31 · QKV transpose | 3.3× on the transpose | **0.06%** of the forward — closed unimplemented | ❌ |
 | 1 · revive dead benchmarks | "unblocks everything" | 3 files revived; harness gained allocs + QPS | ✅ |
 | 26 · `math.Round` not intrinsic | ~5% of the matmul | **0.61%**; the proposed fix is a wash — closed | ❌ |
