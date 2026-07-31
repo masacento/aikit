@@ -26,6 +26,9 @@ type Scored[K comparable] struct {
 // across the rankings (deterministic). An item absent from a ranking contributes
 // 0 from it. A ranking whose scores are all equal (or has one item) normalizes
 // every member to 1.0 — it carries order but no within-list signal.
+//
+// Like RRF, cost is O(shortlist), not O(corpus) — it touches only the ranked lists
+// passed in. Fusion is rarely on a query's critical path; profile before optimising it.
 func RSF[K comparable](rankings ...[]Scored[K]) []Result[K] {
 	return RSFWeighted(nil, rankings...)
 }

@@ -108,6 +108,13 @@ func (f *FlatI8) Len() int { return f.n }
 // Query returns the k highest int8-cosine vectors to q, descending, ties broken
 // by ascending index for determinism — the same contract as Flat.Query. k <= 0 or
 // k >= Len returns all, sorted. A query of the wrong dimension returns nil.
+//
+// The scan is one W8A8 SIMD matmul (q against every stored vector) and it
+// parallelizes across the corpus only above linalg's parallel threshold — a MAC
+// count of dim×Len (see linalg.SetParallelThreshold). Below it the scan runs
+// SERIAL on the calling goroutine, so a small index, or a batch of many small
+// queries you are already fanning out yourself, stays single-threaded here by
+// design — don't expect Query to saturate cores until dim×Len clears the threshold.
 func (f *FlatI8) Query(q []float32, k int) []Hit {
 	return f.query(q, k, nil)
 }

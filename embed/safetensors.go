@@ -348,10 +348,17 @@ func (f *SafetensorsFile) Close() error {
 // package doc). The cost of releasing too eagerly is a fault, never wrong data.
 //
 // No-op on a heap-backed file (OpenSafetensors / OpenSafetensorsFromFS — there
-// are no pages to release), and on every platform but Linux, where madvise
-// cannot force a resident drop for this mapping type. An unknown name is
-// reported as an error — that is a caller bug, not an environment condition, and
-// the two are worth telling apart: madvise failures are swallowed as advisory.
+// are no pages to release), and — load-bearing — a no-op on every platform but
+// Linux. Only Linux's MADV_DONTNEED forces a resident drop for a read-only
+// file-backed mapping; darwin's does not reclaim (the pages stay resident, freely
+// evictable by the OS under pressure, but the RSS number is unchanged). So the
+// peak-RSS win this enables is Linux-only: an M1 Pro measured 726.2 MiB after
+// LoadWeightsQ8, the same as if ReleaseTensors were never called, vs 242.3 MiB on
+// Linux. Correctness is identical everywhere (released pages re-fault identical
+// bytes); only the footprint reduction is OS-specific. Do not quote the Linux
+// peak-RSS figure as a laptop number. An unknown name is reported as an error —
+// that is a caller bug, not an environment condition, and the two are worth
+// telling apart: madvise failures are swallowed as advisory.
 func (f *SafetensorsFile) ReleaseTensors(names ...string) error {
 	defer runtime.KeepAlive(f)
 	var firstErr error

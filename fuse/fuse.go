@@ -53,6 +53,13 @@ type Result[K comparable] struct {
 // first, then 1, …), so the result is deterministic for a given input.
 // k must be > 0 (it's the denominator); RRF panics otherwise, matching
 // the "programmer error, not runtime condition" convention.
+//
+// Cost is O(shortlist), NOT O(corpus): fusion touches only the ranked lists you
+// pass, which are the retrieval shortlists (top-k per source), not the collection.
+// So this is a small-to-medium-shortlist concern — at a 1M-item corpus a fusion is
+// under 0.1% of a query, and behind a reranker the whole retrieval stack is a
+// thousandth of one. Don't reach for a "faster fuse" before profiling shows fusion
+// is actually on your critical path; it usually isn't.
 func RRF[K comparable](k float64, rankings ...[]K) []Result[K] {
 	return RRFWeighted(k, nil, rankings...)
 }

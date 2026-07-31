@@ -265,6 +265,14 @@ func (m *StaticModel) Encode(text string) []float32 {
 // on whichever range happened to be short; the counter costs one atomic add per
 // text against ~156 µs of encoding, which is 0.006%.
 //
+// Scaling with concurrency is near-linear up to the physical core count, then
+// bends: measured on apple-m1pro (6 P-cores + 2 E-cores, no SMT), a batch runs
+// ~5.02× at concurrency=6 (84% efficient) and ~5.23× at concurrency=NumCPU=8 (65%
+// efficient) — the two E-cores together buy only ~1.04× over the six P-cores. So
+// concurrency=NumCPU is the fastest in absolute wall-clock and the right default,
+// but a caller optimising throughput-per-watt should pass the P-core count instead.
+// (This is a per-machine curve; see docs/internal/perf-amdahl-apple-m1pro.md §3.)
+//
 // There is deliberately no variant writing into a caller-supplied flat
 // [n·dim]float32. The two allocations encodeIDs makes per text are 2 of ~365 —
 // the tokenizer makes the rest — and the copy such a variant would save is the

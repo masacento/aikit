@@ -92,6 +92,16 @@ func (ix *Index) minNorm(e *termEntry) float64 {
 // Build constructs the index from already-tokenized documents (use
 // Tokenize). docs[i] is document i's token stream; empty docs are allowed
 // and simply score zero.
+//
+// Build is O(corpus) — one pass over the tokens — and fast (measured ~1.27–1.30×
+// off its own prior baseline in the 2026 perf campaign). That speed is a design
+// note, not just a datum: there is deliberately no serialized-Index format. For a
+// package whose build is O(corpus) and cheap, rebuilding from the already-embedded
+// corpus is often the honest answer to "how do I persist this?" — a versioned
+// on-disk format is a permanent compatibility promise (every future Index field
+// carried, defaulted, and gated for old files) that the build time alone does not
+// justify. If you need persistence, decide it as an API/format question, not as a
+// perf optimization. See docs/internal/roadmap.md (N4/N6).
 func Build(docs [][]string) *Index {
 	// posting packs doc and tf into int32s (item 29). Both bounds are far beyond
 	// any real corpus, but a silent truncation here would corrupt the index, so
