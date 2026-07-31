@@ -217,7 +217,13 @@ func (b *Backend) residentQ8(wq []int8, wscales []float32, K, N int) gpu.Buffer 
 	if c, ok := b.q8[k]; ok && c.n == len(wq) {
 		return c.buf
 	}
-	deq := make([]float32, N*K)
+	// Dequantize STRAIGHT into the UMA buffer's backing (lens §4.4). NewBufferFloats
+	// would first stage a make([]float32, N*K) on the Go heap only to memcpy it into
+	// this same shared memory — 37.8 MB × 12 layers = 453 MB allocated, written, and
+	// immediately garbage on the first forward. On UMA the CPU can write the device
+	// buffer directly, so there is no host copy to stage.
+	buf := b.dev.NewBufferLen(N * K)
+	deq := buf.Floats()[:N*K]
 	for n := range N {
 		sc := wscales[n]
 		row, src := deq[n*K:(n+1)*K], wq[n*K:(n+1)*K]
@@ -225,7 +231,6 @@ func (b *Backend) residentQ8(wq []int8, wscales []float32, K, N int) gpu.Buffer 
 			row[i] = float32(src[i]) * sc
 		}
 	}
-	buf := b.dev.NewBufferFloats(deq)
 	if b.q8 == nil {
 		b.q8 = map[uintptr]q8w{}
 	}

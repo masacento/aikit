@@ -700,6 +700,12 @@ would be 2. (The campaign's recorded dead end — "contiguous vs scattered doesn
 speed up the *scan*" — explicitly leaves GC mark cost and allocation open. Load is
 where they land.)
 
+> **DONE (2026-07-31, M1 Pro):** `residentQ8` now `NewBufferLen(N*K)` then
+> dequantizes straight into `buf.Floats()` — no host staging. **Measured 37.76 MB
+> → 0.00 MB Go-heap per weight** (× 12 layers = the 453 MB, gone from the first
+> forward). Bit-identical: `TestEncMetal_q8Parity` green; builds `CGO_ENABLED=0`
+> (`cgo=0`, the native-Metal path is cgo-free). Two lines, as predicted.
+
 ## 4.4 · `encmetal` stages 453 MB on the Go heap to copy it into host memory
 
 `gpu/encmetal/backend.go:220-228` builds `deq := make([]float32, N*K)` then calls
