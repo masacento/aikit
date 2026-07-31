@@ -665,6 +665,58 @@ func (t Tensor) Float16sToF32() ([]float32, error) {
 	return out, nil
 }
 
+// SubF32 returns a contiguous ELEMENT range [start, start+count) of the tensor as
+// []float32 WITHOUT materializing the whole tensor. For a fused stack (e.g. an
+// [nExpert, ...] weight) this reads one slice at a time, so a big checkpoint can be
+// widened/quantized per-expert rather than paying a whole-tensor f32 transient.
+//
+// start and count are in ELEMENTS (row-major), not bytes; [start, start+count) must
+// lie within Elements(). F32 aliases the mapped bytes (zero-copy view — no alloc,
+// valid only while the owning file is alive, like Float32s); BF16/F16 widen ONLY the
+// requested range into a fresh []float32 of length count.
+func (t Tensor) SubF32(start, count int) ([]float32, error) {
+	defer runtime.KeepAlive(t.owner) // §2.5: guard the read against a mid-decode munmap
+	elems := t.Elements()
+	if elems < 0 {
+		return nil, fmt.Errorf("tensor %q: SubF32 shape %v overflows", t.Name, t.Shape)
+	}
+	if start < 0 || count < 0 || start+count > elems {
+		return nil, fmt.Errorf("tensor %q: SubF32 range [%d,%d) out of bounds (elements %d)", t.Name, start, start+count, elems)
+	}
+	switch t.DType {
+	case "F32":
+		all, err := reinterpretLE[float32](t.Name, t.raw)
+		if err != nil {
+			return nil, err
+		}
+		return all[start : start+count : start+count], nil // zero-copy view of the sub-range
+	case "BF16":
+		if len(t.raw) != 2*elems {
+			return nil, fmt.Errorf("tensor %q: BF16 raw size %d != 2*%d", t.Name, len(t.raw), elems)
+		}
+		out := make([]float32, count)
+		for i := range count {
+			j := start + i
+			bits := uint16(t.raw[2*j]) | uint16(t.raw[2*j+1])<<8
+			out[i] = math.Float32frombits(uint32(bits) << 16)
+		}
+		return out, nil
+	case "F16":
+		if len(t.raw) != 2*elems {
+			return nil, fmt.Errorf("tensor %q: F16 raw size %d != 2*%d", t.Name, len(t.raw), elems)
+		}
+		out := make([]float32, count)
+		for i := range count {
+			j := start + i
+			h := uint16(t.raw[2*j]) | uint16(t.raw[2*j+1])<<8
+			out[i] = halfBitsToF32(h)
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("tensor %q: SubF32 unsupported dtype %s (want F32/BF16/F16)", t.Name, t.DType)
+	}
+}
+
 // halfBitsToF32 converts one IEEE-754 binary16 bit pattern to float32.
 // Standard three-case decode: subnormal/zero (exp==0), Inf/NaN
 // (exp==0x1f), and normal (rebias the 5-bit exponent to f32's 8-bit one).

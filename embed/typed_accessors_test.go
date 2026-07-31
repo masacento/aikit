@@ -66,6 +66,71 @@ func f16raw(bits ...uint16) []byte { // caller passes IEEE-754 half bit patterns
 	}
 	return b
 }
+func bf16raw(v ...float32) []byte { // bf16 = high 16 bits of the f32 pattern
+	b := make([]byte, 2*len(v))
+	for i, x := range v {
+		binary.LittleEndian.PutUint16(b[2*i:], uint16(math.Float32bits(x)>>16))
+	}
+	return b
+}
+
+// TestSafetensorsFile_SubF32 gates the per-slice widener: SubF32(start,count) reads
+// a contiguous element range without materializing the whole tensor, across F32 (a
+// zero-copy view), BF16, and F16. This is what lets a fused [nExpert, …] weight be
+// widened/quantized one expert at a time. Values (1..6) are integers, exact in all
+// three dtypes, so the per-range read must equal the whole-tensor read sliced.
+func TestSafetensorsFile_SubF32(t *testing.T) {
+	blob := buildSafetensors(map[string]stEntry{
+		"f32":  {"F32", []int{2, 3}, f32raw(1, 2, 3, 4, 5, 6)}, // 2 "experts" of 3
+		"bf16": {"BF16", []int{2, 3}, bf16raw(1, 2, 3, 4, 5, 6)},
+		"f16":  {"F16", []int{2, 3}, f16raw(0x3C00, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600)}, // 1..6
+	})
+	sf, err := OpenSafetensorsFromFS(fstest.MapFS{"m.safetensors": &fstest.MapFile{Data: blob}}, "m.safetensors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sf.Close()
+
+	for _, name := range []string{"f32", "bf16", "f16"} {
+		tn, err := sf.Tensor(name)
+		if err != nil {
+			t.Fatalf("Tensor(%s): %v", name, err)
+		}
+		// Each "expert" row [3 elements]; the concatenation of the per-row SubF32 reads
+		// must equal the whole tensor.
+		var got []float32
+		for e := 0; e < 2; e++ {
+			row, err := tn.SubF32(e*3, 3)
+			if err != nil {
+				t.Fatalf("%s SubF32(%d,3): %v", name, e*3, err)
+			}
+			if len(row) != 3 {
+				t.Fatalf("%s SubF32 len=%d want 3", name, len(row))
+			}
+			got = append(got, row...)
+		}
+		if want := []float32{1, 2, 3, 4, 5, 6}; !eqF32(got, want) {
+			t.Errorf("%s per-row SubF32 = %v, want %v", name, got, want)
+		}
+		// Out-of-range must error, not panic.
+		if _, err := tn.SubF32(4, 3); err == nil {
+			t.Errorf("%s SubF32(4,3): expected out-of-bounds error", name)
+		}
+		if _, err := tn.SubF32(-1, 2); err == nil {
+			t.Errorf("%s SubF32(-1,2): expected out-of-bounds error", name)
+		}
+	}
+
+	// F32 SubF32 sub-slices the full read (a view when the mapping is 4-aligned, like
+	// Float32s; a copy otherwise — alignment isn't guaranteed for a heap MapFS). Either
+	// way the sub-range must equal the corresponding slice of the whole tensor.
+	tn, _ := sf.Tensor("f32")
+	full, _ := tn.Float32s()
+	sub, _ := tn.SubF32(3, 3)
+	if !eqF32(sub, full[3:6]) {
+		t.Errorf("F32 SubF32(3,3)=%v want %v", sub, full[3:6])
+	}
+}
 
 func TestSafetensorsFile_typedAccessors(t *testing.T) {
 	blob := buildSafetensors(map[string]stEntry{
