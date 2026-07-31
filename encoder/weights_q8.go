@@ -69,6 +69,14 @@ func (w *WeightsQ8) HeadDim() int { return w.Cfg.HeadDim() }
 // Close() on the safetensors handle — we hold int8 copies on the Go
 // heap instead. The model footprint drops from ~547 MB (heap) +
 // 547 MB (mmap shadow) to ~140 MB int8 + the small f32 tail.
+//
+// Steady state was never the problem; the PEAK was. Quantizing reads every f32
+// weight, so waiting until the end to Close left the entire checkpoint resident
+// at once — measured at 727.6 MiB peak RSS to produce a 199.5 MiB model
+// (TestQ8LoadFootprint). Each tensor is therefore released as soon as it has
+// been quantized, which bounds the resident f32 set at roughly one layer instead
+// of all of them. The pages are clean and file-backed, so this is advisory only:
+// it can cost a re-fault, never wrong data.
 func LoadWeightsQ8(dir string) (*WeightsQ8, error) {
 	// Load the f32 weights first (via the mmap path).
 	w, err := LoadWeights(dir)
@@ -97,6 +105,13 @@ func LoadWeightsQ8(dir string) (*WeightsQ8, error) {
 		EmbLN_B:      cloneFloat32(w.EmbLN_B),
 		Layers:       make([]LayerWeightsQ8, len(w.Layers)),
 	}
+	// The embedding tensors are now copied onto the heap; their mapped pages are
+	// dead weight from here (WordEmb alone is ~92 MB of the checkpoint).
+	_ = w.releasePages(
+		"embeddings.word_embeddings.weight",
+		"embeddings.token_type_embeddings.weight",
+		"emb_ln.weight", "emb_ln.bias",
+	)
 	cfg := &w.Cfg
 	for i, l := range w.Layers {
 		lq := LayerWeightsQ8{
@@ -115,6 +130,10 @@ func LoadWeightsQ8(dir string) (*WeightsQ8, error) {
 		lq.Fc12 = linalg.QuantizeInt8(l.Fc12, cfg.IntermediateDim, cfg.HiddenDim, false)
 		lq.Fc2 = linalg.QuantizeInt8(l.Fc2, cfg.HiddenDim, cfg.IntermediateDim, false)
 		q.Layers[i] = lq
+		// Those five f32 tensors are now int8 + scales on the heap, and nothing
+		// reads their mapped pages again. Drop them before touching layer i+1 so
+		// only one layer's f32 side is resident at a time.
+		_ = w.releasePages(layerQ8TensorNames(i)...)
 	}
 	// Release the underlying mmap (the f32 weights are no longer needed —
 	// we have int8 copies on the heap now).
@@ -122,6 +141,33 @@ func LoadWeightsQ8(dir string) (*WeightsQ8, error) {
 		_ = w.st.Close()
 	}
 	return q, nil
+}
+
+// layerQ8TensorNames lists the five tensors LoadWeightsQ8 quantizes for layer i.
+// The names mirror buildWeightsFromSafetensors' gatedMLP branch — LoadWeightsQ8
+// refuses any checkpoint that doesn't take it, so all five are guaranteed loaded.
+// A drift between the two lists is caught by TestLayerQ8TensorNamesResolve rather
+// than silently degrading into a no-op release.
+func layerQ8TensorNames(i int) []string {
+	pfx := fmt.Sprintf("encoder.layers.%d.", i)
+	return []string{
+		pfx + "attn.Wqkv.weight",
+		pfx + "attn.out_proj.weight",
+		pfx + "mlp.fc11.weight",
+		pfx + "mlp.fc12.weight",
+		pfx + "mlp.fc2.weight",
+	}
+}
+
+// releasePages drops the mapped pages of tensors that have been consumed. It is
+// advisory: an error means either a heap-backed file (nothing to release) or a
+// name that doesn't resolve, and neither is a reason to fail a load that has
+// otherwise succeeded. Tests assert the names resolve; production ignores it.
+func (w *Weights) releasePages(names ...string) error {
+	if w.st == nil {
+		return nil
+	}
+	return w.st.ReleaseTensors(names...)
 }
 
 func cloneFloat32(src []float32) []float32 {

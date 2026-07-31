@@ -734,6 +734,16 @@ a 140 MB model.** For a BF16/F16 checkpoint the f32 side is a real heap allocati
 
 Peak intermediate: `cols·4` = **3 KB**. Bit-identical.
 
+> **Done — 727.6 → 242.3 MiB peak RSS (3.00×), at +0.10% load time.** The
+> magnitude held; the instrument in the claim did not. Peak *heap* is 199.5 MiB,
+> exactly its steady state — the whole spike is the mmapped f32 side faulted in
+> by quantization, which no heap instrument can see. So the fix is not the
+> `QuantizeRowInt8` restructure proposed above but one `madvise(MADV_DONTNEED)`
+> per tensor as it is consumed (`embed.SafetensorsFile.ReleaseTensors`), leaving
+> one layer's f32 side resident instead of all twelve. The BF16/F16 caveat in the
+> paragraph above is the part that would still need the row-streaming version.
+> See `perf-amdahl-linux-amd64.md` §11 and §1.32 of the measuring doc.
+
 ## 4.6 · `vision.Preprocess` builds a full-resolution NRGBA that is ≥74% never read
 
 `vision/preprocess.go:90-96`. A 12 MP photo → **48.8 MB**, live alongside the

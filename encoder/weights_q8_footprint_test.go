@@ -20,8 +20,22 @@ import (
 // heap. Those pages are clean and reclaimable under pressure, which is a
 // materially milder problem than 547 MB of heap, and only RSS sees them at all.
 //
-// It reports rather than asserts. A threshold here would be a guess about the
-// machine's page-cache behaviour, and the point is to have the number on record.
+// Measured, on CodeRankEmbed (521.6 MiB F32 checkpoint → 199.5 MiB model):
+//
+//	peak RSS 727.6 MiB   before the per-tensor release
+//	peak RSS 242.3 MiB   after it — 3.00×, at +0.1% load time (min-of-10)
+//
+// So §4.5's magnitude was right and its character was not: heap peaks at exactly
+// its steady state, and the whole spike was the f32 mapping faulted in by
+// quantization. The fix is to release each tensor's pages as it is consumed, not
+// to restructure the load.
+//
+// It reports the numbers and asserts only the ratio the release controls: peak
+// RSS within 1.5× of the loaded model's own RSS. An absolute threshold would be
+// a guess about the machine's page-cache behaviour, but the ratio is the thing
+// the release exists to hold — it was 3.5× before, and it goes straight back
+// there if the release calls are dropped. Linux-only, because madvise cannot
+// force a resident drop for this mapping type anywhere else (see mmap's docs).
 func TestQ8LoadFootprint(t *testing.T) {
 	const dir = "../testdata/encoder-model"
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
@@ -56,12 +70,56 @@ func TestQ8LoadFootprint(t *testing.T) {
 	}
 
 	afterHeap, afterRSS := heapMiB(), rssMiB()
+	pkHeap, pkRSS := float64(peakHeap.Load())/1024, float64(peakRSS.Load())/1024
 	t.Logf("checkpoint on disk:      %7.1f MiB", onDiskMiB)
 	t.Logf("baseline:                heap %7.1f  RSS %7.1f MiB", baseHeap, baseRSS)
-	t.Logf("PEAK during load:        heap %7.1f  RSS %7.1f MiB",
-		float64(peakHeap.Load())/1024, float64(peakRSS.Load())/1024)
+	t.Logf("PEAK during load:        heap %7.1f  RSS %7.1f MiB", pkHeap, pkRSS)
 	t.Logf("after load (model live): heap %7.1f  RSS %7.1f MiB", afterHeap, afterRSS)
+	if runtime.GOOS == "linux" && afterRSS > 0 {
+		if ratio := pkRSS / afterRSS; ratio > 1.5 {
+			t.Errorf("peak RSS %.1f MiB is %.2f× the loaded model's %.1f MiB — the "+
+				"per-tensor release in LoadWeightsQ8 is not taking effect (it was 3.5× without it)",
+				pkRSS, ratio, afterRSS)
+		}
+	}
 	runtime.KeepAlive(q)
+}
+
+// TestLayerQ8TensorNamesResolve is the drift gate on layerQ8TensorNames: it
+// duplicates the tensor names buildWeightsFromSafetensors uses, and a rename on
+// one side would otherwise turn every per-layer release into a silent no-op —
+// the footprint would quietly regress to 727 MiB with every test still green.
+// ReleaseTensors reports an unknown name precisely so this can fail loudly.
+func TestLayerQ8TensorNamesResolve(t *testing.T) {
+	const dir = "../testdata/encoder-model"
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("no encoder model at %s — see scripts/README.md", dir)
+	}
+	w, err := LoadWeights(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.st.Close() }()
+	if !w.Cfg.gatedMLP() || w.hasMoE() {
+		t.Skip("checkpoint is not the gated-MLP shape LoadWeightsQ8 accepts")
+	}
+	for i := range w.Cfg.NumLayers {
+		if err := w.releasePages(layerQ8TensorNames(i)...); err != nil {
+			t.Errorf("layer %d: %v", i, err)
+		}
+	}
+	if err := w.releasePages(
+		"embeddings.word_embeddings.weight",
+		"embeddings.token_type_embeddings.weight",
+		"emb_ln.weight", "emb_ln.bias",
+	); err != nil {
+		t.Error(err)
+	}
+	// And the negative: a name that doesn't resolve must be reported, or the
+	// check above proves nothing.
+	if err := w.releasePages("encoder.layers.0.attn.Wqkv.weightX"); err == nil {
+		t.Error("releasePages accepted an unknown tensor name")
+	}
 }
 
 func bump(dst *atomic.Uint64, v uint64) {

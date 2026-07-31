@@ -812,6 +812,31 @@ already landed. Sibling packages that were written as parallel implementations
 drift apart exactly where one of them lacks the test or benchmark that would
 have kept them in step.
 
+### 1.32 A footprint claim names a quantity, and heap is often not it
+
+Lens §4.5 predicted `LoadWeightsQ8` peaks near 690 MB to produce a 140 MB model.
+Peak heap during the load measured **199.5 MiB — identical to its steady state**,
+which reads as "the claim is wrong." Peak RSS in the same run measured **727.6
+MiB**, which reads as "the claim is right." Both are correct: the checkpoint is
+mmapped, so the f32 side is file-backed pages, and `HeapInuse` cannot see a page
+that was never allocated by Go.
+
+The instrument decided the verdict, and the two verdicts were opposite. Worse,
+`B/op` would have shown nothing at all — no Go allocation happens for a
+zero-copy tensor view — so the standard benchmark output is silent on the entire
+finding.
+
+The distinction is not academic. Clean file-backed pages are reclaimable under
+pressure; anonymous heap is not. A 528 MiB spike of the first is a soft cost you
+may choose to ignore, and of the second is an OOM. Reporting only "peak was 727
+MiB" hides which one you have.
+
+**Guard:** when a claim is about memory, say which memory before measuring —
+allocated bytes, live heap, or resident set — and sample the one the mechanism
+actually moves. If the mechanism is mmap, page cache or a syscall, heap
+instruments are blind to it by construction and their silence is not evidence.
+Report both when they disagree; the disagreement is the finding.
+
 ---
 
 ## 5 · Keeping this current

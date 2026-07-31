@@ -594,6 +594,50 @@ for predict doublings, so a sampler that might miss a microsecond spike is
 adequate; where one turns out to hinge on a few percent, it is not, and that
 should be said.
 
+### §4.5 — `LoadWeightsQ8`'s peak: right magnitude, wrong instrument, 3.00×
+
+The lens doc predicted "~547 MB f32 + ~140 MB int8 ≈ 690 MB to produce a 140 MB
+model." On CodeRankEmbed (521.6 MiB F32 checkpoint):
+
+| | heap | RSS |
+|---|--:|--:|
+| baseline | 0.8 | 5.8 |
+| peak during load, before | 199.5 | **727.6** |
+| peak during load, after | 199.5 | **242.3** |
+| after load, model live | 199.5 | 206.2 |
+
+**The magnitude was right and the instrument was wrong.** Heap peaks at exactly
+its steady state — every byte of the 528 MiB spike was the f32 mapping faulted in
+by quantization, which `HeapInuse` cannot see at all. So this was never a
+"materializes the whole f32 model" problem in the heap sense the phrasing
+implies; the model is mmapped, and the peak is the page-table cost of touching
+all of it. That distinction matters because clean file-backed pages are
+reclaimable under pressure while 528 MiB of anonymous heap is not — and the lens
+doc anticipates it in its own next sentence, for BF16/F16 checkpoints where the
+widened f32 side *is* a real allocation.
+
+It also changes the fix. §4.5 proposed restructuring the load around
+`QuantizeRowInt8`'s per-row escape hatch; what the measurement asks for is one
+`madvise(MADV_DONTNEED)` per tensor as it is consumed, because the pages are the
+problem and the pages can simply be handed back. `embed.SafetensorsFile.ReleaseTensors`
+is that call; `LoadWeightsQ8` makes it after quantizing each layer's five
+projections and after cloning the embeddings. **Peak RSS 727.6 → 242.3 MiB,
+3.00×**, and the residual 42.8 MiB over steady state is one layer's f32 side
+(37.7 MiB) plus change — which is the bound the design predicts.
+
+**Zero time cost:** 907.96 ms with the release against 907.05 ms without,
+min-of-10, +0.10% — inside the drift floor. Nothing re-reads a released tensor
+within a load, so the only cost is 64 syscalls. (Anecdotally the *un*-released
+arm was also far noisier, 907–1678 ms against 907–943 ms, consistent with 727 MiB
+of page pressure per iteration; not a claim, just a pattern worth knowing.)
+
+Both gates were mutation-checked: stubbing `releasePages` to return early takes
+the ratio assertion to 3.53× and fails it, and misspelling one tensor name fails
+`TestLayerQ8TensorNamesResolve` on all 12 layers. That second gate exists because
+the release names are a second copy of `buildWeightsFromSafetensors`' names — a
+rename would otherwise turn the whole fix into a silent no-op with every test
+still green.
+
 ### Recorded negative: the first-query penalty is not measurable in-process
 
 78.7 µs on a freshly loaded index against 82.7 µs warm — the cold arm is 5%

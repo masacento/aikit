@@ -64,7 +64,26 @@ it.
   document-level parallelism plus longest-pair-first scheduling. Scores are
   bit-identical to `Score`.
 
+- **`embed.SafetensorsFile.ReleaseTensors(names...)`** — drops the resident pages
+  of tensors a loader has finished with, while the file stays open for the rest.
+  Advisory and lossless: the mapping is read-only and file-backed, so a released
+  page re-faults identical bytes; the cost of releasing too eagerly is a fault,
+  never wrong data. A no-op on heap-backed files and off Linux.
+
 ### Changed
+
+- **`encoder.LoadWeightsQ8` peaks at 3.0× less memory** (lens §4.5): **727.6 →
+  242.3 MiB peak RSS** on a 521.6 MiB F32 checkpoint, to produce the same 199.5
+  MiB model, at **+0.10%** load time (min-of-10 — inside the drift floor).
+
+  Quantizing reads every f32 weight, so the whole mapping used to stay resident
+  until `Close()` at the end. Each tensor's pages are now released as soon as it
+  has been quantized, which bounds the resident f32 set at one layer instead of
+  twelve. The model bytes are unchanged.
+
+  Peak *heap* was never the problem and does not move: it is 199.5 MiB before and
+  after, exactly its steady state. This is a resident-set fix, so it matters under
+  a hard memory cap (containers, cgroups) and is invisible to `B/op`.
 
 - **`fuse.RRF` / `fuse.RSF` are 4.8–5.4× faster** (perf campaign A5): 46.4 → 8.7 µs
   at k=50, geomean 5.36× across k=10…1000, allocations 22 → 4. On a hybrid

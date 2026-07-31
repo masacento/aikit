@@ -335,6 +335,42 @@ func (f *SafetensorsFile) Close() error {
 	return firstErr
 }
 
+// ReleaseTensors drops the resident pages backing the named tensors while
+// leaving the file open and every other tensor untouched. It is for loaders that
+// consume a mapping tensor-by-tensor and transform it into something smaller —
+// LoadWeightsQ8 quantizes each f32 projection to int8 and never reads the f32
+// bytes again, so holding them resident until Close costs the whole checkpoint's
+// worth of RSS for no benefit.
+//
+// It is purely advisory, and safe even for a caller still holding a zero-copy
+// alias into a released tensor: the mapping is read-only and file-backed, so a
+// released page re-faults identical bytes on the next access (see the mmap
+// package doc). The cost of releasing too eagerly is a fault, never wrong data.
+//
+// No-op on a heap-backed file (OpenSafetensors / OpenSafetensorsFromFS — there
+// are no pages to release), and on every platform but Linux, where madvise
+// cannot force a resident drop for this mapping type. An unknown name is
+// reported as an error — that is a caller bug, not an environment condition, and
+// the two are worth telling apart: madvise failures are swallowed as advisory.
+func (f *SafetensorsFile) ReleaseTensors(names ...string) error {
+	defer runtime.KeepAlive(f)
+	var firstErr error
+	for _, name := range names {
+		t, ok := f.tensors[name]
+		if !ok {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("safetensors: ReleaseTensors: tensor %q not found", name)
+			}
+			continue
+		}
+		if len(f.mmapped) == 0 {
+			continue // heap-backed, or already Closed: nothing resident to drop
+		}
+		_ = mmap.Advise(mmap.PageAlignedInterior(t.raw), false)
+	}
+	return firstErr
+}
+
 // parseSafetensors is the shared safetensors-bytes parser used by both
 // OpenSafetensors and OpenSafetensorsFromFS. Takes ownership of data — the
 // returned SafetensorsFile retains a reference (the unsafe-slice tensor
