@@ -523,6 +523,60 @@ undocumented behaviour the explicit padding does not rely on.
 
 ---
 
+---
+
+## W3 — cold start, and it overturns the lens doc's split
+
+Lens §5.6 N9: "cold-start warm-up is real and nothing measures it." Now it is
+measured — `bench/coldstart_bench_test.go`, min of 6, over
+`examples/embedded-corpus`'s own assets (1,747 chunks, real potion-code-16M).
+
+| stage | ms | % of run | peak MiB | MB allocated |
+|---|---:|---:|---:|---:|
+| **`embed.LoadFromFS`** | **62.51** | **76.3%** | **142.4** | 73.9 |
+| `ann.LoadFlatI8` | 0.24 | 0.3% | 73.0 | 0.5 |
+| `json.Unmarshal(corpus)` | 5.05 | 6.2% | 74.5 | 1.7 |
+| `bm25.TokenizePlain` ×N | 8.83 | 10.8% | 79.9 | 3.3 |
+| `bm25.Build` | 8.78 | 10.7% | 82.0 | 2.9 |
+| **to first result** | **81.97** | 100% | **148.6** | 82.3 |
+
+**The prior W3 has the split backwards.** Lens §5.4 put `embed.LoadFromFS` at
+**11.1%** and `TokenizePlain + bm25.Build` at **66.9%**. Measured here they are
+**76.3%** and **21.5%** — inverted. That table was built with a hand-written
+`model.safetensors`; this one loads the real 64 MB checkpoint, and loading it is
+what cold start *is*.
+
+**This demotes N4.** Adding a serialization surface to `bm25.Index` is justified
+in the lens doc as "67% of the flagship example's cold start". It is **21.5%**,
+and eliminating it entirely would take 82.0 ms to 64.4 ms. Still real, no longer
+the headline, and still an API design decision rather than a perf one.
+
+Peak heap tells the same story: the model load alone reaches 142.4 MiB of the
+run's 148.6, so everything after it adds ~6 MiB.
+
+### The peak-heap instrument, and why it exists
+
+`B/op` cannot arbitrate any of the remaining footprint findings — it counts bytes
+ALLOCATED over a run, and a doubling of peak RSS can happen with no change in
+that total while a pool can change the total with no change in peak. The
+benchmarks report a `peakMiB` metric instead: a sampled maximum of
+`HeapInuse`, which is a lower bound on peak heap and a loose proxy for peak RSS.
+Approximate, but an approximation of the right quantity. The findings it exists
+for predict doublings, so a sampler that might miss a microsecond spike is
+adequate; where one turns out to hinge on a few percent, it is not, and that
+should be said.
+
+### Recorded negative: the first-query penalty is not measurable in-process
+
+78.7 µs on a freshly loaded index against 82.7 µs warm — the cold arm is 5%
+*faster*. Reloading the index leaves the code, allocator and model warm, so only
+the data is cold, and 443 KB of it does not miss enough to show. A real
+first-query penalty needs a genuinely cold process, which a Go benchmark cannot
+be. The harness's warm-up pass (Step 0b) stands on its own measurement; this just
+cannot reproduce it, and the query is 0.2% of cold start regardless.
+
+---
+
 ## 12 · Where an index run stands
 
 | | ms |
