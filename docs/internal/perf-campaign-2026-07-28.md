@@ -96,7 +96,7 @@ Legend — **Num:** `=` bit-identical · `~` ULP/reassociation, needs golden re-
 
 | # | Item | Area | Win | Num | Effort |
 |---|---|---|---|---|---|
-| ~~22~~ | ~~Q8 encoder path re-widens the whole int8 weight matrix to f32 **per matmul**~~ — **fix (a) DONE both arches** (amd64 −58.2% short input; arm64 NEON 3.43× kernel, §7.18); fix (b) (fuse into `packedFill`) still open | encoder | cost model exactly right; ~190 ms/forward measured | = | — |
+| ~~22~~ | ~~Q8 encoder path re-widens the whole int8 weight matrix to f32 **per matmul**~~ — **fix (a) DONE both arches** (amd64 −58.2% short input; arm64 NEON 3.43× kernel, §7.18); **fix (b) DONE (arm64): widen fused into `packedFillQ8`, −28%/−10%/−4.8% at L=8/64/256, bit-identical (§7.38)** | encoder | cost model exactly right; ~190 ms/forward measured | = | — |
 | 23 | `packedFill` lost `blockedFill`'s m-blocking; a-panel re-read per 8-column group | linalg | **arm64-only; measured, DEFERRED (M1 Pro, 2026-07-30):** serial `packedFill` runs at **75–81% of the ~42 GMAC/s kernel peak** (fc2 M512/M690), so the a-re-read is one bounded contributor to a ~20% gap it shares with the (compute-overlapping) b-copy and the reduce. The m-blocking fix trades a-reads for redundant b-re-packing — a wash-risk core-GEMM restructure for a sub-gap win. Not built. | = | gate on evidence |
 | ~~24~~ | ~~`matmul_blocked.go` packed stride is a 4096 B power-of-two~~ — **DONE, −9.8% on large-encoder fc2** (M1 Pro): a power-of-two `kSpan` (1024, from `packKBlockFor(K%768≠0)` — every hidden-1024 encoder's K=4096 fc2: bge-large, mxbai-large) wraps the 8 packed b-rows onto 2 L1 sets. A 16-f32 (1-line) pad on the packed stride makes them distinct; measured 8% isolated, **−10.7%/−8.8% end-to-end (M357/M512) through `MatmulBT`**. Bit-identical (pad is unused spacing; gated at K=4096 + mutation-checked). No-op for base models (K=768/3072, `kSpan`=768). | = | **DONE** |
 | 25 | arm64 `Dot2x8` has the wrong MR×NR: 4×4 needs 8 loads per 16 FMLAs vs today's 10 | linalg | 1.1–1.25× arm64 f32 GEMM — **likely DEAD on M1 Pro: `dotNEON2x8` measured at ~95% FMLA peak (item 37), so it is compute-bound; cutting loads 10→8 can't help, same as 37** | **=** | S–M |
@@ -1417,15 +1417,16 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     end-to-end effect at short L, which is the opposite of the usual direction
     and the reason the arbiter is the only number quoted above.
 
-    **Fix (b) is still available and still worth doing.** Fusing the widen into
-    `packedFill`'s b-panel pack would eliminate the remaining ~33 ms, the 0.9 GB
-    DRAM round-trip, and `scratch.deqW` (up to 9.4 MB pinned per pooled
-    scratch). What landed is the S-effort half of the item.
+    **Fix (b) is now DONE on arm64 — see §7.38.** Fusing the widen into the
+    b-panel pack (`packedFillQ8`) eliminates the deqW DRAM round-trip; measured
+    −28%/−10%/−4.8% end-to-end at L=8/64/256 on the M1 Pro. The one non-obvious
+    part was that the win only appears once the fused dispatch mirrors *both* of
+    the f32 kernel's parallel axes (columns for small M, rows for large M) — the
+    first cut dropped the row split and ran 43% SLOWER at L=256.
 
-    **arm64 is untouched:** `dequantRowInt8` falls back to scalar there. The NEON
-    version (`SXTL`+`SCVTF`+`FMUL`) is straightforward but unmeasurable on this
-    box, and §7.16 is the standing reminder that per-kernel ratios do not
-    transfer between architectures.
+    **arm64's fix (a) is what landed 2026-07-30** (the NEON `dequantRowInt8`,
+    §7.18); the earlier note that arm64 was untouched is superseded by that and by
+    §7.38's fix (b).
 
 19. **Item 18 is DONE — a large allocation win, a small latency one, and a gate
     that turned out not to be a gate.** `qwenScratch` now mirrors `encScratch`:
@@ -2316,6 +2317,53 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     WAND while it lasted: measured against the unfixed baseline, `sparse` WAND
     looked like 37.5× on one shape and 3.9× on another. Fixing the baseline first
     is what made the revert decision obvious.
+
+38. **Item 22 fix (b) is DONE on arm64 — fuse the widen into the pack, −28% at
+    L=8.** Fix (a) widened the whole `[N,K]` weight into a pooled `deqW` (up to
+    9.4 MB, past L2) and then ran the f32 GEMM over it: ~0.45 GB of stores + 0.45 GB
+    of reads per forward, round-tripping through DRAM. The fused kernel
+    (`linalg.MatmulBTQ8Fused{,Into}` → `packedFillQ8`) widens int8→f32 straight into
+    `packedFill`'s L1 pack tile, so the f32 weight never exists outside a ≤32 KB
+    buffer and only the int8 weights (¼ the bytes) are streamed. Thermally-fair A/B
+    (alternating configs in one process) on the M1 Pro / `encoder-model`:
+
+    | L | dequant (fix a) | fused (fix b) | |
+    |---|--:|--:|--:|
+    | 8   | 43.0 ms | **31.0 ms** | **−27.9%** |
+    | 64  | 143 ms  | **128 ms**  | −10.5% |
+    | 256 | 606 ms  | **577 ms**  | −4.8% |
+    | 512 | 815 ms  | **799 ms**  | −2.0% |
+
+    The shape is 1/M: the widen is fixed per forward, so killing its traffic helps
+    most at the short inputs a reranker actually sees.
+
+    **Two things this cost real time to get right, both recorded because the naive
+    version measured WORSE:**
+
+    - **`packedFill` has no m-blocking (deferred item 23), and that bites the K=768
+      projections.** `packedFill` streams the whole a-panel once per 8-column group.
+      At K≥2048 (fc2, where the reference already packs) that is a bounded cost, but
+      forcing it on the K=768 projections re-streams `a` N/8 times and, run serially
+      at M=512, is ~4× slower than the unpacked path (69 vs 260 GB/s in the kernel
+      microbench). The first cut (fuse all shapes, serial-or-column dispatch)
+      therefore ran **+158% at L=256**.
+    - **The fix was not a K threshold — it was mirroring BOTH parallel axes.** The
+      f32 dispatch uses columns for small M and *rows* for large M
+      (`wantParallelCols` is false above `minRowsPerWorker·numCPU`). Under the row
+      split each worker runs the fused kernel over a small row block, so the
+      m-blocking gap never opens. Once `matmulBTQ8FusedDispatch` carried the row
+      branch too, fusing **every** K shape won at every length (table above). The
+      lesson is §1.18-shaped: an item's win can hide behind a dispatch decision made
+      three functions away.
+
+    **Gate.** `TestMatmulBTQ8Fused_bitIdentical` asserts EXACT equality vs
+    `DequantizeRowsInt8Into`+`MatmulBTInto` over all four real shapes × M∈{1,2,3,10,
+    80,91,357} (the widen value and k-tiling match, so the Dot2x8/Dot8x4 kernels see
+    the same b in the same order), serial==parallel, mutation-checked. Cosine vs f32
+    stays 0.997. amd64 is unchanged: `HasFusedQ8Kernel` is false there (the pack uses
+    the NEON Dot2x8), so it keeps fix (a)'s AVX2 dequant path. `scratch.deqW` is now
+    dead on arm64 (the wrapper skips its allocation); reclaiming the pooled 9.4 MB is
+    a trivial follow-up left for when a non-`N%8==0` shape can't reach the fallback.
 
 ---
 

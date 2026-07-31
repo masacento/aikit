@@ -1,6 +1,11 @@
 package encoder
 
-import "github.com/townsendmerino/aikit/linalg"
+import (
+	"runtime"
+	"sync"
+
+	"github.com/townsendmerino/aikit/linalg"
+)
 
 // matmulBTQ8 is the M8 int8-weight variant of matmulBT. Same shape:
 // dst = a · bᵀ where a is [M, K] f32 (activations) and b is logically
@@ -30,7 +35,13 @@ import "github.com/townsendmerino/aikit/linalg"
 // all of which have M*K*N ≫ the matmulBT small-shape threshold).
 func matmulBTQ8(a []float32, bQ []int8, bScales []float32, M, K, N int) []float32 {
 	dst := make([]float32, M*N)
-	matmulBTQ8Into(dst, a, bQ, bScales, M, K, N, make([]float32, N*K))
+	// The arm64 fused path widens inside the pack and needs no deqW; only the
+	// dequant-then-GEMM fallback does, so don't allocate it when it won't be read.
+	var deqW []float32
+	if !linalg.FusedQ8Applies(K, N) {
+		deqW = make([]float32, N*K)
+	}
+	matmulBTQ8Into(dst, a, bQ, bScales, M, K, N, deqW)
 	return dst
 }
 
@@ -48,17 +59,78 @@ func matmulBTQ8(a []float32, bQ []int8, bScales []float32, M, K, N int) []float3
 // activations and fell below the 0.97 reranker bar; the weights stay int8 in storage
 // (¼ the //go:embed footprint) — deqW is transient runtime scratch only.
 func matmulBTQ8Into(dst, a []float32, bQ []int8, bScales []float32, M, K, N int, deqW []float32) {
-	if len(a) != M*K || len(bQ) != N*K || len(bScales) != N || len(dst) < M*N || len(deqW) < N*K {
+	if len(a) != M*K || len(bQ) != N*K || len(bScales) != N || len(dst) < M*N {
 		panic("encoder: matmulBTQ8Into shape mismatch")
 	}
-	// The widen is O(N*K) and INDEPENDENT of M, so it does not amortize with
-	// sequence length: measured ~190 ms per CodeRankEmbed forward on a 3700X
-	// whether the input is 10 tokens or 350 — 35% of a short forward, 2% of a
-	// long one (perf-campaign item 22). linalg's kernel vectorizes it
-	// (VPMOVSXBD/VCVTDQ2PS/VMULPS on amd64) and is bit-identical to the scalar
-	// loop this replaced: float32(int8) is exact and the scale is one f32
-	// multiply either way.
+	// FUSED (arm64): widen int8→f32 INSIDE the b-panel pack (perf-campaign item 22
+	// fix (b)), so the full [N,K] f32 weight is never materialized — killing the
+	// ~0.9 GB/forward deqW round-trip through DRAM that fix (a) still paid. Needs the
+	// NEON packed kernel and N%8==0 (every encoder Q8 shape: N∈{768,2304,3072}).
+	if linalg.FusedQ8Applies(K, N) {
+		matmulBTQ8FusedDispatch(dst, a, bQ, bScales, M, K, N)
+		return
+	}
+	// FALLBACK (amd64 / odd N): widen the whole matrix into pooled deqW ONCE, then run
+	// the vectorized f32 matmulBTInto over it (fix (a): VPMOVSXBD/VCVTDQ2PS/VMULPS AVX2
+	// widen). The widen is O(N*K), INDEPENDENT of M, so it does not amortize with
+	// sequence length; both paths are bit-identical — float32(int8) is exact and the
+	// scale is one f32 multiply either way.
+	if len(deqW) < N*K {
+		panic("encoder: matmulBTQ8Into deqW too small")
+	}
 	w := deqW[:N*K]
 	linalg.DequantizeRowsInt8Into(w, bQ, bScales, N, K)
 	matmulBTInto(a, w, dst, M, K, N)
+}
+
+// matmulBTQ8FusedDispatch mirrors matmulBTInto's intra-op parallelism for the fused
+// int8 kernel — and it must mirror it EXACTLY, both axes. wantParallelCols is only true
+// for SMALL M (M < minRowsPerWorker·numCPU); above that it hands off to the row split.
+// Dropping the row branch made large-M fc2 (w256, the long-sequence rerank) run SERIAL
+// while the f32 baseline row-parallelised — measured 43% slower end-to-end even though
+// the fused kernel itself is faster. So: columns for small M, rows for large M, serial
+// only when neither clears its threshold. The in-flight guard inside both predicates
+// keeps EncodeBatch (every core already busy with sibling forwards) on the serial path.
+func matmulBTQ8FusedDispatch(dst, a []float32, bQ []int8, bScales []float32, M, K, N int) {
+	if wantParallelCols(M, K, N) {
+		linalg.MatmulBTQ8Fused(dst, a, bQ, bScales, M, K, N)
+		return
+	}
+	if wantParallelMatmul(M, K, N) {
+		matmulBTQ8FusedRowsParallel(dst, a, bQ, bScales, M, K, N)
+		return
+	}
+	linalg.MatmulBTQ8FusedInto(dst, a, bQ, bScales, M, K, N)
+}
+
+// matmulBTQ8FusedRowsParallel is the fused twin of matmulBTBlockedIntoParallel: split
+// the M output rows across workers, each running the serial fused kernel over its
+// disjoint row block (reading a[iStart:iEnd] and the shared read-only int8 weights,
+// writing dst[iStart:iEnd] — no overlap, no locking). Each worker widen-packs the whole
+// [N,K] weight for its rows; that re-widens per worker, but the row split is the
+// large-M regime where the widen is a vanishing fraction of the GEMM anyway.
+func matmulBTQ8FusedRowsParallel(dst, a []float32, bQ []int8, bScales []float32, M, K, N int) {
+	workers := runtime.NumCPU()
+	maxByRows := (M + minRowsPerWorker - 1) / minRowsPerWorker
+	if workers > maxByRows {
+		workers = maxByRows
+	}
+	if workers <= 1 {
+		linalg.MatmulBTQ8FusedInto(dst, a, bQ, bScales, M, K, N)
+		return
+	}
+	rowsPer := (M + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		iStart := w * rowsPer
+		if iStart >= M {
+			break
+		}
+		iEnd := min(iStart+rowsPer, M)
+		wg.Go(func() {
+			m := iEnd - iStart
+			linalg.MatmulBTQ8FusedInto(dst[iStart*N:iEnd*N], a[iStart*K:iEnd*K], bQ, bScales, m, K, N)
+		})
+	}
+	wg.Wait()
 }
