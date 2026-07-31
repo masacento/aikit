@@ -186,8 +186,33 @@ func MatmulBTW8A8Into(ws *Workspace, a []float32, bQ []int8, bScales []float32, 
 	checkMatmulQ8("MatmulBTW8A8", len(a), len(bQ), len(bScales), len(dst), M, K, N)
 	aq := ws.int8Buf(M * K)
 	aScales := ws.f32Buf(M)
+	QuantizeActivationsInto(aq, aScales, a, M, K)
+	MatmulBTW8A8Pre(ws, aq, aScales, bQ, bScales, dst, M, K, N)
+}
+
+// QuantizeActivationsInto quantizes a's M rows of K floats to int8 with a per-row
+// symmetric (max/127) scale — the same dynamic activation quantization
+// MatmulBTW8A8Into does internally, exposed so a caller that reuses one activation
+// across many weight blocks quantizes it ONCE. aq must be len ≥ M*K, scales ≥ M.
+// (A paged FlatI8 scan reuses the query across ~9766 blocks; re-quantizing it in
+// every block cost ~52 ms/query at 10M vectors — lens §3.5.)
+func QuantizeActivationsInto(aq []int8, scales []float32, a []float32, M, K int) {
+	if len(aq) < M*K || len(scales) < M || len(a) < M*K {
+		panic("linalg: QuantizeActivationsInto short buffer")
+	}
 	for i := range M {
-		aScales[i] = quantizeRowInt8(a[i*K:i*K+K], aq[i*K:i*K+K])
+		scales[i] = quantizeRowInt8(a[i*K:i*K+K], aq[i*K:i*K+K])
+	}
+}
+
+// MatmulBTW8A8Pre is MatmulBTW8A8Into with the activations ALREADY quantized (aq +
+// aScales from QuantizeActivationsInto) — it skips the per-call requantization.
+// Bit-identical to MatmulBTW8A8Into given the same aq/aScales (same w8a8Span / dotI8
+// / rescale). For a paged scan that reuses one query across thousands of weight
+// blocks: quantize once, call this per block.
+func MatmulBTW8A8Pre(ws *Workspace, aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, M, K, N int) {
+	if len(aq) < M*K || len(aScales) < M || len(bQ) < N*K || len(bScales) < N || len(dst) < M*N {
+		panic("linalg: MatmulBTW8A8Pre short buffer")
 	}
 	// Serial fast-path calls the named span directly (no closure → no heap
 	// escape → zero alloc, the steady-state decode case). Only the parallel

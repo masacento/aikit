@@ -78,3 +78,17 @@ func (w *Workspace) f32Buf(n int) []float32 {
 	}
 	return w.f32[:n]
 }
+
+// QuantizeActivations dynamically quantizes a's M×K rows to int8 into this
+// Workspace's own reusable int8/scale scratch and returns views of them, for a
+// caller that reuses one activation (a query) across many weight blocks and wants
+// to quantize it ONCE (lens §3.5). The returned slices are valid until the next
+// call that grows the Workspace's int8/f32 scratch — in particular MatmulBTW8A8Pre
+// does NOT touch them, so the paged-scan pattern (quantize once, Pre per block) is
+// safe. Not goroutine-safe: one Workspace per user, as elsewhere.
+func (w *Workspace) QuantizeActivations(a []float32, M, K int) (aq []int8, scales []float32) {
+	aq = w.int8Buf(M * K)
+	scales = w.f32Buf(M)
+	QuantizeActivationsInto(aq, scales, a, M, K)
+	return aq, scales
+}

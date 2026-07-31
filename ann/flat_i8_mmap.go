@@ -113,13 +113,16 @@ func loadFlatI8MmapPaged(path string, budget int64, blockRows int) (*FlatI8, err
 func (f *FlatI8) scorePaged(q []float32, dst []float32) {
 	f.pagerMu.Lock()
 	defer f.pagerMu.Unlock()
+	// Quantize the query ONCE (lens §3.5): it is constant for the whole scan, so
+	// re-quantizing it inside every per-block MatmulBTW8A8Into — two O(dim) passes
+	// plus a math.Round each — cost ~52 ms/query at 10M vectors (~9766 blocks). The
+	// pre-quantized codes live in the persistent f.ws scratch (pagerMu guards it);
+	// MatmulBTW8A8Pre consumes them and never re-grabs those buffers.
+	aq, aScales := f.ws.QuantizeActivations(q, 1, f.dim)
 	for b, r0 := 0, 0; r0 < f.n; b, r0 = b+1, r0+f.blockRows {
 		r1 := min(r0+f.blockRows, f.n)
 		f.pager.Touch(b)
-		// MatmulBTW8A8Into with the persistent f.ws instead of MatmulBTW8A8 (which
-		// allocates a fresh Workspace per call). Bit-identical — the wrapper is
-		// exactly this with a zero Workspace. pagerMu (held) guards f.ws.
-		linalg.MatmulBTW8A8Into(&f.ws, q, f.bq[r0*f.dim:r1*f.dim], f.scales[r0:r1], dst[r0:r1], 1, f.dim, r1-r0)
+		linalg.MatmulBTW8A8Pre(&f.ws, aq, aScales, f.bq[r0*f.dim:r1*f.dim], f.scales[r0:r1], dst[r0:r1], 1, f.dim, r1-r0)
 	}
 }
 
