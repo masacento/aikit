@@ -100,10 +100,20 @@ const ubSlack = 1 + 1e-12
 // pruning the query's selectivity mix allows — so this is a measured constant,
 // not a derived one, and it is the amd64 number.
 //
-// The long-query case is not a dead end, it is a different algorithm: MaxScore
-// partitions terms into essential and non-essential by cumulative bound and
-// never advances the non-essential cursors at all, which is precisely the O(Q)
-// per iteration this pays. That is the remaining headroom in item 39.
+// The long-query case looked like a different algorithm — MaxScore, which
+// partitions terms into essential and non-essential by cumulative bound and never
+// advances the non-essential cursors. It was BUILT, MEASURED, and REVERTED
+// (2026-07-31): exact (== topKExhaustive bit-for-bit over 1000 random long queries,
+// mutation-checked) but 2.5–5.7× SLOWER at 12–48 terms. Two structural reasons it
+// loses here, and they are not implementation bugs: topKExhaustive is a TAAT
+// accumulator — it walks each term's postings ONCE into a scores[] array, O(total
+// postings) and cache-friendly — whereas MaxScore is document-at-a-time, whose
+// per-document overhead only repays when pruning skips many documents; and on the
+// uniform-selectivity queries the benchmarks generate, θ rises slowly so the
+// essential set stays large and little is pruned. MaxScore's real edge is a SKEWED
+// impact distribution (a few dominant terms lift θ fast) — i.e. trained SPLADE
+// weights — which nothing here measures, so shipping it would regress the general
+// long-query case for an unmeasured gain. Left to the exhaustive accumulator.
 const maxWandTerms = 8
 
 // wandUsable reports whether the pruning bound is sound for the current

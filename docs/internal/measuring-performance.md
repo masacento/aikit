@@ -421,6 +421,7 @@ been consistently right; magnitudes consistently optimistic.**
 | 37 · outer-product kernel (arm64) | ~1.45× (2× in the µkernel, amd64) | 1.10× raw / net-negative (dot2x8 at 95% peak) | ❌ |
 | 24 · packed-stride pad (arm64) | "may be a no-op, measure first" | **−9.8% on large-encoder fc2 — real** | ✓ (rare: measured MORE than the guard expected) |
 | §5 · StaticModel word presum | ~29% pool collapse (14% of Encode) | wash serial / **+31% batch** (cache overhead + contention) | ❌ |
+| 39 · MaxScore long-query pruning | faster than exhaustive at >8 terms | **2.5–5.7× SLOWER** (TAAT accumulator beats DAAT when selectivity is uniform) | ❌ |
 | 18 · Qwen ViT arena | ~15 GB/image, ~1.5 s memset | −70/−85% B/op; **~3%** of latency | ⚠️ |
 | 27 · 4-MFLOP naive threshold | 3–9% for L<250 | **up to −50.5%** | ❌ (under) |
 | 24 · packed-stride aliasing | "free" | unreachable on amd64; reverted | — |
