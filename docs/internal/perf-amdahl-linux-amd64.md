@@ -551,6 +551,14 @@ in the lens doc as "67% of the flagship example's cold start". It is **21.5%**,
 and eliminating it entirely would take 82.0 ms to 64.4 ms. Still real, no longer
 the headline, and still an API design decision rather than a perf one.
 
+**N4 is now formally DEFERRED, and the campaign closes without it** (see the note
+at lens §5.6 N4). The remaining ceiling is 17.6 ms of cold start against the cost
+of a versioned on-disk format that every future `Index` field has to honour —
+which is a decision about what `bm25` is, not one a benchmark gets to make. N6 is
+held with it: a streaming `Builder` and a serialized index are the same question
+about that package's input/output surface, and settling either one first
+constrains the other.
+
 Peak heap tells the same story: the model load alone reaches 142.4 MiB of the
 run's 148.6, so everything after it adds ~6 MiB.
 

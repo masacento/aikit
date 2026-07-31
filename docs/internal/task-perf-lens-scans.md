@@ -1004,7 +1004,7 @@ At k=200, `fuse.RRF` alone costs **more than the ANN scan, the BM25 scan and the
 query embedding put together** (182 µs vs 90 µs). Verified identical
 `{Key,Score}` at every rank over 89 items.
 
-### N4 · `examples/embedded-corpus` spends 67% of cold start rebuilding an index it already had — because `bm25` has no serialization surface
+### N4 · `examples/embedded-corpus` spends 67% of cold start rebuilding an index it already had — because `bm25` has no serialization surface — **DEFERRED**
 
 `examples/embedded-corpus/main.go:60-66`, with a comment that concedes it:
 
@@ -1026,6 +1026,30 @@ the library** for the zero-deploy story it markets. (Second-order, same file:
 `json.Unmarshal` at `:57` is another 18.4% at 118 MB/s, to parse text already
 contiguous in the binary.)
 
+> **DEFERRED — 2026-07-30. Not a measurement question, and not one to settle on a
+> benchmark's say-so.** Two things changed since this was written:
+>
+> - **The magnitude is smaller than the heading.** W3 (`bench/coldstart_bench_test.go`)
+>   put the rebuild at **21.5% of time-to-first-result, not 67%** — the earlier
+>   figure was measured before `embed.LoadMmap` and the `bm25.Build` work moved
+>   the denominator. Still the largest single item in cold start, but no longer
+>   two thirds of it, and the ~20 s extrapolation to 378k chunks scales down with
+>   it.
+> - **The cost is permanent exported surface, and the deliverable here was speed.**
+>   A versioned on-disk format is a compatibility promise: every future field
+>   added to `Index` has to be carried, defaulted for old files, and gated. That
+>   is a library-design decision about what `bm25` *is*, and it outlives whatever
+>   this item saves.
+>
+> The perf campaign closes without it. Whoever picks it up should treat it as an
+> API proposal that happens to have a performance justification — starting from
+> the format and the version-skew policy, not from the 21.5% — and should decide
+> alongside it whether `bm25` wants a persistence story at all, or whether callers
+> rebuilding from an already-embedded corpus is the honest answer for a package
+> whose build is O(corpus) and fast. **[N6] is entangled with this**: a streaming
+> `Builder` and a serialized index are the same conversation about `bm25`'s
+> input/output surface, and doing either one first constrains the other.
+
 ### N5 · `ann.NewFlatI8` materializes a full f32 copy of the corpus it is about to discard — **2.02×**
 
 `ann/flat_i8.go:74-78` allocates `make([]float32, n*d)`, copies every input vector
@@ -1045,7 +1069,7 @@ row-streaming QuantizeRowInt8   49.68 ms    5,202,944 B/op    2.02×
 At 378k × 256 the `flat` array is **387 MB allocated and zeroed**, held alongside
 the caller's `[][]float32`. Bit-identical.
 
-### N6 · The `[][]string` seam between `bm25.Tokenize` and `bm25.Build` — 8.8× the corpus, held live, read once
+### N6 · The `[][]string` seam between `bm25.Tokenize` and `bm25.Build` — 8.8× the corpus, held live, read once — **HELD WITH N4**
 
 `bm25/index.go:30` takes `docs [][]string`, so every consumer must materialize the
 token stream of the **entire corpus** before `Build` may start. Measured over
@@ -1056,6 +1080,13 @@ returns, read exactly once at `index.go:50`. At the 378k-chunk scale the
 `Tokenize` is per-document and correct; `Build` is corpus-at-once and correct; the
 *contract between them* forces O(corpus) peak. Additive fix: `Builder.Add(tokens)`
 or `Build(iter.Seq[[]string])` so one token slice can be reused.
+
+> **HELD WITH N4 — 2026-07-30.** The finding stands and the fix is genuinely
+> additive, but `Builder.Add(tokens)` and a serialized `Index` are the same
+> decision seen twice: what `bm25` accepts and what it emits. A `Builder` is the
+> natural place for an incremental index to also *load* one, and committing to
+> either shape first constrains the other. Take them together, as an API review,
+> or not at all this cycle.
 
 ### N7 · Adversarial: campaign #11's "10–50×" rests on a selectivity assumption aikit's own tokenizer breaks
 
@@ -1192,6 +1223,16 @@ findable by reading a hot loop, because the defect is *the absence of a call*.
 Only a workload trace surfaces them — and both are breaking-ish additions worth
 deciding on before v1.0 freezes the surface.
 
+> **And that is exactly why they split.** N1 shipped inside the campaign: it is
+> additive, its contract is obvious from the serial loop it replaces, and it was
+> 8.21×. N4 is deferred out of it: a versioned on-disk format is a compatibility
+> promise, and "this would be faster" is not sufficient grounds to make one.
+> **A perf campaign can measure an absent API's cost but cannot decide its
+> shape** — the measurement says how much the absence costs, never what the
+> presence should look like. Worth remembering the next time a scan's top item
+> turns out to be a missing call: the finding is real, the priority is real, and
+> the fix still belongs to a different kind of review.
+
 ---
 
 # Suggested order — lens-5-corrected
@@ -1243,11 +1284,14 @@ it is 99.8%+ of the query and *nothing else in this document is visible*:
 **Phase D — footprint and cold start, as its own project.** Not latency wins; the
 difference between "runs on a laptop" and "doesn't":
 
-12. **§5.6 N4 — `bm25.Index` serialization.** 67% of the flagship example's cold
-    start, ~20 s at the 378k-chunk scale. **The library's biggest missing API.**
-13. **§5.6 N6** (`bm25.Build` streaming input, ~5 GB peak), **§4.3** (`WriteTo`),
-    **§4.5** (streaming quantize), **§4.2** (gate column-blocking), **§4.6**
-    (preprocess).
+12. ~~**§5.6 N4 — `bm25.Index` serialization.**~~ **DEFERRED** — see the note at
+    N4. Re-measured at 21.5% of cold start, not 67%, and the cost is a permanent
+    versioned format. An API proposal, not a perf item; entangled with N6.
+13. **§5.6 N6** (`bm25.Build` streaming input, ~5 GB peak) — **open, and held
+    with N4** for the same reason: both are decisions about `bm25`'s
+    input/output surface. ~~**§4.3** (`WriteTo`)~~ **done**, ~~**§4.5**
+    (streaming quantize)~~ **done** (as a per-tensor page release — see the note
+    at §4.5), **§4.2** (gate column-blocking), **§4.6** (preprocess).
 
 **Gated:** §3.9's `QueryBatch` batching on **[campaign #12]**; the softmax-scale
 fusion on **[campaign #13]**.

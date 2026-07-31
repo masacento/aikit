@@ -129,6 +129,19 @@ recorded in the commits, but you will read the docs first:
 - **Item 40**, flash-attention / online-softmax tiling — the last untouched Tier 3
   item, and `≠` (numerics change).
 
+**Deferred out of the campaign entirely — do not pick these up as perf work:**
+
+- **lens N4** — `bm25.Index` serialization, and **lens N6** — the `[][]string`
+  seam in `bm25.Build`. Both are decisions about `bm25`'s input/output surface,
+  not optimizations, and they are entangled: a streaming `Builder` and a versioned
+  on-disk format constrain each other. N4's headline "67% of cold start" was
+  re-measured at **21.5%** once the real checkpoint load was in the denominator
+  (17.6 ms), which is not enough to justify a permanent compatibility promise on
+  a benchmark's say-so. If someone takes them, they take them as an API proposal
+  before the v1.0 surface freeze, starting from the format and the version-skew
+  policy. **This is the whole remaining backlog of the three perf docs** — with
+  N4 and N6 deferred, the campaign is closed.
+
 **Not reachable anywhere:** item 35 (VNNI, needs Zen 4+/Ice Lake+), item 36
 (i8mm, needs M2+/Graviton3+).
 
