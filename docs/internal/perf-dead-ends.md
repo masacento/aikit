@@ -17,6 +17,21 @@ A number without a box is a bug; where a source did not name the box it is flagg
 inferred (from the kernel named — `dotFMA8`=amd64, `dotNEON2x8`=arm64 — or the date
 cluster; the 2026-07-30/31 work is the `apple-m1pro` arbiter phase).
 
+> **Recovering an unattributed box.** When a commit's prose does not name the machine,
+> two signals recover it, and across this campaign they agree 10/10:
+> 1. **The `Co-Authored-By` trailer is a machine fingerprint.** The two boxes ran
+>    different configured models — **Claude Opus 5** on `nvidia-rtx2070s`, **Claude
+>    Opus 4.8** on `apple-m1pro` — so the trailer separates them cleanly
+>    (`git log -1 --format=%b <sha> | grep Co-Authored-By`). *Caveat:* it records the
+>    session's configured model, not the machine directly, so it stops separating if
+>    the same model is ever run on both boxes; it held for the whole 2026-07 campaign.
+> 2. **Third-person references to the OTHER box.** A commit that says "the amd64 box's
+>    instinct… was right" while reporting its own build-measure-revert was written on
+>    the arm64 box — you don't write that about yourself.
+> Worked example: `0269de1` (MaxScore, §5.2) carries the Opus 4.8 trailer AND says "The
+> amd64 box's instinct to leave it undone was right" → `apple-m1pro`, both signals
+> agreeing. Use the same method on any other entry marked "inferred."
+
 > **Read this first — a negative needs its numbers as fully as a positive.** Two
 > entries below (HNSW heap pooling, §8.3; item 24 packed-stride pad, §6.1) were
 > recorded as dead ends and then **measured the other way** on a different box or with
@@ -220,15 +235,15 @@ analysis kept predicting load-reduction wins that do not exist on arm64.
   This is item 37's pattern on the retrieval side: the mechanism was real, the shape it
   needed was not the shape the package sees.
 
-### 5.2 · MaxScore long-query pruning (item 39) — **2.5–5.7× SLOWER**, box unnamed (2026-07-31, `0269de1`)
+### 5.2 · MaxScore long-query pruning (item 39) — **2.5–5.7× SLOWER**, `apple-m1pro` (2026-07-31, `0269de1`)
 - **Tried:** MaxScore (partition terms into essential/non-essential, never advance
   non-essential cursors) for the long-query (>8-term) case WAND cannot serve.
 - **Mechanism:** past `maxWandTerms = 8`, MaxScore should beat the exhaustive scan where
   WAND's per-iteration linear cost defeats it.
 - **Number / box:** **2.5–5.7× SLOWER** (exact vs exhaustive over 1000 queries,
-  mutation-checked). **⚠ measuring box not named in any source** — inferred
-  `nvidia-rtx2070s` from bm25 lineage, but the commit is in the 2026-07-31 arbiter
-  cluster; confirm before quoting a machine.
+  mutation-checked), on **`apple-m1pro`**. (The source doc did not name the box; it was
+  recovered from two independent signals — see "Recovering an unattributed box" below.
+  The bm25-lineage inference to `nvidia-rtx2070s` was wrong.)
 - **Why:** the exhaustive TAAT accumulator (postings once into `scores[]`) beats DAAT
   pruning when selectivity is uniform; MaxScore needs skewed impacts (SPLADE weights),
   which nothing here measures.

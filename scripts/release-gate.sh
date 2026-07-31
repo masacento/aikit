@@ -6,9 +6,12 @@
 # gate (roadmap §1.2). It checks:
 #
 #   1. CHANGELOG.md has a `## [X.Y.Z]` section AND a `[X.Y.Z]:` compare link.
-#   2. apidiff shows NO incompatible change in any Hard-tier package vs the previous
+#   2. golangci-lint is clean against .golangci.yml — the SAME config + version CI
+#      runs, so a local gate matches CI (and a missing binary can't mask as a pass:
+#      earlier sessions hit a silent exit 127 when it was off PATH).
+#   3. apidiff shows NO incompatible change in any Hard-tier package vs the previous
 #      tag — the stated release bar.
-#   3. The core module pulls in no external dependency beyond golang.org/x/text
+#   4. The core module pulls in no external dependency beyond golang.org/x/text
 #      and golang.org/x/sys (darwin-only madvise) — the cgo-free, dependency-light
 #      invariant the README promises.
 #
@@ -55,7 +58,22 @@ if ! grep -qE "^\[${VER}\]: " CHANGELOG.md; then
 	err "CHANGELOG.md has no '[${VER}]:' compare link"
 fi
 
-# (2) apidiff — no Hard-tier breakage vs the previous tag.
+# (2) golangci-lint — the same conservative .golangci.yml config CI runs, pinned to
+# the same version, so a local gate reports identically. Guarded install (like apidiff
+# below): golangci-lint is often off PATH (it installs to $GOPATH/bin), and an
+# unguarded call there fails as a silent exit 127 that reads as "lint clean" — the
+# exact trap several campaign sessions fell into. Install-or-err, then run only if the
+# binary is actually present, so a failed install doesn't double-report.
+echo "release-gate: golangci-lint (.golangci.yml)"
+if ! command -v golangci-lint >/dev/null 2>&1 && [ ! -x "$(go env GOPATH)/bin/golangci-lint" ]; then
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4 || err "could not install golangci-lint"
+fi
+GOLANGCILINT="$(command -v golangci-lint || echo "$(go env GOPATH)/bin/golangci-lint")"
+if [ -x "$GOLANGCILINT" ]; then
+	"$GOLANGCILINT" run ./... || err "golangci-lint reported issues"
+fi
+
+# (3) apidiff — no Hard-tier breakage vs the previous tag.
 PREV="$(git tag --list 'v*' --sort=-v:refname | grep -vx "v${VER}" | head -1)"
 if [ -z "$PREV" ]; then
 	echo "release-gate: no previous tag — skipping apidiff"
@@ -93,7 +111,7 @@ else
 	git worktree prune
 fi
 
-# (3) Core dependency invariant: nothing external beyond golang.org/x/text and
+# (4) Core dependency invariant: nothing external beyond golang.org/x/text and
 # golang.org/x/sys. The latter is a darwin-only edge: mmap/madvise_darwin.go calls
 # madvise through golang.org/x/sys/unix because the stdlib lacks it on darwin (the
 # linux build uses syscall directly and pulls neither), so `go list ./...` surfaces

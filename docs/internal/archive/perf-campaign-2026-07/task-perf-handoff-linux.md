@@ -479,6 +479,16 @@ both modules (`chunk/treesitter` run separately).
 result quoted in *this* section was run with the explicit path and is real. Older
 commits' lint claims should be treated as unverified until re-run.
 
+> **[Correction, 2026-08-01 — this over-cast doubt on the tree.]** What was
+> unverified is the *claim in a session report*, not the *state of the code*. CI has
+> linted every pushed commit throughout (`.github/workflows/ci.yml`,
+> golangci-lint-action@v9 pinned v2.11.4 against `.golangci.yml`, on every push to
+> main and every PR), so the tree state is verified — only the ad-hoc local
+> invocations failed as exit 127. `scripts/release-gate.sh` now carries a guarded
+> `golangci-lint` step (same `command -v … || install` shape as its apidiff check),
+> so a local run matches CI and the failure mode is closed by construction, not by
+> discipline.
+
 `scripts/` parity pins unchanged — no checkpoint or golden regenerated; nothing in
 this phase touches numerics, and the pinned tests pass inside the full run. Tree
 clean.
