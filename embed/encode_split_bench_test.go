@@ -12,7 +12,7 @@ import (
 
 // BenchmarkEncodeSplit decomposes StaticModel.Encode into its two halves —
 // Tokenizer.Encode and encodeIDs (gather + weighted pool + L2) — over aikit's
-// own source tree. Step 0c of docs/internal/task-perf-handoff-linux.md.
+// own source tree. Step 0c of docs/internal/archive/perf-campaign-2026-07/task-perf-handoff-linux.md.
 //
 // It lives in package embed rather than alongside the W1/W2 workload benchmarks
 // because encodeIDs is unexported. That is the point: the alternative is to

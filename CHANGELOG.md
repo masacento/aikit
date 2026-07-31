@@ -10,6 +10,16 @@ it.
 
 ## [Unreleased]
 
+> **Measurement provenance (2026-07 perf campaign).** Unless an entry says
+> otherwise, its figures were measured on **`nvidia-rtx2070s`** (Ryzen 7 3700X, Zen 2,
+> amd64 — the Phase A/B box); **`apple-m1pro`** (M1 Pro, arm64, 6P+2E, macOS) figures
+> are called out where they differ. CPU-time and allocation/heap ratios transfer in
+> kind across both (the absolute may move; the ratio holds — measuring-performance
+> §1.34). **RSS, cold-start and page-fault numbers are OS-mediated and do NOT transfer
+> between operating systems** (measuring-performance §1.35): in particular the
+> `LoadWeightsQ8` peak-RSS win below is Linux-only. `ann.*.WriteTo` RSS savings are the
+> different kind — they come from never allocating the blob, so they hold on any OS.
+
 ### Added
 
 - **`ann.FlatI8.WriteTo(w)`** — streams the index to a writer instead of
@@ -22,9 +32,10 @@ it.
 - **`embed.LoadMmap(dir)`** — loads a Model2Vec model with `model.safetensors`
   memory-mapped instead of read onto the heap. **Peak heap falls 5.8× and
   allocation 4.6×** on a 64 MB checkpoint (cold start 75.8 → 13.0 MiB peak, 82.4
-  → 18.1 MB allocated), while **time-to-first-result rises 17%** — mmap defers
-  the page faults to the first `Encode`, and faulting 64 MB in costs more than
-  reading it sequentially from a warm page cache.
+  → 18.1 MB allocated), while **time-to-first-result rises 17%** (`nvidia-rtx2070s`;
+  the page-fault cost is OS- and storage-dependent, so this one number does not port —
+  measuring-performance §1.35) — mmap defers the page faults to the first `Encode`, and
+  faulting 64 MB in costs more than reading it sequentially from a warm page cache.
 
   A footprint option, not a speed one: take it under a memory cap, leave it for a
   short-lived CLI. Additive, so no existing caller changes behaviour. Vectors are
@@ -105,12 +116,14 @@ it.
   same 199.5 MiB model, at **+0.10%** load time (min-of-10 — inside the drift
   floor).
 
-  **Linux-only, confirmed by measurement on both boxes.** The mechanism is
-  `madvise(MADV_DONTNEED)`, which macOS does not honour for a read-only
-  file-backed mapping — an M1 Pro measures **726.2 MiB**, i.e. the unreleased
-  figure. The pages there are clean and file-backed, so the OS still reclaims them
-  under pressure and nothing OOMs; it is the peak-RSS *number* that is a Linux
-  artifact. Do not quote 3.00× as a laptop figure.
+  **Scope: Linux-only, confirmed by measurement on both boxes.** The mechanism is
+  `madvise(MADV_DONTNEED)`, which macOS does not honour for a read-only file-backed
+  mapping — `apple-m1pro` measures **726.2 MiB**, i.e. the unreleased figure, no win at
+  all. The pages there are clean and file-backed, so the OS still reclaims them under
+  pressure and nothing OOMs; it is the peak-RSS *number* that is a Linux artifact. Do
+  not quote 3.00× as a laptop figure. (This is an OS-mediated RSS number — the class
+  that does not transfer between operating systems, measuring-performance §1.35 — not a
+  CPU or allocation figure.)
 
   Quantizing reads every f32 weight, so the whole mapping used to stay resident
   until `Close()` at the end. Each tensor's pages are now released as soon as it
@@ -179,8 +192,9 @@ it.
   scores.
 
 - **`ann.Flat.Query`/`QueryFilter` now shard the scan across cores** (perf
-  campaign item 16): 1.73–2.26× depending on index size, and −42% on the
-  filtered path. Results are unchanged — still the k highest by score with ties
+  campaign item 16): 1.73–2.26× depending on index size (`nvidia-rtx2070s`, 8C/16T —
+  the speedup scales with core count), and −42% on the filtered path. Results are
+  unchanged — still the k highest by score with ties
   broken by ascending index, identical to a serial scan, gated on
   adversarial all-ties inputs and shard-width invariance.
 

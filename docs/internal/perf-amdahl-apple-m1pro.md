@@ -1,6 +1,6 @@
 # Amdahl table — real hardware, real checkpoint (Apple M1 Pro)
 
-> **Phase A hand-back arbiter table** ([`macbook-phase-a-handback.md`](../prompts/macbook-phase-a-handback.md)).
+> **Phase A hand-back arbiter table** ([`macbook-phase-a-handback.md`](archive/perf-campaign-2026-07/macbook-phase-a-handback.md)).
 > The companion to [`perf-amdahl-linux-amd64.md`](perf-amdahl-linux-amd64.md),
 > measured on the M1 Pro with the identical benchmarks and corpus. **This box is
 > the arbiter of record**; the amd64 figures ranked the work, these are the ones
@@ -74,7 +74,7 @@ more here than on amd64. **Built and measured 2026-07-31 — dead**: bit-exact
 (0/386 real docs) but a serial wash (the per-word FNV-hash + RWMutex + map probe
 costs as much as the ~0.4 gathers it collapses — the f64 gather is too cheap to
 beat with a keyed lookup) and **+30.9% under EncodeBatch** (shared-cache reader-
-atom contention across cores). See `task-perf-memoization.md` §5.
+atom contention across cores). See `archive/perf-campaign-2026-07/task-perf-memoization.md` §5.
 
 And a **vectorised f64 gather does not help either — measured, not assumed.** The
 MAC loop (`sum[j] += f64(row[j])·ww`) runs at **0.7 ns/MAC on warm rows**, where a

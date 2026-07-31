@@ -16,13 +16,13 @@ import (
 )
 
 // End-to-end workload benchmarks — W1 (index a repository) and W2 (hybrid
-// query). Step 0c of docs/internal/task-perf-handoff-linux.md.
+// query). Step 0c of docs/internal/archive/perf-campaign-2026-07/task-perf-handoff-linux.md.
 //
 // WHY THESE EXIST AND WHAT THEY ARE FOR. Every other benchmark in this repo
 // measures one function. These measure the two things a user actually runs, and
 // they carry a sub-benchmark per stage so the Amdahl split falls out directly:
 // a 3× win on a stage worth 5% of the run is a 1.7% win, and only a table like
-// this says which is which. docs/internal/task-perf-lens-scans.md §5 has the
+// this says which is which. docs/internal/archive/perf-campaign-2026-07/task-perf-lens-scans.md §5 has the
 // prior table, measured on a 2-core Xeon with a SYNTHETIC vocabulary; this is
 // the first one on real hardware with the real checkpoint.
 //

@@ -45,12 +45,33 @@ On top of the dot kernels, `linalg` provides:
   are K·4 bytes apart and collide in L1 cache sets, so packing them ~kBlock apart kills
   the conflicts (prefill 46%→69%, K=3072 fc2 +15%) — bit-identical (same values, same
   order), via a pooled buffer. K=768 dims stay unpacked (already low-stride); amd64 stays
-  on the unpacked AVX2 path (AVX2 packing deferred).
+  on the unpacked AVX2 path (AVX2 packing deferred). A **padded pack stride** breaks the
+  power-of-two L1 conflict when kSpan is a power of two (item 24): **−9.8%/−10.7%/−8.8%
+  on large-encoder fc2** on `apple-m1pro` — arm64-only, and it measured as pure noise on
+  `nvidia-rtx2070s` where the whole function is dead code (see perf-dead-ends §6.1 for
+  why that flat sweep was a signal, not a null result).
+- **`packedFillQ8` / `MatmulBTQ8Fused` — the int8-weight twin of the packed path**
+  (`matmul_blocked_q8.go`, arm64). It widens each int8 weight to f32 **inside** the pack
+  tile — the ≤32 KB L1-resident buffer above — instead of materializing the whole
+  `[N,K]` f32 weight first, so the ~0.9 GB/forward `deqW` DRAM round-trip is gone.
+  Bit-identical to `DequantizeRowsInt8Into` + `MatmulBTInto` (the widen value and
+  k-tiling match; `TestMatmulBTQ8Fused_bitIdentical`, mutation-checked). The encoder Q8
+  path routes here on arm64 (`FusedQ8Applies`, gated on `HasFusedQ8Kernel` + `N%8==0`):
+  **−28%/−10%/−4.8%/−2.0% end-to-end at L=8/64/256/512** on `apple-m1pro`, 1/M-shaped
+  (the widen is fixed per forward). The dispatch mirrors BOTH f32 parallel axes —
+  columns for small M, rows for large M — so each worker runs the fused kernel over a
+  small row block and never opens `packedFill`'s missing-m-blocking gap (item 23). amd64
+  keeps the vectorized dequant-then-GEMM path (`HasFusedQ8Kernel` false there).
 - The quant matmuls: `MatmulBTQ8` (int8 weights), `MatmulBTQ4` (int4 group, f32
   activations — prefill path), **W8A8** (`MatmulBTW8A8` + the zero-alloc
   `…Into(ws *Workspace)` and the fused `MatmulBTW8A8Batch`), and **W4A8**
   (`MatmulBTW4A8`, int4 weights × int8 activations — the int4 *decode* path).
   See `quant.go`, `workspace.go`, `quant_w4a8*.go`.
+- `DequantizeRowsInt8Into` — bulk int8→f32 weight widen (`float32(q)*scale` per
+  element), vectorized both arches: amd64 AVX2 (`VPMOVSXBD`+`VCVTDQ2PS`+`VMULPS`,
+  32/iter), arm64 NEON (`dequant_i8_arm64.s`, `SXTL/SXTL2`→`SCVTF`→`FMUL`, 16/iter).
+  Bit-identical to the scalar loop. This is item 22's fix (a); `packedFillQ8` above is
+  fix (b), which fuses the same widen into the pack so the full f32 matrix never lands.
 - Dispatch knobs: `SetParallelThreshold` (MAC count to parallelize above) and
   `SetParallelWidth` (cap fan-out shards, for P/E straggler control) — both
   numerically inert (output columns are partitioned). `pool.go` is the optional
@@ -85,6 +106,18 @@ tolerance. Tests assert exact equality.
   threshold + `SetParallelThreshold`/`SetParallelWidth`, the spin-park pool, and
   the column-outer W8A8 re-block (weight reused across M rows). See CHANGELOG.
   goinfer's end-to-end decode is the arbiter for those (warm microbenches mislead).
+- **2026-07 CPU perf campaign (arbited across two boxes).** The CPU/SIMD-relevant
+  kernel outcomes are folded into this doc: item 22a (`DequantizeRowsInt8Into` NEON
+  widen, **3.43×** kernel on `apple-m1pro`), item 22b (`packedFillQ8` fused widen,
+  −28%/−10%/−4.8% forward), item 24 (padded pack stride, −9.8% fc2, arm64-only). The
+  full audit trail is archived under `archive/perf-campaign-2026-07/`; the two Amdahl
+  decompositions are `perf-amdahl-apple-m1pro.md` (6P+2E, §5 "what transferred") and
+  `perf-amdahl-linux-amd64.md`, meant to be read side by side; and every kernel idea
+  that was tried and did NOT ship — item 37 outer-product, item 25, pre-packing weights
+  — is in `perf-dead-ends.md` with its mechanism and number. **The one-line rule from
+  that work:** on `apple-m1pro` `dotNEON2x8` is at ~95% of FMLA peak, so the f32 kernel
+  is compute-bound and no load-reduction lever helps here even where the amd64 analysis
+  said it would (perf-dead-ends §2).
 
 ### AVX2 kernel numbers (Ryzen 7 3700X, `-bench 'Dot'`, MB/s)
 
@@ -180,6 +213,17 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
      Cascade Lake+. Can't be validated on the Zen 2 box (no VNNI), so it's a
      drop-in for a VNNI-capable machine; the AVX2 path is the proven fallback.
 
+5. **`packedFill` m-blocking (item 23) — DEFERRED WITH MEASUREMENT, not dead.**
+   `packedFill` re-reads the a-panel once per 8-column group (it lost `blockedFill`'s
+   m-blocking). On `apple-m1pro` serial `packedFill` still runs at 75–81% of the
+   ~42 GMAC/s kernel peak (fc2 M512/M690), so the a-re-read is one bounded contributor
+   to a ~20% gap it shares with the compute-overlapping b-copy and the reduce. The
+   m-blocking fix trades a-reads for redundant b-re-packing — a wash-risk core-GEMM
+   restructure for a sub-gap win, so it is **not built**. Note the Q8 path already
+   sidesteps it: `MatmulBTQ8Fused` row-splits large M so each worker's `packedFillQ8`
+   runs at small M where the gap does not open. Revisit only with a profile showing the
+   a-re-read is the dominant term, or as part of the §2.12-roadmap 3-level Goto GEMM.
+
 GPU follow-ups (resident buffers, tiled kernel, batch-tiling) are **goinfer's** —
 see `goinfer/gpu` and goinfer's perf docs.
 
@@ -242,6 +286,8 @@ linalg/dot_w4a8_arm64.s, quant_w4a8*.go         fused int4×int8 decode kernel +
 linalg/dot_amd64.go                             AVX2 dispatch + CPUID/XGETBV detect
 linalg/linalg.go                                Dot*/MatmulBT + SetParallelThreshold/Width
 linalg/quant.go                                 Q8/Q4/W8A8 matmuls (+ Into/Batch)
+linalg/dequant_i8.go, dequant_i8_{arm64.s,amd64.go}  bulk int8→f32 widen (item 22a)
+linalg/matmul_blocked.go, matmul_blocked_q8.go  packed f32 GEMM + fused-widen Q8 (22b)
 linalg/workspace.go, pool.go                    reusable scratch + spin-park worker pool
 linalg/{dot,dot_amd64,width,quant,batch,pool}_test.go   kernel/parity/bench tests
 encoder/linalg.go, linalg_q8.go                 encoder's cache-blocked matmul (uses linalg.Dot*)

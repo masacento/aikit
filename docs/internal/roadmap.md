@@ -264,6 +264,34 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
    HF `SiglipModel` (image+text). Trigger: someone actually needs text↔image (a
    cross-modal search adopter), **not** just image→image — don't build the text
    tower speculatively off the image move alone.
+14. **`bm25` persistence — a serialized `Index` and/or a `Builder.Add` seam** —
+   *new (the 2026-07 perf campaign's N4/N6, deferred as an API decision, not a perf
+   item).* The campaign measured the cost of the absent format — `bm25.Build` from
+   scratch is **21.5% of the flagship example's cold start** (`nvidia-rtx2070s` W3;
+   the original lens heading said 67%, which was measuring against a hand-written
+   checkpoint instead of the real 64 MB load), and eliminating it entirely takes
+   time-to-first-result from 82.0 → 64.4 ms. Still the largest single cold-start item,
+   no longer two thirds of it.
+   *Why it is gated, not scheduled:* the cost is a permanent compatibility promise. A
+   versioned on-disk format means every future field on `Index` has to be carried,
+   defaulted for old files, and gated, for as long as the format exists — a decision
+   about what `bm25` **is**, and 17.6 ms is not sufficient grounds for a benchmark to
+   make it. Whoever takes it should start from the format and the version-skew policy,
+   not the percentage, and should decide alongside it whether `bm25` wants a
+   persistence story at all: **rebuilding from an already-embedded corpus may be the
+   honest answer** for a package whose build is O(corpus) and fast (the `bm25.Build`
+   godoc now says this).
+   *N6 (`Builder.Add(tokens)`) is held WITH N4, not separately,* because it is the same
+   question from the other side: a serialized `Index` and an incremental `Builder` are
+   both about `bm25`'s input/output surface, and committing to either shape first
+   constrains the other. Take them together as an API review or not at all.
+   *The general lesson (§5.6, "two of the five biggest items are missing APIs"):* N1
+   (`StaticModel.EncodeBatch`) shipped inside the campaign and N4 did not, and the split
+   is principled — **a perf campaign can measure an absent API's cost but cannot decide
+   its shape.** The measurement says how much the absence costs; it never says what the
+   presence should look like. N1 was additive with a contract obvious from the serial
+   loop it replaced; N4 is a format. Trigger: an adopter who needs warm-restart or
+   incremental indexing badly enough to own the format's compatibility surface.
 
 ---
 

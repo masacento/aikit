@@ -203,4 +203,4 @@ SIMD vs `anncuda` (and `annmetal`) `QueryBatch`, as an (N × batch) crossover on
 real Model2Vec embeddings**, measured against the exact-CPU top-k for recall +
 parity, with the four cost components broken out. That single sweep validates the
 whole methodology and produces the first real dispatch threshold. The kickoff
-prompt is [`prompts/bench-ann-first-slice.md`](prompts/bench-ann-first-slice.md).
+prompt is [`internal/archive/perf-campaign-2026-07/bench-ann-first-slice.md`](internal/archive/perf-campaign-2026-07/bench-ann-first-slice.md).

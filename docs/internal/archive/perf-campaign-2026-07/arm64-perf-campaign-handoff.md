@@ -2,14 +2,14 @@
 
 > **For:** the aikit session on the Apple M1 Pro.
 > **Why now:** the Linux/amd64 box has closed ~30 items of
-> [`perf-campaign-2026-07-28.md`](../internal/perf-campaign-2026-07-28.md). What
+> [`perf-campaign-2026-07-28.md`](perf-campaign-2026-07-28.md). What
 > is left is almost entirely **arm64-gated** — several items live in code that
 > does not execute on amd64 at all — plus one change that was tuned on amd64 and
 > needs checking on yours.
 
 ## Read first, in this order
 
-1. [`docs/internal/measuring-performance.md`](../internal/measuring-performance.md)
+1. [`docs/internal/measuring-performance.md`](../../measuring-performance.md)
    — the campaign's measurement discipline, 24 entries, every one a mistake that
    actually happened. **§1.11 is the one that matters most to you: per-kernel
    tables do not transfer between machines.** Every number quoted below was

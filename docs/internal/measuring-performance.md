@@ -1,12 +1,12 @@
 # Measuring performance in aikit
 
 > **Status:** living document. Started 2026-07-29 during the
-> [2026-07-28 perf campaign](perf-campaign-2026-07-28.md); extended as that
+> [2026-07-28 perf campaign](archive/perf-campaign-2026-07/perf-campaign-2026-07-28.md); extended as that
 > campaign proceeds. Every failure mode below is one that actually happened
 > here, with the numbers it produced — none of it is hypothetical.
 
 The governing rule already existed, in
-[`task-perf-linalg.md`](task-perf-linalg.md): **a microbenchmark proposes, an
+[`task-perf-linalg.md`](archive/perf-campaign-2026-07/task-perf-linalg.md): **a microbenchmark proposes, an
 end-to-end sweep disposes**, and a negative result is written down as
 prominently as a positive one. That doc has the case where a persistent worker
 pool was built correctly, measured honestly, and pulled because the arbiter said
@@ -891,6 +891,60 @@ baseline in the same run rather than hard-coding it. If a second arm is genuinel
 impossible, state the build mode the constant was measured in and expect to
 revisit it. A gate that only holds under `go test` with no flags is a gate that
 will fail someone else's CI for the wrong reason.
+
+---
+
+### 1.35 An OS-mediated win does not transfer between operating systems
+
+Two of the Phase D footprint items measured OUT on `apple-m1pro` for the same
+reason, and it is not a hardware reason. §4.5's `LoadWeightsQ8` peak-RSS drop
+(**727.6 → 242.3 MiB** on `nvidia-rtx2070s`) works by `MADV_DONTNEED` on each f32
+tensor after it is quantized. **macOS does not reclaim clean file-backed pages on
+`madvise`** — `MADV_DONTNEED` is a documented no-op for RSS there — so an M1 Pro
+measured **726.2 MiB**, the *unreleased* figure: no win at all. Item 9's
+`Touch(b+1)` paging prefetch is the same story from the other side: it overlaps a
+page fault that only occurs where `DONTNEED` first evicted the page, so on darwin
+there is no fault to hide and the extra `WILLNEED` syscall measured **+12%**.
+Every `madvise`-reclaim lever in the tree is inert on macOS.
+
+The rule that separates the cases, and it is sharper than "measure per machine":
+
+> Quantities the **Go runtime** computes — heap `HeapInuse`, `B/op`, `allocs/op`,
+> wall-clock CPU time — transfer *in kind* across OSes (the ratio holds even if the
+> absolute moves; see §1.34). Quantities the **OS virtual-memory system** computes
+> — RSS, page-fault counts, page-cache residency, anything behind `madvise` — do
+> **not**, and must be measured **per operating system**, never merely per
+> architecture. A number like "3.00× less memory" is an *RSS* number, i.e. an OS
+> observable, so it carries an OS label or it is wrong.
+
+This is why the two-box discipline (§below, and the two Amdahl docs) is run across
+*both an architecture and an OS boundary* rather than two amd64 boxes: the arch
+boundary catches compute-bound-vs-load-bound errors (items 37/25), the OS boundary
+catches the `madvise` mirages (§4.5, item 9). Neither box alone sees both.
+
+### 1.36 Two boxes, because one box cannot see its own blind spots
+
+The campaign was measured on `nvidia-rtx2070s` (amd64, Zen 2, Linux) and
+`apple-m1pro` (arm64, 6P+2E, macOS) precisely so that each could arbiter the
+other. Three times the second box overturned a conclusion the first had already
+written down:
+
+- **The tokenize/pool split flipped** — 62.9 / 37.1 on `nvidia-rtx2070s`,
+  **50.6 / 49.4** on `apple-m1pro` (the f64 pool is much heavier on arm64). That
+  re-ranked the post-A1 work: the item the amd64 profile said was #2 was #1 here.
+- **Items 37 and 25** — the amd64 analysis said an outer-product / load-reduction
+  kernel should win ~1.45×; on arm64 `dotNEON2x8` is at ~95% of FMLA peak, i.e.
+  **compute-bound**, so no load-reduction idea can help. Same code, opposite verdict,
+  because the bottleneck the kernel hits is set by the microarchitecture.
+- **Phase D's footprint reversal** — §4.5's 3.00× is a Linux-only RSS artifact
+  (§1.35); on the representative laptop it is 726.2 MiB unchanged.
+
+The through-line, written on the macOS Phase D RESULT and worth keeping:
+**L1-resident kernel fixes transfer and win; `madvise`-reclaim footprint levers and
+parallelism-adding restructures do not.** The first two catch what a single box
+gets wrong about *what to work on*; the third catches what it gets wrong about
+*whether the work is even visible to the user it is for*. An arbiter box is not a
+second opinion, it is a different set of blind spots.
 
 ---
 

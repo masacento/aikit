@@ -1,7 +1,7 @@
 # Amdahl table — real hardware, real checkpoint (Linux/amd64)
 
-> **Step 0c of [`task-perf-handoff-linux.md`](task-perf-handoff-linux.md).** The
-> prior stage table ([`task-perf-lens-scans.md`](task-perf-lens-scans.md) §5) was
+> **Step 0c of [`task-perf-handoff-linux.md`](archive/perf-campaign-2026-07/task-perf-handoff-linux.md).** The
+> prior stage table ([`task-perf-lens-scans.md`](archive/perf-campaign-2026-07/task-perf-lens-scans.md) §5) was
 > measured on a **2-core Xeon with a synthetic 7,857-entry vocabulary**. This is
 > the first one on the target hardware with the real Model2Vec checkpoint.
 >
@@ -305,7 +305,7 @@ slower beyond noise. The commit says they measured at zero.
 
 ## 6 · `bm25.Build` single-map — the item A1 promoted, 1.27×
 
-Not a Phase A item at all: [`task-perf-lens-scans.md`](task-perf-lens-scans.md)
+Not a Phase A item at all: [`task-perf-lens-scans.md`](archive/perf-campaign-2026-07/task-perf-lens-scans.md)
 §3.7, taken next because A1 made `bm25.Build` the largest remaining stage of an
 index run (27.6%).
 
@@ -341,7 +341,7 @@ Allocation note: the W1 stage's bytes rose 2.8% (the `entries` slice), against a
 
 ## 7 · The chunker — 1.76×, the other item A1 promoted
 
-[`task-perf-lens-scans.md`](task-perf-lens-scans.md) §3.1 + §3.2, taken because
+[`task-perf-lens-scans.md`](archive/perf-campaign-2026-07/task-perf-lens-scans.md) §3.1 + §3.2, taken because
 A1 left `chunk.ChunkFile` at 18.7% of a batched index run.
 
 | | before | after | |

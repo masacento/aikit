@@ -1,0 +1,397 @@
+# Perf dead ends — the things that were tried and did NOT ship
+
+The single most reusable artifact of the 2026-07 perf campaign. Every entry here is
+a change that was **built and measured** (or reasoned out against a hard ceiling) and
+did not earn its place. A dead end is only useful if the **mechanism** and the
+**number** are here — a bare "tried X, didn't help" gets re-tried, so those are
+recorded in full. Grouped by root cause: several share one, and the root cause is the
+transferable lesson.
+
+**Machine labels are load-bearing** (see measuring-performance §1.35–36). Two boxes:
+- **`nvidia-rtx2070s`** — Ryzen 7 3700X, Zen 2, amd64, AVX2 (no VNNI), Linux. The
+  Phase A/B / lens-scan box.
+- **`apple-m1pro`** — M1 Pro, arm64, 6 P + 2 E cores, no SMT, macOS. The arbiter of
+  record and the representative laptop.
+
+A number without a box is a bug; where a source did not name the box it is flagged as
+inferred (from the kernel named — `dotFMA8`=amd64, `dotNEON2x8`=arm64 — or the date
+cluster; the 2026-07-30/31 work is the `apple-m1pro` arbiter phase).
+
+> **Read this first — a negative needs its numbers as fully as a positive.** Two
+> entries below (HNSW heap pooling, §8.3; item 24 packed-stride pad, §6.1) were
+> recorded as dead ends and then **measured the other way** on a different box or with
+> a better method. Both were originally filed without a rigorous in-process A/B. That
+> is the meta-lesson of this whole file: *a dead end recorded without its measurement
+> is a landmine, not a signpost* — it either gets re-chased or, worse, blocks a real
+> win. When you add to this file, write the mechanism and the number, name the box,
+> and prefer an in-process A/B to a remembered impression.
+
+---
+
+## Group 1 — darwin `MADV_DONTNEED` is a no-op for RSS: every madvise-reclaim lever is inert on macOS
+
+The single sharpest OS-transfer finding. macOS does not reclaim clean file-backed
+pages on `madvise`, so anything whose win is "drop resident pages" or "hide a fault
+that only exists because a page was dropped" does nothing on `apple-m1pro`. See
+measuring-performance §1.35.
+
+### 1.1 · Item 9 `Touch(b+1)` paging prefetch — **+12%**, `apple-m1pro`, 2026-07-30 (`f6e6a33`)
+- **Tried:** a state-free `SpanCache.Prefetch` issuing a one-block-ahead
+  `MADV_WILLNEED` in `scorePaged`, hinting block b+1 while block b is being scored.
+- **Mechanism:** overlap b+1's page fault with b's int8 scoring compute, hiding the
+  fault latency.
+- **Number / box:** **+12% SLOWER**, base 1.95 ms/query → prefetch 2.18 ms, budget
+  64/1875 blocks, on `apple-m1pro`.
+- **Why:** on darwin `MADV_DONTNEED` is a no-op for RSS, so "evicted" blocks stay
+  resident and every prefetch `WILLNEED` is a syscall on an already-resident page —
+  pure overhead, no fault to hide. The win is Linux-only and **unmeasurable on the
+  only box available**; even granting Linux, one block (~24K int8 MACs, ~µs) is too
+  little compute to cover a ~10 µs fault without a multi-block-ahead window.
+
+### 1.2 · §4.5 peak-RSS release, re-measured — **726.2 MiB, no change**, `apple-m1pro`, Phase D (`cc1133b`)
+- **Tried:** the arbiter pass on the `nvidia-rtx2070s`-shipped `ReleaseTensors` (one
+  `MADV_DONTNEED` per f32 tensor after quantizing it; `LoadWeightsQ8` peak RSS
+  727.6 → 242.3 MiB, 3.00× on amd64).
+- **Mechanism:** drop each f32 checkpoint tensor's pages as soon as it is quantized,
+  cutting peak resident set.
+- **Number / box:** **726.2 MiB on `apple-m1pro`** — lands on the amd64 *unreleased*
+  727.6 MiB, not the released 242.3. No win at all.
+- **Why:** same as 1.1 — `ReleaseTensors`→`mmap.Advise(DONTNEED)` is a documented
+  no-op on darwin, so the 547 MB f32 checkpoint stays resident until `Close`. The
+  peak-RSS number the footprint story quotes is a **Linux-only artifact**. Correctness
+  is identical everywhere (released pages re-fault identical bytes); only the footprint
+  drop is OS-specific. *This is not a revert (the Linux code shipped) — it is an
+  arbiter finding that the headline does not transfer.*
+
+### 1.3 · `mmap` eager fault-in (`Advise(WILLNEED)` on map) — **not attempted / unmeasurable**, `apple-m1pro`
+- **Tried:** nothing built — advise `WILLNEED` on the whole mapping so a
+  larger-than-RAM index faults in eagerly.
+- **Mechanism:** the same overlap-the-fault idea, index-wide.
+- **Number / box:** none. Declared unmeasurable: exhibiting the win needs a genuinely
+  larger-than-RAM index (measuring-performance §1.23), which `apple-m1pro` cannot show
+  for the same DONTNEED-no-op reason. Stated "could not measure" rather than shipped
+  blind.
+
+---
+
+## Group 2 — `dotNEON2x8` is ~95% of FMLA peak on `apple-m1pro`: the arm64 f32 kernel is compute-bound, so every load-reduction lever is dead
+
+On the M1 P-core the f32 micro-kernel runs at its arithmetic ceiling (~51 GMAC/s,
+~95% of single-core FMLA peak). On `nvidia-rtx2070s` the same-shaped kernel
+(`dotFMA8`) sits at ~40% of peak, i.e. load/latency-bound — which is why the amd64
+analysis kept predicting load-reduction wins that do not exist on arm64.
+
+### 2.1 · Item 37 — outer-product f32 microkernel — **1.10× raw / ~4× slower full path**, `apple-m1pro` (`5aeab4e`)
+- **Tried:** transpose-pack both operands into K×8 panels + an 8×8 by-element-`FMLA`
+  tile (raw-`WORD`-encoded, bit-gated vs scalar oracle, mutation-checked).
+- **Mechanism:** the outer product does 4.0 FMLA per load vs `dotNEON2x8`'s 1.6, so on
+  a load-bound kernel it should be ~2× (the amd64-shaped ~1.45× prediction).
+- **Number / box:** **raw kernel only 1.10×** (46.1 vs 41.7 GMAC/s) on `apple-m1pro`;
+  the mandatory transpose-pack of both a and b made the **full serial path ~4× slower**.
+- **Why:** `dotNEON2x8` already runs at ~95% of FMLA peak here — compute-bound, so
+  cutting loads 10→4 buys almost nothing, and it is `≠` (a different f32 order) so it
+  would perturb every encoder golden for a loss.
+
+### 2.2 · Item 25 — arm64 `Dot2x8` 4×4 re-tile — **likely dead (not separately built)**, `apple-m1pro`
+- **Tried:** re-tile to a 4×4 register block (8 loads per 16 FMLAs vs today's 10).
+  Measured-out *by inheritance* from 37, not separately built.
+- **Mechanism:** fewer loads per FMLA → predicted 1.1–1.25× arm64 f32 GEMM.
+- **Number / box:** same 95%-FMLA-peak cause as 2.1 — cutting loads 10→8 cannot help a
+  compute-bound kernel. Same finding as 37.
+
+### 2.3 · Pre-packing weights to kill `packedFill`'s per-forward b-copy — **~0–3%, noise**, `apple-m1pro` (`7197c66`)
+- **Tried:** `PackWeightBT` + `MatmulBTPacked` — pack the immutable weights once at
+  load instead of `packedFill` rebuilding the conflict-free b-layout every forward
+  (bit-identical, mutation-checked).
+- **Mechanism:** `packedFill` profiles at **13%** of a GTE forward (`runtime.memmove`,
+  98% from `packedFill`); the weights are immutable so the copy should be removable.
+- **Number / box:** **~0–3%, within noise** (fc2/down, M=91–690) on `apple-m1pro`.
+- **Why:** the 13% is pprof *self-time* the copy spends **overlapping** the
+  compute-bound `Dot2x8` of adjacent tiles on an out-of-order core — not wall-clock you
+  can remove. With `dotNEON2x8` at ~95% FMLA peak, the f32 encoder is at its arm64
+  floor here.
+
+### 2.4 · Lens §4.2 gate column-blocking in `swigluMLP` — **+3.5–6.9%**, `apple-m1pro`, 2026-07-31 (`6a8a368`)
+- **Tried:** column-block the gate into `val[:, j0:j1]`, dropping the full `[L,I]` gate
+  buffer to one jb-wide tile (bit-identical, `TestSwigluMLP_colBlockBitIdentical`,
+  mutation-checked).
+- **Mechanism:** on `nvidia-rtx2070s` this was **latency-neutral** (2126→2123 ms) while
+  cutting gate scratch 44.0 → 3.67 MB/worker — a "free" footprint win expected to
+  transfer.
+- **Number / box:** **+3.5–6.9%** on isolated `swigluMLP` L=3584 (+5.6% jb=256 / +3.5%
+  jb=512 best / +6.9% jb=768 / +5.4% jb=1024, min-of-8) on `apple-m1pro`; full batch
+  forward +0–6%, too noisy to resolve.
+- **Why:** the amd64 "free" reading is spent by the **6P+2E fork/join** — the full gate
+  is one parallel matmul, the blocked gate is I/jb of them, each barrier paying the
+  E-core straggler tax. Same latency-for-footprint tradeoff §4.2 rejected the row-tile
+  variant for, so by the lens's own bar it does not ship here. **`nvidia-rtx2070s` may
+  still ship it.** Its subsumed sibling — GTE's `upGate` [L,2I], campaign #8 — was not
+  attempted once the base transform measured out (same fork/join structure).
+
+---
+
+## Group 3 — the pool / gather is memory- and latency-bound, not compute-bound: no addressable compute lever
+
+### 3.1 · StaticModel word→vector presum (memoization §5) — **wash serial / +30.9% batch**, `apple-m1pro`, 2026-07-31 (`57a93e4`)
+- **Tried:** a sharded, arena-backed `word → (f64 presum over subwords, wsum)` cache +
+  `eachWord` carve-out mirror + opt-in `EnablePresumCache`, to skip both `wordPiece`
+  and the per-subword gather.
+- **Mechanism:** 98% of words repeat and `encodeIDs` (the f64 pooling gather) is 49% of
+  `Encode` on `apple-m1pro`; caching the pooled sum should collapse the repeated-word
+  gather (predicted ~29% pool collapse ≈ 14% of Encode).
+- **Number / box:** **serial +0.4% (wash); batch +30.9% SLOWER** under EncodeBatch (8
+  workers), on `apple-m1pro`. Bit-exact (0/386 docs).
+- **Why:** serial — the per-word cache machinery (FNV hash + sharded `RLock` + map
+  probe + arena view) costs as much as the ~0.4 subword-gathers it collapses; the f64
+  gather is too cheap to beat with a keyed lookup. Batch — the shared cache's RWMutex
+  reader-count atomics ping-pong across cores on the hot words.
+
+### 3.2 · Vectorised f64 gather (the fallback to 3.1) — **memory-bound, no win**, `apple-m1pro`
+- **Tried:** SIMD the pooling MAC loop (`sum[j] += f64(row[j])·ww`).
+- **Mechanism:** if the pool were compute-throughput bound, a wider MAC would help.
+- **Number / box:** **0.7 ns/MAC warm** (4-wide unroll buys only +7%, f32-accumulate
+  +5%); **1.42 ns/MAC on the real corpus** (2× warm — cold gathers of the 63 MB table),
+  on `apple-m1pro`. NEON f64x2 is only 2-wide → single digits at best.
+- **Why:** the warm rate already isn't compute-throughput bound, and the real-corpus
+  gap is cold row gathers — memory-bound, which no MAC kernel fixes. The pool is at its
+  floor on this box.
+
+---
+
+## Group 4 — the scalar arithmetic is hidden behind the SIMD dot: rank-invariance / selection hoists measure at zero
+
+### 4.1 · Both rank-invariance hoists (lens 2) — **0% at three dimensions each**, `nvidia-rtx2070s`
+- **Tried:** hoist the loop-invariant scalar out of the top-K selection in two places —
+  `ann/hnsw.go:236` `sim()`'s `qv.scale`, and `linalg/quant.go:225` via
+  `ann/flat_i8.go:125` the W8A8 query scale.
+- **Mechanism:** the scalar is rank-invariant (monotone), consumed only by a top-K
+  comparison, so it can be hoisted past selection.
+- **Number / box:** **no win at any dimension** on `nvidia-rtx2070s`. hnsw.sim:
+  212533/177480/191400 vs 202560/212670/219227 ns. w8a8: dim 64 = 333,840 vs 341,158;
+  dim 384 = 1,095,497 vs 1,110,221; dim 768 = 2,093,873 vs 2,148,820 ns. (An earlier
+  count=3 run showed 3.5% — noise; use min-of-N.)
+- **Why:** the scan is bound by the int8/SIMD dot, not the scalar around it — one
+  multiply per `sim()` is entirely hidden behind a 384-element SIMD dot. Worse, the
+  w8a8 hoist is **not** bit-identical: a search over 60 M near-tied tuples found **1,824
+  order inversions (3×10⁻⁵)**. Recommendation was: do neither.
+
+### 4.2 · `topk.Push` bounds check — **exactly zero**, `nvidia-rtx2070s`
+- **Tried:** eliminate the bounds check in the reject path.
+- **Mechanism:** the check runs once per rejected candidate; removing it saves the
+  reject-path overhead.
+- **Number / box:** **exactly zero** on `nvidia-rtx2070s` — it runs once per rejected
+  candidate, i.e. noise.
+
+### 4.3 · Items 10 / 29 bm25 scoring wins — **~0% scoring**, `nvidia-rtx2070s`
+- **Tried:** item 10 (precompute per-posting BM25 impact / `1/avgdl` hoist) and item 29
+  (16 B → 8 B posting) to speed scoring.
+- **Mechanism:** cheaper per-posting scalar arithmetic → predicted 1.5–2× scoring.
+- **Number / box:** **~0% scoring** for both on `nvidia-rtx2070s`. (29 still delivered
+  −50% index memory, 381.7 → 190.9 MB; 10 delivered nothing on time.)
+- **Why — this is measuring-performance §1.18 in the flesh:** item 11 (the touched-set
+  accumulator, O(postings touched) instead of O(corpus)) had **already taken the scan
+  off the critical path**, so items optimizing the scan optimized something that had
+  stopped being the bottleneck. An earlier item spent a later one's win.
+
+### 4.4 · Softmax-scale fusion (lens 3) — **16.0 vs 16.0 ns/elem, worth nothing today**, `nvidia-rtx2070s` (inferred)
+- **Tried:** fuse the `scores[i] *= scale` pass into `softmaxRow`.
+- **Mechanism:** eliminate a separate O(L²) scaling pass; provably bit-identical.
+- **Number / box:** **16.0 vs 16.0 ns/elem at L=80** — `math.Exp` at ~16 ns/elem swamps
+  the ~0.3 ns/elem pass. **Revisit after campaign #13 lands SIMD `expF32`** — then it
+  becomes ~20% of the softmax instead of 2%. (Conditionally-open, not permanently dead.)
+
+### 4.5 · `scanFlat`'s per-vector `emit` closure (lens 4) — **1.03×**, `nvidia-rtx2070s` (inferred)
+- **Tried:** de-closure the per-vector emit callback in `scanFlat`.
+- **Number / box:** **1024 → 991 ns/vec, 1.03×** — leave it.
+
+---
+
+## Group 5 — the algorithm needs a shape the package never sees: dynamic-pruning retrieval
+
+### 5.1 · Sparse WAND (item 39, `sparse` half) — **4.93× on 3 terms / 2.4× SLOWER at 30**, `nvidia-rtx2070s` (§7.37)
+- **Tried:** port bm25's WAND dynamic pruning to `sparse` (SPLADE) Query.
+- **Mechanism:** keep posting cursors ordered by doc, accumulate per-term upper bounds,
+  skip any doc whose bound cannot beat the k-th best.
+- **Number / box:** **4.93× on a 3-term mixed query**, but a SPLADE expansion emits
+  20–40 terms and at 30 it ran **2.4× SLOWER** than the exhaustive scan, on
+  `nvidia-rtx2070s`.
+- **Why:** behind a length guard the package's only realistic shape (20–40 terms) takes
+  the exhaustive path unchanged — the code earns nothing and still must be maintained.
+  This is item 37's pattern on the retrieval side: the mechanism was real, the shape it
+  needed was not the shape the package sees.
+
+### 5.2 · MaxScore long-query pruning (item 39) — **2.5–5.7× SLOWER**, box unnamed (2026-07-31, `0269de1`)
+- **Tried:** MaxScore (partition terms into essential/non-essential, never advance
+  non-essential cursors) for the long-query (>8-term) case WAND cannot serve.
+- **Mechanism:** past `maxWandTerms = 8`, MaxScore should beat the exhaustive scan where
+  WAND's per-iteration linear cost defeats it.
+- **Number / box:** **2.5–5.7× SLOWER** (exact vs exhaustive over 1000 queries,
+  mutation-checked). **⚠ measuring box not named in any source** — inferred
+  `nvidia-rtx2070s` from bm25 lineage, but the commit is in the 2026-07-31 arbiter
+  cluster; confirm before quoting a machine.
+- **Why:** the exhaustive TAAT accumulator (postings once into `scores[]`) beats DAAT
+  pruning when selectivity is uniform; MaxScore needs skewed impacts (SPLADE weights),
+  which nothing here measures.
+- *(Sub-finding, recorded:* WAND's first implementation was SLOWER while doing 21× less
+  work — 680 documents evaluated against 14,228 scored, still −19% — until caching the
+  current document on the cursor and writing out the bisection turned −19% into the
+  shipped +3.88×.)*
+
+---
+
+## Group 6 — dead code / unreachable on the measuring box (a flat sweep is itself a signal)
+
+### 6.1 · Item 24 packed-stride pad — **unreachable on `nvidia-rtx2070s`** (`81a8bd6`) — *shipped later on `apple-m1pro`*
+- **Tried:** a padded-stride `packedFill` (pad ∈ {0,4,16}) to break the 4096-byte
+  power-of-two conflict stride.
+- **Mechanism:** the 8 packed b-rows sit exactly 4096 B apart (a power-of-two conflict
+  stride); a pad moves them to distinct L1 sets.
+- **Number / box:** **the sweep measured nothing** on `nvidia-rtx2070s` — every result
+  inside noise *because none of it executed*: `packedFill` is gated on `has2x8Kernel`,
+  false off arm64.
+- **DEAD-END-THAT-WASN'T:** the same change **shipped positively on `apple-m1pro`**
+  (`67da4a2`): −9.8%/−10.7%/−8.8% on large-encoder fc2. File the amd64 result as
+  "unreachable here," not "does not work." The lesson (measuring-performance §1.1): a
+  uniformly-flat sweep is a signal the code did not run, not that it did nothing.
+
+### 6.2 · Item 31 (QKV transpose) & item 23 (packedFill m-blocking) — re-profiled out, not implemented, `nvidia-rtx2070s` (inferred)
+- **Item 31:** QKV split + per-head V transpose, "3.3× on the transpose." Measured, the
+  three copies total **80 ms of 126.9 s of samples, 0.06%** — invisible, not worth
+  doing.
+- **Item 23:** `packedFill` lost `blockedFill`'s m-blocking (a-panel re-read per
+  8-column group). **DEFERRED WITH MEASUREMENT, not dead:** serial `packedFill` runs at
+  75–81% of the ~42 GMAC/s kernel peak, so the a-re-read is one bounded contributor to a
+  ~20% gap it shares with the compute-overlapping b-copy and the reduce. The m-blocking
+  fix trades a-reads for redundant b-re-packing — a wash-risk core-GEMM restructure for
+  a sub-gap win. *This is an open item of type (b), deferred-with-measurement, not a dead
+  end — the row-parallel dispatch in item 22(b) sidesteps it for the Q8 path.*
+
+### 6.3 · Item 26 — `math.Round` not an amd64 intrinsic (premise true, conclusion false) — **wash**, `nvidia-rtx2070s` (`8552e73`)
+- **Tried:** replace `math.Round` with `math.Trunc(x + math.Copysign(0.5, x))` (which
+  emits `ROUNDSD`).
+- **Mechanism:** `math.Round` inlines to an integer-op sequence with no `ROUNDSD`; the
+  Trunc form emits the hardware round.
+- **Number / box:** **a wash** — `math.Round` 1.56–3.07 ns/elem vs `Trunc+Copysign`
+  1.92–2.73 (overlapping, Round's best faster), on `nvidia-rtx2070s`. `Copysign` inlines
+  to its own `MOVQ`/`ANDQ`/`ORQ` sequence, which costs about what Round's extra integer
+  ops cost. And the target is far smaller than estimated: `math.Round` is **0.61% flat**
+  of the W8A8 matmul (`dotI8AVX2` is 84.36%) → ~3% ceiling anyway.
+
+---
+
+## Group 7 — the pass split / overlap wins nothing at repo scale: working-set thrash or goroutine tax exceeds the overlap
+
+### 7.1 · Pass fusion in the index loop (lens N8) — **5.2% SLOWER**, `nvidia-rtx2070s`
+- **Tried:** fuse the bm25-tokenize and embed passes in the index loop
+  (`examples/rag/main.go`).
+- **Mechanism:** one pass over the corpus instead of two should cut redundant traversal.
+- **Number / box:** **5.2% slower** (593.2 vs 564.1 ms W1) on `nvidia-rtx2070s`.
+- **Why:** the combined working set (bm25's pooled buffers + the WordPiece vocab map +
+  the embedding table) evicts more than the split passes cost.
+
+### 7.2 · Query-side retrieval overlap (lens N8) — **21% SLOWER**, `nvidia-rtx2070s`
+- **Tried:** overlap `ann.Query` with `bm25.TopK` (independent, 81 µs of 127).
+- **Mechanism:** run the two independent retrieval stages concurrently to hide one.
+- **Number / box:** **21% slower** (147.5 vs 121.7 µs) on `nvidia-rtx2070s` — goroutine
+  spawn/join costs more than the 15 µs it hides. May flip at ~10× corpus; does not flip
+  at repo scale.
+
+---
+
+## Group 8 — standalone negatives
+
+### 8.1 · Spin-park worker pool — **built, measured end-to-end by goinfer, pulled** (`902cbec`)
+- **Tried:** a spin-park worker pool (warm workers to fix dispatch wake latency).
+- **Mechanism:** keep workers spinning/parked so dispatch avoids goroutine wake latency.
+- **Number / box:** no aikit-side number — measured end-to-end by goinfer, which said
+  no; the pool was built correctly, measured honestly, and pulled. (linalg item 11,
+  dynamic work-stealing over column chunks for E-core straggler imbalance, is a
+  *different* thing; the bar for re-entering this area stays high.)
+
+### 8.2 · Regex union — **9× SLOWER**, `nvidia-rtx2070s` (inferred)
+- **Tried:** compile the N chunker regex patterns into one alternation so a single
+  machine acquisition covers all of them.
+- **Mechanism:** one regex acquisition/scan instead of N.
+- **Number / box:** **9× slower** (Go 2,043 ns/line, TS 5,643 ns/line) — the union
+  defeats onepass and literal-prefix optimizations. Prescreen, don't union.
+
+### 8.3 · Pooling HNSW's search heaps *alone* — **originally slightly slower; OVERTURNED to −27.1%** (`8460bbc`)
+- **Tried:** pool `searchLayer`'s two heaps.
+- **Mechanism:** cut per-call allocations (GC pressure).
+- **Original number / box:** **slightly slower** — 519 vs 475 µs at ef=64 (allocs
+  19–22/query → 1), on `nvidia-rtx2070s` (inferred, original §6 reading).
+- **DEAD-END-THAT-WASN'T:** rebuilt with an **in-process A/B** it became **−27.1% time
+  and 19 → 2 allocs/query** (item 15b, Phase D, `nvidia-rtx2070s`). The campaign flags
+  this as the cautionary tale — *a negative result needs its numbers written down as
+  fully as a positive one.* The original "slightly slower" had no rigorous A/B behind
+  it; the measured redo flipped the sign.
+
+### 8.4 · `layerNorm` vectorisation — **no bit-identical variant, ~0.5% of a forward**, `nvidia-rtx2070s` (inferred)
+- **Tried:** a fused-moment f32 `layerNorm`.
+- **Mechanism:** a SIMD reduction runs at 1.42 ns/elem vs the scalar 2.98 ns/elem (2.1×).
+- **Number / box:** **rejected** — a SIMD reduction needs multiple partial accumulators,
+  which changes the f64 summation order (not bit-identical), and layerNorm is "the
+  single most parity-sensitive op outside the GEMMs" at ~0.5% of a forward. Leave it
+  alone. (Also ruled out for caching in the memoization audit.)
+
+### 8.5 · wordPiece arena (memoization §1 item 3) — **populate ~3% WORSE**, 2026-07-30 (`b74ea6e`)
+- **Tried:** replace the per-entry `[]int32` wordPiece cache storage with a flat
+  `[]int32` arena + `map[string][2]int32` (offset,len).
+- **Mechanism:** collapse ~7,427 per-entry allocations to ~one amortized, improving hit
+  locality.
+- **Number / box:** **populate ~3% worse** (10,204 vs 9,865 mallocs on 8,983 distinct
+  words); steady-state hit throughput identical; only ~4.7% retained compactness gained.
+- **Why — the premise was a misread:** the ~9k allocs are `wordPieceCompute`'s own `out`
+  slices, NOT the cache's storage, so the arena can't remove them — it *copies* `out` in
+  and discards it. Left as-is.
+
+### 8.6 · bm25 Tokenize-side string interner — **1.56× SLOWER tokenize** (`2007d45`/`bc4387a`)
+- **Tried:** a sharded interner in `bm25.Tokenize` to unpin/dedup source text.
+- **Mechanism:** intern token strings so duplicates share a backing array and keys stop
+  pinning the source corpus.
+- **Number / box:** **1.56× slower tokenize** (172 → 110 MB/s), `nvidia-rtx2070s`
+  (inferred) — from adding a lock+map probe to the zero-cost fast-path view.
+- **Resolution:** moving it to single-threaded `Build` fixed it (tokenize at baseline,
+  Build +8%). *Where* you memoize is the whole result — the hot path was the trap.
+
+### 8.7 · `examples/rag` redundant `cosine` norm — **~10⁻⁶ of a rerank, "not a finding"**, `nvidia-rtx2070s` (inferred)
+- `examples/rag/main.go:132-143`'s `cosine` recomputes the query norm per candidate —
+  real redundancy (8 × 768 wasted MACs) but ~10⁻⁶ of a rerank forward. Recorded only so
+  it is not "optimized."
+
+### 8.8 · MarshalBinary single-encoder wrapper — **2.6× slower** (inside §7.40's WriteTo win)
+- The obvious "one `bytes.Buffer` encoder" implementation of the WriteTo path cost
+  **2.6× the time** (30.6 → 80.3 ms) because every byte was written twice; the shipped
+  version keeps one encoder with two buffer policies instead. A local dead end inside a
+  shipped win.
+
+---
+
+## Reasoned out, not built — recorded so nobody re-chases them
+
+- **Native Q6_K K-quant matmul** — proven below the 1.3× gate by a byte-ratio ceiling:
+  Q6_K reads 210 B/superblock vs int8's 256 → ≤ 1.22× if bandwidth-bound, ≤ 1.0× if
+  compute-bound. `apple-m1pro` measured the built-and-correct SDOT path at 20–45× slower
+  (98% of it weight unpack). See cpu-acceleration.md "Native K-quant matmul — evaluated,
+  NOT shipped." (`a5d9030`)
+- **PQ / IVF** — not performance items for this codebase: IVF trades recall for what
+  HNSW already does; PQ's win is memory, and int8 already took the 4×.
+- **AVX-512 for f32** — deprioritized; the blocker is Intel client parts shipping it
+  fused-off, and the int8 VNNI subset (`VPDPBUSD`) is the part worth taking, gated for a
+  VNNI-capable machine (none available).
+
+---
+
+## The three kinds of open item (so "open" is actionable)
+
+- **(a) genuinely open** — nothing measured against it yet. (e.g. the VNNI `MatmulBTW4A8`
+  variant, waiting on VNNI hardware.)
+- **(b) deferred WITH measurement** — built or profiled, the number says "not now": item
+  23 (packedFill m-blocking, a wash-risk restructure for a sub-gap win); softmax-scale
+  fusion §4.4 (revisit after SIMD `expF32`).
+- **(c) hardware-gated** — dead on the boxes we have, needs a different one: AVX-512/VNNI
+  (Zen 4+ / Cascade Lake+); native I8MM (item 36, M2+ — `apple-m1pro` predates
+  FEAT_I8MM); item 24's amd64 side (needs the AVX2 packed path, deferred).
+
+Someone reading "open" should be able to tell which of these it is before spending a day
+on it.

@@ -2,7 +2,7 @@
 
 > **For:** the aikit session on the Apple M1 Pro.
 > **From:** the Ryzen 7 3700X (Zen 2, 8C/16T, AVX2, no VNNI), which has finished
-> [`task-perf-handoff-linux.md`](../internal/task-perf-handoff-linux.md) — Step 0
+> [`task-perf-handoff-linux.md`](task-perf-handoff-linux.md) — Step 0
 > and all of Phase A, plus two items from outside it that Phase A promoted.
 >
 > **You are the arbiter of record.** Every figure below is amd64 and exists to
@@ -10,10 +10,10 @@
 
 ## Read first
 
-1. [`docs/internal/perf-amdahl-linux-amd64.md`](../internal/perf-amdahl-linux-amd64.md)
+1. [`docs/internal/perf-amdahl-linux-amd64.md`](../../perf-amdahl-linux-amd64.md)
    — the new Amdahl table and every Phase A result, with what each prediction
    missed and why. **This is the map.**
-2. [`docs/internal/measuring-performance.md`](../internal/measuring-performance.md)
+2. [`docs/internal/measuring-performance.md`](../../measuring-performance.md)
    §1.29–§1.31, added during this phase.
 
 ---

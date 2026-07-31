@@ -1375,7 +1375,7 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     locally, and `scripts/gen_siglip_bench.py` generates the real-sized towers.
     The parity gates had been passing all along. Cost: one deferred item.
     Recorded as a measurement-discipline entry in
-    [`measuring-performance.md`](measuring-performance.md) §1.13 — *verify a
+    [`measuring-performance.md`](../../measuring-performance.md) §1.13 — *verify a
     blocker before reporting it*.
 
     Also fetched `cross-encoder/ms-marco-MiniLM-L-6-v2`, so
@@ -2553,7 +2553,7 @@ at all (§7.21).
 
 ## 9. One methodological note
 
-> **See also: [`measuring-performance.md`](measuring-performance.md)** — the
+> **See also: [`measuring-performance.md`](../../measuring-performance.md)** — the
 > operational companion to this section. Every way a measurement misled us
 > during this campaign is catalogued there with its numbers, along with the
 > predicted-vs-measured scoreboard. Read it before designing a benchmark for
