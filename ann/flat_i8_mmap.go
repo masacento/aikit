@@ -124,6 +124,10 @@ func (f *FlatI8) scorePaged(q []float32, dst []float32) {
 		f.pager.Touch(b)
 		linalg.MatmulBTW8A8Pre(&f.ws, aq, aScales, f.bq[r0*f.dim:r1*f.dim], f.scales[r0:r1], dst[r0:r1], 1, f.dim, r1-r0)
 	}
+	// A one-block-ahead WILLNEED prefetch here (item 9) was built and measured out —
+	// see the perf-campaign note. It hides a real page fault only where MADV_DONTNEED
+	// reclaims (Linux); on darwin, where DONTNEED is a no-op, it was +12% pure syscall
+	// overhead, and even on Linux one block of ~µs int8 compute can't cover a fault.
 }
 
 // PageStats reports the cumulative (hits, misses, evictions) of a paged index's span

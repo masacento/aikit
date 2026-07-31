@@ -2009,11 +2009,27 @@ Four things an earlier draft asserted that the refutation pass knocked down:
     inside the budget, nothing is evicted and every repeat hits regardless of
     order.
 
-    The item's other two suggestions are not done and are worth separating:
-    `MADV_WILLNEED` on map is already what `Touch` issues per miss, and
-    pipelining `Touch(b+1)` is a change to the CALLER (`scorePaged`), not the
-    cache — it needs its own measurement of whether a prefetch one block ahead
-    beats the fault it replaces.
+    The item's other two suggestions are worth separating: `MADV_WILLNEED` on
+    map is already what `Touch` issues per miss, and pipelining `Touch(b+1)` is a
+    change to the CALLER (`scorePaged`), not the cache.
+
+    **The `Touch(b+1)` prefetch was BUILT, MEASURED, and REVERTED (2026-07-30).**
+    A caller-side one-block-ahead WILLNEED (a state-free `SpanCache.Prefetch` that
+    hints b+1 while scoring b, never disturbing the LRU/eviction state `Touch`
+    owns — scores stay byte-identical, the parity gate holds) measured **+12%
+    SLOWER** on the M1 Pro: budget 64/1875 blocks, base 1.95 ms/query → prefetch
+    2.18 ms. The reason is the one this campaign already documented for eviction:
+    on darwin `MADV_DONTNEED` is a no-op for RSS (madvise_darwin.go), so the
+    "evicted" blocks stay resident and every prefetch WILLNEED is a syscall on an
+    already-resident page — pure overhead, no fault to hide. The win it's meant to
+    capture is **Linux-only** (where DONTNEED reclaims and the fault is real), and
+    the only box available is darwin, so it is UNMEASURABLE where it would help.
+    Even granting Linux, the premise is shaky: one block is `blockRows`×dim ≈ 24 K
+    int8 MACs (~µs), too little compute to cover a ~10 µs fault — it would need a
+    multi-block-ahead window, which complicates the scan-resistant eviction it
+    rides on. Not shipped: a measured regression on the box we can test, and a
+    speculative, architecturally-doubtful win on the one we can't. Left as a code
+    comment in `scorePaged` so the next person doesn't re-derive it.
 
 32. **Items 31 and 23 re-classified after re-profiling, not implemented.**
     Following §1.18 — an earlier item can spend a later one's win — the encoder
