@@ -74,9 +74,18 @@ more here than on amd64. **Built and measured 2026-07-31 — dead**: bit-exact
 (0/386 real docs) but a serial wash (the per-word FNV-hash + RWMutex + map probe
 costs as much as the ~0.4 gathers it collapses — the f64 gather is too cheap to
 beat with a keyed lookup) and **+30.9% under EncodeBatch** (shared-cache reader-
-atom contention across cores). See `task-perf-memoization.md` §5. The pool is a
-real target, but it wants a **vectorised f64 gather** (SIMD MAC over the embedding
-rows), not a cache — the gather itself is scalar here, which is *why* it is 49%.
+atom contention across cores). See `task-perf-memoization.md` §5.
+
+And a **vectorised f64 gather does not help either — measured, not assumed.** The
+MAC loop (`sum[j] += f64(row[j])·ww`) runs at **0.7 ns/MAC on warm rows**, where a
+4-wide unroll buys **+7%** and f32-accumulate **+5%** — it is *not* compute-
+throughput bound, so NEON f64x2 (only 2-wide) would win single digits at best. On
+the real corpus it is **1.42 ns/MAC**, 2× the warm rate: that gap is the cold
+embedding-row gathers from the 63 MB table — **memory-bound**, which no MAC kernel
+fixes. The pool is 49% of `Encode` because it is *memory*- and *latency*-bound, not
+because the arithmetic is slow. There is no addressable compute lever in it, and
+cutting its memory traffic is what §5 tried and lost. **Like the f32 kernel, the
+pool is at its floor on this box.**
 
 ### Where the time goes inside the tokenizer (pprof cum, % of W1)
 

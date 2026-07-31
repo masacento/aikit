@@ -396,9 +396,12 @@ The useful half of the audit. Each of these looks like a candidate and isn't:
      reader-count atomics ping-pong across cores on the hot words. Contention on the
      primary (batch-indexing) workload, the opposite of the intent.
    Even a contention-free redesign only reaches the serial wash. Plus ~model-sized
-   memory. **Reverted.** The 49% pool weight is real but not addressable this way;
-   if the pool is ever the target, it wants a *vectorised gather* (SIMD f64 MAC),
-   not a word cache.
+   memory. **Reverted.** And a *vectorised gather* is not the fallback either —
+   measured, the MAC loop is 0.7 ns/MAC warm (a 4-wide unroll buys +7%, so it is
+   not compute-bound) and 1.42 ns/MAC on the real corpus (memory-bound on the cold
+   63 MB embedding-row gathers). The pool is 49% of `Encode` because it is memory-
+   and latency-bound; there is no addressable compute lever in it. It is at its
+   floor on this box.
 
 §3 and §6 are **documentation-only, not doing**: §3 (Q8 dequant is a *trap* —
 caching the dequantized rows defeats int8; the real fix is fusion, tracked in
