@@ -12,6 +12,13 @@ it.
 
 ### Added
 
+- **`ann.FlatI8.WriteTo(w)`** — streams the index to a writer instead of
+  building the whole blob first. **Transient allocation drops 52.0 MB → 4.1 KB**
+  on a 200k×256 index, and peak heap halves (100.0 → 50.4 MiB) because
+  `MarshalBinary`'s blob is as large as the index it serializes. Implements
+  `io.WriterTo`, so `os.File`, `bufio.Writer` and `io.Copy` pick it up
+  automatically. Bytes are identical to `MarshalBinary`, gated byte-for-byte.
+
 - **`embed.LoadMmap(dir)`** — loads a Model2Vec model with `model.safetensors`
   memory-mapped instead of read onto the heap. **Peak heap falls 5.8× and
   allocation 4.6×** on a 64 MB checkpoint (cold start 75.8 → 13.0 MiB peak, 82.4

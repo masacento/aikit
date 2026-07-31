@@ -127,3 +127,65 @@ func FuzzLoadFlatI8(f *testing.F) {
 		}
 	})
 }
+
+// TestFlatI8_WriteToMatchesMarshal is §4.3's gate: WriteTo must emit exactly the
+// bytes MarshalBinary returns, so the two cannot drift into different formats.
+//
+// Byte-for-byte over several shapes including the degenerate ones, plus a
+// round-trip through LoadFlatI8 — a format that differs only in a header field
+// would still load, and only compare-then-query catches that.
+func TestFlatI8_WriteToMatchesMarshal(t *testing.T) {
+	for _, tc := range []struct{ n, d int }{{0, 0}, {1, 4}, {7, 16}, {500, 64}, {1000, 129}} {
+		var vecs [][]float32
+		if tc.n > 0 {
+			vecs = unitVecs(tc.n, tc.d, int64(tc.n*31+tc.d))
+		}
+		f := NewFlatI8(vecs)
+
+		want, err := f.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got bytes.Buffer
+		nw, err := f.WriteTo(&got)
+		if err != nil {
+			t.Fatalf("n=%d d=%d: %v", tc.n, tc.d, err)
+		}
+		if nw != int64(got.Len()) {
+			t.Fatalf("n=%d d=%d: WriteTo reported %d bytes, wrote %d", tc.n, tc.d, nw, got.Len())
+		}
+		if !bytes.Equal(got.Bytes(), want) {
+			t.Fatalf("n=%d d=%d: WriteTo produced %d bytes, MarshalBinary %d; first diff at %d",
+				tc.n, tc.d, got.Len(), len(want), firstDiff(got.Bytes(), want))
+		}
+		// And the streamed bytes must load back into an equivalent index.
+		back, err := LoadFlatI8(got.Bytes())
+		if err != nil {
+			t.Fatalf("n=%d d=%d: load streamed blob: %v", tc.n, tc.d, err)
+		}
+		if back.Len() != f.Len() || back.dim != f.dim {
+			t.Fatalf("n=%d d=%d: round-trip shape %d×%d, want %d×%d",
+				tc.n, tc.d, back.Len(), back.dim, f.Len(), f.dim)
+		}
+		if tc.n > 0 {
+			a, b := f.Query(vecs[0], 5), back.Query(vecs[0], 5)
+			if len(a) != len(b) {
+				t.Fatalf("n=%d d=%d: %d hits vs %d", tc.n, tc.d, len(a), len(b))
+			}
+			for i := range a {
+				if a[i] != b[i] {
+					t.Fatalf("n=%d d=%d hit %d: %+v vs %+v", tc.n, tc.d, i, a[i], b[i])
+				}
+			}
+		}
+	}
+}
+
+func firstDiff(a, b []byte) int {
+	for i := range min(len(a), len(b)) {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return min(len(a), len(b))
+}

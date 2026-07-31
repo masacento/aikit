@@ -2,7 +2,10 @@ package ann
 
 import (
 	"encoding/binary"
+	"errors"
+	"io"
 	"math"
+	"runtime"
 	"unsafe"
 )
 
@@ -64,6 +67,69 @@ func (f *FlatI8) MarshalBinary() ([]byte, error) {
 		b = binary.LittleEndian.AppendUint32(b, math.Float32bits(s))
 	}
 	return b, nil
+}
+
+// WriteTo streams the same bytes MarshalBinary returns, without building them.
+//
+// It implements io.WriterTo, so os.File, bufio.Writer, gzip.Writer and
+// io.Copy all pick it up automatically.
+//
+// WHY IT EXISTS. MarshalBinary allocates the whole blob — 16 bytes plus the code
+// block plus four bytes per vector — and a caller writing an index to disk
+// therefore holds the index AND a second full copy of it at once. On a
+// 1M×768 index that is ~770 MB of transient heap to write 770 MB of file. The
+// blob is not needed as a value by anyone who is only going to write it; it was
+// simply the only shape offered (lens doc §4.3).
+//
+// Streaming changes the transient cost from a full copy to a 4 KB buffer. The
+// code block is written straight from the index's own memory in one Write — the
+// same int8/byte aliasing MarshalBinary and LoadFlatI8Mmap both already rely on —
+// so only the scales pass through the buffer.
+//
+// Byte-for-byte identical to MarshalBinary; TestFlatI8_WriteToMatchesMarshal
+// asserts it, so the two cannot drift into different formats.
+func (f *FlatI8) WriteTo(w io.Writer) (int64, error) {
+	// f.bq may alias an mmap owned by f (LoadFlatI8Mmap); keep f reachable for
+	// the whole write so a finalizer cannot unmap it mid-Write.
+	defer runtime.KeepAlive(f)
+	if f.closed {
+		return 0, errors.New("ann: WriteTo on a closed FlatI8 (mmap released by Close)")
+	}
+	var total int64
+	var hdr [16]byte
+	binary.LittleEndian.PutUint32(hdr[0:], flatI8Magic)
+	binary.LittleEndian.PutUint32(hdr[4:], flatI8Version)
+	binary.LittleEndian.PutUint32(hdr[8:], uint32(int32(f.dim)))
+	binary.LittleEndian.PutUint32(hdr[12:], uint32(int32(f.n)))
+	n, err := w.Write(hdr[:])
+	total += int64(n)
+	if err != nil {
+		return total, err
+	}
+	if len(f.bq) > 0 {
+		n, err = w.Write(unsafe.Slice((*byte)(unsafe.Pointer(&f.bq[0])), len(f.bq)))
+		total += int64(n)
+		if err != nil {
+			return total, err
+		}
+	}
+	// 4 KB of scales at a time: large enough that the syscall count is
+	// negligible next to the code block's single Write, small enough to stay a
+	// stack-sized buffer rather than a second allocation proportional to n.
+	var buf [4096]byte
+	for i := 0; i < len(f.scales); {
+		k := min(len(buf)/4, len(f.scales)-i)
+		for j := range k {
+			binary.LittleEndian.PutUint32(buf[j*4:], math.Float32bits(f.scales[i+j]))
+		}
+		n, err = w.Write(buf[:k*4])
+		total += int64(n)
+		if err != nil {
+			return total, err
+		}
+		i += k
+	}
+	return total, nil
 }
 
 // fcur is a bounds-checked little-endian reader over a FlatI8 header (the
