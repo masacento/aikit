@@ -64,6 +64,27 @@ it.
   document-level parallelism plus longest-pair-first scheduling. Scores are
   bit-identical to `Score`.
 
+- **`ann.HNSW.WriteTo(w)`** — streams the index to a writer instead of building
+  the whole blob first, mirroring `FlatI8.WriteTo`. On a 50k×256 index
+  **transient allocation drops 131.0 MB → 65.5 KB** (1999×) and cold-process peak
+  RSS falls **181.3 → 125.5 MiB** — the saving is one whole copy of the index, so
+  it grows with the index (~3.1 GB at 1M×768). Implements `io.WriterTo`, so
+  `os.File`, `bufio.Writer` and `io.Copy` pick it up automatically. Serialized
+  bytes are unchanged and SHA-256-gated against the previous format.
+
+  It is also faster — **1.68×** f32, **8.02×** int8 — but this is a footprint
+  change; the allocation figure is the one that transfers across machines.
+
+- **`ann.Load` allocates 8 times instead of 153,396** on a 50k-doc HNSW index
+  (2.164 → 0.004 per doc). The graph and vectors are read into flat arenas and
+  sub-sliced rather than allocated per doc and per node. No API change, no format
+  change; at 1M docs this is >2.1 M allocations removed from one `Load`.
+
+- **`ann.HNSW.MarshalBinary` allocates 2.25× less** — 131.0 MB → 58.2 MB for a
+  58.2 MB blob. Its capacity estimate budgeted 8 bytes of graph header per node
+  where a node with L layers needs 4+4L, so `append` doubled mid-write. Output
+  bytes are unchanged.
+
 - **`embed.SafetensorsFile.ReleaseTensors(names...)`** — drops the resident pages
   of tensors a loader has finished with, while the file stays open for the rest.
   Advisory and lossless: the mapping is read-only and file-backed, so a released
@@ -72,9 +93,17 @@ it.
 
 ### Changed
 
-- **`encoder.LoadWeightsQ8` peaks at 3.0× less memory** (lens §4.5): **727.6 →
-  242.3 MiB peak RSS** on a 521.6 MiB F32 checkpoint, to produce the same 199.5
-  MiB model, at **+0.10%** load time (min-of-10 — inside the drift floor).
+- **`encoder.LoadWeightsQ8` peaks at 3.0× less memory on Linux** (lens §4.5):
+  **727.6 → 242.3 MiB peak RSS** on a 521.6 MiB F32 checkpoint, to produce the
+  same 199.5 MiB model, at **+0.10%** load time (min-of-10 — inside the drift
+  floor).
+
+  **Linux-only, confirmed by measurement on both boxes.** The mechanism is
+  `madvise(MADV_DONTNEED)`, which macOS does not honour for a read-only
+  file-backed mapping — an M1 Pro measures **726.2 MiB**, i.e. the unreleased
+  figure. The pages there are clean and file-backed, so the OS still reclaims them
+  under pressure and nothing OOMs; it is the peak-RSS *number* that is a Linux
+  artifact. Do not quote 3.00× as a laptop figure.
 
   Quantizing reads every f32 weight, so the whole mapping used to stay resident
   until `Close()` at the end. Each tensor's pages are now released as soon as it
