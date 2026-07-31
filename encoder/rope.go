@@ -119,11 +119,18 @@ func newRopeTable(seqLen, headDim int, base float64) *ropeTable {
 //
 // This is the same shape PyTorch's NomicBert applies via
 // rotary_emb_interleaved=false.
-func (t *ropeTable) apply(x []float32, heads int) {
+func (t *ropeTable) apply(x []float32, heads int) { t.applyRows(x, heads, t.seqLen) }
+
+// applyRows is apply restricted to the first `rows` positions, for a caller
+// holding fewer rows than the table was built for — the trimmed final layer of a
+// CLS-only forward computes Q for row 0 alone (lens doc §4.1). Position m still
+// indexes the same cos/sin row, so row 0 gets exactly the rotation it gets in a
+// full-length pass.
+func (t *ropeTable) applyRows(x []float32, heads, rows int) {
 	half := t.halfDim
 	hd := t.headDim
 	stride := heads * hd // per-position stride
-	for m := 0; m < t.seqLen; m++ {
+	for m := 0; m < rows; m++ {
 		cosRow := t.cos[m*half : (m+1)*half]
 		sinRow := t.sin[m*half : (m+1)*half]
 		base := m * stride

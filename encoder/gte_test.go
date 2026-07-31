@@ -148,3 +148,31 @@ func TestGTE_encodeEndToEnd(t *testing.T) {
 		t.Errorf("%d/%d cases had tokenizer id mismatches", tokMismatch, len(gld.Cases))
 	}
 }
+
+// TestGTE_clsHiddenStateMatchesFullRow0 is the GTE half of lens §4.1's gate.
+//
+// It has one thing the BERT half does not: the trimmed path replaces the single
+// packed [3D] QKV matmul with three [D] ones, so it asserts not only
+// M-invariance but that splitting an output by columns leaves each element's
+// reduction unchanged. If that failed, K and V would differ and row 0's
+// attention with them — which is exactly what this compares.
+func TestGTE_clsHiddenStateMatchesFullRow0(t *testing.T) {
+	g := loadTestGTE(t)
+	D := g.cfg.Hidden
+	for _, n := range []int{1, 2, 9, 64, 200} {
+		ids := make([]int32, n)
+		for i := range ids {
+			ids[i] = int32((i*7919 + 13) % 1000)
+		}
+		full := g.hiddenStates(ids)
+		trimmed := g.clsHiddenState(ids)
+		if len(trimmed) != D {
+			t.Fatalf("n=%d: trimmed length %d, want %d", n, len(trimmed), D)
+		}
+		for j := range D {
+			if trimmed[j] != full[j] {
+				t.Fatalf("n=%d component %d: trimmed %v, full row 0 %v", n, j, trimmed[j], full[j])
+			}
+		}
+	}
+}

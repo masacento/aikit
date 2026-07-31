@@ -188,13 +188,25 @@ func (g *GTE) Encode(text string) ([]float32, error) {
 // embedding for token ids (already wrapped with <s>…</s>).
 func (g *GTE) Embed(ids []int32) []float32 {
 	D := g.cfg.Hidden
+	if g.pool == poolCLS {
+		// Only row 0 is read, so the last layer need not produce the rest.
+		return l2norm(poolOne(g.clsHiddenState(ids), 1, D, poolCLS))
+	}
 	h := g.hiddenStates(ids)
 	return l2norm(poolOne(h, len(h)/D, D, g.pool))
 }
 
 // hiddenStates runs the GTE transformer forward on token ids and returns the last
 // hidden state [L, hidden], row-major.
-func (g *GTE) hiddenStates(ids []int32) []float32 {
+func (g *GTE) hiddenStates(ids []int32) []float32 { return g.forward(ids, false) }
+
+// clsHiddenState is hiddenStates for a caller that reads only row 0, returning
+// just that row. See BERT.clsHiddenState — same argument, same bit-identity
+// contract, a second forward implementation (RoPE + a gated MLP) rather than a
+// shared one.
+func (g *GTE) clsHiddenState(ids []int32) []float32 { return g.forward(ids, true) }
+
+func (g *GTE) forward(ids []int32, clsOnly bool) []float32 {
 	// In-flight accounting for the intra-op matmul gate — see BERT.hiddenStates
 	// (perf-campaign item 6). GTE.Encode had the same permanently-0 counter.
 	enterForward()
@@ -240,7 +252,24 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 	for li := range g.layers {
 		l := &g.layers[li]
 
-		// Packed qkv = h·Wqkvᵀ + b, then split into Q,K,V [L,D] each.
+		// mOut is how many rows of this layer's OUTPUT are needed — L everywhere
+		// except the final layer of a CLS-only forward. K and V stay at full L:
+		// attention reads every position.
+		mOut := L
+		if clsOnly && li == len(g.layers)-1 {
+			mOut = 1
+		}
+
+		// The packed QKV projection stays at FULL L even in the trimmed layer, and
+		// that is a deliberate retreat from the obvious version. Wqkv is
+		// [3D, D] row-major, so Wq/Wk/Wv are contiguous and splitting it to
+		// compute Q for one row is easy — and measurably worse at short input:
+		// three narrower matmuls in place of one wide one cost more than the
+		// L−1 rows of Q they save, and GTEEncode/L16 regressed 10% while L128
+		// and L512 gained 7%. Keeping it packed leaves ~17% of the last layer's
+		// available saving on the table (the projection is 906 of 5235 MFLOP at
+		// L=512) and removes the regression entirely; the MLP, which is 69% of
+		// the layer, is trimmed either way.
 		s.mm(h, l.Wqkv, qkv, L, D, 3*D)
 		addBias(qkv, l.WqkvB, L, 3*D)
 		Q, K, V := s.Q[:L*D], s.K[:L*D], s.V[:L*D]
@@ -254,48 +283,51 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 		rope.apply(Q, c.Heads)
 		rope.apply(K, c.Heads)
 
-		ctx := s.ctx[:L*D]
-		qH, kH := s.qH[:L*headDim], s.kH[:L*headDim]
+		ctx := s.ctx[:mOut*D]
+		qH, kH := s.qH[:mOut*headDim], s.kH[:L*headDim]
 		vHT := s.vH[:headDim*L]
-		ctxHead := s.ctxHead[:L*headDim]
-		scores := s.scores[:L*L]
+		ctxHead := s.ctxHead[:mOut*headDim]
+		scores := s.scores[:mOut*L]
 		for headIdx := 0; headIdx < c.Heads; headIdx++ {
 			for i := range L {
 				src := i*D + headIdx*headDim
-				copy(qH[i*headDim:(i+1)*headDim], Q[src:src+headDim])
+				if i < mOut {
+					copy(qH[i*headDim:(i+1)*headDim], Q[src:src+headDim])
+				}
 				copy(kH[i*headDim:(i+1)*headDim], K[src:src+headDim])
 				for d := range headDim {
 					vHT[d*L+i] = V[src+d]
 				}
 			}
-			s.mm(qH, kH, scores, L, headDim, L)
+			s.mm(qH, kH, scores, mOut, headDim, L)
 			for i := range scores {
 				scores[i] *= scale
 			}
-			softmaxRows(scores, L, L)
-			s.mm(scores, vHT, ctxHead, L, L, headDim)
-			for i := range L {
+			softmaxRows(scores, mOut, L)
+			s.mm(scores, vHT, ctxHead, mOut, L, headDim)
+			for i := range mOut {
 				copy(ctx[i*D+headIdx*headDim:i*D+headIdx*headDim+headDim], ctxHead[i*headDim:(i+1)*headDim])
 			}
 		}
-		attnOut := s.out[:L*D]
-		s.mm(ctx, l.Wo, attnOut, L, D, D)
-		addBias(attnOut, l.WoB, L, D)
+		attnOut := s.out[:mOut*D]
+		s.mm(ctx, l.Wo, attnOut, mOut, D, D)
+		addBias(attnOut, l.WoB, mOut, D)
+		h = h[:mOut*D]
 		for i := range h {
 			h[i] += attnOut[i] // residual
 		}
-		layerNorm(h, l.AttnLNW, l.AttnLNB, L, D, eps)
+		layerNorm(h, l.AttnLNW, l.AttnLNB, mOut, D, eps)
 
 		// GeGLU MLP: up_gate = h·UpGateᵀ [L,2I]; split up=[:I], gate=[I:2I];
 		// mid = gelu(gate) ⊙ up; ffn = mid·Downᵀ + b; residual; post-norm.
-		s.mm(h, l.UpGate, upGate, L, D, 2*I)
-		mid := s.val[:L*I]
+		s.mm(h, l.UpGate, upGate, mOut, D, 2*I)
+		mid := s.val[:mOut*I]
 		// Split by token row: each writes only its own mid[i], and the
 		// activation is elementwise, so this is numerically inert. It is worth
 		// splitting because geluScalar is math.Erf per element — after the
 		// attention softmax was parallelized this was the largest remaining
 		// serial stage of GTE.Encode, ~27% of the call at L=690.
-		parallelRows(L, L*I, func(start, end int) {
+		parallelRows(mOut, mOut*I, func(start, end int) {
 			for i := start; i < end; i++ {
 				up := upGate[i*2*I : i*2*I+I]
 				gate := upGate[i*2*I+I : i*2*I+2*I]
@@ -305,13 +337,13 @@ func (g *GTE) hiddenStates(ids []int32) []float32 {
 				}
 			}
 		})
-		ffn := s.mid[:L*D]
-		s.mm(mid, l.Down, ffn, L, I, D)
-		addBias(ffn, l.DownB, L, D)
+		ffn := s.mid[:mOut*D]
+		s.mm(mid, l.Down, ffn, mOut, I, D)
+		addBias(ffn, l.DownB, mOut, D)
 		for i := range h {
 			h[i] += ffn[i] // residual
 		}
-		layerNorm(h, l.MLPLNW, l.MLPLNB, L, D, eps)
+		layerNorm(h, l.MLPLNW, l.MLPLNB, mOut, D, eps)
 	}
 	return h
 }
