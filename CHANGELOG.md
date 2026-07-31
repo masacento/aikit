@@ -10,6 +10,22 @@ it.
 
 ## [Unreleased]
 
+## [1.15.0] — 2026-07-31
+
+The performance-campaign release: measured work across `ann`, `bm25`, `embed`,
+`encoder`, `fuse` and `chunk`, plus the native-GPU phases. Additive only —
+`apidiff` reports **zero incompatible changes** in every Hard-tier package against
+1.14.0, and the ~40 new exported symbols are tier-assigned in
+[README's stability tiers](README.md#stability-tiers).
+
+> **Note on 1.13.0 and 1.14.0.** Those two tags were cut without CHANGELOG
+> sections, so their changes — the native-GPU CUDA device layer and Phase-1b
+> GPU-scored ANN, `FlatI8.QueryBatch`, the tiled Metal/CUDA GEMMs and the ANN GPU
+> crossover harness — were never filed and are folded into this section rather
+> than reconstructed after the fact. Several entries below span all three tags, so
+> splitting them retroactively would mean guessing; the compare links for 1.13.0
+> and 1.14.0 are listed at the bottom so the actual ranges remain inspectable.
+
 > **Measurement provenance (2026-07 perf campaign).** Unless an entry says
 > otherwise, its figures were measured on **`nvidia-rtx2070s`** (Ryzen 7 3700X, Zen 2,
 > amd64 — the Phase A/B box); **`apple-m1pro`** (M1 Pro, arm64, 6P+2E, macOS) figures
@@ -207,7 +223,7 @@ it.
   requirement is now documented on `FlatI8.QueryFilter` and `HNSW.QueryFilter`,
   which still apply `keep` serially, so one filter works with every index.
 
-### Added
+### Added — native-GPU (Phases 1b–4)
 
 - **Native-Metal SigLIP resident encoder (`gpu` + `gpu/visionmetal`, native-GPU
   Phase 3, Apple).** The Metal mirror of the CUDA ViT: the 8-kernel encoder set in
@@ -1804,6 +1820,9 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.11.0...HEAD
+[1.15.0]: https://github.com/townsendmerino/aikit/compare/v1.14.0...v1.15.0
+[1.14.0]: https://github.com/townsendmerino/aikit/compare/v1.13.0...v1.14.0
+[1.13.0]: https://github.com/townsendmerino/aikit/compare/v1.12.0...v1.13.0
 [1.12.0]: https://github.com/townsendmerino/aikit/compare/v1.11.0...v1.12.0
 [1.11.0]: https://github.com/townsendmerino/aikit/compare/v1.10.1...v1.11.0
 [1.10.1]: https://github.com/townsendmerino/aikit/compare/v1.10.0...v1.10.1

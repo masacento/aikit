@@ -43,6 +43,31 @@ HARD="topk ann bm25 fuse embed encoder chunk"
 experimental_syms() {
 	case "$1" in
 	encoder) echo "Backend RegisterBackend NewBackend LoadQ8 ModelQ8 WeightsQ8 LayerWeightsQ8 LoadBERT BERT LoadSPLADE SPLADE LoadCrossEncoder CrossEncoder" ;;
+	ann) echo "FlatBinary NewFlatBinary NewFlatBinaryOverquery DefaultOverquery" ;;
+	embed) echo "LoadMmap" ;;
+	*) echo "" ;;
+	esac
+}
+
+# Experimental MEMBERS on Hard-tier types — the case experimental_syms cannot
+# express, because the leading symbol is Hard and only the member is outside the
+# guarantee. Matched as whole apidiff symbol paths (literal, not leading-symbol),
+# so listing one member never exempts the rest of its type.
+#
+# `(*SafetensorsFile).ReleaseTensors` is the motivating case: `SafetensorsFile`
+# and `OpenSafetensors*` are Hard, but ReleaseTensors is advisory and its
+# observable effect is platform-conditional (a no-op off Linux), so README places
+# it in the Experimental tier. Putting `SafetensorsFile` in experimental_syms
+# would have exempted the whole type — the opposite of what is wanted.
+#
+# KNOWN GAP: `ann`'s pre-existing Experimental types (HNSW, FlatI8, Config, Load)
+# are NOT listed in experimental_syms, so an incompatible change to them — e.g. to
+# the new `(*HNSW).WriteTo` — still fails the gate. That is the behaviour every
+# release so far has had; broadening it is a deliberate decision for whoever needs
+# it, not a side effect of this release.
+experimental_members() {
+	case "$1" in
+	embed) echo "(*SafetensorsFile).ReleaseTensors Tensor.SubF32" ;;
 	*) echo "" ;;
 	esac
 }
@@ -102,6 +127,15 @@ else
 				echo "$excluded" | sed 's/^/    /'
 			fi
 		fi
+		for m in $(experimental_members "$p"); do
+			[ -n "$inc" ] || break
+			ex_m="$(echo "$inc" | grep -F -- "- ${m}:" || true)"
+			if [ -n "$ex_m" ]; then
+				inc="$(echo "$inc" | grep -vF -- "- ${m}:" || true)"
+				echo "release-gate: '${p}' — allowed Experimental-tier change to member ${m}:"
+				echo "$ex_m" | sed 's/^/    /'
+			fi
+		done
 		if [ -n "$inc" ]; then
 			err "apidiff: incompatible change in Hard-tier '${p}' vs ${PREV}:"
 			echo "$inc"

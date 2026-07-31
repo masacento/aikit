@@ -174,11 +174,11 @@ the Hard tier is verified backward-compatible across the 0.4.x and 0.5.x minors
 From v1.0 these follow semver: no breaking change before a v2.0. This is the API
 to build on.
 
-- `topk.Selector[T]`, `topk.New`
+- `topk.Selector[T]`, `topk.New`, `topk.Selector.Threshold`
 - `ann.New`, `ann.Flat.Query`, `ann.Hit`
 - `bm25.Build`, `bm25.Index`, `bm25.Result`, `bm25.Tokenize`
 - `fuse.RRF`, `fuse.RRFWeighted`, `fuse.Keys`, `fuse.Result`
-- `embed.Load`, `embed.LoadFromFS`, `embed.StaticModel`
+- `embed.Load`, `embed.LoadFromFS`, `embed.StaticModel`, `embed.StaticModel.EncodeBatch`
 - `embed.LoadTokenizer`, `embed.Tokenizer`
 - `embed.OpenSafetensors*`
 - `encoder.Load`, `encoder.LoadFromFS`, `encoder.Model`, `encoder.Encoder` interface
@@ -248,6 +248,41 @@ settles.
   cross-encoder reranker (scores a query/document pair → relevance logit), parity-
   pinned to ms-marco-MiniLM-L-6-v2. The cross-encoder half of reranking. New surface.
 - The mmap variant of `embed.OpenSafetensors`.
+- `ann.FlatBinary` / `ann.NewFlatBinary` / `ann.NewFlatBinaryOverquery` /
+  `ann.DefaultOverquery` — binary (SimHash) prefilter + exact int8 rerank, 13–26×
+  end-to-end over `FlatI8`. Recall is ≈1.0 on real embeddings but it is an
+  **approximate** first stage, and `DefaultOverquery = 16` is a tuning constant
+  chosen from a measured recall curve — both may move. Same `Hit`/`Query` shape as
+  `Flat`; new surface, so Experimental, like `FlatI8` before it.
+- `ann.HNSW.WriteTo` / `ann.FlatI8.WriteTo` — streaming serialization
+  (`io.WriterTo`), avoiding `MarshalBinary`'s full second copy of the index. They
+  emit byte-identical output to `MarshalBinary` and inherit its tier: the format is
+  versioned but stays Experimental until the graph internals settle.
+- `embed.LoadMmap` — memory-mapped Model2Vec load. Peak heap falls 5.8× and
+  time-to-first-result rises 17%, so it is a deliberate footprint/latency trade
+  rather than a better `Load`. Experimental while that default is still being
+  argued; the returned `*StaticModel` is the Hard-tier type.
+- `embed.SafetensorsFile.ReleaseTensors` — advisory release of a consumed tensor's
+  resident pages. **Explicitly Experimental despite living on a Hard-tier type**,
+  because its observable effect is platform-conditional: it is a no-op on
+  heap-backed files and on every OS but Linux (macOS does not honour
+  `MADV_DONTNEED` for a read-only file-backed mapping). Freezing a method whose
+  behaviour is "nothing" on some platforms is not a promise worth making yet.
+- `embed.Tensor.SubF32` — zero-copy element sub-range of a tensor, for widening or
+  quantizing a fused stack one slice at a time. Aliasing and lifetime rules match
+  `Float32s`; new surface.
+- `encoder.CrossEncoder.ScoreBatch` — the batch form of `CrossEncoder.Score`
+  (7.56× over a `Score` loop at 50 documents, bit-identical scores). Covered by
+  `CrossEncoder`'s existing Experimental status; listed here so the batch API is
+  not read as a separate promise.
+- `linalg`'s v1.15.0 additions — the elementwise math kernels (`ExpF32`, `TanhF32`,
+  `ErfF32`, `GELUF32`, `GELUTanhF32`, `SiLUF32` and their `*Into` forms,
+  `SoftmaxRowInto`), the fused Q8 matmul (`MatmulBTQ8Fused{,Into}`,
+  `HasFusedQ8Kernel`, `FusedQ8Applies`), W8A8 activation quantization
+  (`QuantizeActivations{,Into}`, `MatmulBTW8A8Pre`, `DequantizeRowsInt8Into`) and
+  the Hamming/SimHash primitives (`PackSignBits{,Row}`, `PackedWords`,
+  `HammingRows`). The whole package is Experimental, so these need no separate
+  carve-out — noted because it is a large batch of new surface.
 - The concrete chunker structs (`regex.Chunker`, `markdown.Chunker`,
   `treesitter.Chunker`) and their `New()` — prefer `chunk.Get("regex")`.
 - `chunk/treesitter` — its own opt-in module, **tagged in lockstep with the core
