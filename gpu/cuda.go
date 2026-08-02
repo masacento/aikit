@@ -609,6 +609,16 @@ type MappedHostBuffer struct {
 // NewMappedHostBuffer allocates nBytes of pinned, device-mapped host memory. Bytes() is the
 // host-writable backing (fill it with the tensor's bytes); Buffer() is the device-usable handle to
 // pass to a kernel. Errors (not panics) so a caller can fall back to a device upload.
+//
+// KNOWN CONDITION — validate before relying on mapped reads in a NEW kernel. The zero-copy read is
+// verified bit-identical to a device buffer for a straightforward GEMV at K up to 1 MB rows, byte
+// offsets up to 64 MB, and 4096 concurrent warps. BUT one indexed MoE GEMV (goinfer's
+// gemv_w4a8_moe) was observed to mis-read this memory at large widths — deterministically, cause
+// unknown (not offset/K/occupancy/stream-ordering; a device buffer of the same bytes is correct).
+// The primitive is correct in isolation and the failure was in that kernel's composition, but the
+// safe rule for a new consumer is: check any kernel's mapped reads against a device-buffer control
+// (same bytes, same launch) before trusting them; a passing isolation test does not prove the
+// composed use.
 func (d *Device) NewMappedHostBuffer(nBytes int) (*MappedHostBuffer, error) {
 	if d.cx == nil {
 		return nil, fmt.Errorf("cuda: NewMappedHostBuffer on a released device")
