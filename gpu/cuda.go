@@ -261,6 +261,10 @@ type Buffer struct {
 	cx  *gc.Context // owning context, so upload can order its copy against launches
 	n   int         // element count in the constructor's unit (floats, int8s, u32s, …)
 	off uintptr     // byte offset for binding (a sub-view into a larger buffer; 0 = whole)
+	// raw != 0 ⇒ this Buffer is a device-usable pointer into MAPPED PINNED HOST memory (see
+	// NewMappedHostBuffer): b is nil, the bytes live in host RAM, and a kernel reads them
+	// directly over PCIe (zero-copy). arg() binds raw instead of b.b.DevicePtr().
+	raw cudasys.CUdeviceptr
 }
 
 // At returns a view of the buffer bound at byteOff — for reading a slice of a
@@ -588,6 +592,74 @@ func (h *HostBuffer[T]) Close() error {
 	return h.h.Close()
 }
 
+// MappedHostBuffer is page-locked host memory a kernel reads DIRECTLY over PCIe (zero-copy): no
+// device allocation, no H2D copy. cuMemAllocHost memory is device-accessible, and on a UVA system
+// (asserted at construction — every 64-bit CUDA GPU has it) the host pointer IS the device pointer,
+// so Buffer().arg() binds it straight into a launch. This is how an int4 model whose weights exceed
+// VRAM runs resident: keep the always-resident core in device memory and the large streamed tensors
+// (MoE experts) host-mapped, and the kernel streams them on demand. Slower per byte than a
+// DMA-to-VRAM cache (uncoalesced PCIe reads, no DMA engine), but architecturally trivial — the
+// kernels and dispatch are unchanged; only where the tensor is allocated differs. Close before the
+// owning Device.
+type MappedHostBuffer struct {
+	hb  *HostBuffer[uint8]
+	buf Buffer
+}
+
+// NewMappedHostBuffer allocates nBytes of pinned, device-mapped host memory. Bytes() is the
+// host-writable backing (fill it with the tensor's bytes); Buffer() is the device-usable handle to
+// pass to a kernel. Errors (not panics) so a caller can fall back to a device upload.
+func (d *Device) NewMappedHostBuffer(nBytes int) (*MappedHostBuffer, error) {
+	if d.cx == nil {
+		return nil, fmt.Errorf("cuda: NewMappedHostBuffer on a released device")
+	}
+	if nBytes <= 0 {
+		return nil, fmt.Errorf("cuda: NewMappedHostBuffer nBytes=%d", nBytes)
+	}
+	// UVA is required: without unified addressing the host pointer is not a valid device pointer and
+	// the zero-copy read would fault. Every 64-bit CUDA GPU has it, but assert rather than assume.
+	if d.dev != nil {
+		if uva, err := d.dev.Attribute(gc.DeviceAttributeUnifiedAddressing); err == nil && uva == 0 {
+			return nil, fmt.Errorf("cuda: NewMappedHostBuffer needs UNIFIED_ADDRESSING (zero-copy host reads)")
+		}
+	}
+	hb, err := NewHostBuffer[uint8](d, nBytes)
+	if err != nil {
+		return nil, err
+	}
+	s := hb.Slice()
+	if len(s) == 0 {
+		_ = hb.Close()
+		return nil, fmt.Errorf("cuda: NewMappedHostBuffer got an empty pinned slice")
+	}
+	dptr := cudasys.CUdeviceptr(uintptr(unsafe.Pointer(&s[0])))
+	return &MappedHostBuffer{hb: hb, buf: Buffer{cx: d.cx, n: nBytes, raw: dptr}}, nil
+}
+
+// Bytes is the host-writable backing memory — fill it with the tensor's bytes before launch.
+func (m *MappedHostBuffer) Bytes() []byte {
+	if m == nil {
+		return nil
+	}
+	return m.hb.Slice()
+}
+
+// Buffer is the device-usable, zero-copy handle to pass to a kernel via Arg.
+func (m *MappedHostBuffer) Buffer() Buffer {
+	if m == nil {
+		return Buffer{}
+	}
+	return m.buf
+}
+
+// Close unregisters and frees the pinned host memory. Close before the owning Device.
+func (m *MappedHostBuffer) Close() error {
+	if m == nil {
+		return nil
+	}
+	return m.hb.Close()
+}
+
 // ReadToHost copies the device buffer's contents (from its bind offset) into
 // pinned host memory — the readback goinfer's logits path uses. The transfer size
 // is dst's byte length, so dst sizes the copy.
@@ -737,6 +809,9 @@ func (q Queue) Sync() error { return q.sync() }
 // pass a raw device pointer and forgoes that guard, which is why At is documented
 // as a sub-view of a buffer the caller keeps alive.
 func (b Buffer) arg() gc.KernelArg {
+	if b.raw != 0 { // mapped pinned host memory: the host pointer IS the device pointer under UVA
+		return gc.ArgDevicePtr(b.raw + cudasys.CUdeviceptr(b.off))
+	}
 	if b.off == 0 {
 		return gc.Arg(b.b)
 	}
