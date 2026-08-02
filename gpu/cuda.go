@@ -813,6 +813,64 @@ func (q Queue) Launch(p Pipeline, cfg LaunchConfig, args ...KernelArg) error {
 // explicit boundary the async Launch model is built around.
 func (q Queue) Sync() error { return q.sync() }
 
+// Graph is a replayable capture of a FIXED sequence of stream work: record it once with Capture,
+// then Replay it per iteration as a SINGLE driver call instead of re-issuing every kernel launch —
+// which is the whole win on the cgo-free (purego) path, where each launch is an FFI crossing. The
+// captured work must be STATIC: fixed kernel arguments, with only buffer CONTENTS varying between
+// replays (a per-call arg VALUE is frozen at capture). Nothing may synchronize the stream during
+// capture (no Sync/Upload/Download inside the issue closure). Capture and Replay must run on the same
+// OS thread that owns the queue's context. Close before the owning Device.
+type Graph struct {
+	exec *gc.GraphExec
+	q    Queue
+}
+
+// Capture records the launches that `issue` enqueues on this queue's stream into a replayable Graph.
+// It brackets issue with BeginCapture/EndCapture (thread-local: safety checks scoped to this thread,
+// matching a single pinned-executor model) and instantiates the result.
+func (q Queue) Capture(issue func() error) (*Graph, error) {
+	if q.s == nil {
+		return nil, fmt.Errorf("cuda: Capture on a queue with no stream")
+	}
+	if err := q.s.BeginCapture(gc.CaptureModeThreadLocal); err != nil {
+		return nil, err
+	}
+	issueErr := issue()
+	g, endErr := q.s.EndCapture() // always end capture, even if issue failed, to leave the stream usable
+	if issueErr != nil {
+		if g != nil {
+			_ = g.Close()
+		}
+		return nil, fmt.Errorf("cuda: Capture issue: %w", issueErr)
+	}
+	if endErr != nil {
+		return nil, endErr
+	}
+	defer g.Close()
+	exec, err := g.Instantiate()
+	if err != nil {
+		return nil, err
+	}
+	return &Graph{exec: exec, q: q}, nil
+}
+
+// Replay launches the captured graph on the queue's stream — one driver call for all captured
+// kernels, stream-ordered like any launch. Run it on the queue's owning thread.
+func (g *Graph) Replay() error {
+	if g == nil || g.exec == nil {
+		return fmt.Errorf("cuda: Replay of a nil graph")
+	}
+	return g.exec.Launch(bg, g.q.s)
+}
+
+// Close destroys the instantiated graph. Call before the owning Device.
+func (g *Graph) Close() error {
+	if g == nil || g.exec == nil {
+		return nil
+	}
+	return g.exec.Close()
+}
+
 // UploadAsync enqueues an H2D copy of the pinned src into dst on THIS queue's stream and returns
 // WITHOUT synchronizing. Because the copy is stream-ordered, any kernel later Launch'd on the same
 // queue observes the bytes with no host-side wait — unlike Upload, which does a blocking synchronous
