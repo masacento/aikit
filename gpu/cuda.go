@@ -813,6 +813,30 @@ func (q Queue) Launch(p Pipeline, cfg LaunchConfig, args ...KernelArg) error {
 // explicit boundary the async Launch model is built around.
 func (q Queue) Sync() error { return q.sync() }
 
+// UploadAsync enqueues an H2D copy of the pinned src into dst on THIS queue's stream and returns
+// WITHOUT synchronizing. Because the copy is stream-ordered, any kernel later Launch'd on the same
+// queue observes the bytes with no host-side wait — unlike Upload, which does a blocking synchronous
+// copy through a private path. Use it for a producer whose only consumer is a kernel on this queue
+// (e.g. a per-token index buffer): same-stream order is the ONLY guarantee, so a consumer on a
+// DIFFERENT queue still needs an explicit event, and the host must not overwrite src until this queue
+// drains (Sync, or a later drain such as a per-token logits readback). src MUST be pinned (a
+// HostBuffer); dst is written from its base (any bind offset on dst is ignored).
+func (q Queue) UploadAsync(dst Buffer, src *HostBuffer[uint8]) error {
+	if dst.b == nil {
+		return fmt.Errorf("cuda: UploadAsync into a nil or mapped-host buffer")
+	}
+	if q.s == nil {
+		return fmt.Errorf("cuda: UploadAsync on a queue with no stream")
+	}
+	if src == nil || src.h == nil {
+		return fmt.Errorf("cuda: UploadAsync from a nil pinned buffer")
+	}
+	if src.h.Bytes() > dst.b.Bytes() {
+		return fmt.Errorf("cuda: UploadAsync src %d bytes exceeds dst %d bytes", src.h.Bytes(), dst.b.Bytes())
+	}
+	return dst.b.CopyFromHostAsync(bg, q.s, src.h)
+}
+
 // arg builds the kernel argument for this buffer. At offset 0 it goes through
 // gocudrv's Arg, which holds the buffer's lock for the launch (so a concurrent
 // Close cannot free memory out from under a running kernel); an offset view has to
