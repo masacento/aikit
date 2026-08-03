@@ -201,6 +201,7 @@ var (
 	selNewFunctionName = objc.RegisterName("newFunctionWithName:")
 	selNewPipelineFn   = objc.RegisterName("newComputePipelineStateWithFunction:error:")
 	selNewBufferBytes  = objc.RegisterName("newBufferWithBytes:length:options:")
+	selNewBufferNoCopy = objc.RegisterName("newBufferWithBytesNoCopy:length:options:deallocator:")
 	selNewBufferLen    = objc.RegisterName("newBufferWithLength:options:")
 	selContents        = objc.RegisterName("contents")
 	selCommandBuffer   = objc.RegisterName("commandBuffer")
@@ -351,6 +352,18 @@ func (d *Device) NewBufferInt8(data []int8) Buffer {
 	id := d.id.Send(selNewBufferBytes, unsafe.Pointer(&data[0]), uintptr(len(data)), uintptr(0))
 	runtime.KeepAlive(data)
 	return d.MustBuf(id, len(data), "int8")
+}
+
+// NewBufferNoCopy wraps caller-owned memory in a shared MTLBuffer WITHOUT copying
+// (newBufferWithBytesNoCopy) — the resident-weights lever: alias an mmap'd .giw straight into
+// Metal instead of uploading a second GB-scale copy. ptr MUST be page-aligned and nBytes SHOULD be
+// a page multiple (Metal drops a trailing partial page); an mmap base satisfies both. The
+// deallocator is nil — Metal never frees this memory; the caller owns the mapping and munmaps it
+// (AND must keep it mapped for the buffer's whole life). n counts BYTES, like NewBufferBytes. Bind
+// per-tensor sub-views with Buffer.At(byteOffset) over the single whole-mapping buffer.
+func (d *Device) NewBufferNoCopy(ptr unsafe.Pointer, nBytes int) Buffer {
+	id := d.id.Send(selNewBufferNoCopy, ptr, uintptr(nBytes), uintptr(0), uintptr(0))
+	return d.MustBuf(id, nBytes, "nocopy")
 }
 
 func (d *Device) NewBufferU32(v uint32) Buffer {
