@@ -220,6 +220,12 @@ var (
 	selGPUEndTime      = objc.RegisterName("GPUEndTime")      // GPU busy window for this command buffer
 	selKernelStartTime = objc.RegisterName("kernelStartTime") // incl scheduling; > GPU window
 	selKernelEndTime   = objc.RegisterName("kernelEndTime")
+
+	selNewSharedEvent     = objc.RegisterName("newSharedEvent")            // MTLDevice → id<MTLSharedEvent>
+	selSignaledValue      = objc.RegisterName("signaledValue")             // MTLSharedEvent → uint64 (CPU read)
+	selSetSignaledValue   = objc.RegisterName("setSignaledValue:")         // MTLSharedEvent uint64 (CPU signal)
+	selEncodeSignalEvent  = objc.RegisterName("encodeSignalEvent:value:")  // MTLCommandBuffer: GPU sets value here
+	selEncodeWaitForEvent = objc.RegisterName("encodeWaitForEvent:value:") // MTLCommandBuffer: GPU waits for value
 )
 
 // mtlSize mirrors MTLSize {NSUInteger width,height,depth}. At 24 bytes (>16) it is
@@ -592,6 +598,40 @@ func (e *Encoder) End() {
 	e.ReadTimes()
 	e.pool.Send(selDrain)
 }
+
+// SharedEvent is an MTLSharedEvent — a monotonic counter both the GPU (encodeSignalEvent /
+// encodeWaitForEvent inside a command buffer) and the CPU (Value / SetValue) can read and advance.
+// It exists to let the host observe per-layer progress WITHOUT tearing a token into one command
+// buffer per layer: encode the whole trunk once, have the GPU signal after each layer's router and
+// wait for a CPU ack before the expert dispatches, and the CPU stage the routed experts in between —
+// one submit per token, with per-layer host intervention. This is the Metal-idiomatic alternative to
+// per-layer submit+wait for the Gemma-4 MoE expert-paging path; the Step-6 Step-0 probe prices it.
+type SharedEvent struct{ id objc.ID }
+
+// NewSharedEvent creates a shared event (initial signaledValue 0).
+func (d *Device) NewSharedEvent() SharedEvent { return SharedEvent{id: d.id.Send(selNewSharedEvent)} }
+
+// Value reads the event's current signaledValue (CPU side). SetValue advances it (CPU signal to the
+// GPU's encodeWaitForEvent). Both are the documented CPU⇄GPU shared-event handshake ops on UMA.
+func (ev SharedEvent) Value() uint64     { return objc.Send[uint64](ev.id, selSignaledValue) }
+func (ev SharedEvent) SetValue(v uint64) { ev.id.Send(selSetSignaledValue, uintptr(v)) }
+
+// EventBoundary closes the current compute segment, has the GPU signal `sig` (so a spinning CPU sees
+// this layer finished), then has the GPU wait for `wait` (blocking the next segment until the CPU
+// acks), then opens a fresh compute segment. curPipe is reset so the next Dispatch re-binds its
+// pipeline. Called between encodeLayer calls to build the one-command-buffer handshake trunk.
+func (e *Encoder) EventBoundary(ev SharedEvent, sig, wait uint64) {
+	e.enc.Send(selEndEncoding)
+	e.cb.Send(selEncodeSignalEvent, ev.id, uintptr(sig))
+	e.cb.Send(selEncodeWaitForEvent, ev.id, uintptr(wait))
+	e.enc = e.cb.Send(selComputeEncoder)
+	e.curPipe = 0
+}
+
+// DrainPool drains the Encoder's autorelease pool — the tail of a hand-built command buffer (e.g.
+// the shared-event handshake) that uses FinishEncoding + Commit + WaitDone directly instead of End()
+// because the caller runs CPU handshake work between Commit and WaitDone.
+func (e *Encoder) DrainPool() { e.pool.Send(selDrain) }
 
 // Run1DBatch encodes `reps` dispatches of the same kernel into ONE command buffer and
 // submits once — the shape a real token uses (a whole layer stack encoded into one
