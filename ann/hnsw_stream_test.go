@@ -282,10 +282,21 @@ func TestQuery_scratchIsPooled(t *testing.T) {
 		h.putScratch(sc)
 		h.Query(q, 10)
 	})
+	// Measure the pooled (warm) arm as the MIN over several samples. Under -race the
+	// race allocator adds transient, variable allocations to the pooled path — a single
+	// AllocsPerRun spikes (7–13 seen where the steady floor is ~7) — so the reused-heap
+	// cost is the floor, and comparing that floor to the (stable) cold arm denoises the
+	// ratio. §1.34: the saving compresses from ~9.5× normally to ~2.5× under -race, and
+	// the raw warm count is too noisy there to compare at a 2× bar without this — this
+	// test's own predecessor already learned that -race moves the counts, and the CI
+	// arm64 `go test -race ./...` job is where the residual noise tipped it red.
 	warm := testing.AllocsPerRun(200, func() { h.Query(q, 10) })
-	t.Logf("Query allocations: %.1f cold heaps, %.1f pooled (%.1f×)", cold, warm, cold/warm)
+	for range 4 {
+		warm = min(warm, testing.AllocsPerRun(200, func() { h.Query(q, 10) }))
+	}
+	t.Logf("Query allocations: %.1f cold heaps, %.1f pooled min-of-5 (%.1f×)", cold, warm, cold/warm)
 	if warm*2 > cold {
-		t.Errorf("pooled query allocates %.1f per call against %.1f with cold heaps — "+
+		t.Errorf("pooled query allocates %.1f per call (min of 5) against %.1f with cold heaps — "+
 			"less than a 2× saving means the search heaps are not being reused", warm, cold)
 	}
 }
