@@ -169,7 +169,48 @@ func (d *Device) CompileLibrary(src string, ver uint) (objc.ID, error) {
 	return lib, nil
 }
 
-var selSetFastMath = objc.RegisterName("setFastMathEnabled:")
+// Fast-math / math-mode selectors and the MTLMathMode raw values (probed empirically
+// on macOS 26.5.2: MTLMathModeSafe=0, Relaxed=1, Fast=2, and the default is Fast).
+// Metal 3.2 / macOS 15 introduced setMathMode: and DEPRECATED setFastMathEnabled:; we
+// prefer the former where it exists and fall back to the latter on older OSes, and
+// read the result back either way (see setPreciseMath).
+var (
+	selRespondsToSel = objc.RegisterName("respondsToSelector:")
+	selSetMathMode   = objc.RegisterName("setMathMode:")       // Metal 3.2+
+	selMathMode      = objc.RegisterName("mathMode")           // Metal 3.2+
+	selSetFastMath   = objc.RegisterName("setFastMathEnabled:") // deprecated in Metal 3.2
+	selFastMath      = objc.RegisterName("fastMathEnabled")     // getter is fastMathEnabled, NOT isFastMathEnabled
+)
+
+const mtlMathModeSafe uintptr = 0 // no fast-math: true divides, no f32 reassoc/contract
+
+// respondsTo reports whether obj implements sel. BOOL is a signed char returned in the
+// low byte of the result register, so mask before testing.
+func respondsTo(obj objc.ID, sel objc.SEL) bool {
+	return objc.Send[uintptr](obj, selRespondsToSel, uintptr(sel))&0xff != 0
+}
+
+// setPreciseMath disables fast-math on opts and VERIFIES the demand took, mirroring the
+// languageVersion read-back guard. Without the read-back a future OS could silently
+// no-op the setter — setFastMathEnabled: is already deprecated (→ MTLMathMode in Metal
+// 3.2 / macOS 15) — and hand back a fast-math library while claiming to be precise,
+// breaking the ViT parity gate (its exact maxAbs/127 quant scale needs true divides)
+// with no error and no red test. Prefers the non-deprecated MTLMathModeSafe; falls back
+// to setFastMathEnabled:NO on older OSes; read-back-asserts whichever it used.
+func setPreciseMath(opts objc.ID) error {
+	if respondsTo(opts, selSetMathMode) && respondsTo(opts, selMathMode) {
+		opts.Send(selSetMathMode, mtlMathModeSafe)
+		if got := objc.Send[uintptr](opts, selMathMode); got != mtlMathModeSafe {
+			return fmt.Errorf("metal: setMathMode:MTLMathModeSafe did not take (mathMode reads %d, want %d) — the 'precise' library would be silently fast-math", got, mtlMathModeSafe)
+		}
+		return nil
+	}
+	opts.Send(selSetFastMath, uintptr(0)) // fastMathEnabled = NO
+	if got := objc.Send[uintptr](opts, selFastMath) & 0xff; got != 0 {
+		return fmt.Errorf("metal: setFastMathEnabled:NO did not take (fastMathEnabled reads YES) — likely deprecated on this OS (→ MTLMathMode); the 'precise' library is silently fast-math")
+	}
+	return nil
+}
 
 // CompileLibraryPrecise compiles MSL with fast-math DISABLED: divides are true
 // divides (not reciprocal approximations) and the compiler won't reassociate or
@@ -177,13 +218,19 @@ var selSetFastMath = objc.RegisterName("setFastMathEnabled:")
 // ViT kernels use this because their parity gate needs an exact per-row quant scale
 // (maxAbs/127, which fast-math turns into maxAbs*rcp(127), off by a ULP). CompileLibrary
 // keeps the default (fast-math on), which is what goinfer's tuned decode kernels want.
+//
+// Both the languageVersion and the fast-math demand are read back and asserted, so a
+// silent no-op (the LC_BUILD_VERSION landmine, or a deprecated fast-math setter on a
+// future OS) fails loudly here instead of producing a wrong-numerics library.
 func (d *Device) CompileLibraryPrecise(src string, ver uint) (objc.ID, error) {
 	opts := objc.ID(objc.GetClass("MTLCompileOptions")).Send(selAlloc).Send(selInit)
 	defer opts.Send(selRelease)
 	opts.Send(selSetLanguageVersion, ver)
-	opts.Send(selSetFastMath, uintptr(0)) // fastMathEnabled = NO
 	if got := uint(objc.Send[uintptr](opts, selLanguageVersion)); got != ver {
 		return 0, fmt.Errorf("metal: languageVersion set to %#x but reads %#x — the LC_BUILD_VERSION landmine (golang/go#77917)", ver, got)
+	}
+	if err := setPreciseMath(opts); err != nil {
+		return 0, err
 	}
 	var nsErr objc.ID
 	lib := d.id.Send(selNewLibrarySource, nsString(src), opts, unsafe.Pointer(&nsErr))
