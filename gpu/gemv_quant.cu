@@ -9,12 +9,17 @@
 // along the entry-point boundary. The LLM pair stays in goinfer; the generic pair lives
 // here, where every consumer can reach it.
 //
-// The bodies are byte-identical to the originals ON PURPOSE. goinfer's CUDA decode is
-// parity-gated against HF, and that gate is the tripwire for this extraction: same
-// source + same NVRTC + same --gpu-architecture must yield the same instructions, so the
-// lift changes nothing numerically. Do NOT "clean up" a kernel here — a reformat that
-// changes instruction selection is a silent numeric change wearing a refactor's clothes.
-// Tune deliberately, re-run goinfer's parity suite, and say so.
+// THE BIT-IDENTITY RULE (2026-08-04): every float multiply-accumulate under a bit-identity
+// contract MUST use an explicit intrinsic — __fmaf_rn (fused) or __fmul_rn/__fadd_rn (unfused)
+// — NEVER a bare `a*b + c`. A bare MAC leaves the fma-vs-mul+add contraction to the compiler,
+// and separately-compiled kernels that share a bit-identity contract (this GEMV is the decode
+// half; goinfer's gemv_w4a8_rn is the batched half) then compile to different numerics — ~1 ULP
+// apart, DATA-DEPENDENT, invisible on uniform random fixtures but an 84% token-stream divergence
+// on real weights. The gate is the PTX instruction histogram, not a numerical test. goinfer JITs
+// via NVRTC, so a libnvrtc bump could silently re-contract a bare MAC — explicit intrinsics remove
+// that risk. Do NOT "clean up" a kernel here; tune deliberately, keep every MAC explicit, and
+// re-run goinfer's parity suite. (This supersedes the earlier "byte-identical to the originals"
+// note — the originals in goinfer/cuda/gemv_fwd.cu carry the same rule now.)
 //
 // Both kernels follow this layer's conventions (gpu/cuda.go): scalars are passed BY VALUE
 // (gpu.ArgValue), each kernel bounds-checks its own row index because a CUDA launch rounds
@@ -55,8 +60,13 @@ extern "C" __global__ void gemv_w4a8_fwd(
         p0 = __dp4a((int)__vsub4((w0 >> 4) & 0x0F0F0F0Fu, 0x08080808u), a[2 * wi0 + 1], p0);
         p1 = __dp4a((int)__vsub4(w1 & 0x0F0F0F0Fu, 0x08080808u), a[2 * wi1], p1);
         p1 = __dp4a((int)__vsub4((w1 >> 4) & 0x0F0F0F0Fu, 0x08080808u), a[2 * wi1 + 1], p1);
-        facc += (float)p0 * __half2float(sr[wi0 >> 2]);
-        facc += (float)p1 * __half2float(sr[wi1 >> 2]);
+        // Explicit __fmaf_rn (bit-identity rule): a bare `facc += p*s` lets the compiler CHOOSE to
+        // contract to fma or emit mul+add, and that choice differs between separately-compiled
+        // kernels (e.g. goinfer's gemv_w4a8_rn) — ~1 ULP apart, data-dependent, an 84% token-stream
+        // divergence on real weights. Any MAC under a bit-identity contract MUST be an explicit
+        // intrinsic so no compiler discretion remains. See docs/kernel-bit-identity.md.
+        facc = __fmaf_rn((float)p0, __half2float(sr[wi0 >> 2]), facc);
+        facc = __fmaf_rn((float)p1, __half2float(sr[wi1 >> 2]), facc);
     }
     // Tail: Kwords need NOT be a multiple of 32 (e.g. qwen2.5-0.5B H=896 → Kwords=112).
     // Guard per lane — the scale-per-word float accumulate has no cross-lane dependency, so
@@ -68,13 +78,13 @@ extern "C" __global__ void gemv_w4a8_fwd(
             int p = 0;
             p = __dp4a((int)__vsub4(word & 0x0F0F0F0Fu, 0x08080808u), a[2 * wi], p);
             p = __dp4a((int)__vsub4((word >> 4) & 0x0F0F0F0Fu, 0x08080808u), a[2 * wi + 1], p);
-            facc += (float)p * __half2float(sr[wi >> 2]);
+            facc = __fmaf_rn((float)p, __half2float(sr[wi >> 2]), facc); // explicit-FMA bit-identity rule
         }
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) facc += __shfl_down_sync(0xffffffffu, facc, off);
     if (lane == 0) {
-        float val = facc * (*aScalePtr) + (bias ? bias[n] : 0.f);
+        float val = __fmaf_rn(facc, *aScalePtr, (bias ? bias[n] : 0.f)); // explicit-FMA
         dst[n] = accum ? dst[n] + val : val;
     }
 }
@@ -95,7 +105,8 @@ extern "C" __global__ void gemv_w8a8_fwd(
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
     if (lane == 0) {
-        float val = (float)acc * wScale[n] * (*aScalePtr) + (bias ? bias[n] : 0.f);
+        // explicit: mul the two scales, then fma the activation-scale·+bias (no bare a*b*c+d).
+        float val = __fmaf_rn(__fmul_rn((float)acc, wScale[n]), *aScalePtr, (bias ? bias[n] : 0.f));
         dst[n] = accum ? dst[n] + val : val;
     }
 }
