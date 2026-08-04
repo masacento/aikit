@@ -176,8 +176,8 @@ func (d *Device) CompileLibrary(src string, ver uint) (objc.ID, error) {
 // read the result back either way (see setPreciseMath).
 var (
 	selRespondsToSel = objc.RegisterName("respondsToSelector:")
-	selSetMathMode   = objc.RegisterName("setMathMode:")       // Metal 3.2+
-	selMathMode      = objc.RegisterName("mathMode")           // Metal 3.2+
+	selSetMathMode   = objc.RegisterName("setMathMode:")        // Metal 3.2+
+	selMathMode      = objc.RegisterName("mathMode")            // Metal 3.2+
 	selSetFastMath   = objc.RegisterName("setFastMathEnabled:") // deprecated in Metal 3.2
 	selFastMath      = objc.RegisterName("fastMathEnabled")     // getter is fastMathEnabled, NOT isFastMathEnabled
 )
@@ -190,26 +190,40 @@ func respondsTo(obj objc.ID, sel objc.SEL) bool {
 	return objc.Send[uintptr](obj, selRespondsToSel, uintptr(sel))&0xff != 0
 }
 
+// respondsToFn is the seam respondsTo goes through, so a test can force the
+// "no verifiable API" path without needing a future OS. Production is respondsTo.
+var respondsToFn = respondsTo
+
 // setPreciseMath disables fast-math on opts and VERIFIES the demand took, mirroring the
 // languageVersion read-back guard. Without the read-back a future OS could silently
 // no-op the setter — setFastMathEnabled: is already deprecated (→ MTLMathMode in Metal
 // 3.2 / macOS 15) — and hand back a fast-math library while claiming to be precise,
 // breaking the ViT parity gate (its exact maxAbs/127 quant scale needs true divides)
 // with no error and no red test. Prefers the non-deprecated MTLMathModeSafe; falls back
-// to setFastMathEnabled:NO on older OSes; read-back-asserts whichever it used.
+// to setFastMathEnabled:NO on older OSes.
+//
+// It requires that BOTH the setter AND the getter of the chosen path respond before it
+// touches either — so a set is never issued through a selector we cannot read back —
+// and if NEITHER pair is verifiable it returns an error naming both. "I could not
+// verify" must fail loudly, not fall through to an unchecked "precise" library: that
+// silent pass is the exact failure this guard exists to prevent.
 func setPreciseMath(opts objc.ID) error {
-	if respondsTo(opts, selSetMathMode) && respondsTo(opts, selMathMode) {
+	switch {
+	case respondsToFn(opts, selSetMathMode) && respondsToFn(opts, selMathMode):
 		opts.Send(selSetMathMode, mtlMathModeSafe)
 		if got := objc.Send[uintptr](opts, selMathMode); got != mtlMathModeSafe {
 			return fmt.Errorf("metal: setMathMode:MTLMathModeSafe did not take (mathMode reads %d, want %d) — the 'precise' library would be silently fast-math", got, mtlMathModeSafe)
 		}
 		return nil
+	case respondsToFn(opts, selSetFastMath) && respondsToFn(opts, selFastMath):
+		opts.Send(selSetFastMath, uintptr(0)) // fastMathEnabled = NO
+		if got := objc.Send[uintptr](opts, selFastMath) & 0xff; got != 0 {
+			return fmt.Errorf("metal: setFastMathEnabled:NO did not take (fastMathEnabled reads YES) — likely deprecated on this OS (→ MTLMathMode); the 'precise' library is silently fast-math")
+		}
+		return nil
+	default:
+		return fmt.Errorf("metal: cannot verify precise math — MTLCompileOptions responds to neither setMathMode:/mathMode (Metal 3.2+) nor setFastMathEnabled:/fastMathEnabled (deprecated); refusing to return an unverified 'precise' library")
 	}
-	opts.Send(selSetFastMath, uintptr(0)) // fastMathEnabled = NO
-	if got := objc.Send[uintptr](opts, selFastMath) & 0xff; got != 0 {
-		return fmt.Errorf("metal: setFastMathEnabled:NO did not take (fastMathEnabled reads YES) — likely deprecated on this OS (→ MTLMathMode); the 'precise' library is silently fast-math")
-	}
-	return nil
 }
 
 // CompileLibraryPrecise compiles MSL with fast-math DISABLED: divides are true

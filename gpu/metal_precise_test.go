@@ -3,6 +3,7 @@
 package gpu
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ebitengine/purego/objc"
@@ -48,5 +49,50 @@ func TestCompileLibraryPrecise_mathVerified(t *testing.T) {
 	defer def.Send(selRelease)
 	if fm := objc.Send[uintptr](def, selFastMath) & 0xff; fm == 0 {
 		t.Errorf("default MTLCompileOptions fastMathEnabled = 0, expected fast-math ON — CompileLibrary's default may have changed")
+	}
+}
+
+// TestSetPreciseMath_unverifiableIsError forces the future-OS case where NEITHER math
+// API responds. setPreciseMath must return an error naming both selectors it tried —
+// "I could not verify" is the exact silent-pass this guard exists to prevent. It uses
+// the respondsToFn seam, so it needs no device and no Metal load (the default branch
+// never sends to the id).
+func TestSetPreciseMath_unverifiableIsError(t *testing.T) {
+	orig := respondsToFn
+	respondsToFn = func(objc.ID, objc.SEL) bool { return false } // no math API responds
+	defer func() { respondsToFn = orig }()
+
+	err := setPreciseMath(objc.ID(0))
+	if err == nil {
+		t.Fatal("setPreciseMath returned nil when no math API responds — an unverified 'precise' library was reported as success")
+	}
+	for _, want := range []string{"setMathMode:", "setFastMathEnabled:"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q must name the selector %q it tried", err, want)
+		}
+	}
+}
+
+// TestSetPreciseMath_fallbackPath exercises the deprecated setFastMathEnabled: fallback
+// on real hardware by hiding the modern API from the selector check. It must still set
+// AND verify fast-math off.
+func TestSetPreciseMath_fallbackPath(t *testing.T) {
+	d, err := CreateSystemDefaultDevice()
+	if err != nil {
+		t.Skipf("no Metal device: %v", err)
+	}
+	t.Cleanup(func() { d.ReleaseObjects(); d.ReleaseAll() })
+
+	orig := respondsToFn
+	respondsToFn = func(_ objc.ID, sel objc.SEL) bool { return sel == selSetFastMath || sel == selFastMath }
+	defer func() { respondsToFn = orig }()
+
+	opts := objc.ID(objc.GetClass("MTLCompileOptions")).Send(selAlloc).Send(selInit)
+	defer opts.Send(selRelease)
+	if err := setPreciseMath(opts); err != nil {
+		t.Fatalf("fallback setFastMathEnabled path returned error: %v", err)
+	}
+	if fm := objc.Send[uintptr](opts, selFastMath) & 0xff; fm != 0 {
+		t.Errorf("fallback did not disable fast-math: fastMathEnabled = %d, want 0", fm)
 	}
 }
