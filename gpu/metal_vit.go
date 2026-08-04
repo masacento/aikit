@@ -27,7 +27,12 @@ import "fmt"
 //   - scalars bind as 1-element buffers (there is no by-value arg on Metal).
 
 // vitMSL is the encoder kernel set, compiled at load by NewViT (Metal compiles MSL at
-// runtime, so unlike the CUDA side there is no embedded PTX). LNBLOCK matches ViTBlock.
+// runtime, so unlike the CUDA side there is no embedded PTX). LNBLOCK matches ViTBlock,
+// and — like ViTBlock — is a BIT-IDENTITY dependency, not just an array size: it is the
+// width of the cross-thread f32 sum reductions below (layernorm mean/variance, softmax
+// sum), and f32 addition is not associative, so changing it changes the bits. Keep it
+// equal to the host ViTBlock and do not sweep either for performance without
+// re-baselining the parity gate.
 const vitMSL = `
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -130,6 +135,9 @@ kernel void layernorm(
     for (int i = tid; i < dim; i += tgsz) acc += xr[i];
     sm[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // f32 cross-thread SUM — the reduction order is fixed by tgsz (== ViTBlock/LNBLOCK).
+    // f32 addition is not associative, so this width is a bit-identity dependency, not a
+    // perf knob: sweeping it moves the bits and needs a parity-gate re-baseline (see ViTBlock).
     for (uint o = tgsz >> 1; o > 0; o >>= 1) { if (tid < o) sm[tid] += sm[tid + o]; threadgroup_barrier(mem_flags::mem_threadgroup); }
     float mean = sm[0] / (float)dim;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -138,6 +146,9 @@ kernel void layernorm(
     for (int i = tid; i < dim; i += tgsz) { float d = xr[i] - mean; acc += d * d; }
     sm[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // f32 cross-thread SUM — the reduction order is fixed by tgsz (== ViTBlock/LNBLOCK).
+    // f32 addition is not associative, so this width is a bit-identity dependency, not a
+    // perf knob: sweeping it moves the bits and needs a parity-gate re-baseline (see ViTBlock).
     for (uint o = tgsz >> 1; o > 0; o >>= 1) { if (tid < o) sm[tid] += sm[tid + o]; threadgroup_barrier(mem_flags::mem_threadgroup); }
     float var = sm[0] / (float)dim;
     float inv = rsqrt(var + eps);
@@ -192,6 +203,9 @@ kernel void attention(
     for (int j = tid; j < np; j += tgsz) { float e = exp(sc[j] - mx); sc[j] = e; su += e; }
     ssum[tid] = su;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // f32 cross-thread SUM — the reduction order is fixed by tgsz (== ViTBlock/LNBLOCK).
+    // f32 addition is not associative, so this width is a bit-identity dependency, not a
+    // perf knob: sweeping it moves the bits and needs a parity-gate re-baseline (see ViTBlock).
     for (uint o = tgsz >> 1; o > 0; o >>= 1) { if (tid < o) ssum[tid] += ssum[tid + o]; threadgroup_barrier(mem_flags::mem_threadgroup); }
     float inv = 1.0f / ssum[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -236,6 +250,9 @@ kernel void rmsnorm(
     for (int i = tid; i < dim; i += tgsz) { float vv = xr[i]; acc += vv * vv; }
     sm[tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // f32 cross-thread SUM — the reduction order is fixed by tgsz (== ViTBlock/LNBLOCK).
+    // f32 addition is not associative, so this width is a bit-identity dependency, not a
+    // perf knob: sweeping it moves the bits and needs a parity-gate re-baseline (see ViTBlock).
     for (uint o = tgsz >> 1; o > 0; o >>= 1) { if (tid < o) sm[tid] += sm[tid + o]; threadgroup_barrier(mem_flags::mem_threadgroup); }
     float inv = rsqrt(sm[0] / (float)dim + eps);
     for (int i = tid; i < dim; i += tgsz) dst[i] = (xr[i] * inv) * w[i];
@@ -310,6 +327,9 @@ kernel void attention_seg(
     for (int t = tid; t < n; t += tgsz) { float e = exp(sc[t] - mx); sc[t] = e; su += e; }
     ssum[tid] = su;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // f32 cross-thread SUM — the reduction order is fixed by tgsz (== ViTBlock/LNBLOCK).
+    // f32 addition is not associative, so this width is a bit-identity dependency, not a
+    // perf knob: sweeping it moves the bits and needs a parity-gate re-baseline (see ViTBlock).
     for (uint o = tgsz >> 1; o > 0; o >>= 1) { if (tid < o) ssum[tid] += ssum[tid + o]; threadgroup_barrier(mem_flags::mem_threadgroup); }
     float inv = 1.0f / ssum[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -601,6 +621,16 @@ func TileDims(M, N int) (gx, gy, tgx, tgy int) {
 
 // ViTBlock is the threadgroup width the per-row/attention kernels reduce at; it must
 // match vitMSL's LNBLOCK (the static threadgroup reduction arrays are sized to it).
+//
+// It is PART OF THE BIT-IDENTITY CONTRACT, not just a performance knob. The layernorm
+// and softmax kernels sum floats across `tgsz` (== this width) threads, and f32 addition
+// is not associative, so the summation order — and therefore the exact bits — is fixed
+// by this value. Precise-math compilation (CompileLibraryPrecise) removes the compiler's
+// discretion over contraction/reassociation but NOT this: the width is chosen here, in
+// host code. Do not sweep it for a speed win without re-baselining the ViT parity gate —
+// a small consistent shift passes the tolerance-based maxAbsDiff check while the numbers
+// have moved. Change ViTBlock and LNBLOCK together (see the cross-thread `+=` reductions
+// in vitMSL, each tagged as bit-identity-coupled).
 const ViTBlock = 256
 
 // ViT holds the compiled encoder kernel pipelines — identical shape to the CUDA ViT.
