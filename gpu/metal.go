@@ -13,6 +13,7 @@
 package gpu
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -281,6 +282,8 @@ var (
 	selGPUEndTime      = objc.RegisterName("GPUEndTime")      // GPU busy window for this command buffer
 	selKernelStartTime = objc.RegisterName("kernelStartTime") // incl scheduling; > GPU window
 	selKernelEndTime   = objc.RegisterName("kernelEndTime")
+	selStatus          = objc.RegisterName("status") // MTLCommandBuffer.status → MTLCommandBufferStatus (Int)
+	selError           = objc.RegisterName("error")  // MTLCommandBuffer.error  → NSError* (nil on success)
 
 	selNewSharedEvent     = objc.RegisterName("newSharedEvent")            // MTLDevice → id<MTLSharedEvent>
 	selSignaledValue      = objc.RegisterName("signaledValue")             // MTLSharedEvent → uint64 (CPU read)
@@ -587,6 +590,37 @@ func (e *Encoder) Commit()         { e.cb.Send(selCommit) }
 func (e *Encoder) WaitDone() {
 	e.cb.Send(selWaitCompleted)
 	e.ReadTimes()
+}
+
+// MTLCommandBufferStatus values: NotEnqueued 0, Enqueued 1, Committed 2, Scheduled 3,
+// Completed 4, Error 5. Only Error means the buffer aborted (a GPU fault, a threadgroup-memory
+// over-budget dispatch, etc.).
+const mtlCmdBufStatusError = 5
+
+// Err reports whether the last committed command buffer aborted. It is valid only AFTER WaitDone
+// (the status must be terminal). waitUntilCompleted returns cleanly even when a kernel faults, so
+// without this the host reads stale / previous-token results with no signal (goinfer audit C-09):
+// callers MUST consult Err before trusting the outputs of a committed buffer.
+func (e *Encoder) Err() error {
+	// Integer returns come back in x0 on arm64; objc.Send[uintptr] is the integer-return path this
+	// file already uses for enum getters (selLanguageVersion, selMathMode, selRespondsToSel).
+	if int(objc.Send[uintptr](e.cb, selStatus)) != mtlCmdBufStatusError {
+		return nil
+	}
+	return cmdBufError(e.cb.Send(selError)) // NSError* — non-nil once status is Error
+}
+
+// cmdBufError formats an aborted command buffer's NSError (or a nil NSError) into a Go error. Split
+// from Err so the NSError→string path is unit-testable with a synthetic NSError: on Apple silicon a
+// real GPU abort is nearly impossible to provoke on demand (the hardware silently tolerates OOB
+// writes, unmapped-address stores, over-budget threadgroup memory, and over-max dispatches — every
+// such command buffer still reports status Completed), which is exactly why this status check must
+// exist as the safety net for the strict OS/GPU cases where a fault DOES set status Error.
+func cmdBufError(nsErr objc.ID) error {
+	if nsErr == 0 {
+		return errors.New("metal: command buffer aborted")
+	}
+	return fmt.Errorf("metal: command buffer aborted: %s", goString(nsErr.Send(selLocalizedDesc)))
 }
 
 // ReadTimes reads the command buffer's GPU/kernel timestamps (valid post-completion).
