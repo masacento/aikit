@@ -59,6 +59,7 @@ var (
 	selUTF8String         = objc.RegisterName("UTF8String")
 	selLocalizedDesc      = objc.RegisterName("localizedDescription")
 	selName               = objc.RegisterName("name")
+	selMaxTgMem           = objc.RegisterName("maxThreadgroupMemoryLength") // device tile-memory limit (bytes)
 )
 
 // nsString wraps a Go string as an autoreleased NSString.
@@ -149,6 +150,14 @@ func CreateSystemDefaultDevice() (*Device, error) {
 
 // Name is the device's product name (e.g. "Apple M1 Pro").
 func (d *Device) Name() string { return goString(d.id.Send(selName)) }
+
+// MaxThreadgroupMemoryLength is the device's maximum threadgroup (tile) memory per dispatch, in
+// bytes (~32 KiB on Apple GPUs). A dispatch whose setThreadgroupMemoryLength exceeds it aborts the
+// command buffer, so callers that size threadgroup scratch from model dims must check against this
+// and decline (goinfer audit M-11). Integer return → objc.Send[uintptr] (arm64 x0 path).
+func (d *Device) MaxThreadgroupMemoryLength() int {
+	return int(objc.Send[uintptr](d.id, selMaxTgMem))
+}
 
 // CompileLibrary compiles MSL `src` at languageVersion `ver` — with the landmine
 // defused: an explicit MTLCompileOptions, plus a read-back assertion that the option

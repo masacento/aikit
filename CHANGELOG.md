@@ -12,6 +12,11 @@ it.
 
 ### Added
 
+- **`gpu.Device.MaxThreadgroupMemoryLength()`** (`gpu/v0.27.0`, darwin/Metal) — the device's tile-
+  memory limit in bytes (~32 KiB on Apple GPUs). A dispatch whose `setThreadgroupMemoryLength`
+  exceeds it aborts the command buffer, so a caller sizing threadgroup scratch from model dims can
+  check against this and decline instead (goinfer audit M-11).
+
 - **`gpu.Encoder.Err()`** (`gpu/v0.26.1`, darwin/Metal) — `WaitDone`/`End` now latch the
   committed command buffer's `status`/`error` while the cb is still alive (before the pool
   drain frees it), and `Err()` returns it. `waitUntilCompleted` returns cleanly even when a
