@@ -554,6 +554,9 @@ type Encoder struct {
 	// GPU timing of the last committed command buffer (seconds), captured in end() after
 	// waitUntilCompleted (valid post-completion) and before the pool drains the cb.
 	gpuStart, gpuEnd, kernStart, kernEnd float64
+	// err is the command-buffer abort latched at WaitDone/End — read from the cb's status/error
+	// BEFORE the autorelease pool drains (and possibly frees) the cb, so Err() is a safe getter.
+	err error
 }
 
 func (q Queue) Begin() *Encoder {
@@ -586,10 +589,26 @@ func (q Queue) BeginNP() *Encoder {
 func (e *Encoder) FinishEncoding() { e.enc.Send(selEndEncoding) }
 func (e *Encoder) Commit()         { e.cb.Send(selCommit) }
 
-// waitDone blocks until the committed command buffer completes, then reads its GPU timestamps.
+// waitDone blocks until the committed command buffer completes, then captures any abort and reads
+// its GPU timestamps. Both reads are valid only post-completion and are taken here, while the cb is
+// still alive — a later pool drain may free it.
 func (e *Encoder) WaitDone() {
 	e.cb.Send(selWaitCompleted)
+	e.captureErr()
 	e.ReadTimes()
+}
+
+// captureErr latches the command buffer's terminal status/error into e.err. MUST be called after
+// waitUntilCompleted and BEFORE the autorelease pool drains the cb (reading a drained cb is a
+// use-after-free). waitUntilCompleted returns cleanly even on a GPU fault, so this is the only
+// signal that a kernel aborted (goinfer audit C-09).
+func (e *Encoder) captureErr() {
+	// Integer returns come back in x0 on arm64; objc.Send[uintptr] is the integer-return path this
+	// file already uses for enum getters (selLanguageVersion, selMathMode, selRespondsToSel).
+	if int(objc.Send[uintptr](e.cb, selStatus)) != mtlCmdBufStatusError {
+		return
+	}
+	e.err = cmdBufError(e.cb.Send(selError)) // NSError* — non-nil once status is Error
 }
 
 // MTLCommandBufferStatus values: NotEnqueued 0, Enqueued 1, Committed 2, Scheduled 3,
@@ -597,21 +616,14 @@ func (e *Encoder) WaitDone() {
 // over-budget dispatch, etc.).
 const mtlCmdBufStatusError = 5
 
-// Err reports whether the last committed command buffer aborted. It is valid only AFTER WaitDone
-// (the status must be terminal). waitUntilCompleted returns cleanly even when a kernel faults, so
-// without this the host reads stale / previous-token results with no signal (goinfer audit C-09):
-// callers MUST consult Err before trusting the outputs of a committed buffer.
-func (e *Encoder) Err() error {
-	// Integer returns come back in x0 on arm64; objc.Send[uintptr] is the integer-return path this
-	// file already uses for enum getters (selLanguageVersion, selMathMode, selRespondsToSel).
-	if int(objc.Send[uintptr](e.cb, selStatus)) != mtlCmdBufStatusError {
-		return nil
-	}
-	return cmdBufError(e.cb.Send(selError)) // NSError* — non-nil once status is Error
-}
+// Err reports whether the last committed command buffer aborted. Valid AFTER WaitDone / End, which
+// latch the status while the cb is still alive. waitUntilCompleted returns cleanly even when a
+// kernel faults, so without this the host reads stale / previous-token results with no signal
+// (goinfer audit C-09): callers MUST consult Err before trusting the outputs of a committed buffer.
+func (e *Encoder) Err() error { return e.err }
 
 // cmdBufError formats an aborted command buffer's NSError (or a nil NSError) into a Go error. Split
-// from Err so the NSError→string path is unit-testable with a synthetic NSError: on Apple silicon a
+// out so the NSError→string path is unit-testable with a synthetic NSError: on Apple silicon a
 // real GPU abort is nearly impossible to provoke on demand (the hardware silently tolerates OOB
 // writes, unmapped-address stores, over-budget threadgroup memory, and over-max dispatches — every
 // such command buffer still reports status Completed), which is exactly why this status check must
@@ -690,6 +702,7 @@ func (e *Encoder) End() {
 	e.enc.Send(selEndEncoding)
 	e.cb.Send(selCommit)
 	e.cb.Send(selWaitCompleted)
+	e.captureErr() // BEFORE the drain frees the cb (C-09)
 	e.ReadTimes()
 	e.pool.Send(selDrain)
 }

@@ -12,10 +12,11 @@ it.
 
 ### Added
 
-- **`gpu.Encoder.Err()`** (`gpu/v0.26.0`, darwin/Metal) — reads the committed command
-  buffer's `status`/`error` after `WaitDone`. `waitUntilCompleted` returns cleanly even
-  when a kernel aborts, so without this the host would trust stale results after a GPU
-  fault; callers now consult `Err()` before reading a buffer's output (goinfer audit C-09).
+- **`gpu.Encoder.Err()`** (`gpu/v0.26.1`, darwin/Metal) — `WaitDone`/`End` now latch the
+  committed command buffer's `status`/`error` while the cb is still alive (before the pool
+  drain frees it), and `Err()` returns it. `waitUntilCompleted` returns cleanly even when a
+  kernel aborts, so without this the host would trust stale results after a GPU fault;
+  callers now consult `Err()` before reading a buffer's output (goinfer audit C-09).
 
 ## [1.16.0] — 2026-07-31
 
