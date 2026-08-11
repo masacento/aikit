@@ -145,9 +145,20 @@ jobs:
         run: |
           python3 -m pip install --quiet \
             nvidia-cuda-nvrtc-cu12==12.9.86 nvidia-cuda-runtime-cu12==12.9.79
-          site="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
-          echo "NVRTC_LIB=${site}/nvidia/cuda_nvrtc/lib" >> "$GITHUB_ENV"
-          echo "CUDA_INC=${site}/nvidia/cuda_runtime/include" >> "$GITHUB_ENV"
+          # Ask the packages where they landed rather than guessing a site-packages
+          # path: site.getsitepackages()[0] is not where pip necessarily installs
+          # (it named /usr/local/lib/.../dist-packages on the runner while the wheels
+          # went elsewhere, and lib64 vs lib locally). These are NAMESPACE packages,
+          # so __file__ is None and __path__ is the thing to read.
+          lib="$(python3 -c 'import nvidia.cuda_nvrtc as m; print(m.__path__[0])')/lib"
+          inc="$(python3 -c 'import nvidia.cuda_runtime as m; print(m.__path__[0])')/include"
+          # Fail HERE, with the path, if the layout is not what we expect — otherwise
+          # the first symptom is an OSError from ctypes inside a test, which reads as
+          # a broken test rather than a broken install step.
+          test -e "$lib/libnvrtc.so.12" || { echo "no libnvrtc.so.12 under $lib"; ls -la "$lib" || true; exit 1; }
+          test -e "$inc/cuda_fp16.h"    || { echo "no cuda_fp16.h under $inc";    ls -la "$inc" || true; exit 1; }
+          echo "NVRTC_LIB=$lib" >> "$GITHUB_ENV"
+          echo "CUDA_INC=$inc" >> "$GITHUB_ENV"
       # Three gates, in increasing order of what they need:
       #   TestKernelFMALint*        source only — the PRIMARY check
       #   TestGemvQuantFMAHistogram committed PTX only

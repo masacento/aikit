@@ -31,13 +31,38 @@ anything red. The release ritual is the enforcement, so do not skip it:
 
 Concretely:
 
+0. **Run the mechanical gate: `scripts/gpu_gate.sh`.** Five groups — all nine gpu
+   modules build cgo-free, `gofmt`/`vet` on `gpu/`, and the three kernel assertions
+   (FMA lint, fma histogram, PTX reproducibility). Paste its `VERDICT:` line into the
+   tag message. It needs NVRTC but **no GPU**, so it runs on any box:
+   `pip install nvidia-cuda-nvrtc-cu12==12.9.86 nvidia-cuda-runtime-cu12`, or point
+   `NVRTC_LIB` at an existing install.
+
+   The gate refuses to report PASS on a dirty tree (a verdict names a commit, and an
+   uncommitted edit means it does not describe that commit), and it treats a **skip as
+   a failure** — `go test` prints `ok` for a package whose tests all skipped, so
+   "NVRTC not installed" must not read as "reproducibility verified".
+
+   The `gpu-kernels` CI job runs the same three assertions on every push. The gate is
+   still the enforcement point: CI is advisory here by choice — see the note at the
+   end of this section.
 1. On a Mac with a Metal GPU (and, for the CUDA half, a Linux/NVIDIA box if that path
    changed): `cd gpu && CGO_ENABLED=0 go test ./...`. The Metal parity gates
    (`metal_vit_test.go`) and the compile guards (`metal_precise_test.go`) must pass;
-   CUDA tests skip cleanly without an NVIDIA device.
-2. `gh auth switch --user townsendmerino` before pushing (a second account on this
-   machine 403s on `townsendmerino` repos), and author commits as
-   `townsendmerino@gmail.com`.
+   CUDA tests skip cleanly without an NVIDIA device. This is the half `gpu_gate.sh`
+   cannot do for you.
+2. Push as `townsendmerino` (a second account on this machine 403s on `townsendmerino`
+   repos), and author commits as `townsendmerino@gmail.com`.
+
+   > A bare `gh auth switch --user townsendmerino` is a **no-op whenever `GITHUB_TOKEN`
+   > is set** — gh resolves that variable before `hosts.yml` and refuses to switch,
+   > printing "The value of the GITHUB_TOKEN environment variable is being used for
+   > authentication". Clear it for the switch only:
+   > `env -u GITHUB_TOKEN -u GH_TOKEN gh auth switch --user townsendmerino`.
+   > Note also that git reaches GitHub through `gh auth git-credential` (see
+   > `~/.gitconfig`), so the identity is whatever gh resolves — `credential.helper
+   > store` is not consulted for github.com, and the `x-access-token` username git
+   > reports is how gh presents a token, not a second account.
 3. Tag **annotated**, with the environment in the message, so the "tested on" record
    travels with the tag:
    ```
@@ -52,3 +77,21 @@ A local `pre-push` hook that runs `cd gpu && go test ./...` when a `gpu/v*` tag 
 pushed would enforce this by construction and is welcome — but it only works on a Mac
 with a GPU, so the checklist above is the portable minimum: it turns a habit into a step
 someone can visibly fail to complete.
+
+### Why CI is not the enforcement point (revisit at v1.0)
+
+`main` has **no branch protection and no rulesets**, so no aikit CI check is required —
+not `gpu-kernels`, not `core`, not any of them. That is a deliberate choice, not an
+oversight:
+
+- Required status checks effectively force **PR-only merges**, because a direct push
+  cannot carry passing checks for a commit that does not exist yet. Both development
+  boxes push straight to `main` and rebase on each other; that workflow would end.
+- The friction buys protection against a threat model aikit does not have. There are no
+  outside contributors — every push is a maintainer's.
+- The real risk is **a maintainer not running the check**, and protection relocates that
+  risk rather than solving it: the same person can merge a PR whose checks they did not
+  read. Putting the gate in the tagging ritual puts it where the risk actually is.
+
+Revisit when external contributors become plausible, i.e. at v1.0. At that point
+required checks are the right tool, because the threat model will have changed.
