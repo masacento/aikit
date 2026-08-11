@@ -33,8 +33,32 @@ jobs:
         with:
           go-version: "1.26.x"
 
+      # Retry ONCE, but only when no reproducer was written. `go test -fuzz` with a
+      # duration deadline can report "context deadline exceeded" with no crasher when the
+      # coordinator cannot wind its workers down within the grace on a slow/loaded runner
+      # — a shutdown-timing flake, not a bug (steady exec/sec right up to the deadline,
+      # empty testdata/fuzz). A REAL find persists a reproducer under
+      # testdata/fuzz/<Target>/ that replays deterministically, so if one exists we fail
+      # immediately: never retry a real crasher away, and let the upload step capture it.
       - name: fuzz ${{ matrix.pkg }} ${{ matrix.fn }}
-        run: go test "./${{ matrix.pkg }}/" -run '^$' -fuzz "^${{ matrix.fn }}\$" -fuzztime=5m
+        shell: bash
+        run: |
+          crashdir="${{ matrix.pkg }}/testdata/fuzz/${{ matrix.fn }}"
+          for attempt in 1 2; do
+            echo "::group::fuzz attempt ${attempt}: ${{ matrix.pkg }} ${{ matrix.fn }}"
+            if go test "./${{ matrix.pkg }}/" -run '^$' -fuzz "^${{ matrix.fn }}\$" -fuzztime=5m; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            if compgen -G "${crashdir}/*" >/dev/null 2>&1; then
+              echo "reproducer written under ${crashdir} — real failure, not retrying"
+              exit 1
+            fi
+            echo "no reproducer written (shutdown/deadline flake) — retry ${attempt}/2"
+          done
+          echo "fuzz flaked with no reproducer on both attempts"
+          exit 1
 
       # A crash drops a reproducer under testdata/fuzz/<Target>/; keep it so the
       # failure can be replayed locally and promoted to a committed seed.
