@@ -78,6 +78,50 @@ pushed would enforce this by construction and is welcome — but it only works o
 with a GPU, so the checklist above is the portable minimum: it turns a habit into a step
 someone can visibly fail to complete.
 
+### How to tell whether a fix is already released
+
+**Ask `git tag --contains <commit>`, per commit. Do not reason from "commits since
+`<tag>`".** The second measures *distance* and says nothing about *release state* — a
+commit can sit many commits back and still be unreleased, or be one commit back and
+already tagged. Only containment answers the question:
+
+```sh
+git tag --list 'gpu/v*' --contains <commit> --sort=v:refname | head -1   # first tag shipping it
+grep -rn 'aikit/gpu ' ../goinfer/*/go.mod                               # what consumers require
+```
+
+Those two lines together answer "is the consumer blocked?" — which is the only
+question that justifies an out-of-cycle tag.
+
+### Recorded non-decision: 2026-08-11, no tag cut
+
+A `gpu/v0.28.0` was proposed to unblock goinfer's C-09 and M-11 audit findings. **It
+was not cut, because the premise did not survive checking:**
+
+| commit | first `gpu/` tag containing it |
+|---|---|
+| `cea19ab` C-09 `Encoder.Err()` | `gpu/v0.26.0` |
+| `6bb28fc` C-09 latch at WaitDone/End | `gpu/v0.26.1` |
+| `4642b7c` M-11 `MaxThreadgroupMemoryLength()` | `gpu/v0.27.0` — it *is* that tag |
+
+goinfer's `cuda/go.mod` and `metal/go.mod` already require `v0.27.0`, so both findings
+were shipped and pinned before the question was asked. Nothing was blocked.
+
+What was actually unreleased: two new `_test.go` files and comment-only edits to three
+`.cu` sources and one `.go` file — **the PTX byte-identical**, as the new
+reproducibility test proves. No exported surface changed, so the rule above would have
+made it a **patch (`v0.27.1`)**, not a minor.
+
+It was declined even at patch level. A Go module tag is **immutable once the proxy
+fetches it**, and this one would have announced a property no consumer receives: a
+version whose only content is assurance machinery that runs in *this* repo. The three
+gates and the first CI job ride along with the next release that has a substantive
+reason of its own — likely **v1.0**, where "the GPU modules acquired their first gates
+and their first CI" is a real line item rather than the whole changelog.
+
+The general form: *a release needs a reason a consumer can receive.* Test coverage,
+lint rules and CI are properties of the repository, not of the artifact.
+
 ### Why CI is not the enforcement point (revisit at v1.0)
 
 `main` has **no branch protection and no rulesets**, so no aikit CI check is required —
