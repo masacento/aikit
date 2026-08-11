@@ -120,8 +120,28 @@ const (
 // their shared-memory staging arrays statically.
 const GEMMTile = 16
 
-// ViTBlock is the block width the per-row kernels reduce at. It must match vit.cu's
-// LNBLOCK, since those kernels size their shared-memory reduction arrays statically.
+// ViTBlock is the block width the per-row/attention kernels reduce at; it must match
+// vit.cu's LNBLOCK (the static __shared__ reduction arrays are sized to it).
+//
+// It is PART OF THE BIT-IDENTITY CONTRACT, not just an array size. The layernorm,
+// rmsnorm and softmax kernels sum across blockDim.x (== this width) threads, and
+// addition is not associative — in f64 as in f32 — so the summation order, and
+// therefore the exact bits, is fixed by this value. Note what does NOT protect it:
+// vit.cu carries a BIT-IDENTITY-EXEMPT declaration and the FMA lint deliberately
+// skips it, and even a contracted file's explicit intrinsics would only remove the
+// compiler's discretion over CONTRACTION — the reduction width is chosen here, in
+// host code, where no kernel-level rule reaches.
+//
+// Do not sweep it for a speed win without re-baselining the ViT parity gate. That
+// gate (gpu/visioncuda/encoder_test.go) is a cosine bound, deliberately — the CPU
+// tower accumulates in float64 while these kernels work in f32/int32, so bit
+// equality is impossible by construction — and a small consistent shift passes a
+// tolerance while the numbers have moved. Change ViTBlock and LNBLOCK together; the
+// five cross-thread `+=` reductions in vit.cu are each tagged at the edit point.
+// (The max reductions are left untagged: max is associative, so width-independent.)
+//
+// This mirrors gpu/metal_vit.go's ViTBlock, which pinned the same hazard first. Two
+// backends carry one coupling; both should say so.
 const ViTBlock = 256
 
 // ViT holds the compiled encoder kernel pipelines.

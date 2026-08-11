@@ -1015,6 +1015,32 @@ on resolve it?" On a ~1 ms-tick CI runner a µs-scale micro-benchmark did not, a
 assertion is measuring the timer, not the code. `p50 == 0.000 ms` in the failure log is
 the fingerprint.
 
+### 1.38 A marker matched by substring cannot be discussed in the file it governs
+
+`TestKernelFMALint` opts kernels in by declaration: a `.cu` carries a
+`BIT-IDENTITY-CONTRACT:` or `BIT-IDENTITY-EXEMPT:` line and the lint reads it. The
+first version classified with `strings.Contains`, and immediately mis-classified
+`vit.cu` as **contracted** — reporting 13 violations in a deliberately uncontracted
+kernel — because its EXEMPT block contains the sentence:
+
+> If that ever changes … flip this to **BIT-IDENTITY-CONTRACT** and expect real work.
+
+The marker matched its own explanation. A substring test cannot distinguish a
+declaration from a mention, so the moment a file explains *why* it is exempt, or
+cross-references the other state, it silently re-declares itself.
+
+The fix is to require the marker to **begin a comment line**
+(`(?m)^\s*//\s*MARKER:`), which makes the grammar "a declaration is a line, a
+mention is prose." That is what lets the declarations be argued for in the file they
+govern rather than merely asserted — which was the whole point of putting them in
+the source instead of a central list.
+
+**Guard:** any in-file marker that drives behaviour needs an anchored match and a
+worked example of the marker appearing in prose. The next marker added to this repo
+will have the same shape; this one cost a false CONTRACTED classification to find.
+It was caught only because the lint was first run against a file whose correct answer
+was already known — §1.29's rule, applied to a lint instead of a benchmark.
+
 ---
 
 ## 5 · Keeping this current

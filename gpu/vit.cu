@@ -151,6 +151,9 @@ extern "C" __global__ void layernorm(
     for (int i = threadIdx.x; i < dim; i += blockDim.x) acc += (double)xr[i];
     sm[threadIdx.x] = acc;
     __syncthreads();
+    // Cross-thread SUM reduction: the order is fixed by blockDim.x (== host ViTBlock
+    // == LNBLOCK), and f64 addition is not associative either, so this width is a
+    // BIT-IDENTITY dependency, not a tuning knob. See cuda_vit.go's ViTBlock.
     for (int off = blockDim.x / 2; off > 0; off >>= 1) {
         if (threadIdx.x < off) sm[threadIdx.x] += sm[threadIdx.x + off];
         __syncthreads();
@@ -165,6 +168,9 @@ extern "C" __global__ void layernorm(
     }
     sm[threadIdx.x] = acc;
     __syncthreads();
+    // Cross-thread SUM reduction: the order is fixed by blockDim.x (== host ViTBlock
+    // == LNBLOCK), and f64 addition is not associative either, so this width is a
+    // BIT-IDENTITY dependency, not a tuning knob. See cuda_vit.go's ViTBlock.
     for (int off = blockDim.x / 2; off > 0; off >>= 1) {
         if (threadIdx.x < off) sm[threadIdx.x] += sm[threadIdx.x + off];
         __syncthreads();
@@ -238,6 +244,9 @@ extern "C" __global__ void attention(
     }
     ssum[threadIdx.x] = su;
     __syncthreads();
+    // Cross-thread SUM reduction: the order is fixed by blockDim.x (== host ViTBlock
+    // == LNBLOCK), and f64 addition is not associative either, so this width is a
+    // BIT-IDENTITY dependency, not a tuning knob. See cuda_vit.go's ViTBlock.
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {
         if (threadIdx.x < o) ssum[threadIdx.x] += ssum[threadIdx.x + o];
         __syncthreads();
@@ -286,6 +295,9 @@ extern "C" __global__ void rmsnorm(
     }
     sm[threadIdx.x] = acc;
     __syncthreads();
+    // Cross-thread SUM reduction: the order is fixed by blockDim.x (== host ViTBlock
+    // == LNBLOCK), and f64 addition is not associative either, so this width is a
+    // BIT-IDENTITY dependency, not a tuning knob. See cuda_vit.go's ViTBlock.
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {
         if (threadIdx.x < o) sm[threadIdx.x] += sm[threadIdx.x + o];
         __syncthreads();
@@ -382,6 +394,9 @@ extern "C" __global__ void attention_seg(
     }
     ssum[threadIdx.x] = su;
     __syncthreads();
+    // Cross-thread SUM reduction: the order is fixed by blockDim.x (== host ViTBlock
+    // == LNBLOCK), and f64 addition is not associative either, so this width is a
+    // BIT-IDENTITY dependency, not a tuning knob. See cuda_vit.go's ViTBlock.
     for (int o = blockDim.x / 2; o > 0; o >>= 1) {
         if (threadIdx.x < o) ssum[threadIdx.x] += ssum[threadIdx.x + o];
         __syncthreads();

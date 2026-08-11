@@ -191,14 +191,29 @@ func fmaHistogram(ptx []byte) (fma, mul int) {
 // in every job. TestPTXReproducible is what ties that artifact back to the source.
 //
 // The single mul is deliberate: gemv_w8a8_fwd's two-scale product is an explicit
-// __fmul_rn (there is no accumulate to fuse it with). If these counts change, the question
-// is not "update the constant" — it is which MAC stopped being explicit, or which kernel
-// gained or lost one.
+// __fmul_rn (there is no accumulate to fuse it with).
+//
+// THE EXPECTED COUNTS ARE VERSION-COUPLED: 13/1 holds at NVRTC 12.9.86, the version every
+// committed artifact records and the version TestPTXReproducible pins. A toolchain bump can
+// legitimately move them.
+//
+// THAT IS ALSO THE RISK. The failure mode this gate must survive is not the counts moving —
+// it is someone making a red test green by editing the constants. A DROP IN fma.rn.f32 WITH
+// A MATCHING RISE IN mul.f32 IS THE SIGNATURE OF THE ORIGINAL DEFECT, not a version
+// artifact: it means the compiler chose mul+add where the contract requires fusion, which is
+// precisely how gemv_w4a8_fwd shipped at 11 fma + 3 mul against its batched counterpart's
+// 192 fma + 0 mul. Re-baselining that away reinstates an 84% token-stream divergence and
+// leaves the test green. Before touching these numbers, verify in gemv_quant.cu that every
+// float MAC is still an explicit intrinsic — the failure text below says so too, because
+// whoever hits it may not read this far.
 func TestGemvQuantFMAHistogram(t *testing.T) {
 	const (
 		path    = "testdata/gemv_quant.ptx"
 		wantFMA = 13
 		wantMul = 1
+		// The toolchain the expectations were taken at; reported on failure so a
+		// version bump is distinguishable from a regression at a glance.
+		baselineNVRTC = "12.9.86"
 	)
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -209,12 +224,23 @@ func TestGemvQuantFMAHistogram(t *testing.T) {
 	}
 	fma, mul := fmaHistogram(b)
 	if fma != wantFMA || mul != wantMul {
-		t.Errorf("gemv_quant.ptx float mix is %d fma.rn.f32 / %d mul.f32, want %d / %d — "+
-			"every float MAC in this kernel is contracted to be an explicit intrinsic "+
-			"(BIT-IDENTITY-CONTRACT in gemv_quant.cu). A drop in fma with a rise in mul is the "+
-			"original defect returning: the compiler chose mul+add where goinfer's batched "+
-			"counterpart chose fma, ~1 ULP apart and data-dependent.",
-			fma, mul, wantFMA, wantMul)
+		suspect := ""
+		if fma < wantFMA && mul > wantMul {
+			suspect = "\n\n  *** fma DROPPED and mul ROSE — that is the SIGNATURE OF THE DEFECT this gate " +
+				"exists to catch, not a toolchain difference. The compiler chose mul+add where the " +
+				"contract requires fusion. Treat this as a regression until proven otherwise. ***"
+		}
+		t.Errorf("gemv_quant.ptx float mix is %d fma.rn.f32 / %d mul.f32, want %d / %d "+
+			"(baseline taken at NVRTC %s; this artifact records %q).%s\n\n"+
+			"  DO NOT update these constants to make this pass until you have verified, in "+
+			"gemv_quant.cu, that EVERY float MAC is still an explicit intrinsic (__fmaf_rn / "+
+			"__fmul_rn / __fadd_rn) — TestKernelFMALint checks exactly that and should be read "+
+			"as the first response to this failure. Re-baselining a real regression away is how "+
+			"an 84%% token-stream divergence ships with a green test.\n"+
+			"  A legitimate cause is an NVRTC version change, which shifts counts without "+
+			"changing the source; TestPTXReproducible pins the version precisely so the two "+
+			"cases stay distinguishable.",
+			fma, mul, wantFMA, wantMul, baselineNVRTC, ptxToolchainVersion(b), suspect)
 		return
 	}
 	t.Logf("gemv_quant.ptx: %d fma.rn.f32 / %d mul.f32 — no compiler discretion remains", fma, mul)
