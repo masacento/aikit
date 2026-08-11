@@ -126,6 +126,40 @@ jobs:
           go vet ./...
           go test ./...
 
+  gpu-kernels:
+    name: gpu kernel gates (CUDA sources — no GPU required)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+      # NVRTC compiles CUDA C++ -> PTX with no host compiler and no device, so the
+      # whole gate runs on a stock runner. The version is PINNED to the one the
+      # committed artifacts record in their own headers (V12.9.86): comparing PTX
+      # bytes across toolchain versions would report drift that is really a version
+      # difference, so the test skips rather than fails when they disagree — and
+      # AIKIT_REQUIRE_PTX_REPRO below turns any skip into a failure, because a
+      # skipping test is a passing test.
+      - name: install pinned NVRTC 12.9.86
+        run: |
+          python3 -m pip install --quiet \
+            nvidia-cuda-nvrtc-cu12==12.9.86 nvidia-cuda-runtime-cu12==12.9.79
+          site="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
+          echo "NVRTC_LIB=${site}/nvidia/cuda_nvrtc/lib" >> "$GITHUB_ENV"
+          echo "CUDA_INC=${site}/nvidia/cuda_runtime/include" >> "$GITHUB_ENV"
+      # Three gates, in increasing order of what they need:
+      #   TestKernelFMALint*        source only — the PRIMARY check
+      #   TestGemvQuantFMAHistogram committed PTX only
+      #   TestPTXReproducible       NVRTC rebuild
+      - name: kernel gates
+        working-directory: gpu
+        env:
+          AIKIT_REQUIRE_PTX_REPRO: "1"
+        run: |
+          go vet ./...
+          go test -run 'TestKernelFMALint|TestGemvQuantFMAHistogram|TestPTXReproducible' -v ./...
+
   windows:
     name: windows (pure-Go core)
     # Pinned: GitHub redirects `windows-latest` to windows-2025 by 2026-06-15;

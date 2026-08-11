@@ -9,6 +9,9 @@
 // along the entry-point boundary. The LLM pair stays in goinfer; the generic pair lives
 // here, where every consumer can reach it.
 //
+// BIT-IDENTITY-CONTRACT: decode half of a pair with goinfer's batched gemv_w4a8_rn; every
+// float MAC must be an explicit intrinsic. Enforced by TestKernelFMALint.
+//
 // THE BIT-IDENTITY RULE (2026-08-04): every float multiply-accumulate under a bit-identity
 // contract MUST use an explicit intrinsic — __fmaf_rn (fused) or __fmul_rn/__fadd_rn (unfused)
 // — NEVER a bare `a*b + c`. A bare MAC leaves the fma-vs-mul+add contraction to the compiler,

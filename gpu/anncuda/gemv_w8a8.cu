@@ -3,6 +3,13 @@
 // the MSL in gpu/annmetal/backend.go: `gemv_w8a8` scores ONE query against the whole
 // index (FlatI8.Query), `gemm_w8a8` scores M queries in one launch (FlatI8.QueryBatch).
 //
+// BIT-IDENTITY-EXEMPT: structurally immune rather than merely uncontracted. The dot
+// products accumulate into an `int` — integer addition is associative, so the reduction
+// is exact and order-independent — and the float tail is `(float)acc * qscale * scale`,
+// two multiplies with NO add. There is no multiply-accumulate here for a compiler to
+// contract, which the shipped PTX confirms: 0 fma.rn.f32, 4 mul.f32. Adding a float
+// accumulate or a bias term would end that, so re-classify if this kernel grows one.
+//
 // Both compute the EXACT int32 dot of the host-quantized int8 query against each
 // row, then apply the query/row rescale — the same value linalg.MatmulBTW8A8
 // produces on the CPU. Integer accumulation is exact, so GPU and CPU rank

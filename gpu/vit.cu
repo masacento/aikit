@@ -3,6 +3,22 @@
 // exist to run vision.ResidentEncoder on NVIDIA the way goinfer's WebGPU backend runs it
 // on any GPU — but cgo-free.
 //
+// BIT-IDENTITY-EXEMPT: no bit-identity contract exists for this tower, so the bare float
+// MACs below are free to contract. The gate is gpu/visioncuda/encoder_test.go, which
+// requires cosine >= 1-1e-6 against the pure-Go CPU tower — a TOLERANCE, deliberately:
+// that tower accumulates LayerNorm/softmax/GELU in float64 while these kernels work in
+// f32/int32, so bit-equality is impossible BY CONSTRUCTION, not merely unachieved. The
+// int8 dots are exact, so the residual divergence is float reassociation only, which is
+// why the bar is tight rather than loose. Nothing downstream consumes these outputs
+// bit-for-bit. If that ever changes — if some path must match this kernel exactly — flip
+// this to BIT-IDENTITY-CONTRACT and expect real work: the reductions here are unprotected.
+//
+// Related, and NOT the same claim: gpu/metal_vit.go pins its threadgroup width
+// (ViTBlock/LNBLOCK) as a bit-identity dependency. That is about the Metal kernel matching
+// ITSELF across configurations — a perf sweep of the width silently moves its bits and the
+// tolerance gate would not notice — not about matching the CPU tower. gpu/cuda_vit.go's
+// ViTBlock carries the same structural coupling but documents it only as an array size.
+//
 // PARITY IS THE POINT, SO THE MATH MIRRORS THE CPU TOWER EXACTLY
 // --------------------------------------------------------------
 // Every kernel here is written against vision/encoder.go's arithmetic, not against
