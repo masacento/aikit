@@ -12,7 +12,14 @@ Automated and CI-enforced.
 2. Run the gate locally first: `scripts/release-gate.sh X.Y.Z` — it checks the CHANGELOG
    section, `golangci-lint`, `apidiff` (no Hard-tier API breakage vs the previous tag),
    and the cgo-free dependency invariant.
-3. Push the prep commit, wait for **root CI green**, then push the tag `vX.Y.Z`.
+3. Run `scripts/vulncheck.sh` and **put its `STATEMENT:` line in the release notes.**
+   This is a deliverable, not hygiene: aikit's pitch is a static binary someone scps
+   somewhere and runs offline, and a binary deployed that way cannot be patched in
+   place by whoever is running it. "What is in it, and is any of it known-vulnerable"
+   is part of the same claim as cgo-free and dependency-light, both of which already
+   have gates. `govulncheck` is reachability-filtered, so a clean result is a statement
+   about the binary rather than about the dependency list.
+4. Push the prep commit, wait for **root CI green**, then push the tag `vX.Y.Z`.
    `.github/workflows/release.yml` re-runs the gate on the tag and publishes the GitHub
    Release from the CHANGELOG section.
 
