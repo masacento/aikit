@@ -951,6 +951,43 @@ func TestCUDAQuery_deviceSelectPathAndItsGuards(t *testing.T) {
 	t.Log("device-select Query ≡ CPU over 20 queries; filter, k=n and k=0 all fall through correctly")
 }
 
+// TestBatchGridX pins the row-grid narrowing. The kernel strides over rows, so ANY
+// grid width is correct — which is exactly why this needs its own test: a wrong value
+// costs throughput and nothing else, and every parity gate in this file stays green.
+//
+// Two directions to get wrong. Too wide gives back the staging saving the stride loop
+// exists for; too narrow starves the device, and at small N the full grid can already
+// be smaller than the machine, so dividing it further is pure loss.
+func TestBatchGridX(t *testing.T) {
+	const sm = 40
+	// A large grid gets divided.
+	if got := batchGridX(3125, 1, sm); got != 3125/batchRowsPerBlock {
+		t.Errorf("batchGridX(3125, 1) = %d, want %d", got, 3125/batchRowsPerBlock)
+	}
+	// The floor holds across planes: with more query-tile planes, fewer blocks per
+	// plane are needed to reach the same total.
+	for _, planes := range []int{1, 4, 16} {
+		got := int(batchGridX(8, planes, sm))
+		if total := got * planes; total < batchMinBlocks*sm && got != 8 {
+			t.Errorf("batchGridX(8, planes=%d) = %d gives %d blocks, below %d and not the full grid",
+				planes, got, total, batchMinBlocks*sm)
+		}
+	}
+	// Never wider than the grid it was given, and never zero.
+	for _, full := range []int{1, 2, 7, 8, 100, 100_000} {
+		for _, planes := range []int{1, 16} {
+			got := int(batchGridX(full, planes, sm))
+			if got < 1 || got > full {
+				t.Errorf("batchGridX(%d, %d) = %d, out of [1, %d]", full, planes, got, full)
+			}
+		}
+	}
+	// An unknown SM count must still produce a legal grid.
+	if got := batchGridX(3125, 1, 0); got < 1 {
+		t.Errorf("batchGridX with sm=0 returned %d", got)
+	}
+}
+
 // TestTopKPipelineWidths ties the three things that must agree — the kernel names, the
 // widths the routing uses, and the widths those kernels were actually compiled with —
 // and checks that topkPlan picks the narrowest kernel able to hold k.

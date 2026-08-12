@@ -192,9 +192,9 @@ __device__ __forceinline__ void batch_body(
     unsigned int m0 = blockIdx.y * QTILE;
     unsigned int mc = (m - m0 < QTILE) ? (m - m0) : QTILE;
 
-    // Stage this tile's queries, zero-filling rows past mc. EVERY thread in the block
-    // runs this loop and reaches the barrier, which is why the row-bound return below
-    // is placed after __syncthreads() — returning first would strand the survivors.
+    // Stage this tile's queries, zero-filling rows past mc. Every thread in the block
+    // runs this loop and reaches the barrier; with the grid-stride loop below, no thread
+    // returns early at all, so the barrier cannot strand anyone.
     for (unsigned int i = threadIdx.x; i < (unsigned int)QTILE * k; i += blockDim.x) {
         unsigned int t = i / k;
         qs[i] = (t < mc) ? qi8[(unsigned long long)(m0 + t) * k + (i - t * k)] : (signed char)0;
@@ -202,9 +202,20 @@ __device__ __forceinline__ void batch_body(
     __syncthreads();
 
     unsigned int groupsPerBlock = blockDim.x / LANES;
-    unsigned int j = blockIdx.x * groupsPerBlock + (threadIdx.x / LANES);
-    if (j >= n) return;
     unsigned int lane = threadIdx.x & (unsigned int)(LANES - 1);
+
+    // GRID-STRIDE OVER ROWS, so the staging above is paid once per BLOCK rather than
+    // once per row-group. It used to be one block per group of rows, which meant every
+    // block re-staged the whole QTILE*K query tile and hit the barrier for 64 rows of
+    // work. Ablation put that at 14% of the kernel at M=64 — the second largest line
+    // item after the corpus stream itself — and launching 8x fewer blocks recovered
+    // 10-24% (M=16 1.230 -> 1.111 ms, M=64 4.659 -> 3.552, M=256 15.49 -> 13.87).
+    //
+    // Same arithmetic per row, so results are unchanged; only how many rows amortize
+    // one staging. The launch chooses the block count (see launchBatch).
+    unsigned int stride = gridDim.x * groupsPerBlock;
+    for (unsigned int j = blockIdx.x * groupsPerBlock + (threadIdx.x / LANES);
+         j < n; j += stride) {
     const signed char* row = codes + (unsigned long long)j * k;
 
     int acc[QTILE];
@@ -249,6 +260,7 @@ __device__ __forceinline__ void batch_body(
             out[(unsigned long long)(m0 + t) * n + j] = (float)a * qscale[m0 + t] * scales[j];
         }
     }
+    } // grid-stride row loop
 }
 
 // gemv_w8a8_batch8 — 8 lanes per row, 8 queries per tile. For M <= 8.

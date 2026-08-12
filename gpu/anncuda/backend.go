@@ -499,6 +499,38 @@ func (x *cudaI8Index) launchTopK(scoreBuf, idxBuf, valBuf, mBuf, kBuf gpu.Buffer
 		gpu.Arg(mBuf), gpu.Arg(pBuf), gpu.Arg(kBuf))
 }
 
+// batchGridX narrows the row grid so each block sweeps several row-groups instead of
+// one, amortizing the query-tile staging the kernel does before its row loop.
+//
+// batchRowsPerBlock is 8 because that is where it stopped paying, measured at N=200k:
+// dividing the full grid by 8 landed within 0.1% of the best division at M=16, 64 and
+// 256 alike, where /2 left most of the win on the table and /16 gained nothing. The
+// floor keeps enough blocks to fill the device for small N — dividing a grid that was
+// already smaller than the machine would trade a staging saving for idle SMs.
+func batchGridX(full, planes, sm int) uint32 {
+	if sm <= 0 {
+		sm = topkSMFallback
+	}
+	gx := full / batchRowsPerBlock
+	if min := (batchMinBlocks*sm + planes - 1) / planes; gx < min {
+		gx = min
+	}
+	if gx > full {
+		gx = full
+	}
+	if gx < 1 {
+		gx = 1
+	}
+	return uint32(gx)
+}
+
+const (
+	// Row-groups' worth of grid to collapse into each block's stride loop.
+	batchRowsPerBlock = 8
+	// Blocks per multiprocessor to keep regardless, across all query-tile planes.
+	batchMinBlocks = 4
+)
+
 // topkBlockThreads is TKBLOCK in gemv_w8a8.cu. Every top-k kernel is written against
 // it — it sets both the reduction tree depth and the stride a thread scans with — so a
 // launch at any other width would silently select from a subset of the row.
@@ -653,11 +685,13 @@ func (x *cudaI8Index) launchBatch(qi8Buf, qscaleBuf, outBuf gpu.Buffer, M, N, K 
 	if wide {
 		p = x.b.batchWide
 	}
-	// Grid X covers N rows at `lanes` threads each; grid Y is one plane per query
-	// tile. The kernel bounds-checks the row index, since the grid overhangs N
-	// whenever the block size does not divide N*lanes.
+	// Grid Y is one plane per query tile. Grid X covers N rows at `lanes` threads
+	// each, DIVIDED BY batchRowsPerBlock: the kernel strides over rows, so fewer
+	// blocks means each one amortizes its query-tile staging over more of them.
+	planes := (M + qtile - 1) / qtile
 	cfg := gpu.Grid1D(N*lanes, batchBlock)
-	cfg.GridY = uint32((M + qtile - 1) / qtile)
+	cfg.GridX = batchGridX(int(cfg.GridX), planes, x.b.sm)
+	cfg.GridY = uint32(planes)
 	// The query tile lives in dynamic shared memory: QTILE rows of K bytes. At the
 	// shapes this backend sees (K ≤ 1024) that is at most 16 KiB, inside the 48 KiB
 	// a block gets by default.
