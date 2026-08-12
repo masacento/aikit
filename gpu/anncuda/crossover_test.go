@@ -130,11 +130,51 @@ func TestCUDAANNCrossover(t *testing.T) {
 			cpuHitsByBatch[b] = hits
 		}
 
+		// --- single-query FlatI8.Query — the path gemv_w8a8 serves, and a DIFFERENT
+		// kernel from the batch one. Without this row the harness cannot answer "is
+		// EnableGPU worth it for one query", which is the question a caller with an
+		// interactive workload actually has. Mirrors the Metal harness (ab803ab). ---
+		sq := qpool[:min(64, queryPool)]
+		cpuQThr, cpuQHits := timeSingleQuery(fi8, sq, kTop)
+		cpuQRecall := meanRecall(cpuQHits, truth[:len(sq)])
+
 		t0 := time.Now()
 		if err := fi8.EnableGPU(); err != nil {
 			t.Skipf("EnableGPU: %v (no CUDA device?)", err)
 		}
 		oneTimeMs := float64(time.Since(t0).Nanoseconds()) / 1e6
+
+		gpuQThr, gpuQHits := timeSingleQuery(fi8, sq, kTop)
+		gpuQRecall := meanRecall(gpuQHits, truth[:len(sq)])
+		qParityOK, qMaxDelta := parity(gpuQHits, cpuQHits, cpuQRecall, gpuQRecall)
+		if !qParityOK {
+			t.Errorf("PARITY(Query): N=%d single-query CUDA ranking diverged from CPU int8 — a bug, not a knob.", N)
+		}
+		qsp := gpuQThr / cpuQThr
+		qShape := bench.Shape{N: N, Dim: dim, Batch: 1, K: kTop}
+		cpuQR, gpuQR := cpuQRecall, gpuQRecall
+		cpuQRec := bench.Record{
+			Workload: "ann.FlatI8.Query", Backend: "cpu-simd", Precision: "int8",
+			Device: cpuDev, Shape: qShape,
+			Timing:     bench.Timing{Compute: msPer(cpuQThr, 1), Wall: msPer(cpuQThr, 1)},
+			Throughput: cpuQThr, ThroughputUnit: "queries/s",
+			Quality: bench.Quality{RecallAtK: &cpuQR, ParityOK: true},
+			Meta:    meta,
+		}
+		gpuQRec := bench.Record{
+			Workload: "ann.FlatI8.Query", Backend: "cuda", Precision: "int8",
+			Device: gpuDev, Shape: qShape,
+			Timing:     bench.Timing{OneTime: oneTimeMs, Compute: msPer(gpuQThr, 1), Wall: msPer(gpuQThr, 1)},
+			Throughput: gpuQThr, ThroughputUnit: "queries/s",
+			Quality:      bench.Quality{RecallAtK: &gpuQR, ParityOK: qParityOK, MaxDeltaVsCPU: qMaxDelta},
+			SpeedupVsCPU: &qsp,
+			Meta:         meta,
+		}
+		if err := bench.AppendRecords(recordsPath, cpuQRec, gpuQRec); err != nil {
+			t.Fatalf("append query records: %v", err)
+		}
+		t.Logf("N=%-7d Query(1)     cpu %8.0f q/s  cuda %8.0f q/s  %5.2f×  recall cpu %.4f cuda %.4f  parity %v",
+			N, cpuQThr, gpuQThr, qsp, cpuQR, gpuQR, qParityOK)
 
 		for _, b := range batches {
 			qs := qpool[:b]
@@ -197,6 +237,31 @@ func envStr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// timeSingleQuery times FlatI8.Query ONE query at a time (min per-query over iters),
+// returning queries/s and the best pass's hits. Deliberately not QueryBatch with a
+// 1-element slice: that takes the batch kernel, and the whole point of this row is the
+// single-query GEMV path.
+func timeSingleQuery(f *ann.FlatI8, qs [][]float32, k int) (float64, [][]ann.Hit) {
+	for range warmup {
+		for _, q := range qs {
+			f.Query(q, k)
+		}
+	}
+	best := time.Hour
+	var hits [][]ann.Hit
+	for range iters {
+		h := make([][]ann.Hit, len(qs))
+		t0 := time.Now()
+		for i, q := range qs {
+			h[i] = f.Query(q, k)
+		}
+		if d := time.Since(t0) / time.Duration(len(qs)); d < best {
+			best, hits = d, h
+		}
+	}
+	return 1.0 / best.Seconds(), hits
 }
 
 func msPer(thr float64, batch int) float64 {
