@@ -3,8 +3,11 @@
 package anncuda
 
 import (
+	"bytes"
+	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"testing"
 
 	"github.com/townsendmerino/aikit/ann"
@@ -183,11 +186,15 @@ func TestCUDA_shapesOffBlockBoundary(t *testing.T) {
 	// n values straddling the 256-block boundary; dims that are not multiples of 4
 	// (so the K loop's tail is exercised too).
 	for _, shape := range []struct{ n, dim, m int }{
-		{1, 7, 1},     // single row, single query
-		{255, 33, 3},  // one short of a block
-		{256, 64, 1},  // exactly one block
-		{257, 17, 2},  // one past a block
-		{1023, 31, 7}, // large, prime-ish
+		{1, 7, 1},      // single row, single query
+		{255, 33, 3},   // one short of a block
+		{256, 64, 1},   // exactly one block
+		{257, 17, 2},   // one past a block
+		{1023, 31, 7},  // large, prime-ish
+		{97, 23, 9},    // M just past batchSmallMaxM — the wide kernel, partial tile
+		{513, 12, 16},  // wide kernel, tile exactly full
+		{31, 5, 17},    // n below one lane-group's worth; M spills to a second tile
+		{2049, 40, 33}, // three tiles, and n well past a block
 	} {
 		vecs := randUnit(rng, shape.n, shape.dim)
 		cpu := ann.NewFlatI8(vecs)
@@ -224,7 +231,7 @@ func TestCUDA_shapesOffBlockBoundary(t *testing.T) {
 		}
 		gpu.Close()
 	}
-	t.Log("GEMV+GEMM ≡ CPU across 5 shapes straddling the 256-thread block boundary")
+	t.Log("GEMV+batch ≡ CPU across 9 shapes straddling the block, lane-group and query-tile boundaries")
 }
 
 // TestCUDA_concurrentScore runs many goroutines against one GPU index. A CUDA
@@ -394,12 +401,18 @@ func newTestIndex(t *testing.T, vecs [][]float32) *cudaI8Index {
 		dev.ReleaseObjects()
 		t.Fatalf("topk: %v", err)
 	}
-	vit, err := dev.NewViT()
+	batchSmall, err := dev.NewComputePipeline(lib, "gemv_w8a8_batch8")
 	if err != nil {
 		dev.ReleaseObjects()
-		t.Fatalf("NewViT: %v", err)
+		t.Fatalf("batch8: %v", err)
 	}
-	b := &cudaBackend{dev: dev, q: dev.NewCommandQueue(), gemv: gemv, gemmT: vit.GEMMW8A8Tiled, topk: topk}
+	batchWide, err := dev.NewComputePipeline(lib, "gemv_w8a8_batch16")
+	if err != nil {
+		dev.ReleaseObjects()
+		t.Fatalf("batch16: %v", err)
+	}
+	b := &cudaBackend{dev: dev, q: dev.NewCommandQueue(), gemv: gemv,
+		batchSmall: batchSmall, batchWide: batchWide, topk: topk}
 	t.Cleanup(dev.ReleaseObjects)
 
 	// Quantize with the package's own quantizeRowInt8 — byte-identical to what
@@ -462,17 +475,21 @@ func TestCUDATopK_declines(t *testing.T) {
 	t.Log("declines below topkMinN, for k>=n and k<=0; the fallback answer is unchanged")
 }
 
-// TestCUDAGEMM_batchM1MatchesQuery covers the ONE batch width the tiled GEMM never
-// sees. gemmTileMinM is 2, so M=1 is the only batch that took the naive
-// thread-per-(query,row) kernel — and is now routed to the warp-per-row GEMV
-// instead (backend.go launchGEMM). TestCUDAGEMM_batchParityWithCPU runs at M=16 and
-// therefore exercises the tiled path only; without this, the reroute ships ungated.
+// TestCUDAGEMM_batchMatchesQuery gates the batched kernels against the single-query
+// one at every width where the routing or the tiling changes behaviour.
 //
-// The assertion is that a 1-query batch equals the single-query Query path exactly,
-// which is both the natural contract and the thing the reroute could break: the two
-// kernels take their arguments in a different order, so a mis-bound buffer would
-// still produce plausible-looking scores.
-func TestCUDAGEMM_batchM1MatchesQuery(t *testing.T) {
+// The widths are chosen, not sampled. batchSmallMaxM (8) selects between the two
+// instantiations, and each pads its query tile to QTILE (8 and 16), so M=8/9 crosses
+// the kernel choice, M=9/16/17 crosses the wide kernel's tile boundary, and M=1 takes
+// the GEMV reroute. The failure this catches is a mis-sized launch: GridY is
+// ceil(M/QTILE) and shared memory is QTILE*K, both computed host-side from constants
+// that are duplicated from the .cu, so a wrong one drops a whole tile of queries or
+// truncates the staged tile — and either way the surviving rows still look plausible.
+//
+// Exact equality is the right bar rather than a tolerance: the batch kernels compute
+// the same int32 dot in a different lane order, and integer addition is associative,
+// so any difference at all is a bug rather than rounding.
+func TestCUDAGEMM_batchMatchesQuery(t *testing.T) {
 	if !ann.HasBackend() {
 		t.Skip("no CUDA backend registered (no GPU?)")
 	}
@@ -486,21 +503,99 @@ func TestCUDAGEMM_batchM1MatchesQuery(t *testing.T) {
 	}
 	defer idx.Close()
 
-	for qi, q := range randUnit(rng, 25, dim) {
-		want := idx.Query(q, k)
-		got := idx.QueryBatch([][]float32{q}, k)
-		if len(got) != 1 {
-			t.Fatalf("QueryBatch(M=1) returned %d result sets", len(got))
+	for _, M := range []int{1, 2, 7, 8, 9, 16, 17, 33} {
+		queries := randUnit(rng, M, dim)
+		got := idx.QueryBatch(queries, k)
+		if len(got) != M {
+			t.Fatalf("M=%d: QueryBatch returned %d result sets", M, len(got))
 		}
-		if len(got[0]) != len(want) {
-			t.Fatalf("query %d: batch returned %d hits, Query returned %d", qi, len(got[0]), len(want))
+		for qi, q := range queries {
+			want := idx.Query(q, k)
+			if len(got[qi]) != len(want) {
+				t.Fatalf("M=%d q%d: batch returned %d hits, Query returned %d", M, qi, len(got[qi]), len(want))
+			}
+			for i := range want {
+				if got[qi][i].Index != want[i].Index || got[qi][i].Score != want[i].Score {
+					t.Fatalf("M=%d q%d hit %d: batch {%d, %v} != Query {%d, %v}",
+						M, qi, i, got[qi][i].Index, got[qi][i].Score, want[i].Index, want[i].Score)
+				}
+			}
 		}
-		for i := range want {
-			if got[0][i].Index != want[i].Index || got[0][i].Score != want[i].Score {
-				t.Fatalf("query %d hit %d: batch {%d, %v} != Query {%d, %v}",
-					qi, i, got[0][i].Index, got[0][i].Score, want[i].Index, want[i].Score)
+		// Vacuity: a batch that collapsed every row to the same query would still
+		// pass the loop above if Query were consulted per row, so check the rows differ.
+		if M > 1 {
+			distinct := false
+			for m := 1; m < M; m++ {
+				if len(got[m]) > 0 && len(got[0]) > 0 && got[m][0].Index != got[0][0].Index {
+					distinct = true
+					break
+				}
+			}
+			if !distinct {
+				t.Errorf("M=%d: every batch row shared the same top hit", M)
 			}
 		}
 	}
-	t.Logf("M=1 batch ≡ Query over 25 queries, exactly (n=%d dim=%d k=%d)", n, dim, k)
+	t.Logf("batch ≡ Query exactly at M ∈ {1,2,7,8,9,16,17,33} (n=%d dim=%d k=%d)", n, dim, k)
+}
+
+// TestBatchPlan gates the pairing of kernel to geometry. See batchPlan's comment for
+// why this cannot be left to the parity tests: the under-launch direction drops the
+// tail of the corpus and still returns a complete, plausible top-k from the rows it
+// did reach, and the over-launch direction is invisible to correctness entirely.
+func TestBatchPlan(t *testing.T) {
+	for _, tc := range []struct {
+		M            int
+		wantWide     bool
+		lanes, qtile int
+	}{
+		{1, false, 8, 8},
+		{8, false, 8, 8},
+		{9, true, 4, 16},
+		{256, true, 4, 16},
+	} {
+		wide, lanes, qtile := batchPlan(tc.M)
+		if wide != tc.wantWide || lanes != tc.lanes || qtile != tc.qtile {
+			t.Errorf("batchPlan(%d) = (wide=%v, lanes=%d, qtile=%d), want (%v, %d, %d)",
+				tc.M, wide, lanes, qtile, tc.wantWide, tc.lanes, tc.qtile)
+		}
+	}
+	// The geometry must belong to the kernel that was picked, not merely be one of
+	// the two valid pairs: a swapped pairing satisfies "lanes is 4 or 8" and would
+	// under-launch by 2x.
+	if _, lanes, qtile := batchPlan(batchSmallMaxM + 1); lanes*qtile != batchLanesWide*batchQTileWide {
+		t.Errorf("wide plan (%d, %d) is not the wide kernel's pair", lanes, qtile)
+	}
+}
+
+// TestBatchKernelConstantsMatchSource ties the host-side launch geometry to the
+// kernel source it must agree with. batchLanes*/batchQTile* are duplicated from
+// gemv_w8a8.cu's template arguments because PTX carries no way to ask a kernel what
+// it was compiled with, and a silent divergence there mis-sizes GridY and the shared
+// query tile.
+//
+// This is the one gate in this file that needs no GPU, which is the point: on a
+// machine without CUDA every parity test above skips, and a skipping test is a
+// passing test.
+func TestBatchKernelConstantsMatchSource(t *testing.T) {
+	src, err := os.ReadFile("gemv_w8a8.cu")
+	if err != nil {
+		t.Fatalf("read kernel source: %v", err)
+	}
+	for _, want := range []struct {
+		call         string
+		lanes, qtile int
+	}{
+		{"batch_body<8, 8>", batchLanesSmall, batchQTileSmall},
+		{"batch_body<4, 16>", batchLanesWide, batchQTileWide},
+	} {
+		if !bytes.Contains(src, []byte(want.call)) {
+			t.Errorf("gemv_w8a8.cu has no %q — the Go constants say (%d, %d)",
+				want.call, want.lanes, want.qtile)
+			continue
+		}
+		if got := fmt.Sprintf("batch_body<%d, %d>", want.lanes, want.qtile); got != want.call {
+			t.Errorf("Go constants render %q, source has %q", got, want.call)
+		}
+	}
 }

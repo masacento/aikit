@@ -1,29 +1,45 @@
-// gemv_w8a8.cu — the minimal, correctness-only W8A8 kernels behind the CUDA
-// ann.Backend (docs/task-native-gpu.md, Phase 1b). Line-for-line the CUDA twin of
-// the MSL in gpu/annmetal/backend.go: `gemv_w8a8` scores ONE query against the whole
-// index (FlatI8.Query), `gemm_w8a8` scores M queries in one launch (FlatI8.QueryBatch).
+// gemv_w8a8.cu — the W8A8 scoring kernels behind the CUDA ann.Backend
+// (docs/task-native-gpu.md, Phase 1b). `gemv_w8a8` scores ONE query against the whole
+// index (FlatI8.Query); `gemv_w8a8_batch8`/`gemv_w8a8_batch16` score M queries in one
+// launch (FlatI8.QueryBatch, FlatI8.TopKBatch); `topk_rows` selects on the device.
+//
+// This no longer mirrors gpu/annmetal/backend.go's MSL kernel-for-kernel. Both
+// backends started from the same two-kernel sketch, and both have since been
+// measured against their own device's ceilings, which pushed them apart — the batch
+// path here is a lane-group GEMV where Metal's is a threadgroup-tiled GEMM. The
+// PARITY contract is what the two share, not the kernel shape.
 //
 // BIT-IDENTITY-EXEMPT: structurally immune rather than merely uncontracted. The dot
 // products accumulate into an `int` — integer addition is associative, so the reduction
 // is exact and order-independent — and the float tail is `(float)acc * qscale * scale`,
 // two multiplies with NO add. There is no multiply-accumulate here for a compiler to
-// contract, which the shipped PTX confirms: 0 fma.rn.f32, 4 mul.f32. Adding a float
-// accumulate or a bias term would end that, so re-classify if this kernel grows one.
+// contract, which the shipped PTX confirms: 0 fma.rn.f32 against 50 mul.f32 (the count
+// rose with the batch kernels' unrolled epilogues; what matters is that the fma count
+// is ZERO, since there is nothing to fuse). Adding a float accumulate or a bias term
+// would end that, so re-classify if this kernel grows one.
 //
-// Both compute the EXACT int32 dot of the host-quantized int8 query against each
+// All compute the EXACT int32 dot of the host-quantized int8 query against each
 // row, then apply the query/row rescale — the same value linalg.MatmulBTW8A8
 // produces on the CPU. Integer accumulation is exact, so GPU and CPU rank
 // identically (backend_test.go gates that, break-it-first).
 //
-// gemv_w8a8 WAS deliberately untuned — "no __dp4a, no warp-per-row reduction, no
-// vectorized loads", on the reasoning that the tuned blob is goinfer's. Measurement
-// retired that: one thread per row means adjacent threads read addresses K bytes
-// apart (768 at the real shape), so a 32-thread warp's load touches 32 cache lines
-// and uses one byte from each. It ran at 25–28 GB/s against this device's measured
-// 403 GB/s streaming ceiling — SEVEN PERCENT — which made FlatI8.EnableGPU() slower
-// than the CPU path it was meant to accelerate. A proving kernel is fine; a proving
-// kernel wired to a production entry point is a pessimization. gemv_w8a8 is now
-// warp-per-row with __dp4a; gemm_w8a8 below is still the naive reference.
+// BOTH SCORING KERNELS WERE ONCE DELIBERATELY UNTUNED — "no __dp4a, no warp-per-row
+// reduction, no vectorized loads", on the reasoning that the tuned blob is goinfer's
+// and this is only the proving kernel. Measurement retired that twice, for the same
+// underlying reason: a proving kernel is fine, but a proving kernel wired to a
+// production entry point is a pessimization.
+//
+//   - gemv_w8a8 (FlatI8.Query) was thread-per-row, so adjacent threads read addresses
+//     K bytes apart and a warp's load touched 32 cache lines to use one byte of each.
+//     25-28 GB/s against a measured 412 GB/s streaming ceiling. Now warp-per-row with
+//     __dp4a: 3.3-6.0x (be90aec).
+//   - The batch path (FlatI8.QueryBatch) ran gpu/vit.cu's 16x16 gemm_w8a8_tiled, whose
+//     cost depends on ceil(M/16) rather than M — 6.79 ms at N=200k for every M from 1
+//     to 16. Now the lane-group batch GEMV below: 6.4-12.7x, and the tiled kernel is
+//     no longer reachable from this backend at any M.
+//
+// The lesson both share is in docs/internal/roofline-2026-08.md: the denominator has
+// to be measured before the kernel can be called fast or slow.
 //
 // Two shape conventions carried over from the Metal side:
 //   - Scalars arrive as 1-element BUFFERS, not by-value kernel params, mirroring
@@ -84,29 +100,154 @@ extern "C" __global__ void gemv_w8a8(
     }
 }
 
-// gemm_w8a8: out[m*N+j] = dot(qi8[m], codes[j]) * qscale[m] * scales[j],
-// one thread per (query, row) pair.
-extern "C" __global__ void gemm_w8a8(
-    const signed char* __restrict__ codes,  // [N*K] int8
-    const signed char* __restrict__ qi8,    // [M*K] int8 queries (host-quantized)
-    const float* __restrict__ scales,       // [N]
-    const unsigned int* __restrict__ K,
-    const unsigned int* __restrict__ N,
-    const float* __restrict__ qscale,       // [M] per-query scale
-    float* __restrict__ out,                // [M*N] scores, row-major
-    const unsigned int* __restrict__ total) // M*N (the launch bound)
+// ---------------------------------------------------------------------------
+// gemv_w8a8_batch{8,16}: the BATCHED form — out[m*N+j] for M queries — as one
+// group of lanes per corpus row, with the query tile staged in shared memory so
+// every loaded corpus row is reused across all QTILE queries in the tile.
+//
+// WHY THIS REPLACED THE TILED GEMM. This path used to run gpu/vit.cu's
+// gemm_w8a8_tiled, which stages a 16x16 output tile, so its wall time depends on
+// ceil(M/16) rather than on M: measured on nvidia-rtx2070s at N=200k K=768 it took
+// 6.79 ms for EVERY M from 1 to 16, and 109 ms at M=256. Looping the single-query
+// gemv_w8a8 costs 0.47 ms per query, so the tiled kernel did not break even until
+// M ~ 15 and never beat that loop by more than 9%. Both sat far below both roofs
+// (360 GMAC/s against a measured 4876 GMAC/s int32-MAD ceiling; 45 GB/s against a
+// measured 412 GB/s streaming ceiling) because a 16x16 byte-wise tile spends its
+// time on shared-memory traffic and __syncthreads, not on the dot. The constant
+// that selected it (gemmTileMinM = 2) was calibrated when the single-query GEMV was
+// still thread-per-row and 5.6x slower — the tiled kernel only ever looked good
+// against a broken baseline. See docs/internal/roofline-2026-08.md.
+//
+// THE TWO PARAMETERS WERE SWEPT, NOT REASONED. LANES (lanes cooperating on one row)
+// and QTILE (queries per tile) trade off against each other: the shuffle reduction
+// costs QTILE * log2(LANES) per row, so a wider query tile wants FEWER lanes, while
+// coalescing wants more (8 lanes * 4 B = 32 B, exactly one sector). Measured at
+// N=200k K=768, ms per launch, best in each column marked *:
+//
+//        M=1     M=2     M=4     M=8    M=16    M=64   M=256
+//  L8Q8   0.571*  0.547*  0.587*  0.664*  1.267   4.858  19.450
+//  L4Q16  0.908   0.914   0.922   0.956   1.082*  3.935*  15.513*
+//  L8Q16  0.919   0.921   0.944   1.026   1.206   4.465  17.360
+//  L2Q8   0.978   0.981   0.982   0.993   1.940   7.531  24.970
+//  L32Q16 1.893   —       —       —       2.402   9.622  —
+//
+// Hence L8Q8 for M <= 8 and L4Q16 above it. The all-32-lane form at the bottom is
+// what a straight port of the single-query kernel would have given: 2.2x off.
+//
+// QTILE ACCUMULATORS ARE ALWAYS COMPUTED, EVEN WHEN M < QTILE. The alternative — a
+// runtime-bounded loop over mc — indexes acc[] dynamically, which spills the array
+// from registers to local memory and costs far more than the padded MACs. The
+// staging loop zero-fills the unused query rows, so the padded accumulators compute
+// a defined zero and are simply not stored. That is what the M=1..8 column above is
+// paying for, and it is still an order of magnitude better than the tiled kernel.
+//
+// BIT-IDENTITY: same structural exemption as gemv_w8a8 — int accumulation is
+// associative, so the reduction over LANES equals the sequential sum, and the float
+// tail is two multiplies with no add. out[m*N+j] is exactly the value gemv_w8a8
+// writes for query m, which TestCUDAGEMM_batchMatchesQuery gates as exact equality.
+// ---------------------------------------------------------------------------
+
+template <int LANES, int QTILE>
+__device__ __forceinline__ void batch_body(
+    const signed char* __restrict__ codes, const signed char* __restrict__ qi8,
+    const float* __restrict__ scales, const unsigned int* __restrict__ K,
+    const float* __restrict__ qscale, float* __restrict__ out,
+    const unsigned int* __restrict__ N, const unsigned int* __restrict__ M)
 {
-    unsigned int g = blockIdx.x * blockDim.x + threadIdx.x;
-    if (g >= *total) return;
-    unsigned int n = *N, k = *K;
-    unsigned int m = g / n, j = g % n;
-    const signed char* qrow = qi8   + (unsigned long long)m * k;
-    const signed char* crow = codes + (unsigned long long)j * k;
-    int acc = 0;
-    for (unsigned int i = 0; i < k; i++) {
-        acc += (int)qrow[i] * (int)crow[i];
+    // Dynamic shared memory, declared as int so the 4-byte reads below are aligned;
+    // the launch sizes it at QTILE*K bytes (gpu.Buffer-free, so it costs no upload).
+    extern __shared__ int qsmem[];
+    signed char* qs = (signed char*)qsmem;
+
+    unsigned int k = *K, n = *N, m = *M;
+    unsigned int m0 = blockIdx.y * QTILE;
+    unsigned int mc = (m - m0 < QTILE) ? (m - m0) : QTILE;
+
+    // Stage this tile's queries, zero-filling rows past mc. EVERY thread in the block
+    // runs this loop and reaches the barrier, which is why the row-bound return below
+    // is placed after __syncthreads() — returning first would strand the survivors.
+    for (unsigned int i = threadIdx.x; i < (unsigned int)QTILE * k; i += blockDim.x) {
+        unsigned int t = i / k;
+        qs[i] = (t < mc) ? qi8[(unsigned long long)(m0 + t) * k + (i - t * k)] : (signed char)0;
     }
-    out[g] = (float)acc * qscale[m] * scales[j];
+    __syncthreads();
+
+    unsigned int groupsPerBlock = blockDim.x / LANES;
+    unsigned int j = blockIdx.x * groupsPerBlock + (threadIdx.x / LANES);
+    if (j >= n) return;
+    unsigned int lane = threadIdx.x & (unsigned int)(LANES - 1);
+    const signed char* row = codes + (unsigned long long)j * k;
+
+    int acc[QTILE];
+    #pragma unroll
+    for (int t = 0; t < QTILE; t++) acc[t] = 0;
+
+    if ((k & 3u) == 0) {
+        // 4 int8 MACs per instruction via __dp4a, 4 bytes per lane per load. k%4==0
+        // makes every row start 4-byte aligned (the base allocation is 256-byte
+        // aligned), and the shared tile inherits qsmem's alignment.
+        const int* row4 = (const int*)row;
+        const int* qs4 = (const int*)qs;
+        unsigned int k4 = k >> 2;
+        for (unsigned int i = lane; i < k4; i += LANES) {
+            int rv = row4[i]; // ONE global load feeds all QTILE dp4a's — the whole point
+            #pragma unroll
+            for (int t = 0; t < QTILE; t++) {
+                acc[t] = __dp4a(rv, qs4[(unsigned int)t * k4 + i], acc[t]);
+            }
+        }
+    } else {
+        // Byte path for k%4 != 0: still coalesced, one MAC per lane per step.
+        for (unsigned int i = lane; i < k; i += LANES) {
+            int rv = (int)row[i];
+            #pragma unroll
+            for (int t = 0; t < QTILE; t++) {
+                acc[t] += rv * (int)qs[(unsigned int)t * k + i];
+            }
+        }
+    }
+
+    // One reduction per query. The shuffles are warp-wide but the tree is only
+    // log2(LANES) deep, so the lanes of the other row-groups sharing this warp
+    // reduce their own rows in the same instructions.
+    #pragma unroll
+    for (int t = 0; t < QTILE; t++) {
+        int a = acc[t];
+        for (int off = LANES / 2; off > 0; off >>= 1) {
+            a += __shfl_down_sync(0xffffffffu, a, off);
+        }
+        if (lane == 0 && (unsigned int)t < mc) {
+            out[(unsigned long long)(m0 + t) * n + j] = (float)a * qscale[m0 + t] * scales[j];
+        }
+    }
+}
+
+// gemv_w8a8_batch8 — 8 lanes per row, 8 queries per tile. For M <= 8.
+extern "C" __global__ void gemv_w8a8_batch8(
+    const signed char* __restrict__ codes,  // [N*K] int8, row-major
+    const signed char* __restrict__ qi8,    // [M*K] int8 queries (host-quantized)
+    const float* __restrict__ scales,       // [N]   per-row scale
+    const unsigned int* __restrict__ K,
+    const float* __restrict__ qscale,       // [M]   per-query scale
+    float* __restrict__ out,                // [M*N] scores, row-major
+    const unsigned int* __restrict__ N,
+    const unsigned int* __restrict__ M)     // query count
+{
+    batch_body<8, 8>(codes, qi8, scales, K, qscale, out, N, M);
+}
+
+// gemv_w8a8_batch16 — 4 lanes per row, 16 queries per tile. For M > 8.
+extern "C" __global__ void gemv_w8a8_batch16(
+    const signed char* __restrict__ codes,
+    const signed char* __restrict__ qi8,
+    const float* __restrict__ scales,
+    const unsigned int* __restrict__ K,
+    const float* __restrict__ qscale,
+    float* __restrict__ out,
+    const unsigned int* __restrict__ N,
+    const unsigned int* __restrict__ M)
+{
+    batch_body<4, 16>(codes, qi8, scales, K, qscale, out, N, M);
 }
 
 // topk_rows — per-query top-k selection ON THE DEVICE, so a batch returns M*k hits

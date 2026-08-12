@@ -1,9 +1,10 @@
 # Roofline campaign, 2026-08 — linalg CPU and CUDA
 
-> **Status:** RESULT of one session on `nvidia-rtx2070s` (Ryzen 7 3700X, Zen 2, 8C/16T,
-> AVX2 no VNNI; RTX 2070 SUPER, driver 595.58.03). Five commits, `8073a57`…`71269fe`.
-> Every ratio below is against a ceiling **measured on the machine that ran it**, and
-> the probes that produce those ceilings are now in the tree.
+> **Status:** RESULT of two sessions on `nvidia-rtx2070s` (Ryzen 7 3700X, Zen 2, 8C/16T,
+> AVX2 no VNNI; RTX 2070 SUPER, driver 595.58.03). Every ratio below is against a
+> ceiling **measured on the machine that ran it**, by a probe in the tree:
+> `linalg/fmapeak_amd64.s` for the CPU roofs, `gpu/roofline.cu` for the device ones.
+> Re-run the device three with `cd gpu && go test -run TestDeviceCeilings -v`.
 >
 > The companion docs are [`measuring-performance.md`](measuring-performance.md) (method
 > and failure catalogue), [`perf-amdahl-linux-amd64.md`](perf-amdahl-linux-amd64.md)
@@ -12,9 +13,9 @@
 ## The one-line version
 
 The f32 GEMM went from **39% to 52–64%** of this box's FMA peak, the CPU int8 W8A8
-matmul gained **17.4%**, and `FlatI8`'s CUDA `Query` got **3.3–6.0×**. Every win came
-from measuring a ceiling first; **every prediction made from reading the instruction
-mix was wrong.**
+matmul gained **17.4%**, `FlatI8`'s CUDA `Query` got **3.3–6.0×** and its `QueryBatch`
+**2.2–5.4×**. Every win came from measuring a ceiling first; **every prediction made
+from reading an instruction mix was wrong — four for four.**
 
 ## 0 · Why the ceilings had to be built first
 
@@ -31,11 +32,24 @@ wrong number is harder to catch than an obviously wrong one.
 |---|--:|---|
 | f32 FMA peak (amd64) | **135 GFLOP/s** | `fmapeak_amd64.s`, 14 YMM accumulators, no memory |
 | VPMADDWD throughput (int8) | **69.0 GMAC/s** | load-free probe, 1.03/cycle — single-pipe on Zen 2 |
-| device streaming read | **403 GB/s** | `int4` grid-stride over 512 MiB, 90% of the 448 nameplate |
+| device streaming read | **412 GB/s** | `int4` grid-stride over 512 MiB, 92% of the 448 nameplate |
+| device int32 mul-add | **4876 GMAC/s** | 16 independent `a=a*b+c` chains, no memory |
+| device `__dp4a` | **19534 GMAC/s** | same loop, 4 int8 MACs per instruction |
 
-The f32 probe cross-checks itself: 135 GFLOP/s ÷ 32 flops/cycle implies **4.2 GHz**,
-exactly where a 3700X boosts. A figure implying 8 GHz or 1 GHz would mean it was
-measuring something other than FMA throughput.
+Each probe cross-checks itself, which is the part that makes a denominator
+trustworthy rather than merely plausible:
+
+- 135 GFLOP/s ÷ 32 flops/cycle implies **4.2 GHz**, exactly where a 3700X boosts.
+- 4876 GMAC/s ÷ (40 SM × 64 lanes) implies **1.90 GHz**, inside the 2070 SUPER's
+  1.77–2.15 GHz boost range.
+- `dp4a_peak` and `imad_peak` run the *same* loop with the *same* chain count and
+  differ only in the instruction issued, so their **instruction** rates must match —
+  4883 vs 4876 G/s. If they had not, dp4a's 4× MAC advantage would have been an
+  artifact of loop overhead rather than a property of the ISA. `TestDeviceCeilings`
+  asserts this ratio, so the probe fails loudly rather than reporting a pretty lie.
+
+A figure implying 8 GHz, or a dp4a/imad ratio of 4, would mean the probe was measuring
+something other than what it claims.
 
 ## 1 · CPU f32: 39% → 52–64% of peak
 
@@ -146,6 +160,59 @@ confirms rather than assumes: GPU≡CPU top-10 over 200 queries at worst Δ **0.
 `71269fe` then routed **M=1 batches** to the same kernel, since `gemmTileMinM = 2` means
 the naive thread-per-(query,row) GEMM only ever ran at that one width.
 
+## 3b · CUDA: the batch path, `QueryBatch` 2.2–5.4×
+
+This was §6's open item — "the only unmeasured production path on this device, tuned
+before any ceiling existed to tune against". It was worse than unmeasured.
+
+`FlatI8.QueryBatch` ran `vit.cu`'s 16×16 `gemm_w8a8_tiled`. Kernel time at N=200k,
+K=768:
+
+| M | tiled GEMM | looped GEMV | **new batch GEMV** | vs tiled |
+|--:|--:|--:|--:|--:|
+| 2 | 6.79 ms | 0.96 | **0.55** | 12.4× |
+| 8 | 6.82 | 3.75 | **0.66** | 10.3× |
+| 16 | 6.88 | 7.48 | **1.08** | 6.4× |
+| 64 | 27.36 | ~29.9 | **3.94** | 7.0× |
+| 256 | 109.28 | ~119.5 | **15.51** | 7.0× |
+
+**The tiled kernel's wall time did not depend on M at all below 16.** It tiles a 16×16
+output block, so a batch of 2 pays for 16 rows and discards 14. `gemmTileMinM = 2`
+routed everything from M=2 up into it.
+
+That constant was not wrong when it was written — it was **invalidated by §3**. It was
+calibrated against a thread-per-row GEMV that was 5.6× slower than the one that ships
+now. Re-measured against the current baseline, the tiled kernel does not break even
+until M ≈ 15 and never beats a loop over the single-query GEMV by more than 9%. A
+tuning constant is a claim about two things, and fixing one of them silently retires it.
+
+End-to-end through `QueryBatch`, which is what a caller feels:
+
+| M | before | after | | per query |
+|--:|--:|--:|--:|--:|
+| 2 | 9.19 ms | 1.69 ms | 5.4× | 4.59 → 0.85 ms |
+| 16 | 10.25 | 4.65 | 2.2× | 0.64 → 0.29 |
+| 64 | 31.21 | 9.13 | 3.4× | 0.49 → 0.14 |
+| 256 | 121.02 | 26.54 | 4.6× | 0.47 → 0.10 |
+
+**Batching now pays at every width.** Before, M=2 cost 4.59 ms per query against M=1's
+1.22 — asking for two answers at once was 3.8× *worse* per answer than asking twice.
+
+The replacement is a lane-group GEMV: LANES threads cooperate on one corpus row (as
+§3's kernel does), but QTILE queries are staged in shared memory so **one corpus load
+feeds QTILE `__dp4a`s**. Corpus traffic falls from once-per-query to once-per-tile.
+
+**The two parameters were swept, not reasoned — and reasoning would have got it wrong
+for the fourth time.** The obvious port of §3's kernel keeps 32 lanes per row: that is
+the slowest row of the sweep, 2.2× off the best, because the reduction cost scales with
+QTILE × log2(LANES) and a wider query tile therefore wants *fewer* lanes. Predicted
+~0.5 ms at M=16 from a bandwidth argument; measured 2.78 ms, because the kernel is not
+bandwidth-bound at all — it reaches 110 GB/s of a 412 GB/s roof. The sweep table is in
+`gemv_w8a8.cu`.
+
+`gemm_w8a8_tiled` is no longer reachable from this backend at any M, and the naive
+`gemm_w8a8` — dead since `71269fe` rerouted M=1 — is deleted.
+
 ## 4 · Negatives and process failures, in full
 
 - **2×4 AVX2 kernel** — 1.33 FMA/load vs 0.89, +4%, not kept. Its disproof is recorded
@@ -161,9 +228,21 @@ the naive thread-per-(query,row) GEMM only ever ran at that one width.
   the reasoning lives at `measureFMAPeak` and the implied-clock check is the real gate.
 - **A "verified by mutation" comment that had not been mutation-checked.** Written into
   the 2-loader test before testing it. Caught, and the claim removed.
-- **Three gates found exercising a different path than the change.** Most recently
-  `TestCUDAGEMM_batchParityWithCPU` runs at M=16, which is ≥ `gemmTileMinM` and so
-  exercises the *tiled* kernel — the one path the M=1 reroute does not touch.
+- **Three gates found exercising a different path than the change.**
+  `TestCUDAGEMM_batchParityWithCPU` runs at M=16, which was ≥ `gemmTileMinM` and so
+  exercised the *tiled* kernel — the one path the M=1 reroute did not touch.
+- **A stale tuning constant that no test could ever have caught.** `gemmTileMinM = 2`
+  selected a kernel that was 7–12× slower than the alternative, and every parity gate
+  stayed green throughout, correctly: both kernels compute the same scores. Nothing in
+  the suite measures *which* kernel is faster, so the only thing standing between a
+  correct-but-slow route and production was someone re-measuring. Worth remembering
+  before trusting any other constant of this shape.
+- **A mutation that was RIGHT to survive.** Pairing the wide batch kernel with the
+  narrow one's lane count passed every parity test — and should have: over-launching is
+  absorbed by the row-bound check, at 2× the blocks for the same answer. The reverse
+  pairing silently drops the tail of the corpus and still returns a full, plausible
+  top-k. Neither is reachable by a correctness test, so the pairing was extracted into
+  `batchPlan` and gated as a pure function.
 
 ## 5 · The through-line
 
@@ -174,8 +253,11 @@ was right.**
   latency, found by varying only chain count.
 - int8: "half the uops are widening" → built the fix → 8.5%. The lever was register
   blocking, worth 4.4× more.
-- CUDA: the roofline pointed straight at coalescing and was right first time —
+- CUDA `Query`: the roofline pointed straight at coalescing and was right first time —
   **because a bandwidth-bound kernel has exactly one thing to get right.**
+- CUDA `QueryBatch`: "stage the queries and it becomes bandwidth-bound" → built it →
+  2.78 ms against a predicted 0.5, at 27% of the bandwidth roof. The lever was the
+  reduction width, found by sweeping two parameters and reading the table.
 
 The corollary for whoever picks this up: the probes are cheap (each is a few dozen lines
 and runs in under a second) and they are the only step that has never misled. Build the
@@ -185,9 +267,16 @@ denominator before the kernel.
 
 **Unmeasured on this box:**
 
-- The **tiled batch GEMM** (`vit.cu`'s `gemm_w8a8`, used for `QueryBatch` M≥2) has never
-  been measured against the 403 GB/s ceiling. It is now the only unmeasured production
-  path on this device, and it was tuned before any ceiling existed to tune against.
+- **`topk_rows` is now the batch path's largest remaining cost.** At M=256, N=200k the
+  kernel is 15.5 ms of a 26.5 ms end-to-end call; the other 11 ms is host quantization
+  plus a device top-k that runs ONE BLOCK PER QUERY over N=200k, k times. It has never
+  been measured against anything. It is the same shape of problem §3b just fixed — a
+  correctness-first kernel on a production entry point — and it is now the biggest
+  single line item.
+- **The single-query GEMV has 22% left, already measured.** The §3b sweep covered
+  QTILE=1, and 8 lanes per row beats the shipped 32 at M=1: 0.401 ms against 0.490 at
+  N=200k. `gemv_w8a8` is untouched here because it is a separate path with its own
+  gates; the change is a constant.
 - CPU f32 remains at ~63% and int8 at 78% of their ceilings. The rest is loop overhead,
   the 12 horizontal reductions, and cache — diminishing returns.
 
@@ -204,7 +293,13 @@ denominator before the kernel.
   numbers in `cpu-acceleration.md` (~95 GFLOPS ceiling, 68–73%) can be re-derived rather
   than trusted.
 
-**Stale on both sides:** the CPU int8 path gained 17–38% and the CUDA path 3.3–6.0×, so
-`crossover_test.go`'s recorded CPU/GPU crossover points describe neither. Regenerating
-them is arguably worth more than another kernel — it is what decides when
-`EnableGPU()` is worth calling at all.
+**Crossover, one side done.** The M1 Pro's `crossover_test.go` was regenerated
+(`ab803ab`) after the Metal fix, and gained a single-query row the old harness lacked —
+it only ever timed `QueryBatch`, so it could not answer "is `EnableGPU()` worth it for
+one query". Its finding: on the M1 Pro single-query GPU still LOSES to CPU (0.43–0.66×)
+and `EnableGPU()` pays only at batch ≥ 8.
+
+**CUDA's is still stale, and now doubly so** — the batch path moved 2.2–5.4× after
+those points were recorded, on top of the CPU int8 path's 17–38%. It needs the same
+treatment, including the single-query row. That regeneration is arguably worth more
+than another kernel: it is what decides when `EnableGPU()` is worth calling at all.

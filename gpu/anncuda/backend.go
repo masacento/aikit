@@ -9,13 +9,12 @@
 // Importing this package is the opt-in: aikit's core `ann` never imports `gpu`,
 // so the default build stays pure-Go CPU.
 //
-// Two kernels (gemv_w8a8.cu, PTX-embedded): gemv_w8a8 scores ONE query against the
-// whole index (FlatI8.Query), gemm_w8a8 scores M queries in one launch
-// (FlatI8.QueryBatch). Both compute the exact int32 dot of the host-quantized int8
-// query against each row, then the query/row rescale — the same value the CPU
-// linalg.MatmulBTW8A8 produces, so GPU and CPU rank identically. The kernels are
-// intentionally minimal and correctness-only; the tuned decode kernels are
-// goinfer's and stay there.
+// The kernels live in gemv_w8a8.cu and ship as embedded PTX: gemv_w8a8 scores ONE
+// query against the whole index (FlatI8.Query), gemv_w8a8_batch8/16 score M queries
+// in one launch (FlatI8.QueryBatch, FlatI8.TopKBatch), and topk_rows selects on the
+// device. All compute the exact int32 dot of the host-quantized int8 query against
+// each row, then the query/row rescale — the same value the CPU linalg.MatmulBTW8A8
+// produces, so GPU and CPU rank identically.
 package anncuda
 
 import (
@@ -40,13 +39,12 @@ type cudaBackend struct {
 	dev  *gpu.Device
 	q    gpu.Queue
 	gemv gpu.Pipeline // one query  × N rows (FlatI8.Query)
-	gemm gpu.Pipeline // M queries × N rows (FlatI8.QueryBatch) — naive, kept as reference
-	// gemmT is gpu's TILED W8A8 GEMM, reused rather than duplicated here: its
-	// (A, aScale, B, bScale, C, M, N, K) is exactly this backend's
-	// (qi8, qscale, codes, scales, out, M, N, K). Bit-identical to gemm — int32 sums
-	// are associative, so re-chunking K cannot change a score.
-	gemmT gpu.Pipeline
-	topk  gpu.Pipeline // per-query top-k on the device (avoids the M×N readback)
+	// The two batch instantiations differ only in their (LANES, QTILE) constants,
+	// which gemv_w8a8.cu records the sweep for. batchSmall is 8 lanes/row × 8
+	// queries/tile, batchWide 4 × 16; batchQTile below is the selection rule.
+	batchSmall gpu.Pipeline // M ≤ batchSmallMaxM
+	batchWide  gpu.Pipeline // M >  batchSmallMaxM
+	topk       gpu.Pipeline // per-query top-k on the device (avoids the M×N readback)
 }
 
 // init reaches CUDA and registers the backend. If there is no CUDA device (no
@@ -67,7 +65,12 @@ func init() {
 		dev.ReleaseObjects()
 		return
 	}
-	gemm, err := dev.NewComputePipeline(lib, "gemm_w8a8")
+	batchSmall, err := dev.NewComputePipeline(lib, "gemv_w8a8_batch8")
+	if err != nil {
+		dev.ReleaseObjects()
+		return
+	}
+	batchWide, err := dev.NewComputePipeline(lib, "gemv_w8a8_batch16")
 	if err != nil {
 		dev.ReleaseObjects()
 		return
@@ -77,16 +80,9 @@ func init() {
 		dev.ReleaseObjects()
 		return
 	}
-	// The tiled GEMM lives in gpu's ViT module; loading it here reuses that kernel
-	// instead of keeping a second copy of the same 16×16 tile in this package.
-	vit, err := dev.NewViT()
-	if err != nil {
-		dev.ReleaseObjects()
-		return
-	}
 	ann.RegisterBackend(&cudaBackend{
 		dev: dev, q: dev.NewCommandQueue(),
-		gemv: gemv, gemm: gemm, gemmT: vit.GEMMW8A8Tiled, topk: topk,
+		gemv: gemv, batchSmall: batchSmall, batchWide: batchWide, topk: topk,
 	})
 }
 
@@ -212,7 +208,7 @@ func (x *cudaI8Index) ScoreBatch(queries [][]float32, dst []float32) (err error)
 			x.b.dev.ReleaseBuf(b)
 		}
 	}()
-	if err := x.launchGEMM(qi8Buf, qscaleBuf, outBuf, M, N, K); err != nil {
+	if err := x.launchBatch(qi8Buf, qscaleBuf, outBuf, M, N, K); err != nil {
 		return err
 	}
 	if err := x.b.q.Sync(); err != nil {
@@ -280,13 +276,19 @@ const topkMinN = 50_000
 // needs a real batch behind it.
 const topkMinBatch = 8
 
-// gemmTileMinM is where the TILED GEMM starts to pay. It stages a 16x16 output tile, so
-// a batch of M < 16 leaves (16-M)/16 of every block's rows idle — at M=1 that is 15/16
-// of the threads doing nothing, which is why batch=1 REGRESSED when the tiled kernel was
-// switched on unconditionally (N=10k: 1.32x -> 1.12x). The naive kernel parallelises over
-// M*N and has no such waste, so it stays the right choice for thin batches. This is the
-// opposite of the usual "tiling always wins" intuition and only shows up at small M.
-const gemmTileMinM = 2
+// batchSmallMaxM is where the wider query tile starts to pay, and both halves of the
+// choice were swept rather than reasoned (the table is in gemv_w8a8.cu). The narrow
+// kernel tiles 8 queries and the wide one 16, so a batch of M pays for ceil(M/QTILE)
+// full tiles: at M=8 the wide kernel computes 16 accumulators to store 8, which costs
+// more than the extra corpus pass the narrow kernel makes. Above 8 that reverses,
+// because a second pass over an N×K corpus is far more expensive than padded MACs.
+//
+// This replaced gemmTileMinM = 2, which selected gpu/vit.cu's 16×16 tiled GEMM. That
+// constant was measured when the single-query GEMV was still thread-per-row and 5.6×
+// slower than it is now — the tiled kernel only ever looked good against a baseline
+// that has since been fixed. Re-measured against the current one it lost at every M
+// (6.4–12.7×), so there is no longer a tiled route at all.
+const batchSmallMaxM = 8
 
 // TopKBatch implements ann.I8TopKIndex: score the batch on the device, select each
 // query's top-k THERE, and return only M*k hits.
@@ -342,7 +344,7 @@ func (x *cudaI8Index) TopKBatch(queries [][]float32, k int) (hits [][]ann.Hit, e
 		}
 	}()
 
-	if err := x.launchGEMM(qi8Buf, qscaleBuf, scoreBuf, M, N, K); err != nil {
+	if err := x.launchBatch(qi8Buf, qscaleBuf, scoreBuf, M, N, K); err != nil {
 		return nil, err
 	}
 	// One block per query; the kernel consumes winners in place, so scoreBuf is
@@ -379,29 +381,63 @@ func (x *cudaI8Index) TopKBatch(queries [][]float32, k int) (hits [][]ann.Hit, e
 	return out, nil
 }
 
-// launchGEMM dispatches the batched W8A8 GEMM, picking the tiled kernel only when the
-// batch is deep enough to fill its 16-row tile (see gemmTileMinM). Both kernels are
-// bit-identical — int32 sums are associative — so this is purely a throughput choice and
-// never changes a score.
-func (x *cudaI8Index) launchGEMM(qi8Buf, qscaleBuf, outBuf gpu.Buffer, M, N, K int) error {
-	if M >= gemmTileMinM {
-		return x.b.q.Launch(x.b.gemmT, gpu.TileGrid(M, N),
-			gpu.Arg(qi8Buf), gpu.Arg(qscaleBuf), gpu.Arg(x.codes), gpu.Arg(x.scales), gpu.Arg(outBuf),
-			gpu.ArgValue(int32(M)), gpu.ArgValue(int32(N)), gpu.ArgValue(int32(K)))
-	}
+// launchBatch dispatches the batched W8A8 scoring kernel over M queries, writing
+// [M*N] scores into outBuf. Both instantiations produce bit-identical results — int32
+// sums are associative, and each output is exactly the value gemv_w8a8 computes for
+// that query — so the choice between them is purely throughput and can never change
+// a score. TestCUDAGEMM_batchMatchesQuery gates that as exact equality.
+func (x *cudaI8Index) launchBatch(qi8Buf, qscaleBuf, outBuf gpu.Buffer, M, N, K int) error {
 	if M == 1 {
-		// gemmTileMinM is 2, so the naive GEMM only ever ran at M=1 — and at M=1 the
-		// batch IS a single-query GEMV, whose kernel is warp-per-row and therefore
-		// coalesced (be90aec: 3.3–6.0× the thread-per-row form). The naive GEMM still
-		// has the defect the GEMV shed: one thread per (query, row), each walking its
-		// row byte by byte. Route M=1 to the fast kernel instead of maintaining a
-		// second slow one. Layouts already match — qscaleBuf is [1] here, which is
-		// what gemv's scalar qscale binding expects, and out[j] is the same [N] row.
-		return x.b.q.Run1D(x.b.gemv, x.n*32, 256,
+		// A 1-query batch IS a single-query GEMV, and the dedicated kernel is the
+		// faster way to run one: 0.49 ms against batch8's 0.57 at N=200k K=768,
+		// because batch8 computes 8 accumulators to store 1. The layouts already
+		// agree — qscaleBuf is [1] here, which is what gemv's scalar qscale binding
+		// expects, and out[j] is the same [N] row.
+		return x.b.q.Run1D(x.b.gemv, x.n*32, batchBlock,
 			x.codes, qi8Buf, x.scales, x.kbuf, qscaleBuf, outBuf, x.nbuf)
 	}
-	totalBuf := x.b.dev.NewBufferU32(uint32(M * N))
-	defer x.b.dev.ReleaseBuf(totalBuf)
-	return x.b.q.Run1D(x.b.gemm, M*N, 256,
-		x.codes, qi8Buf, x.scales, x.kbuf, x.nbuf, qscaleBuf, outBuf, totalBuf)
+	wide, lanes, qtile := batchPlan(M)
+	p := x.b.batchSmall
+	if wide {
+		p = x.b.batchWide
+	}
+	// Grid X covers N rows at `lanes` threads each; grid Y is one plane per query
+	// tile. The kernel bounds-checks the row index, since the grid overhangs N
+	// whenever the block size does not divide N*lanes.
+	cfg := gpu.Grid1D(N*lanes, batchBlock)
+	cfg.GridY = uint32((M + qtile - 1) / qtile)
+	// The query tile lives in dynamic shared memory: QTILE rows of K bytes. At the
+	// shapes this backend sees (K ≤ 1024) that is at most 16 KiB, inside the 48 KiB
+	// a block gets by default.
+	cfg.SharedMemBytes = uint32(qtile * K)
+	mBuf := x.b.dev.NewBufferU32(uint32(M))
+	defer x.b.dev.ReleaseBuf(mBuf)
+	return x.b.q.Launch(p, cfg,
+		gpu.Arg(x.codes), gpu.Arg(qi8Buf), gpu.Arg(x.scales), gpu.Arg(x.kbuf),
+		gpu.Arg(qscaleBuf), gpu.Arg(outBuf), gpu.Arg(x.nbuf), gpu.Arg(mBuf))
 }
+
+// batchPlan picks the batch kernel for M and returns the geometry constants THAT
+// kernel was compiled with. It is a separate pure function, and tested as one,
+// because pairing a kernel with the wrong constants is the failure mode no parity
+// test can see: too many lanes over-launches and the row-bound check quietly absorbs
+// it (2x the blocks, half discarded), while too few under-launches and the tail of
+// the corpus is never scored at all — and the second one still returns a full,
+// plausible top-k drawn from the rows it did reach.
+func batchPlan(M int) (wide bool, lanes, qtile int) {
+	if M > batchSmallMaxM {
+		return true, batchLanesWide, batchQTileWide
+	}
+	return false, batchLanesSmall, batchQTileSmall
+}
+
+// The (LANES, QTILE) constants each batch kernel was compiled with. They are
+// duplicated from gemv_w8a8.cu because the launch geometry depends on them and PTX
+// carries no way to ask; TestBatchKernelConstantsMatchSource keeps the two in step.
+const (
+	batchLanesSmall = 8
+	batchQTileSmall = 8
+	batchLanesWide  = 4
+	batchQTileWide  = 16
+	batchBlock      = 256
+)
