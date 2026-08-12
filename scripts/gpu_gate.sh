@@ -31,6 +31,25 @@
 # Env:    NVRTC_LIB / CUDA_INC   override NVRTC discovery (see gpu/build_ptx.sh)
 set -u
 
+# GOWORK=off IS LOAD-BEARING, not a workaround.
+#
+# go.work is gitignored (.gitignore) and therefore per-machine: this box has none, the
+# Mac has one listing only the *metal modules. With the workspace active, `go list ./...`
+# inside a module the workspace omits fails with "directory prefix . does not contain
+# modules listed in go.work" — a workspace error raised BEFORE build tags are considered,
+# so a not-applicable module is indistinguishable from a broken one. That is how the Mac
+# got FAIL for the four *cuda modules on 2026-08-12.
+#
+# Adding them to go.work would fix that symptom and make this gate WORSE. A workspace
+# deliberately overrides module resolution with local directories, and what this gate
+# exists to check is each module AS IT WILL BE PUBLISHED. A workspace would have hidden
+# the `require aikit/gpu v0.0.0` defect completely — in-repo everything built, while no
+# consumer could resolve it at all (RELEASING.md, "Backend submodules"). A release gate
+# that reads the developer's local overrides is measuring the wrong thing.
+#
+# So: resolve every module standalone, through its own go.mod, on every machine.
+export GOWORK=off
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
