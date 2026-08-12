@@ -6,14 +6,31 @@ import (
 )
 
 // BenchmarkGEMMPeakFraction measures the blocked f32 GEMM (MatmulBTInto) as a fraction of
-// a MEASURED single-core ceiling (see fmaPeakARM64 / TestFMAPeak_empirical: 95.4 GFLOPS on
-// this M1 Pro). GFLOPS is the hard number; the fraction follows the measured peak, not a
-// spec sheet (the "8 FMA/cyc" back-of-envelope is ~2× low — Firestorm is 4 pipes × 4 lanes
-// = 16). The 1×8 Dot8x4 kernel sat at ~40%; the 2×8 dual-row kernel lifts it to ~68–73%.
+// a ceiling measured ON THE MACHINE RUNNING IT (MeasuredFMAPeakGFLOPS → the per-arch
+// register-saturating FMA probe). GFLOPS is the hard number; the fraction follows the
+// measured peak, never a spec sheet — the "8 FMA/cyc" back-of-envelope for Firestorm is
+// ~2× low (4 pipes × 4 lanes = 16).
+//
+// THE DENOMINATOR USED TO BE A CONSTANT, AND THIS BENCHMARK HAS NO BUILD TAG. It divided
+// by 3.2 GHz × 16 f32-FMA/cyc = 102.4 GFLOPS on every architecture, so on a Zen 2 box
+// (measured ceiling ~135) it reported the GEMM at "~50 %peak" where the true figure is
+// ~38%. Both numbers are believable; only one is real. Measuring the denominator removes
+// the class.
+//
+// Reference points, each against its OWN measured ceiling:
+//   - apple-m1pro (~95 GFLOPS): 1×8 Dot8x4 sat at ~40%; the 2×8 dual-row kernel lifted
+//     it to ~68–73%.
+//   - nvidia-rtx2070s (~135 GFLOPS): ~38%, i.e. the arm64 PRE-2×8 ratio — has2x8Kernel
+//     is false off arm64 (kernel_other.go), so amd64 never packs and runs dot-per-output
+//     with a 0.5 FMA-per-load inner loop. Two load ports feeding 2-flop FMAs cap that
+//     shape at ~50% of FMA peak before any other effect; it reaches 77% of THAT cap.
 func BenchmarkGEMMPeakFraction(b *testing.B) {
-	const clockGHz = 3.2
-	peakReal := 2.0 * 16 * clockGHz // 16 f32-FMA/cyc (4 pipes × 4 lanes)
-	b.Logf("M1 Pro single-core f32 peak @ %.1f GHz ≈ %.1f GFLOPS (measured ceiling ~95)", clockGHz, peakReal)
+	peakReal, ok := MeasuredFMAPeakGFLOPS()
+	if !ok {
+		b.Logf("no FMA-peak probe for this architecture — reporting GFLOPS only, no fraction")
+	} else {
+		b.Logf("measured single-core f32 FMA ceiling on THIS machine: %.1f GFLOPS", peakReal)
+	}
 
 	shapes := []struct {
 		name    string
@@ -43,7 +60,11 @@ func BenchmarkGEMMPeakFraction(b *testing.B) {
 			secs := b.Elapsed().Seconds() / float64(b.N)
 			g := flops / secs / 1e9
 			b.ReportMetric(g, "GFLOPS")
-			b.ReportMetric(100*g/peakReal, "%peak")
+			// Only report a fraction when the denominator was measured here. Emitting
+			// one from a guessed peak is what produced the "~50 %peak" fiction on amd64.
+			if ok && peakReal > 0 {
+				b.ReportMetric(100*g/peakReal, "%peak")
+			}
 		})
 	}
 }
