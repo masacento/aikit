@@ -24,8 +24,13 @@
 #   ln -sf ../../scripts/preflight.sh .git/hooks/pre-push
 set -u
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+# Resolve the repo root via git, NOT relative to this script. As a pre-push hook this
+# runs from a symlink at .git/hooks/pre-push, where "$(dirname "$0")/.." is `.git` — so a
+# BASH_SOURCE-relative root made the first hook invocation lint an empty directory and
+# report "no go files to analyze" as three failures. Caught by the hook, on itself.
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -z "$ROOT" ] && ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
 
 # The gpu modules carry `replace` directives and a developer may have a go.work; neither
 # should decide what this reports. Same reasoning as scripts/gpu_gate.sh.
