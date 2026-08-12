@@ -53,11 +53,31 @@ Concretely:
    The `gpu-kernels` CI job runs the same three assertions on every push. The gate is
    still the enforcement point: CI is advisory here by choice — see the note at the
    end of this section.
-1. On a Mac with a Metal GPU (and, for the CUDA half, a Linux/NVIDIA box if that path
-   changed): `cd gpu && CGO_ENABLED=0 go test ./...`. The Metal parity gates
-   (`metal_vit_test.go`) and the compile guards (`metal_precise_test.go`) must pass;
-   CUDA tests skip cleanly without an NVIDIA device. This is the half `gpu_gate.sh`
+1. **Run the device half: `scripts/gpu_device.sh`, on BOTH a Mac and an NVIDIA box.**
+   Paste both `VERDICT:` lines into the tag message. This is the half `gpu_gate.sh`
    cannot do for you.
+
+   > This step used to read `cd gpu && CGO_ENABLED=0 go test ./...`, and **`./...` stops
+   > at module boundaries** — so it tested one of the nine gpu modules and silently
+   > skipped the other eight. Found on 2026-08-12 by running the step as written and
+   > noticing `gpu/annmetal` had never been covered. The eight it missed are the same
+   > eight that had never been tagged (below): both are what you get when a tree of
+   > sibling modules is treated as one module out of habit.
+
+   The script iterates all nine modules — the same enumeration `gpu_gate.sh` uses for its
+   build group — and distinguishes three states, which is the point:
+
+   - **ok** — tests ran and passed, with the passed/skipped counts shown, because a
+     module whose every test skipped also prints `ok`.
+   - **n/a** — no buildable packages on this OS. The four `*metal` modules on Linux and
+     the four `*cuda` modules on darwin. `go test` exits 1 for these, which is neither
+     red nor green, so they are excluded from the tally rather than counted either way.
+   - **FAIL** — with the first failing lines.
+
+   Because of the `n/a` state the arithmetic is honest about something the old command
+   hid: **no single machine can cover all nine.** A Mac reports 5/5 applicable, an NVIDIA
+   box reports a different 5/5, and a `gpu/vX.Y.Z` tag needs both lines. One verdict alone
+   covers a bit over half the tree.
 2. Push as `townsendmerino` (a second account on this machine 403s on `townsendmerino`
    repos), and author commits as `townsendmerino@gmail.com`.
 
@@ -80,9 +100,9 @@ Concretely:
    Bump the **patch** for a fix/hardening with no API change, the **minor** for new
    exported surface.
 
-A local `pre-push` hook that runs `cd gpu && go test ./...` when a `gpu/v*` tag is being
-pushed would enforce this by construction and is welcome — but it only works on a Mac
-with a GPU, so the checklist above is the portable minimum: it turns a habit into a step
+A local `pre-push` hook that runs `scripts/gpu_device.sh` when a `gpu/v*` tag is being
+pushed would enforce this by construction and is welcome — but one machine can only ever
+produce one of the two verdicts, so the checklist above is the portable minimum: it turns a habit into a step
 someone can visibly fail to complete.
 
 ## Backend submodules — the eight that have never been tagged
