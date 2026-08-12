@@ -60,12 +60,21 @@ DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 BOX="$(uname -s)/$(uname -m)"
 
 # Declared groups (see the reconciliation rule above). Every one must emit a verdict.
-EXPECTED=(build fmt-vet fma-lint fma-histogram ptx-repro)
-declare -A SEEN=()
+#
+# SPACE-DELIMITED STRINGS, NOT ARRAYS, AND THAT IS DELIBERATE. This used `declare -A`,
+# which is bash 4.0+; macOS ships bash 3.2.57 (the last GPLv2 release) and has no other
+# bash by default. The gate therefore died on `declare: -A: invalid option` before
+# emitting a single verdict — on a Mac, which is the machine the RELEASING ritual most
+# needs it on. It went unnoticed from the day it was written because it had only ever run
+# on Linux. Keep every construct here POSIX-portable; `sh scripts/gpu_gate.sh` should
+# work, and is the cheap way to check.
+EXPECTED="build fmt-vet fma-lint fma-histogram ptx-repro"
+NEXPECTED="$(set -- $EXPECTED; echo $#)"
+SEEN=" "
 FAILED=0
 
 verdict() { # verdict <group> <PASS|FAIL> <detail>
-	SEEN["$1"]=1
+	SEEN="$SEEN$1 "
 	printf '  %-14s %-4s %s\n' "$1" "$2" "$3"
 	[ "$2" = "FAIL" ] && FAILED=$((FAILED + 1))
 	return 0
@@ -129,8 +138,11 @@ run_test ptx-repro     'TestPTXReproducible'       AIKIT_REQUIRE_PTX_REPRO=1
 
 # Reconcile declared groups against emitted verdicts (goinfer audit G-01).
 missing=""
-for g in "${EXPECTED[@]}"; do
-	[ -n "${SEEN[$g]:-}" ] || missing="$missing $g"
+for g in $EXPECTED; do
+	case "$SEEN" in
+	*" $g "*) ;;
+	*) missing="$missing $g" ;;
+	esac
 done
 if [ -n "$missing" ]; then
 	printf '  %-14s %-4s %s\n' reconcile FAIL "declared groups produced no verdict:$missing"
@@ -139,7 +151,7 @@ fi
 
 echo
 if [ "$FAILED" -gt 0 ]; then
-	echo "VERDICT: FAIL — $FAILED of ${#EXPECTED[@]} groups red at $COMMIT$DIRTY ($BOX, $DATE)"
+	echo "VERDICT: FAIL — $FAILED of $NEXPECTED groups red at $COMMIT$DIRTY ($BOX, $DATE)"
 	exit 1
 fi
 # Every group is green. A dirty tree is not a failure of the CHECKS — it is a failure of
@@ -147,10 +159,10 @@ fi
 # not describe what that commit contains. Distinguish the two rather than printing
 # "FAIL — 0 groups red", which reads as a bug in the gate.
 if [ -n "$DIRTY" ]; then
-	echo "VERDICT: INCONCLUSIVE — ${#EXPECTED[@]}/${#EXPECTED[@]} groups green, but the working tree is DIRTY."
+	echo "VERDICT: INCONCLUSIVE — $NEXPECTED/$NEXPECTED groups green, but the working tree is DIRTY."
 	echo "The verdict names $COMMIT and the tree is not $COMMIT. Commit, then re-run before tagging."
 	exit 1
 fi
-echo "VERDICT: PASS — ${#EXPECTED[@]}/${#EXPECTED[@]} groups green at $COMMIT ($BOX, $DATE)"
+echo "VERDICT: PASS — $NEXPECTED/$NEXPECTED groups green at $COMMIT ($BOX, $DATE)"
 echo "Paste that line into the tag message. Device tests are the hand-run half — see RELEASING.md."
 exit 0
