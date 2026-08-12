@@ -165,7 +165,10 @@ func (x *cudaI8Index) Score(q []float32, dst []float32) error {
 	if err := x.qscale.WriteFloats([]float32{qscale}); err != nil {
 		return err
 	}
-	if err := x.b.q.Run1D(x.b.gemv, x.n, 256, x.codes, x.qi8, x.scales, x.kbuf, x.qscale, x.out, x.nbuf); err != nil {
+	// gemv_w8a8 is WARP-per-row, not thread-per-row: 32 lanes cooperate on one row so
+	// their loads coalesce. The dispatch is therefore n*32 threads, and the kernel's
+	// own bound check compares the global WARP index against n.
+	if err := x.b.q.Run1D(x.b.gemv, x.n*32, 256, x.codes, x.qi8, x.scales, x.kbuf, x.qscale, x.out, x.nbuf); err != nil {
 		return err
 	}
 	return x.out.ReadFloats(dst)

@@ -15,9 +15,15 @@
 // produces on the CPU. Integer accumulation is exact, so GPU and CPU rank
 // identically (backend_test.go gates that, break-it-first).
 //
-// These are deliberately NOT the tuned decode kernels — no __dp4a, no warp-per-row
-// reduction, no vectorized loads. That blob is goinfer's and stays there; this is
-// the proving kernel that shows the device layer computes the right numbers.
+// gemv_w8a8 WAS deliberately untuned — "no __dp4a, no warp-per-row reduction, no
+// vectorized loads", on the reasoning that the tuned blob is goinfer's. Measurement
+// retired that: one thread per row means adjacent threads read addresses K bytes
+// apart (768 at the real shape), so a 32-thread warp's load touches 32 cache lines
+// and uses one byte from each. It ran at 25–28 GB/s against this device's measured
+// 403 GB/s streaming ceiling — SEVEN PERCENT — which made FlatI8.EnableGPU() slower
+// than the CPU path it was meant to accelerate. A proving kernel is fine; a proving
+// kernel wired to a production entry point is a pessimization. gemv_w8a8 is now
+// warp-per-row with __dp4a; gemm_w8a8 below is still the naive reference.
 //
 // Two shape conventions carried over from the Metal side:
 //   - Scalars arrive as 1-element BUFFERS, not by-value kernel params, mirroring
@@ -27,7 +33,7 @@
 //     a CUDA launch rounds up to whole blocks, where Metal's dispatchThreads
 //     launches exactly n (gpu/cuda.go, divergence 2).
 
-// gemv_w8a8: out[j] = dot(qi8, codes[j]) * qscale * scales[j], one thread per row.
+// gemv_w8a8: out[j] = dot(qi8, codes[j]) * qscale * scales[j], one WARP per row.
 extern "C" __global__ void gemv_w8a8(
     const signed char* __restrict__ codes,  // [N*K] int8, row-major
     const signed char* __restrict__ qi8,    // [K]   int8 query (host-quantized)
@@ -37,15 +43,45 @@ extern "C" __global__ void gemv_w8a8(
     float* __restrict__ out,                // [N]   scores
     const unsigned int* __restrict__ N)     // row count (the launch bound)
 {
-    unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+    // ONE WARP PER ROW. The 32 lanes walk the SAME row, so a warp's load covers 32
+    // consecutive addresses — one fully-used transaction, against the 32 partly-used
+    // ones the thread-per-row form issued. The launch therefore dispatches N*32
+    // threads (see cudaI8Index.Score); j is the global WARP index, not thread index.
+    unsigned int warpsPerBlock = blockDim.x >> 5;
+    unsigned int j = blockIdx.x * warpsPerBlock + (threadIdx.x >> 5);
     if (j >= *N) return;
+    unsigned int lane = threadIdx.x & 31u;
     unsigned int k = *K;
     const signed char* row = codes + (unsigned long long)j * k;
+
     int acc = 0;
-    for (unsigned int i = 0; i < k; i++) {
-        acc += (int)qi8[i] * (int)row[i];
+    if ((k & 3u) == 0) {
+        // 4 int8 MACs per instruction via __dp4a, and 4 bytes per lane per load, so a
+        // warp moves 128 bytes at a time. Safe because k%4==0 makes every row start
+        // 4-byte aligned (the base allocation is 256-byte aligned).
+        const int* row4 = (const int*)row;
+        const int* q4 = (const int*)qi8;
+        unsigned int k4 = k >> 2;
+        for (unsigned int i = lane; i < k4; i += 32) {
+            acc = __dp4a(row4[i], q4[i], acc);
+        }
+    } else {
+        // Byte path for k%4 != 0: still coalesced (32 consecutive bytes per warp),
+        // just one MAC per lane per step instead of four.
+        for (unsigned int i = lane; i < k; i += 32) {
+            acc += (int)qi8[i] * (int)row[i];
+        }
     }
-    out[j] = (float)acc * (*qscale) * scales[j];
+
+    // Warp reduction. Integer addition is associative, so this is EXACTLY the
+    // sequential sum — the reason this kernel can be reshaped at all, and why it
+    // stays BIT-IDENTITY-EXEMPT rather than needing a contract.
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        out[j] = (float)acc * (*qscale) * scales[j];
+    }
 }
 
 // gemm_w8a8: out[m*N+j] = dot(qi8[m], codes[j]) * qscale[m] * scales[j],
