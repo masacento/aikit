@@ -461,3 +461,46 @@ func TestCUDATopK_declines(t *testing.T) {
 	}
 	t.Log("declines below topkMinN, for k>=n and k<=0; the fallback answer is unchanged")
 }
+
+// TestCUDAGEMM_batchM1MatchesQuery covers the ONE batch width the tiled GEMM never
+// sees. gemmTileMinM is 2, so M=1 is the only batch that took the naive
+// thread-per-(query,row) kernel — and is now routed to the warp-per-row GEMV
+// instead (backend.go launchGEMM). TestCUDAGEMM_batchParityWithCPU runs at M=16 and
+// therefore exercises the tiled path only; without this, the reroute ships ungated.
+//
+// The assertion is that a 1-query batch equals the single-query Query path exactly,
+// which is both the natural contract and the thing the reroute could break: the two
+// kernels take their arguments in a different order, so a mis-bound buffer would
+// still produce plausible-looking scores.
+func TestCUDAGEMM_batchM1MatchesQuery(t *testing.T) {
+	if !ann.HasBackend() {
+		t.Skip("no CUDA backend registered (no GPU?)")
+	}
+	rng := rand.New(rand.NewSource(7))
+	const n, dim, k = 5000, 128, 10
+	vecs := randUnit(rng, n, dim)
+
+	idx := ann.NewFlatI8(vecs)
+	if err := idx.EnableGPU(); err != nil {
+		t.Fatalf("EnableGPU: %v", err)
+	}
+	defer idx.Close()
+
+	for qi, q := range randUnit(rng, 25, dim) {
+		want := idx.Query(q, k)
+		got := idx.QueryBatch([][]float32{q}, k)
+		if len(got) != 1 {
+			t.Fatalf("QueryBatch(M=1) returned %d result sets", len(got))
+		}
+		if len(got[0]) != len(want) {
+			t.Fatalf("query %d: batch returned %d hits, Query returned %d", qi, len(got[0]), len(want))
+		}
+		for i := range want {
+			if got[0][i].Index != want[i].Index || got[0][i].Score != want[i].Score {
+				t.Fatalf("query %d hit %d: batch {%d, %v} != Query {%d, %v}",
+					qi, i, got[0][i].Index, got[0][i].Score, want[i].Index, want[i].Score)
+			}
+		}
+	}
+	t.Logf("M=1 batch ≡ Query over 25 queries, exactly (n=%d dim=%d k=%d)", n, dim, k)
+}

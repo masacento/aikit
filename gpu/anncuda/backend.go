@@ -389,6 +389,17 @@ func (x *cudaI8Index) launchGEMM(qi8Buf, qscaleBuf, outBuf gpu.Buffer, M, N, K i
 			gpu.Arg(qi8Buf), gpu.Arg(qscaleBuf), gpu.Arg(x.codes), gpu.Arg(x.scales), gpu.Arg(outBuf),
 			gpu.ArgValue(int32(M)), gpu.ArgValue(int32(N)), gpu.ArgValue(int32(K)))
 	}
+	if M == 1 {
+		// gemmTileMinM is 2, so the naive GEMM only ever ran at M=1 — and at M=1 the
+		// batch IS a single-query GEMV, whose kernel is warp-per-row and therefore
+		// coalesced (be90aec: 3.3–6.0× the thread-per-row form). The naive GEMM still
+		// has the defect the GEMV shed: one thread per (query, row), each walking its
+		// row byte by byte. Route M=1 to the fast kernel instead of maintaining a
+		// second slow one. Layouts already match — qscaleBuf is [1] here, which is
+		// what gemv's scalar qscale binding expects, and out[j] is the same [N] row.
+		return x.b.q.Run1D(x.b.gemv, x.n*32, 256,
+			x.codes, qi8Buf, x.scales, x.kbuf, qscaleBuf, outBuf, x.nbuf)
+	}
 	totalBuf := x.b.dev.NewBufferU32(uint32(M * N))
 	defer x.b.dev.ReleaseBuf(totalBuf)
 	return x.b.q.Run1D(x.b.gemm, M*N, 256,
