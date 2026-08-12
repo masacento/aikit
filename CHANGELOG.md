@@ -10,6 +10,8 @@ it.
 
 ## [Unreleased]
 
+## [1.17.0] — 2026-08-12
+
 Measured on `nvidia-rtx2070s` (Ryzen 7 3700X, RTX 2070 SUPER) and an Apple M1 Pro. Every
 ratio is against a ceiling measured on the machine that ran it; method, negatives and the
 full decomposition are in
@@ -17,19 +19,19 @@ full decomposition are in
 
 ### Added
 
-- **`gpu.Device.SMCount()`** (`gpu`, linux/CUDA) — the device's multiprocessor count, so a
+- **`gpu.Device.SMCount()`** (`gpu/v0.28.0`, linux/CUDA) — the device's multiprocessor count, so a
   launch can size its grid against *this* device instead of a constant measured on one. 0
   means "unknown", not "none". `gpu/anncuda` uses it to decide when splitting one query's
   top-k across blocks pays.
 
-- **`gpu.Pipeline.ThreadExecutionWidth()`** (`gpu`, darwin/Metal) — the pipeline's SIMD
+- **`gpu.Pipeline.ThreadExecutionWidth()`** (`gpu/v0.28.0`, darwin/Metal) — the pipeline's SIMD
   width, for kernels that put one SIMD group on each unit of work.
 
 - **`bench.MinDuration` / `bench.MinWindow`** (root) — a timed loop that runs at least
   `iters` times *and* for at least 50 ms. See Fixed, below: this exists because the old
   fixed-count loop was shorter than a Go GC cycle.
 
-- **`gpu/roofline.cu` + `TestDeviceCeilings`** (`gpu`, test-only) — three device ceilings
+- **`gpu/roofline.cu` + `TestDeviceCeilings`** (`gpu/v0.28.0`, test-only) — three device ceilings
   (streaming read, int32 multiply-add, `__dp4a`) with a self-check that the probes measure
   what they claim. Every "% of peak" in the docs above is against one of these.
 
@@ -1926,6 +1928,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.16.0...HEAD
+[1.17.0]: https://github.com/townsendmerino/aikit/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/townsendmerino/aikit/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/townsendmerino/aikit/compare/v1.14.0...v1.15.0
 [1.14.0]: https://github.com/townsendmerino/aikit/compare/v1.13.0...v1.14.0
