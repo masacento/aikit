@@ -239,7 +239,33 @@ func MatmulBTW8A8Pre(ws *Workspace, aq []int8, aScales []float32, bQ []int8, bSc
 // each dst[i,j] is the same float32 expression regardless of loop order —
 // bit-identical for any M.
 func w8a8Span(aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, M, K, N, j0, j1 int) {
-	for j := j0; j < j1; j++ {
+	// Eight columns at a time through the shared-a kernel, then the <8 remainder
+	// one at a time. The a-row is widened once per group instead of once per
+	// column, which is where the 1×1 form spent most of its vector issue
+	// (39.1 → 53.9 GMAC/s at K=768, 78% of this box's VPMADDWD ceiling).
+	//
+	// The loop order flips from column-outer to row-outer inside a group so the
+	// widened a-row is reused across the group. That is sanctioned by this
+	// function's own contract above: dst[i,j] is the same float32 expression
+	// regardless of loop order. The int8 sum feeding it is integer, hence exactly
+	// order-independent; only the two float multiplies follow, unchanged.
+	j := j0
+	var cols [8]int32
+	for ; j+8 <= j1; j += 8 {
+		for i := range M {
+			if aScales[i] == 0 {
+				for c := range 8 {
+					dst[i*N+j+c] = 0
+				}
+				continue
+			}
+			dotI8Cols8(aq[i*K:i*K+K], bQ, K, j, &cols)
+			for c := range 8 {
+				dst[i*N+j+c] = float32(cols[c]) * aScales[i] * bScales[j+c]
+			}
+		}
+	}
+	for ; j < j1; j++ {
 		bj := bQ[j*K : j*K+K]
 		bScale := bScales[j]
 		for i := range M {
