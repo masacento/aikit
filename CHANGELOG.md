@@ -10,6 +10,36 @@ it.
 
 ## [Unreleased]
 
+## [1.17.1] — 2026-08-12
+
+### Fixed
+
+- **The W8A8 matmul is 3–5% slower at streaming shapes in 1.17.0. Reverted.** The
+  eight-column int8 kernel shipped in 1.17.0 widens the activation row once per group of
+  eight output columns instead of once per column — a real arithmetic saving, measured at
+  **one** shape (K=768 with a small N) and reported as +17.4%.
+
+  What that shape hid is that the two forms walk memory differently. The previous span
+  reads B strictly linearly; the eight-column form advances eight streams `K` bytes apart,
+  which the hardware prefetcher handles far worse once B stops fitting in cache. Measured
+  on a Ryzen 7 3700X (32 MB L3), parallel dispatch, M=1:
+
+  | shape | B size | eight-column vs linear |
+  |---|--:|--:|
+  | K=768 N=8192 | 6 MB | **−31%** (the win that was shipped) |
+  | K=768 N=200000 | 154 MB | +3.5% — `FlatI8`'s CPU scan over a real corpus |
+  | K=3584 N=18944 | 68 MB | +5% — a 7B model's FFN |
+
+  Both production callers are in the streaming regime. goinfer measured **~3% end to end
+  on decode** and reported it against v1.17.0; this restores parity with v1.16.0 at both
+  shapes, verified interleaved.
+
+  Not replaced with a "use the wide kernel when B fits in L3" threshold, deliberately —
+  that is the shape of three constants this campaign already found stale. `dotI8Cols8`
+  stays in the tree with its tests and the evidence for why it is not wired, and
+  `BenchmarkW8A8SpanShapes` now covers both regimes so the next attempt cannot be
+  evaluated at one shape again.
+
 ## [1.17.0] — 2026-08-12
 
 Measured on `nvidia-rtx2070s` (Ryzen 7 3700X, RTX 2070 SUPER) and an Apple M1 Pro. Every
@@ -1928,6 +1958,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.16.0...HEAD
+[1.17.1]: https://github.com/townsendmerino/aikit/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/townsendmerino/aikit/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/townsendmerino/aikit/compare/v1.15.0...v1.16.0
 [1.15.0]: https://github.com/townsendmerino/aikit/compare/v1.14.0...v1.15.0

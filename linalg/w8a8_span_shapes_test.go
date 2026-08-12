@@ -1,0 +1,64 @@
+package linalg
+
+import (
+	"fmt"
+	"math/rand"
+	"testing"
+)
+
+// BenchmarkW8A8SpanShapes exists because v1.17.0 shipped a W8A8 regression that a
+// single-shape benchmark could not see, and it covers BOTH regimes on purpose.
+//
+// The eight-column kernel (dotI8Cols8) was measured at K=768 with a small N — where
+// B is cache-resident — and reported +30%. At the shapes production actually uses,
+// where B is far larger than L3 and is streamed from DRAM, the same kernel was 3.5-5%
+// SLOWER, because it advances eight streams K bytes apart where the shipped span walks
+// B linearly. goinfer measured ~3% end-to-end on decode from it.
+//
+// The lesson is not "that kernel was bad". It is that an int8 matmul has at least two
+// regimes and a benchmark that samples one of them is not evidence about the other.
+// The shapes below straddle the boundary deliberately:
+//
+//	cache-resident : B under ~32 MB. Arithmetic efficiency dominates.
+//	streamed       : B far above it. Access pattern dominates.
+//
+// Anything proposing to change w8a8Span should show numbers for every row here, and
+// should expect the two halves to disagree.
+func BenchmarkW8A8SpanShapes(b *testing.B) {
+	rng := rand.New(rand.NewSource(1))
+	for _, s := range []struct {
+		K, N int
+		note string
+	}{
+		{768, 8192, "cache-resident; the shape v1.17.0's +30% was measured at"},
+		{2048, 2048, "cache-resident"},
+		{3584, 4096, "cache-resident; a 7B attention projection"},
+		{768, 200000, "STREAMED; FlatI8's CPU scan over a real corpus"},
+		{1536, 8960, "STREAMED; a 1.5B model's FFN"},
+		{3584, 18944, "STREAMED; a 7B model's FFN — where goinfer saw ~3% on decode"},
+	} {
+		K, N := s.K, s.N
+		aq := make([]int8, K)
+		for i := range aq {
+			aq[i] = int8(rng.Intn(255) - 127)
+		}
+		bq := make([]int8, K*N)
+		for i := range bq {
+			bq[i] = int8(rng.Intn(255) - 127)
+		}
+		as := []float32{0.01}
+		bs := make([]float32, N)
+		for i := range bs {
+			bs[i] = 0.01
+		}
+		dst := make([]float32, N)
+		var ws Workspace
+		mb := float64(K) * float64(N) / (1 << 20)
+		b.Run(fmt.Sprintf("K%d_N%d", K, N), func(b *testing.B) {
+			b.Logf("B is %.1f MB — %s", mb, s.note)
+			for b.Loop() {
+				MatmulBTW8A8Pre(&ws, aq, as, bq, bs, dst, 1, K, N)
+			}
+		})
+	}
+}

@@ -239,33 +239,42 @@ func MatmulBTW8A8Pre(ws *Workspace, aq []int8, aScales []float32, bQ []int8, bSc
 // each dst[i,j] is the same float32 expression regardless of loop order —
 // bit-identical for any M.
 func w8a8Span(aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, M, K, N, j0, j1 int) {
-	// Eight columns at a time through the shared-a kernel, then the <8 remainder
-	// one at a time. The a-row is widened once per group instead of once per
-	// column, which is where the 1×1 form spent most of its vector issue
-	// (39.1 → 53.9 GMAC/s at K=768, 78% of this box's VPMADDWD ceiling).
+	// ONE COLUMN OF B AT A TIME, CONTIGUOUS. This is not the naive form; it is the
+	// form that was measured to be faster at the shapes that matter, and the
+	// eight-column kernel it replaced is still in the tree (dotI8Cols8) with the
+	// evidence for why it is not wired here.
 	//
-	// The loop order flips from column-outer to row-outer inside a group so the
-	// widened a-row is reused across the group. That is sanctioned by this
-	// function's own contract above: dst[i,j] is the same float32 expression
-	// regardless of loop order. The int8 sum feeding it is integer, hence exactly
-	// order-independent; only the two float multiplies follow, unchanged.
-	j := j0
-	var cols [8]int32
-	for ; j+8 <= j1; j += 8 {
-		for i := range M {
-			if aScales[i] == 0 {
-				for c := range 8 {
-					dst[i*N+j+c] = 0
-				}
-				continue
-			}
-			dotI8Cols8(aq[i*K:i*K+K], bQ, K, j, &cols)
-			for c := range 8 {
-				dst[i*N+j+c] = float32(cols[c]) * aScales[i] * bScales[j+c]
-			}
-		}
-	}
-	for ; j < j1; j++ {
+	// v1.17.0 shipped an eight-column version: dotI8Cols8 scores columns j..j+7
+	// against one widened a-row, so the a-row is widened once per group instead of
+	// once per column. That is a real arithmetic saving — 39.1 → 53.9 GMAC/s in
+	// isolation — and it was measured at ONE shape, K=768 with a small N, where it
+	// is worth about +30%.
+	//
+	// What that shape hid is that the two forms walk memory differently. This loop
+	// reads B strictly linearly. The eight-column form advances EIGHT streams K
+	// bytes apart, and the hardware prefetcher does much worse on that as soon as B
+	// stops fitting in cache. Measured on nvidia-rtx2070s (Ryzen 7 3700X, 32 MB L3),
+	// eight-column against this one, parallel dispatch, M=1:
+	//
+	//     K=768   N=8192     -31%   B is 6 MB, cache-resident  -> the win I shipped
+	//     K=768   N=200000    +3.5%  B is 154 MB, streamed     -> aikit's own ANN path
+	//     K=3584  N=18944     +5%    B is 68 MB, streamed      -> a 7B model's FFN
+	//     K=1536  N=18944    +49%    (serial; worst case seen)
+	//
+	// So it wins when B is cache-resident and loses when B is streamed, and both
+	// production callers — FlatI8's CPU scan over a real corpus, and goinfer's decode
+	// — are in the streaming regime. goinfer measured ~3% end-to-end on decode from
+	// exactly this.
+	//
+	// NOT REPLACED WITH A SIZE THRESHOLD, deliberately. A "use the wide kernel when
+	// B fits in L3" constant is precisely the shape of the three constants this
+	// campaign already found stale (gemmTileMinM, topkMinBatch, the GEMV warp width):
+	// correct when measured, silently wrong once something around it changes. The
+	// arithmetic saving is real and worth having, but it needs a form that does not
+	// trade the access pattern for it — widening the a-row ONCE per span into an
+	// int16 scratch and keeping this linear walk would get both. That is the redo,
+	// and BenchmarkW8A8SpanShapes exists so it cannot be evaluated at one shape again.
+	for j := j0; j < j1; j++ {
 		bj := bQ[j*K : j*K+K]
 		bScale := bScales[j]
 		for i := range M {
