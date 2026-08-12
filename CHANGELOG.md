@@ -10,7 +10,28 @@ it.
 
 ## [Unreleased]
 
+Measured on `nvidia-rtx2070s` (Ryzen 7 3700X, RTX 2070 SUPER) and an Apple M1 Pro. Every
+ratio is against a ceiling measured on the machine that ran it; method, negatives and the
+full decomposition are in
+[`docs/internal/roofline-2026-08.md`](docs/internal/roofline-2026-08.md).
+
 ### Added
+
+- **`gpu.Device.SMCount()`** (`gpu`, linux/CUDA) — the device's multiprocessor count, so a
+  launch can size its grid against *this* device instead of a constant measured on one. 0
+  means "unknown", not "none". `gpu/anncuda` uses it to decide when splitting one query's
+  top-k across blocks pays.
+
+- **`gpu.Pipeline.ThreadExecutionWidth()`** (`gpu`, darwin/Metal) — the pipeline's SIMD
+  width, for kernels that put one SIMD group on each unit of work.
+
+- **`bench.MinDuration` / `bench.MinWindow`** (root) — a timed loop that runs at least
+  `iters` times *and* for at least 50 ms. See Fixed, below: this exists because the old
+  fixed-count loop was shorter than a Go GC cycle.
+
+- **`gpu/roofline.cu` + `TestDeviceCeilings`** (`gpu`, test-only) — three device ceilings
+  (streaming read, int32 multiply-add, `__dp4a`) with a self-check that the probes measure
+  what they claim. Every "% of peak" in the docs above is against one of these.
 
 - **`gpu.Device.MaxThreadgroupMemoryLength()`** (`gpu/v0.27.0`, darwin/Metal) — the device's tile-
   memory limit in bytes (~32 KiB on Apple GPUs). A dispatch whose `setThreadgroupMemoryLength`
@@ -22,6 +43,51 @@ it.
   drain frees it), and `Err()` returns it. `waitUntilCompleted` returns cleanly even when a
   kernel aborts, so without this the host would trust stale results after a GPU fault;
   callers now consult `Err()` before reading a buffer's output (goinfer audit C-09).
+
+### Changed
+
+Performance only; every path below is gated on producing byte-identical results to the
+CPU, and all of them do.
+
+- **`ann.FlatI8.Query` selects on the device** when the backend offers it and no filter is
+  set, so `k` hits cross back instead of `n` scores: **1.19× at N=200k, 1.33× at 500k,
+  1.46× at 1M**. The win grows with N because what it removes is O(N). A `keep` filter
+  still scores and selects on the host — the device selects before filtering, so it cannot
+  be used there.
+
+- **`gpu/anncuda` batch scoring** — the batched path ran a 16×16 tiled GEMM whose cost
+  depended on `ceil(M/16)` rather than on M (6.79 ms for every M from 1 to 16 at N=200k).
+  Replaced with a lane-group GEMV that stages the query tile in shared memory and strides
+  over rows: **`QueryBatch` is 4.5–4.6× end to end at every batch width**.
+
+- **`gpu/anncuda` device top-k** — was k passes over the score row, so its cost scaled with
+  k while the scoring in front of it did not. Now one pass with per-thread candidates in
+  registers, split across blocks when one per query would leave the device idle:
+  **3.2–3.4× at k=10, 12× at batch 1**, and flat in k rather than linear.
+
+- **`gpu/anncuda` single-query GEMV** — lane group per row retuned from 32 threads to 16:
+  **19% at K=768, 34% at K=256, 15% at K=255**. 16 is not the fastest on the common
+  shapes; it is the only width within 4% of the best on *every* shape measured, including
+  `K%4 != 0`.
+
+- **`gpu/annmetal`** — SIMD-group-per-row `gemv_w8a8` (**6.0–9.2×**, 27–42% of that
+  device's measured bandwidth ceiling) and a parallel tree-merge `topk_rows` (**2.1×**).
+
+### Fixed
+
+- **`CUDA_ERROR_MISALIGNED_ADDRESS` in `gpu/anncuda`'s top-k** — the `float4` path read
+  `scores + m*N` as `float4`, which is only 16-byte aligned when `m*N` is a multiple of 4.
+  Any corpus whose size was not a multiple of 4 faulted at `k <= 8`, and a misaligned
+  access kills the whole CUDA context rather than the one launch. Now guarded on the
+  pointer.
+
+- **Benchmark timings at small batch were wrong by up to 2×** (`bench`, and both crossover
+  harnesses). The timed loop ran a fixed 10 iterations and kept the fastest; at small batch
+  one iteration is ~0.1 ms, so the whole window fit inside a single Go GC cycle. Taking the
+  minimum is the right defence against transient interference and cannot work when the
+  interference outlasts the sample. **Published crossover numbers changed materially as a
+  result** — single-query Metal at N=100k was recorded at 0.65× and is actually **0.09×** —
+  so `docs/BENCH-gpu-results.md` was regenerated on both machines.
 
 ## [1.16.0] — 2026-07-31
 
