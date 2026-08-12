@@ -279,10 +279,10 @@ timed single-query `Query` at all — only `QueryBatch`, a different kernel. Bot
 
 | | CUDA (RTX 2070S) | Metal (M1 Pro) |
 |---|--:|--:|
-| Query(1), N=100k | **2.61×** | 0.65× |
-| Query(1), N=10k | 1.06× | 0.42× |
-| batch 8, N=100k | 5.49× | 0.56× |
-| batch 256, N=100k | **32.44×** | 1.50× |
+| Query(1), N=100k | **2.45×** | 0.65× |
+| Query(1), N=10k | 1.12× | 0.42× |
+| batch 8, N=100k | **8.54×** | 0.56× |
+| batch 256, N=100k | **33.41×** | 1.50× |
 
 **Read these to one significant figure.** Re-running the CUDA column on an otherwise
 identical tree moved batch-256 from 36.50× to 32.44× and Query(1) from 2.74× to 2.61× —
@@ -300,10 +300,12 @@ is worth sending to the GPU at N=100k (2.61× after §3e); on the M1 Pro it is n
 sending at any measured size, and batching only pays from 64. A single "use the GPU above X" rule would
 be wrong on one of them.
 
-One reading trap worth recording: at N=10k the CUDA batch speedup **peaks at 8 and
-declines** (4.78 → 3.80 → 3.19), because the CPU baseline itself jumps at batch 64 while
-the GPU is already near its floor. Reading only the largest batch would have suggested
-the advantage grows monotonically with batch size. It does not, at small N.
+One reading trap worth recording: at N=10k the CUDA batch speedup is **not monotone in
+batch size** — 4.63 → 4.14 → 5.01 across batches 8/64/256 — because the CPU baseline
+itself nearly doubles at batch 64 while the GPU is already near its floor. Before §3f the
+same row read 4.78 → 3.80 → 3.19, i.e. a clear decline. Neither shape is an artifact;
+both are the ratio of two curves that bend in different places, which is why a dispatch
+rule wants the crossover point and not the ratio.
 
 ## 3e · CUDA: the single-query GEMV group width, 15–34%
 
@@ -344,6 +346,41 @@ obvious next target, and the reason it is not done here is measured too: a devic
 for one query would launch ONE block over the whole corpus (§3c), which at N=200k costs
 more than the 0.325 ms it would save. It needs the multi-block top-k first, not a
 routing change.
+
+## 3f · CUDA: splitting the top-k across blocks — 13× at M=1
+
+§3c left the top-k running **one block per query**, so a batch of M occupied M of this
+device's 40 SMs: 20% of the machine at M=8, 2.5% at M=1. Phase 1 now selects each chunk's
+top k, phase 2 merges the `parts·k` partials. At N=200k, k=10:
+
+| M | one block | split | |
+|--:|--:|--:|--:|
+| 1 | 0.682 ms | **0.056** | 12.2× |
+| 8 | 0.783 | 0.145 | 5.4× |
+| 32 | 0.794 | 0.443 | 1.8× |
+| 256 | 2.610 | *split loses* | — |
+
+Exact by construction, not by tolerance: the global top k is contained in the union of
+the per-chunk top k, since a candidate excluded from its own chunk has k better
+candidates in that chunk alone.
+
+**The split count is derived from the device rather than measured into a constant.**
+Splitting stops paying exactly when M ≥ the multiprocessor count — above that there are
+already more blocks than SMs and the second launch is pure overhead (at N=500k, M=256 the
+split form is 48% *slower*). That threshold is 40 here and something else everywhere
+else, so `gpu.Device.SMCount()` now asks the driver. Hardcoding 40 would have been this
+file's own `gemmTileMinM`.
+
+**And it retired `topkMinBatch = 8`** — a constant that existed *because of* the
+one-block limitation ("a batch of 1 occupies a single SM of 40 while the rest of the card
+idles"). Device selection now beats score-then-host-select at every width, M=1 included,
+so the gate declines nothing on batch size.
+
+That is the **third** constant in this file that was correct when written and became
+wrong when the kernel it described improved — after `gemmTileMinM` and the GEMV's warp
+width. The pattern is the finding: a constant that encodes a kernel's limitation is a
+dated claim, and nothing in the test suite expires it, because both sides of the choice
+stay correct.
 
 ## 4 · Negatives and process failures, in full
 
@@ -399,10 +436,11 @@ denominator before the kernel.
 
 **Unmeasured on this box:**
 
-- **The top-k still runs ONE BLOCK PER QUERY.** At M=8 that leaves 8 of 40 SMs busy; at
-  M=1 it leaves 1, which is what blocks §3e's remaining 43%. Splitting N across several
-  blocks per query needs a second merge pass; not attempted. This is now the single
-  highest-value open item on this device.
+- **`FlatI8.Query` still selects on the host** (§3e's 43%), and the device path is now
+  fast enough to beat it — but routing `Query` through `TopKBatch` measured *slower*,
+  because `TopKBatch` allocates its whole scratch set per call where `Score` reuses
+  per-index buffers. The win needs a cached single-query device-select route, not a
+  routing change. Measured, not assumed.
 - **k > 64 still takes the k-pass kernel**, at 36 ms where the register form would be
   ~19. A 128-wide instantiation would spill; a radix-select would not, and is the
   principled answer if large-k retrieval ever matters.
