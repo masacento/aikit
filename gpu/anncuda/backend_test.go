@@ -837,6 +837,120 @@ func TestTopKSplitParts(t *testing.T) {
 	}
 }
 
+// TestCUDATopK_scratchReuseIsInert gates the per-index scratch TopKBatch reuses for
+// small batches. Reuse trades a fresh allocation for the risk of reading something the
+// previous call left behind, and the shapes vary between calls: M and k change the
+// score matrix, the hit arrays and the split partials independently.
+//
+// The order below is deliberate. Each call is preceded by a WIDER or DEEPER one, so
+// every buffer is larger than the call needs and any stale tail is live memory rather
+// than a fresh zero page — which is the only arrangement where reading past the current
+// call's extent produces a plausible wrong answer instead of an obvious one.
+func TestCUDATopK_scratchReuseIsInert(t *testing.T) {
+	if !ann.HasBackend() {
+		t.Skip("no CUDA backend registered (no GPU?)")
+	}
+	rng := rand.New(rand.NewSource(77))
+	const n, dim = 60_000, 32
+	vecs := randUnit(rng, n, dim)
+	cpu := ann.NewFlatI8(vecs)
+	x := newTestIndex(t, vecs)
+	pool := randUnit(rng, 8, dim)
+
+	for _, step := range []struct{ M, k int }{
+		{8, 64}, {1, 8}, // wide+deep, then the narrowest and shallowest
+		{4, 32}, {2, 4},
+		{8, 1}, {1, 64}, // deep after shallow, so k grows back
+		{1, 8}, {8, 8},
+	} {
+		queries := pool[:step.M]
+		hits, err := x.TopKBatch(queries, step.k)
+		if err != nil {
+			t.Fatalf("M=%d k=%d: %v", step.M, step.k, err)
+		}
+		for m, q := range queries {
+			want := cpu.Query(q, step.k)
+			if len(hits[m]) != len(want) {
+				t.Fatalf("M=%d k=%d q%d: %d hits, want %d", step.M, step.k, m, len(hits[m]), len(want))
+			}
+			for i := range want {
+				if hits[m][i].Index != want[i].Index || hits[m][i].Score != want[i].Score {
+					t.Fatalf("M=%d k=%d q%d rank %d: {%d, %v} != CPU {%d, %v} — stale scratch?",
+						step.M, step.k, m, i, hits[m][i].Index, hits[m][i].Score, want[i].Index, want[i].Score)
+				}
+			}
+		}
+	}
+	t.Log("8 TopKBatch calls with varying (M, k) over reused scratch, each ≡ CPU exactly")
+}
+
+// TestCUDAQuery_deviceSelectPathAndItsGuards covers the branch FlatI8.Query grew to
+// route a single unfiltered query to the device's own top-k instead of copying all n
+// scores back and scanning them here.
+//
+// The guards are the interesting part, and they are NOT equally load-bearing — which
+// mutation testing is how we know, rather than assuming three conditions in one `if`
+// carry equal weight:
+//
+//   - The keep filter guard IS load-bearing. Removing it fails this test: the device
+//     selects before any filtering, so it hands back the global top k and the filter
+//     then drops most of them, silently returning fewer hits than the caller asked for.
+//   - The k guards (k > 0, k < n) are NOT observable through this backend. Removing
+//     either leaves the test green, because cudaI8Index.TopKBatch declines exactly the
+//     same k values and Query falls through anyway. They stay because ann must not
+//     depend on a backend's decline policy for correctness — k >= n is topHits's
+//     full-sort contract, which no device kernel here implements — but this test cannot
+//     claim to prove them, and saying otherwise would make a redundant condition look
+//     verified.
+//
+// Each case is checked against the CPU index computing the same thing.
+func TestCUDAQuery_deviceSelectPathAndItsGuards(t *testing.T) {
+	if !ann.HasBackend() {
+		t.Skip("no CUDA backend registered (no GPU?)")
+	}
+	rng := rand.New(rand.NewSource(101))
+	// n above topkMinN so the device path is actually reachable — below it TopKBatch
+	// declines and this test would pass by never exercising the branch.
+	const n, dim = 60_000, 32
+	vecs := randUnit(rng, n, dim)
+	cpu := ann.NewFlatI8(vecs)
+	gpuIdx := ann.NewFlatI8(vecs)
+	if err := gpuIdx.EnableGPU(); err != nil {
+		t.Fatalf("EnableGPU: %v", err)
+	}
+	defer gpuIdx.Close()
+
+	same := func(t *testing.T, what string, got, want []ann.Hit) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s: %d hits, want %d", what, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].Index != want[i].Index || got[i].Score != want[i].Score {
+				t.Fatalf("%s rank %d: {%d, %v} != CPU {%d, %v}",
+					what, i, got[i].Index, got[i].Score, want[i].Index, want[i].Score)
+			}
+		}
+	}
+
+	for qi, q := range randUnit(rng, 20, dim) {
+		// The path itself.
+		same(t, fmt.Sprintf("Query q%d", qi), gpuIdx.Query(q, 10), cpu.Query(q, 10))
+
+		// Guard 1: a filter must fall through to score-then-select-here. Keeping only
+		// even indices halves the corpus, so a device selection of the global top 10
+		// would come back with roughly half the hits a caller asked for.
+		keep := func(id int) bool { return id%2 == 0 }
+		same(t, fmt.Sprintf("QueryFilter q%d", qi),
+			gpuIdx.QueryFilter(q, 10, keep), cpu.QueryFilter(q, 10, keep))
+
+		// Guard 2 and 3: k outside (0, n) is topHits's full-sort contract.
+		same(t, fmt.Sprintf("Query k=n q%d", qi), gpuIdx.Query(q, n), cpu.Query(q, n))
+		same(t, fmt.Sprintf("Query k=0 q%d", qi), gpuIdx.Query(q, 0), cpu.Query(q, 0))
+	}
+	t.Log("device-select Query ≡ CPU over 20 queries; filter, k=n and k=0 all fall through correctly")
+}
+
 // TestTopKPipelineWidths ties the three things that must agree — the kernel names, the
 // widths the routing uses, and the widths those kernels were actually compiled with —
 // and checks that topkPlan picks the narrowest kernel able to hold k.

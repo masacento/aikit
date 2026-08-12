@@ -165,6 +165,9 @@ type cudaI8Index struct {
 	out    gpu.Buffer // [n] f32 (reused)
 	hq     []int8     // host staging for the quantized query (reused)
 	mu     sync.Mutex
+	// tk is the reused device scratch for SMALL top-k batches. Large batches keep
+	// allocating per call — see topkScratchMaxM.
+	tk topkScratch
 }
 
 // Score dynamically quantizes q on the host (byte-identical to linalg's
@@ -251,7 +254,9 @@ func (x *cudaI8Index) ScoreBatch(queries [][]float32, dst []float32) (err error)
 // Close releases this index's device buffers (the shared device stays alive for
 // other indexes; the process holds one CUDA context).
 func (x *cudaI8Index) Close() error {
-	for _, b := range []gpu.Buffer{x.codes, x.scales, x.qi8, x.qscale, x.kbuf, x.nbuf, x.out} {
+	t := &x.tk
+	for _, b := range []gpu.Buffer{x.codes, x.scales, x.qi8, x.qscale, x.kbuf, x.nbuf, x.out,
+		t.qi8, t.qscale, t.score, t.idx, t.val, t.pIdx, t.pVal, t.mBuf, t.kBuf, t.pBuf} {
 		x.b.dev.ReleaseBuf(b)
 	}
 	return nil
@@ -418,6 +423,39 @@ const (
 	topkSMFallback = 16
 )
 
+// topkScratch is the reused device scratch for a small top-k batch, grown on demand.
+//
+// WHY IT IS BOUNDED. TopKBatch's biggest allocation is the M*N score matrix; at M=256,
+// N=1e6 that is 1 GB, and caching the largest batch a process ever ran would hold it for
+// the process's life. So only small batches reuse, which is also where the allocation
+// actually mattered: at M=1 the per-call cudaMallocs were most of the difference between
+// device selection (1.05 ms) and score-then-host-select (1.18), while at M=256 they are
+// noise against 21 ms of kernel.
+type topkScratch struct {
+	qi8, qscale, score, idx, val gpu.Buffer
+	pIdx, pVal                   gpu.Buffer
+	mBuf, kBuf, pBuf             gpu.Buffer
+}
+
+// topkScratchMaxM is the batch width up to which scratch is cached rather than
+// allocated per call. 8 keeps the resident score matrix at 8*N floats — 32 MB at N=1e6,
+// against the 1 GB a 256-batch would pin — while covering the single-query path this
+// exists for.
+const topkScratchMaxM = 8
+
+// growBuf returns a buffer of at least n elements, reusing b when it is already large
+// enough and reallocating otherwise. The old buffer is released, so a growing sequence
+// of calls does not leak; the device ledger tracks both.
+func (x *cudaI8Index) growBuf(b gpu.Buffer, n int, make func(int) gpu.Buffer) gpu.Buffer {
+	if b.Len() >= n && n > 0 {
+		return b
+	}
+	if b.Len() > 0 {
+		x.b.dev.ReleaseBuf(b)
+	}
+	return make(n)
+}
+
 // launchTopK selects each query's top k from the [M*N] score matrix, either with one
 // block per query or split across several with a merge pass (see topkSplitParts). Both
 // routes return identical hits — the split is exact because the global top k is
@@ -520,19 +558,49 @@ func (x *cudaI8Index) TopKBatch(queries [][]float32, k int) (hits [][]ann.Hit, e
 			hits, err = nil, fmt.Errorf("gpu: topk scratch allocation failed: %v", r)
 		}
 	}()
-	qi8Buf := x.b.dev.NewBufferInt8(qi8)
-	qscaleBuf := x.b.dev.NewBufferFloats(qscale)
-	scoreBuf := x.b.dev.NewBufferLen(M * N)
-	idxBuf := gpu.NewBufferLenOf[int32](x.b.dev, M*k)
-	valBuf := x.b.dev.NewBufferLen(M * k)
-	mBuf := x.b.dev.NewBufferU32(uint32(M))
-	kBuf := x.b.dev.NewBufferU32(uint32(k))
-	defer func() {
-		for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, scoreBuf, idxBuf, valBuf, mBuf, kBuf} {
-			x.b.dev.ReleaseBuf(b)
-		}
-	}()
 
+	// Small batches reuse the per-index scratch; large ones allocate and release, so a
+	// one-off wide batch cannot pin its score matrix for the process's life.
+	var qi8Buf, qscaleBuf, scoreBuf, idxBuf, valBuf, mBuf, kBuf gpu.Buffer
+	if M <= topkScratchMaxM {
+		t := &x.tk
+		t.qi8 = x.growBuf(t.qi8, M*K, func(n int) gpu.Buffer { return x.b.dev.NewBufferInt8(make([]int8, n)) })
+		t.qscale = x.growBuf(t.qscale, M, x.b.dev.NewBufferLen)
+		t.score = x.growBuf(t.score, M*N, x.b.dev.NewBufferLen)
+		t.idx = x.growBuf(t.idx, M*k, func(n int) gpu.Buffer { return gpu.NewBufferLenOf[int32](x.b.dev, n) })
+		t.val = x.growBuf(t.val, M*k, x.b.dev.NewBufferLen)
+		t.mBuf = x.growBuf(t.mBuf, 1, func(int) gpu.Buffer { return x.b.dev.NewBufferU32(uint32(M)) })
+		t.kBuf = x.growBuf(t.kBuf, 1, func(int) gpu.Buffer { return x.b.dev.NewBufferU32(uint32(k)) })
+		// The scalars are one element each, so growBuf never resizes them — they have
+		// to be rewritten every call instead.
+		if err := t.mBuf.SetU32(uint32(M)); err != nil {
+			return nil, err
+		}
+		if err := t.kBuf.SetU32(uint32(k)); err != nil {
+			return nil, err
+		}
+		if err := t.qi8.WriteInt8s(qi8); err != nil {
+			return nil, err
+		}
+		if err := t.qscale.WriteFloats(qscale); err != nil {
+			return nil, err
+		}
+		qi8Buf, qscaleBuf, scoreBuf = t.qi8, t.qscale, t.score
+		idxBuf, valBuf, mBuf, kBuf = t.idx, t.val, t.mBuf, t.kBuf
+	} else {
+		qi8Buf = x.b.dev.NewBufferInt8(qi8)
+		qscaleBuf = x.b.dev.NewBufferFloats(qscale)
+		scoreBuf = x.b.dev.NewBufferLen(M * N)
+		idxBuf = gpu.NewBufferLenOf[int32](x.b.dev, M*k)
+		valBuf = x.b.dev.NewBufferLen(M * k)
+		mBuf = x.b.dev.NewBufferU32(uint32(M))
+		kBuf = x.b.dev.NewBufferU32(uint32(k))
+		defer func() {
+			for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, scoreBuf, idxBuf, valBuf, mBuf, kBuf} {
+				x.b.dev.ReleaseBuf(b)
+			}
+		}()
+	}
 	if err := x.launchBatch(qi8Buf, qscaleBuf, scoreBuf, M, N, K); err != nil {
 		return nil, err
 	}
