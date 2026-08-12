@@ -239,6 +239,39 @@ routed by k: at M=256, width 8 runs at **233 GB/s (57% of the roof)**, 16 at 95,
 `float4` loads help **only at width 8**, where the scan is near memory-bound; at 16 and
 32 they cost 15–25%, adding pressure to a kernel already limited by registers.
 
+## 3c (Metal) · `topk_rows` 2.1×, and where the M1 wall is different
+
+The M1 mirror had the **same disease in a different organ**. It never made k passes — it
+was already one-pass, each thread keeping a register top-k over its strip — but then a
+single thread merged all `TOPK_TG·k` partial candidates alone, k times, while the other
+127 idled. Isolated against this box's **187 GB/s** streaming ceiling (a new
+`TestMetalTopKBandwidth`, GPU-timestamped, min-of-8) it ran at **1.5–8.3%** of it.
+
+Two changes, both measured:
+
+- **Parallel tree merge.** Each thread sorts its local top-k, then the `TOPK_TG` lists
+  fold pairwise in log₂(`TOPK_TG`) O(k) two-pointer steps — a block merge over 128 heads
+  per round, not one thread over all of them. Same total-order (score desc, index asc)
+  top-k regardless of merge shape, so parity is by construction. ~1.5–2.2×.
+- **Scalar worst-cache** in the strip-scan, so the reject path — nearly every element — is
+  a register-only compare that never touches the dynamically-indexed, local-memory-backed
+  candidate array. ~10% on top.
+
+M=256/N=200k **24.2 → 11.5 ms**, N=500k **32.8 → 18.7 ms** (2.1× / 1.75×).
+
+**But the M1's remaining wall is occupancy, not k.** The CUDA side's width-routing win does
+not transfer at the shipped k=10: this kernel's accept loop is already k-bounded, not
+width-bounded, so the register array is the minimal width-16 tier either way (routing would
+only help k<8). What is left is different: at M=256 the kernel reaches **9.5% of the roof
+against CUDA's 23% at width-16**, and a `TOPK_TG` sweep shows **64 beats 128 at large M**
+(more threadgroups resident) **but loses up to 46% at small M** — the limiter is the 16 KB
+of threadgroup memory the staged lists occupy, capping residency to ~2 groups/core. So 128
+stays the balanced point; closing the gap is a staging redesign, and per-M dispatch (cf.
+`batchPlan`) is the cheaper next lever. Same trap as §4's stale-gate entry surfaced here
+too: `TestMetalGEMM_batchParityWithCPU` runs at n=3000 < `topkMinN`, so it exercises the
+host fallback and never reached the device kernel — a new `TestMetalTopK_randomParityWithCPU`
+at n≥`topkMinN` gates the merge on random scores, worst Δ **0.000e+00**.
+
 ## 3d · Crossover, regenerated on both boxes
 
 Neither box's recorded crossover described its own code any more, and neither harness
@@ -246,10 +279,14 @@ timed single-query `Query` at all — only `QueryBatch`, a different kernel. Bot
 
 | | CUDA (RTX 2070S) | Metal (M1 Pro) |
 |---|--:|--:|
-| Query(1), N=100k | **2.28×** | 0.70× |
+| Query(1), N=100k | **2.28×** | 0.65× |
 | Query(1), N=10k | 1.02× | 0.42× |
-| batch 8, N=100k | 6.44× | — |
-| batch 256, N=100k | **36.50×** | 1.36× |
+| batch 8, N=100k | 6.44× | 0.56× |
+| batch 256, N=100k | **36.50×** | 1.50× |
+
+The Metal column is post-§3c(Metal): its `QueryBatch` numbers moved up with the topk_rows
+rewrite (batch 256 at N=100k 1.36 → 1.50×), while the single-query rows sit on the
+unchanged `gemv_w8a8` path and drift only with run-to-run variance.
 
 **The two backends now disagree about when `EnableGPU()` pays.** On CUDA a single query
 is worth sending to the GPU at N=100k; on the M1 Pro it is not worth sending at any
