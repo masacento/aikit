@@ -111,12 +111,22 @@ kernel void gemm_w8a8_tiled(
 }
 // topk_rows selects each query's top-k directly on the device, so QueryBatch never copies
 // (or allocates on the host) the full M*N score matrix — only M*k hits cross back. One
-// threadgroup per query, TOPK_TG threads: each thread scans a strip of the row keeping a
-// local top-k, then thread 0 merges the TOPK_TG partial lists. The order is
-// (score DESC, index ASC) — byte-for-byte the tie-break FlatI8.topHits uses, so the device
-// top-k is the SAME set the CPU picks. k is capped at TOPK_MAXK (else QueryBatch falls back).
+// threadgroup per query, TOPK_TG threads: each thread strip-scans the row keeping a local
+// top-k and sorts it, then the TOPK_TG partial lists are folded by a PARALLEL TREE MERGE
+// (log2(TOPK_TG) steps, each an O(k) two-list merge) leaving the group's top-k in slot 0.
+// The prior form had thread 0 merge all TOPK_TG*k candidates alone while the rest idled; it
+// measured at 1.5–8% of streaming bandwidth (docs/internal/roofline-2026-08.md §6). The order
+// is (score DESC, index ASC) — byte-for-byte FlatI8.topHits's tie-break — so the device top-k
+// is the SAME set the CPU picks, independent of merge strategy. k is capped at TOPK_MAXK (else
+// QueryBatch falls back). TOPK_TG must be a power of two (the reduction halves the stride) and
+// the dispatch launches exactly TOPK_TG threads per group, so every group is full.
 #define TOPK_TG   128
 #define TOPK_MAXK 16
+// tkBetter: is (sa,ia) strictly ahead of (sb,ib) in topHits order — score desc, then index
+// asc? Filler slots carry (-INF, -1), so any real entry outranks them.
+static inline bool tkBetter(float sa, int ia, float sb, int ib) {
+    return sa > sb || (sa == sb && ia < ib);
+}
 kernel void topk_rows(
     device const float* scores   [[buffer(0)]], // [M*N]
     constant uint&      N        [[buffer(1)]],
@@ -128,39 +138,75 @@ kernel void topk_rows(
     threadgroup float mScore[TOPK_TG * TOPK_MAXK];
     threadgroup int   mIdx  [TOPK_TG * TOPK_MAXK];
     device const float* row = scores + (uint)m * N;
+    // 1. strip-scan: this thread's local top-k over its stride of the row (unsorted, worst-tracked).
     float ls[TOPK_MAXK];
     int   li[TOPK_MAXK];
+    // worstS/worstI mirror ls[worst]/li[worst] in scalars so the common case — an element that
+    // does not beat the current worst — is a register-only compare that never touches the
+    // dynamically-indexed (i.e. local-memory-backed) ls/li arrays. Those are read only on an
+    // actual eviction, ~k·ln(N/k) times over the strip rather than once per element.
     int cnt = 0, worst = 0;
+    float worstS = INFINITY;
+    int   worstI = 0;
     for (uint j = tid; j < N; j += tgsz) {
         float s = row[j]; int idx = (int)j;
         if (cnt < (int)k) {
             ls[cnt] = s; li[cnt] = idx; cnt++;
-            if (cnt == (int)k) { worst = 0;
+            if (cnt == (int)k) {
+                worst = 0;
                 for (int t = 1; t < (int)k; t++)
-                    if (ls[t] < ls[worst] || (ls[t] == ls[worst] && li[t] > li[worst])) worst = t;
+                    if (tkBetter(ls[worst], li[worst], ls[t], li[t])) worst = t;
+                worstS = ls[worst]; worstI = li[worst];
             }
-        } else if (s > ls[worst] || (s == ls[worst] && idx < li[worst])) {
-            ls[worst] = s; li[worst] = idx; worst = 0;
+        } else if (tkBetter(s, idx, worstS, worstI)) {
+            ls[worst] = s; li[worst] = idx;
+            worst = 0;
             for (int t = 1; t < (int)k; t++)
-                if (ls[t] < ls[worst] || (ls[t] == ls[worst] && li[t] > li[worst])) worst = t;
+                if (tkBetter(ls[worst], li[worst], ls[t], li[t])) worst = t;
+            worstS = ls[worst]; worstI = li[worst];
         }
     }
     for (int t = cnt; t < (int)k; t++) { ls[t] = -INFINITY; li[t] = -1; }
-    for (int t = 0; t < (int)k; t++) { mScore[tid * k + t] = ls[t]; mIdx[tid * k + t] = li[t]; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        int total = (int)tgsz * (int)k;
-        for (int r = 0; r < (int)k; r++) {
-            int best = -1;
-            for (int c = 0; c < total; c++) {
-                if (mIdx[c] < 0) continue;
-                if (best < 0 || mScore[c] > mScore[best] || (mScore[c] == mScore[best] && mIdx[c] < mIdx[best])) best = c;
-            }
-            outScore[(uint)m * k + (uint)r] = (best < 0) ? -INFINITY : mScore[best];
-            outIdx[(uint)m * k + (uint)r]   = (best < 0) ? -1 : mIdx[best];
-            if (best >= 0) mIdx[best] = -2; // consume
-        }
+    // 2. sort this thread's k entries into topHits order (selection sort, k ≤ TOPK_MAXK).
+    for (int a = 0; a < (int)k; a++) {
+        int best = a;
+        for (int b = a + 1; b < (int)k; b++)
+            if (tkBetter(ls[b], li[b], ls[best], li[best])) best = b;
+        float ts = ls[a]; ls[a] = ls[best]; ls[best] = ts;
+        int   ti = li[a]; li[a] = li[best]; li[best] = ti;
     }
+    for (int t = 0; t < (int)k; t++) { mScore[tid * (int)k + t] = ls[t]; mIdx[tid * (int)k + t] = li[t]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // 3. parallel tree merge: fold tgsz sorted lists pairwise. Active thread tid merges its
+    //    sorted-k list with tid+stride's, keeping the top-k of the two (linear two-pointer, O(k)).
+    //    tid+stride is inactive this round, so its list is stable; A is written only after it is
+    //    fully read. Leaves the group's top-k in slot 0.
+    for (uint stride = tgsz >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            threadgroup float* A  = &mScore[tid * (int)k];
+            threadgroup int*   AI = &mIdx[tid * (int)k];
+            threadgroup float* B  = &mScore[(tid + stride) * (int)k];
+            threadgroup int*   BI = &mIdx[(tid + stride) * (int)k];
+            float rs[TOPK_MAXK];
+            int   ri[TOPK_MAXK];
+            int ia = 0, ib = 0;
+            for (int r = 0; r < (int)k; r++) {
+                if (ib >= (int)k || (ia < (int)k && tkBetter(A[ia], AI[ia], B[ib], BI[ib]))) {
+                    rs[r] = A[ia]; ri[r] = AI[ia]; ia++;
+                } else {
+                    rs[r] = B[ib]; ri[r] = BI[ib]; ib++;
+                }
+            }
+            for (int r = 0; r < (int)k; r++) { A[r] = rs[r]; AI[r] = ri[r]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // 4. slot 0 holds the merged top-k already in topHits order.
+    if (tid == 0)
+        for (int r = 0; r < (int)k; r++) {
+            outScore[(uint)m * k + (uint)r] = mScore[r];
+            outIdx[(uint)m * k + (uint)r]   = mIdx[r];
+        }
 }`
 
 type metalBackend struct {

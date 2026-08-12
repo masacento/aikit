@@ -149,6 +149,55 @@ func TestMetalGEMV_offBoundaryShapes(t *testing.T) {
 	t.Logf("off-boundary GEMV parity: %d×%d shapes, every GPU≡CPU exact", len(Ns), len(Ks))
 }
 
+// TestMetalTopK_randomParityWithCPU gates the on-device top-k (topk_rows) on RANDOM,
+// all-distinct scores at n ≥ topkMinN — the regime where QueryBatch actually takes the
+// device path (TopKBatch), not the host fallback. The all-tie test above proves the
+// tie-break; this proves the parallel tree merge picks the same k largest the CPU does,
+// in the same order, with worst score Δ 0 (int32 dot ⇒ exact). Without an n ≥ topkMinN
+// case, the device merge has no random-data gate at all — TestMetalGEMM_batchParityWithCPU
+// runs at n=3000 < topkMinN and so exercises the fallback, never the kernel.
+func TestMetalTopK_randomParityWithCPU(t *testing.T) {
+	if !ann.HasBackend() {
+		t.Skip("no Metal backend registered (no GPU?)")
+	}
+	rng := rand.New(rand.NewSource(11))
+	const n, dim, k, M = 120_000, 96, 10, 32 // n ≥ topkMinN (100k) → device top-k path
+	vecs := randUnit(rng, n, dim)
+
+	cpu := ann.NewFlatI8(vecs)
+	gpu := ann.NewFlatI8(vecs)
+	if err := gpu.EnableGPU(); err != nil {
+		t.Fatalf("EnableGPU: %v", err)
+	}
+	defer gpu.Close()
+
+	queries := randUnit(rng, M, dim)
+	batch := gpu.QueryBatch(queries, k)
+	if len(batch) != M {
+		t.Fatalf("QueryBatch returned %d rows, want %d", len(batch), M)
+	}
+	worst := 0.0
+	for m, q := range queries {
+		want := cpu.Query(q, k)
+		got := batch[m]
+		if len(got) != len(want) {
+			t.Fatalf("q%d: %d hits, want %d", m, len(got), len(want))
+		}
+		for i := range want {
+			if got[i].Index != want[i].Index {
+				t.Fatalf("q%d rank %d: device top-k index %d != CPU %d (tree merge diverged)", m, i, got[i].Index, want[i].Index)
+			}
+			if d := math.Abs(got[i].Score - want[i].Score); d > worst {
+				worst = d
+			}
+		}
+	}
+	t.Logf("device top-k (n=%d≥topkMinN, M=%d) ≡ CPU top-%d: worst score Δ %.3e", n, M, k, worst)
+	if worst != 0 {
+		t.Errorf("worst score Δ %.3e, want 0 (int32 dot is exact; the merge must not perturb it)", worst)
+	}
+}
+
 // Compile-time proof that the Metal index is a batch index — so FlatI8.QueryBatch
 // takes the batched-GEMM path (ScoreBatch), never the per-query fallback.
 var _ ann.I8BatchIndex = (*metalI8Index)(nil)
