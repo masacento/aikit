@@ -85,6 +85,55 @@ pushed would enforce this by construction and is welcome — but it only works o
 with a GPU, so the checklist above is the portable minimum: it turns a habit into a step
 someone can visibly fail to complete.
 
+## Backend submodules — the eight that have never been tagged
+
+`gpu/anncuda`, `gpu/annmetal`, `gpu/enccuda`, `gpu/encmetal`, `gpu/qwencuda`,
+`gpu/qwenmetal`, `gpu/visioncuda`, `gpu/visionmetal` are separate Go modules and **none
+of them has ever carried a tag**. Until 2026-08-12 nothing above said so, and the
+consequence was invisible from inside the repo: everything here builds, because each of
+them carries `replace` directives into the tree.
+
+**A consumer sees something different, and it was verified rather than reasoned about.**
+An external module importing `aikit/gpu/anncuda`:
+
+1. **resolves the backend fine** — Go synthesizes a pseudo-version from the latest
+   commit, so the absence of a tag is not itself the problem;
+2. **then fails on its dependency**: `require github.com/townsendmerino/aikit/gpu v0.0.0`
+   is a version that does not exist —
+   `reading .../gpu/@v/v0.0.0.zip: 404 Not Found`.
+
+The `replace` lines are NOT the fault. Go ignores replace directives from a dependency's
+go.mod, which is correct and is what the 404 proves — the build tried to fetch
+`gpu@v0.0.0` from the proxy rather than following the replace. Keeping them for local
+development is fine.
+
+A consumer *can* work around it, which is why this went unnoticed: adding an explicit
+`require github.com/townsendmerino/aikit/gpu v0.27.0` makes MVS pick the higher version
+and resolution succeeds. **It then fails to compile** —
+`dev.SMCount undefined (type *gpu.Device has no field or method SMCount)` — because the
+backend's code needs `gpu` surface newer than any tag. That is the real shape of the
+problem: `v0.0.0` does not merely fail, it forces every consumer to guess a version, and
+a wrong guess surfaces as a compile error inside someone else's dependency.
+
+### Fixing it, in this order
+
+Each layer's `require` must resolve before the layer above it can be tagged, so the
+order is not optional:
+
+1. **Root** — tag `vX.Y.Z`. Nothing here depends on the rest of the repo.
+2. **`gpu`** — tag `gpu/vX.Y.Z`. Also depends on nothing in-repo (`gpu/go.mod` has no
+   replaces).
+3. **The eight** — set `require github.com/townsendmerino/aikit <root tag>` and
+   `require github.com/townsendmerino/aikit/gpu <gpu tag>` in each go.mod, keep the
+   replaces, commit, then tag `gpu/anncuda/vX.Y.Z` and so on.
+
+Step 3 cannot be done before steps 1 and 2, because the versions it names have to exist.
+The window in between is not a regression: these modules do not resolve for consumers
+today either.
+
+Verify from outside afterwards, not from inside the repo — the replaces make an in-tree
+check meaningless. A scratch module, `go build`, and no `replace` of your own.
+
 ### How to tell whether a fix is already released
 
 **Ask `git tag --contains <commit>`, per commit. Do not reason from "commits since
