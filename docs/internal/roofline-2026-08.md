@@ -279,10 +279,16 @@ timed single-query `Query` at all — only `QueryBatch`, a different kernel. Bot
 
 | | CUDA (RTX 2070S) | Metal (M1 Pro) |
 |---|--:|--:|
-| Query(1), N=100k | **2.74×** | 0.65× |
-| Query(1), N=10k | 1.04× | 0.42× |
-| batch 8, N=100k | 6.44× | 0.56× |
-| batch 256, N=100k | **36.50×** | 1.50× |
+| Query(1), N=100k | **2.61×** | 0.65× |
+| Query(1), N=10k | 1.06× | 0.42× |
+| batch 8, N=100k | 5.49× | 0.56× |
+| batch 256, N=100k | **32.44×** | 1.50× |
+
+**Read these to one significant figure.** Re-running the CUDA column on an otherwise
+identical tree moved batch-256 from 36.50× to 32.44× and Query(1) from 2.74× to 2.61× —
+about 10% run-to-run, since each cell is a min-of-10 over a whole GPU pipeline including
+transfers. The crossover *points* are stable; the ratios are not precise to the two
+decimals the generated table prints.
 
 Both columns are post-rewrite on their own box. Metal's `QueryBatch` rows moved up with
 its topk_rows rewrite (batch 256 at N=100k 1.36 → 1.50×) while its single-query rows sit
@@ -290,12 +296,12 @@ on an unchanged `gemv_w8a8`; CUDA's single-query rows moved up with §3e (2.28 �
 while its batch rows were already current.
 
 **The two backends now disagree about when `EnableGPU()` pays.** On CUDA a single query
-is worth sending to the GPU at N=100k (2.74× after §3e); on the M1 Pro it is not worth
+is worth sending to the GPU at N=100k (2.61× after §3e); on the M1 Pro it is not worth
 sending at any measured size, and batching only pays from 64. A single "use the GPU above X" rule would
 be wrong on one of them.
 
 One reading trap worth recording: at N=10k the CUDA batch speedup **peaks at 8 and
-declines** (4.06 → 3.70 → 3.20), because the CPU baseline itself jumps at batch 64 while
+declines** (4.78 → 3.80 → 3.19), because the CPU baseline itself jumps at batch 64 while
 the GPU is already near its floor. Reading only the largest batch would have suggested
 the advantage grows monotonically with batch size. It does not, at small N.
 
