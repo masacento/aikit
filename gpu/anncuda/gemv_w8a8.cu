@@ -397,7 +397,14 @@ __device__ __forceinline__ void topk_reg_body(
     for (int i = 0; i < TKREG; i++) { kv[i] = -3.402823466e+38f; ki[i] = -1; }
 
     // ONE pass over the row, against the k-pass kernel's k of them.
-    if (VEC4) {
+    //
+    // THE ALIGNMENT GUARD IS LOAD-BEARING, not defensive. row is scores + m*N, so a
+    // float4 read of it is only legal when that pointer is 16-byte aligned — which the
+    // 256-byte-aligned base allocation gives only when m*N is a multiple of 4. At
+    // N=60001 every odd row is off by one float and the kernel takes
+    // CUDA_ERROR_MISALIGNED_ADDRESS, which kills the whole context, not just the launch.
+    // Checking the pointer rather than reasoning about N keeps that self-evident.
+    if (VEC4 && ((((unsigned long long)row) & 15ull) == 0)) {
         unsigned int n4 = N >> 2;
         const float4* row4 = (const float4*)row;
         for (unsigned int i = threadIdx.x; i < n4; i += TKBLOCK) {

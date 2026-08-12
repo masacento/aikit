@@ -582,7 +582,16 @@ func TestCUDATopK_kernelsAgree(t *testing.T) {
 	}
 	q := dev.NewCommandQueue()
 
-	const N, M = 60_000, 3
+	// N values straddling every residue mod 4 — see the alignment note above.
+	for _, N := range []int{60_000, 60_001, 60_002, 60_003} {
+		topkKernelsAgreeAt(t, dev, lib, q, N)
+	}
+	t.Logf("5 kernels ≡ CPU selection over clustered/tied/random rows, 14 values of k, N ≡ 0..3 mod 4")
+}
+
+func topkKernelsAgreeAt(t *testing.T, dev *gpu.Device, lib gpu.Library, q gpu.Queue, N int) {
+	t.Helper()
+	const M = 3
 	rng := rand.New(rand.NewSource(23))
 	scores := make([]float32, M*N)
 	for i := range scores[0:N] { // row 0: clustered into thread 0's stride
@@ -641,8 +650,8 @@ func TestCUDATopK_kernelsAgree(t *testing.T) {
 			for m := range M {
 				for i := range k {
 					if got[m*k+i] != want[m*k+i] {
-						t.Fatalf("%s k=%d row %q rank %d: index %d, want %d",
-							name, k, rowName[m], i, got[m*k+i], want[m*k+i])
+						t.Fatalf("%s N=%d (N%%4=%d) k=%d row %q rank %d: index %d, want %d",
+							name, N, N%4, k, rowName[m], i, got[m*k+i], want[m*k+i])
 					}
 				}
 			}
@@ -651,7 +660,6 @@ func TestCUDATopK_kernelsAgree(t *testing.T) {
 			dev.ReleaseBuf(b)
 		}
 	}
-	t.Logf("5 kernels ≡ CPU selection over clustered/tied/random rows at 14 values of k")
 }
 
 // tkBlockThreads is TKBLOCK in gemv_w8a8.cu — the block width every top-k kernel
