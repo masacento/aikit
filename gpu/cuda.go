@@ -42,6 +42,7 @@
 // runtime.LockOSThread'd executor goroutine and funnels every driver call
 // (alloc, memcpy, launch, sync) through it. The affinity guarantee is structural,
 // which is why this file has no pinning of its own.
+
 package gpu
 
 import (
@@ -238,7 +239,8 @@ type Library struct{ m *gc.Module }
 // module. It is the CUDA counterpart of metal.go's CompileLibrary, with the one
 // unavoidable signature change: Metal compiles MSL *source* at run time, whereas
 // the cgo-free CUDA path ships PTX built ahead of time (build_ptx.sh → NVRTC →
-// go:embed) so the runtime needs no CUDA toolkit — only libcuda. That also means
+// embedded with go:embed) so the runtime needs no CUDA toolkit — only libcuda.
+// That also means
 // there is no languageVersion landmine to defuse on this side.
 func (d *Device) CompileLibrary(ptx []byte) (Library, error) {
 	if d.cx == nil {
@@ -865,7 +867,7 @@ func (q Queue) Capture(issue func() error) (*Graph, error) {
 	if endErr != nil {
 		return nil, endErr
 	}
-	defer g.Close()
+	defer func() { _ = g.Close() }()
 	exec, err := g.Instantiate()
 	if err != nil {
 		return nil, err

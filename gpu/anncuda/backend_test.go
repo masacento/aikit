@@ -462,7 +462,7 @@ func TestCUDATopK_declines(t *testing.T) {
 	const dim, k, small = 48, 5, 2_000
 	vecs := randUnit(rng, small, dim)
 	idx := newTestIndex(t, vecs)
-	defer idx.Close()
+	defer func() { _ = idx.Close() }()
 
 	q := [][]float32{randUnit(rng, 1, dim)[0]}
 	if _, err := idx.TopKBatch(q, k); err == nil {
@@ -521,7 +521,7 @@ func TestCUDAGEMM_batchMatchesQuery(t *testing.T) {
 	if err := idx.EnableGPU(); err != nil {
 		t.Fatalf("EnableGPU: %v", err)
 	}
-	defer idx.Close()
+	defer func() { _ = idx.Close() }()
 
 	for _, M := range []int{1, 2, 7, 8, 9, 16, 17, 33} {
 		queries := randUnit(rng, M, dim)

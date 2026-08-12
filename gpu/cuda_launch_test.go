@@ -403,7 +403,7 @@ func goinferLaunchShape(d *Device, q Queue, fRms Pipeline, hidden int, eps float
 	if err != nil {
 		return err
 	}
-	defer pinned.Close()
+	defer func() { _ = pinned.Close() }()
 	if err := ReadToHost(src, pinned); err != nil {
 		return err
 	}

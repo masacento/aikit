@@ -68,7 +68,7 @@ func TestCUDA_mappedHostWeight_zeroCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMappedHostBuffer: %v", err)
 	}
-	defer mb.Close()
+	defer func() { _ = mb.Close() }()
 	copy(mb.Bytes(), asBytes(W))
 	gotMapped := run(mb.Buffer())
 

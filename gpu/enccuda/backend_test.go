@@ -49,7 +49,7 @@ func refMatmulBT(a, w []float32, M, K, N int) []float64 {
 // that mis-routed, would show here.
 func TestEncCUDA_parity(t *testing.T) {
 	b := mustBackend(t)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	rng := rand.New(rand.NewSource(3))
 	for _, s := range []struct {
 		name    string
@@ -97,7 +97,7 @@ func TestEncCUDA_parity(t *testing.T) {
 // mutated contents, two calls, results must differ.
 func TestEncCUDA_noStaleOperands(t *testing.T) {
 	b := mustBackend(t)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	rng := rand.New(rand.NewSource(4))
 	const M, K, N = 128, 768, 768
 	a := randF(rng, M*K)
@@ -144,7 +144,7 @@ func TestEncCUDA_registersWithEncoder(t *testing.T) {
 	if err != nil {
 		t.Skipf("NewBackend(cuda): %v", err)
 	}
-	defer be.Close()
+	defer func() { _ = be.Close() }()
 	if be.Name() != "cuda" {
 		t.Fatalf("NewBackend(cuda).Name() = %q", be.Name())
 	}
@@ -159,12 +159,12 @@ func TestEncCUDA_registersWithEncoder(t *testing.T) {
 // kernel this backend cannot actually offer.
 func BenchmarkEncoderMatmulBT(b *testing.B) {
 	gb := mustBackend(b)
-	defer gb.Close()
+	defer func() { _ = gb.Close() }()
 	cpu, err := encoder.NewBackend("cpu")
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer cpu.Close()
+	defer func() { _ = cpu.Close() }()
 	rng := rand.New(rand.NewSource(9))
 	for _, s := range []struct{ M, K, N int }{
 		{80, 64, 80},     // per-head QK^T at L=80 — the smallest matmul in a forward
@@ -238,7 +238,7 @@ func randQ8(rng *rand.Rand, n int) []int8 {
 // reassociates, and a quantized-activation kernel cannot fit inside 2e-4.
 func TestEncCUDA_q8Parity(t *testing.T) {
 	b := mustBackend(t)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	rng := rand.New(rand.NewSource(11))
 	for _, s := range []struct {
 		name    string
@@ -293,7 +293,7 @@ func TestEncCUDA_q8Parity(t *testing.T) {
 // be the same bug wearing different clothes — so that is asserted separately.
 func TestEncCUDA_q8WeightResidency(t *testing.T) {
 	b := mustBackend(t)
-	defer b.Close()
+	defer func() { _ = b.Close() }()
 	rng := rand.New(rand.NewSource(12))
 	const M, K, N = 128, 768, 768
 	a1, a2 := randF(rng, M*K), randF(rng, M*K)
@@ -370,7 +370,7 @@ func TestEncCUDA_q8WeightResidency(t *testing.T) {
 // the f32 weight resident.
 func BenchmarkEncoderMatmulBTQ8(b *testing.B) {
 	gb := mustBackend(b)
-	defer gb.Close()
+	defer func() { _ = gb.Close() }()
 	rng := rand.New(rand.NewSource(13))
 	for _, s := range []struct{ M, K, N int }{
 		{128, 768, 768},

@@ -10,6 +10,7 @@
 // (golang/go#77917), so Metal's runtime compiler DEFAULTS languageVersion to MSL 2.4
 // and silently strips modern types. We NEVER rely on the default: every library is
 // compiled with an explicit MTLCompileOptions at MSL >=3.1, and we assert it took.
+
 package gpu
 
 import (
@@ -23,7 +24,8 @@ import (
 	"github.com/ebitengine/purego/objc"
 )
 
-// MTLLanguageVersion values (NSUInteger). MSL 3.1 = (3<<16)|1. Rig is macOS 26, so
+// MSL3_1 and friends are MTLLanguageVersion values (NSUInteger). MSL 3.1 = (3<<16)|1.
+// Rig is macOS 26, so
 // >=3.1 is safe; bump to match features used.
 const MSL3_1 uint = (3 << 16) | 1
 
@@ -358,7 +360,6 @@ func (d *Device) NewComputePipeline(lib objc.ID, fn string) (Pipeline, error) {
 	return Pipeline{id: p}, nil
 }
 
-// NewBufferFloats uploads data into a shared (UMA host-visible) MTLBuffer.
 // MustBuf turns a FAILED MTLBuffer allocation into a loud panic instead of a silently
 // zero-filled Buffer, and records the id so ReleaseAll can free it. objc returns nil on OOM and
 // every constructor here used to keep it, so an out-of-memory condition surfaced as garbage
@@ -609,7 +610,7 @@ func (q Queue) BeginNP() *Encoder {
 func (e *Encoder) FinishEncoding() { e.enc.Send(selEndEncoding) }
 func (e *Encoder) Commit()         { e.cb.Send(selCommit) }
 
-// waitDone blocks until the committed command buffer completes, then captures any abort and reads
+// WaitDone blocks until the committed command buffer completes, then captures any abort and reads
 // its GPU timestamps. Both reads are valid only post-completion and are taken here, while the cb is
 // still alive — a later pool drain may free it.
 func (e *Encoder) WaitDone() {
@@ -820,7 +821,8 @@ func (q Queue) Run1DTG(p Pipeline, n, tg, tgBytes int, bufs ...Buffer) {
 	q.Run1DBatchTG(p, n, tg, 1, tgBytes, bufs...)
 }
 
-// GPUStart/GPUEnd/KernStart/KernEnd expose the last committed command buffer's GPU/kernel
+// GPUStart returns the last committed command buffer's GPU start timestamp; GPUEnd,
+// KernStart and KernEnd are the siblings covering the rest of the GPU/kernel
 // timestamps (seconds), valid after WaitDone/End. Accessors, since the fields are unexported.
 func (e *Encoder) GPUStart() float64  { return e.gpuStart }
 func (e *Encoder) GPUEnd() float64    { return e.gpuEnd }

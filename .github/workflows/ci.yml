@@ -34,10 +34,18 @@ jobs:
       # and HF-checkpoint spellings on purpose; see the config). Pinned to the
       # same action major + version ken uses so the two repos report
       # identically for the packages that moved between them (ADR-034).
+      #
+      # install-mode: goinstall — NOT the default binary download. On 2026-08-12 this
+      # step failed twice in one hour fetching the release tarball from GitHub's CDN
+      # (a 503, then a socket hang up), each time after the action's own retries, and
+      # each failure cost a full re-run and looked like a code problem. goinstall
+      # sources the same pinned version through the Go module proxy, which setup-go
+      # already caches, so a CDN blip cannot redden a build.
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.11.4
+          install-mode: goinstall
 
       # Core-cleanliness guard (migration-plan §7/§9): the root module must
       # stay pure-Go — no cgo WebGPU, no tree-sitter. Those live in the
@@ -182,6 +190,16 @@ jobs:
       #   TestKernelFMALint*        source only — the PRIMARY check
       #   TestGemvQuantFMAHistogram committed PTX only
       #   TestPTXReproducible       NVRTC rebuild
+      # The nine gpu modules are NOT covered by the root job's golangci-lint — it runs
+      # in the root module only, and `./...` stops at module boundaries. That gap is
+      # how a reverted kernel sat unused in linalg and was caught only by luck of it
+      # being in the root module; the same mistake in gpu/anncuda would have shipped.
+      # Required, not advisory: the gate treats a missing linter as a failure.
+      - name: golangci-lint (nine gpu modules)
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
       - name: kernel gates
         working-directory: gpu
         env:

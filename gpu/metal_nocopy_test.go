@@ -81,7 +81,7 @@ func TestNoCopyWiring(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mmap %d bytes (file too small?): %v", mapBytes, err)
 	}
-	defer syscall.Munmap(mapping)
+	defer func() { _ = syscall.Munmap(mapping) }()
 	if uintptr(unsafe.Pointer(&mapping[0]))%pageSize != 0 {
 		t.Fatalf("mmap base not page-aligned: %p", unsafe.Pointer(&mapping[0]))
 	}

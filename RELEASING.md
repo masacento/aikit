@@ -38,7 +38,19 @@ anything red. The release ritual is the enforcement, so do not skip it:
 
 Concretely:
 
-0. **Run the mechanical gate: `scripts/gpu_gate.sh`.** Five groups — all nine gpu
+0. **Before any of this: `scripts/preflight.sh`.** It runs what CI's root-module job
+   runs — gofmt, build, vet, golangci-lint, cgo-free build, tests — in about a minute,
+   and treats a MISSING linter as a failure rather than a skip. Install it as a hook so
+   it is not a thing to remember: `ln -sf ../../scripts/preflight.sh .git/hooks/pre-push`.
+
+   > Added 2026-08-12, after using CI as a first linter rather than a last check cost
+   > three round trips in one evening — one of them a genuine `unused` finding that the
+   > already-installed local linter reports in three seconds. Two of the other failures
+   > that evening were the lint action failing to download its own binary from GitHub's
+   > CDN (a 503, then a socket hang up), which is why CI now installs it through the Go
+   > module proxy (`install-mode: goinstall`) instead.
+
+0b. **Run the mechanical gate: `scripts/gpu_gate.sh`.** Five groups — all nine gpu
    modules build cgo-free, `gofmt`/`vet` on `gpu/`, and the three kernel assertions
    (FMA lint, fma histogram, PTX reproducibility). Paste its `VERDICT:` line into the
    tag message. It needs NVRTC but **no GPU**, so it runs on any box:

@@ -9,7 +9,8 @@ import (
 	"github.com/ebitengine/purego/objc"
 )
 
-// MTLResidencySet (macOS 15+) pins a set of allocations resident so the driver does NOT re-validate
+// ResidencySet wraps MTLResidencySet (macOS 15+), which pins a set of allocations resident so the
+// driver does NOT re-validate
 // their residency on every command-buffer commit — the fix for the per-submit make-resident tax that
 // dominates a per-layer-submit decode (measured ~15 ms/boundary of GPU-idle-in-wait, vs ~0.4 ms once
 // a set is cached). Add the stable working set (always-on weights + slot buffers) ONCE, commit,

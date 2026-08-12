@@ -46,7 +46,7 @@ func TestCUDA_graphDependentChain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-	defer g.Close()
+	defer func() { _ = g.Close() }()
 
 	const reps = 200
 	bad := 0
@@ -111,7 +111,7 @@ func TestCUDA_graphReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-	defer g.Close()
+	defer func() { _ = g.Close() }()
 
 	read := func() []float32 {
 		if err := q.Sync(); err != nil {

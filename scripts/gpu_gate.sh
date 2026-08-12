@@ -76,7 +76,7 @@ BOX="$(uname -s)/$(uname -m)"
 # needs it on. It went unnoticed from the day it was written because it had only ever run
 # on Linux. Keep every construct here POSIX-portable; `sh scripts/gpu_gate.sh` should
 # work, and is the cheap way to check.
-EXPECTED="build fmt-vet fma-lint fma-histogram ptx-repro"
+EXPECTED="build fmt-vet lint fma-lint fma-histogram ptx-repro"
 NEXPECTED="$(set -- $EXPECTED; echo $#)"
 SEEN=" "
 NA=""
@@ -117,6 +117,38 @@ else
 	verdict build PASS "$nmod modules build with CGO_ENABLED=0"
 fi
 
+# (2b) golangci-lint across ALL NINE modules. The root module's CI job lints only the
+#      root module — `./...` stops at module boundaries — so before this the nine gpu
+#      modules had gofmt and vet and nothing that finds an unused function. That is
+#      exactly how a reverted kernel sat with no caller in linalg on 2026-08-12; had it
+#      been in gpu/anncuda instead, nothing would have said a word.
+#
+#      A MISSING LINTER IS A FAILURE, NOT A SKIP. Unlike NVRTC on darwin (which cannot
+#      exist and is reported n/a), golangci-lint installs everywhere, so "not installed"
+#      means unchecked and must read as red.
+lint_gpu_modules() {
+	gcl="$(command -v golangci-lint 2>/dev/null || true)"
+	[ -z "$gcl" ] && [ -x "$HOME/go/bin/golangci-lint" ] && gcl="$HOME/go/bin/golangci-lint"
+	if [ -z "$gcl" ]; then
+		verdict lint FAIL "golangci-lint not installed — install it, do not skip it (CI pins v2.11.4)"
+		return
+	fi
+	bad=""
+	n=0
+	for m in $mods; do
+		# Modules with no buildable packages on this OS have nothing to lint.
+		pkgs="$(cd "$m" && CGO_ENABLED=0 go list ./... 2>/dev/null)"
+		[ $? -eq 0 ] && [ -z "$pkgs" ] && continue
+		n=$((n + 1))
+		if ! (cd "$m" && CGO_ENABLED=0 "$gcl" run >/dev/null 2>&1); then bad="$bad $m"; fi
+	done
+	if [ -n "$bad" ]; then
+		verdict lint FAIL "golangci-lint issues in:$bad"
+	else
+		verdict lint PASS "$n applicable modules clean"
+	fi
+}
+
 # (2) gofmt + vet on the gpu module itself.
 unformatted="$(cd gpu && gofmt -l . 2>/dev/null)"
 vetout="$(cd gpu && CGO_ENABLED=0 go vet ./... 2>&1)"
@@ -151,6 +183,8 @@ run_test() { # run_test <group> <-run pattern> <extra env assignments…>
 
 run_test fma-lint      'TestKernelFMALint'
 run_test fma-histogram 'TestGemvQuantFMAHistogram'
+lint_gpu_modules
+
 # NVRTC required: without the flag this test skips when NVRTC is absent, and a skipping
 # gate check is a passing one.
 # NVRTC exists for Linux and Windows, never for Apple Silicon, so this group is not
