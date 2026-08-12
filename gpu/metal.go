@@ -60,6 +60,7 @@ var (
 	selLocalizedDesc      = objc.RegisterName("localizedDescription")
 	selName               = objc.RegisterName("name")
 	selMaxTgMem           = objc.RegisterName("maxThreadgroupMemoryLength") // device tile-memory limit (bytes)
+	selThreadExecWidth    = objc.RegisterName("threadExecutionWidth")       // pipeline SIMD-group width
 )
 
 // nsString wraps a Go string as an autoreleased NSString.
@@ -310,6 +311,16 @@ type mtlSize struct{ w, h, d uint64 }
 // Queue / Pipeline / Buffer are thin id wrappers.
 type Queue struct{ id objc.ID }
 type Pipeline struct{ id objc.ID }
+
+// ThreadExecutionWidth is the pipeline's SIMD-group width — the number of threads that
+// execute in lockstep and over which simd_sum/simd_shuffle reduce (32 on every Apple GPU,
+// but read rather than assumed). A SIMD-group-per-row kernel launches N × this many threads
+// and strides each row across the group; the host needs the width for that launch geometry,
+// and it must match the kernel's [[threads_per_simdgroup]] since both are the hardware width.
+func (p Pipeline) ThreadExecutionWidth() int {
+	return int(objc.Send[uintptr](p.id, selThreadExecWidth))
+}
+
 type Buffer struct {
 	id  objc.ID
 	n   int     // element count (float32)

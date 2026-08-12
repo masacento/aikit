@@ -37,8 +37,22 @@ import (
 // LOSING ~5× to the SIMD CPU (docs/BENCH-gpu-results.md); this is the Phase-2 fix.
 const w8a8Src = `
 #include <metal_stdlib>
+#include <metal_simdgroup>
 using namespace metal;
 #define TILE 16
+// gemv_w8a8 scores ONE query against every row: one SIMD-GROUP per output row, not one
+// thread. The naive one-thread-per-row form (lanes j and j+1 read addresses K bytes apart)
+// touched 32 cache lines per warp and used one byte from each — measured 4.7% of the M1 Pro's
+// 182 GB/s streaming ceiling, and LOST to the CPU SIMD path. Here the 32 lanes of a SIMD-group
+// walk the SAME row: lane L reads the L-th char4 chunk, striding by the group width, so the 32
+// lanes cover a contiguous 128-byte span (fully-used cache lines / coalesced). simd_sum folds
+// the lanes' int32 partials — exact, not approximate, because integer addition is associative
+// (this kernel is bit-identity-exempt for that reason; the f32 kernels are NOT).
+//
+// Launch is N × threadExecutionWidth threads with the threadgroup a multiple of the width, so
+// j = gid/W is the row (0..N-1 exactly — Metal's dispatchThreads launches EXACTLY that many,
+// no round-up) and lane = gid%W is the SIMD lane; no bound check is needed because every
+// thread maps to a valid row. W is read from the hardware, not assumed 32.
 kernel void gemv_w8a8(
     device const char*  codes  [[buffer(0)]],   // [N*K] int8, row-major
     device const char*  qi8    [[buffer(1)]],   // [K]   int8 query (host-quantized)
@@ -46,13 +60,27 @@ kernel void gemv_w8a8(
     constant uint&      K      [[buffer(3)]],
     constant float&     qscale [[buffer(4)]],   // query scale (0 ⇒ all-zero query)
     device float*       out    [[buffer(5)]],   // [N]   scores
-    uint j [[thread_position_in_grid]]) {
+    uint gid [[thread_position_in_grid]],
+    uint W   [[threads_per_simdgroup]]) {
+    uint j    = gid / W;                 // output row this SIMD-group owns
+    uint lane = gid % W;                 // == thread_index_in_simdgroup (tg is a multiple of W)
     device const char* row = codes + (uint)j * K;
     int acc = 0;
-    for (uint k = 0; k < K; k++) {
-        acc += int(qi8[k]) * int(row[k]);
+    if ((K & 3u) == 0u) {
+        // Coalesced char4 path (K%4==0 ⇒ row and qi8 are 4-byte aligned): no __dp4a on Metal,
+        // so load char4 per lane and do the four products explicitly.
+        device const char4* r4 = (device const char4*)row;
+        device const char4* q4 = (device const char4*)qi8;
+        for (uint c = lane; c < (K >> 2); c += W) {
+            char4 a = q4[c], b = r4[c];
+            acc += int(a.x)*int(b.x) + int(a.y)*int(b.y) + int(a.z)*int(b.z) + int(a.w)*int(b.w);
+        }
+    } else {
+        // K not a multiple of 4: scalar strided fallback (still lane-coalesced byte reads).
+        for (uint k = lane; k < K; k += W) acc += int(qi8[k]) * int(row[k]);
     }
-    out[j] = float(acc) * qscale * scales[j];
+    int total = simd_sum(acc);           // fold the W lane partials (int add is associative)
+    if (lane == 0) out[j] = float(total) * qscale * scales[j];
 }
 kernel void gemm_w8a8_tiled(
     device const char*  codes  [[buffer(0)]],   // [N*K] int8 (corpus rows = B)
@@ -136,11 +164,12 @@ kernel void topk_rows(
 }`
 
 type metalBackend struct {
-	dev  *gpu.Device
-	q    gpu.Queue
-	gemv gpu.Pipeline // one query  × N rows (FlatI8.Query)
-	gemm gpu.Pipeline // M queries × N rows (FlatI8.QueryBatch), tiled
-	topk gpu.Pipeline // per-query top-k over the device score matrix
+	dev   *gpu.Device
+	q     gpu.Queue
+	gemv  gpu.Pipeline // one query  × N rows (FlatI8.Query), SIMD-group per row
+	gemvW int          // gemv's SIMD-group width (threadExecutionWidth); launch is N×this
+	gemm  gpu.Pipeline // M queries × N rows (FlatI8.QueryBatch), tiled
+	topk  gpu.Pipeline // per-query top-k over the device score matrix
 }
 
 // topkTG / topkMaxK mirror the topk_rows kernel's TOPK_TG / TOPK_MAXK; k above topkMaxK
@@ -186,7 +215,11 @@ func init() {
 		dev.ReleaseObjects()
 		return
 	}
-	ann.RegisterBackend(&metalBackend{dev: dev, q: dev.NewCommandQueue(), gemv: gemv, gemm: gemm, topk: topk})
+	w := gemv.ThreadExecutionWidth()
+	if w <= 0 {
+		w = 32 // every Apple GPU is 32; guard a bad query rather than divide by zero on launch
+	}
+	ann.RegisterBackend(&metalBackend{dev: dev, q: dev.NewCommandQueue(), gemv: gemv, gemvW: w, gemm: gemm, topk: topk})
 }
 
 func (b *metalBackend) Name() string { return "metal" }
@@ -260,11 +293,11 @@ func (x *metalI8Index) Score(q []float32, dst []float32) error {
 	defer x.mu.Unlock()
 	qscale := quantizeRowInt8(q, x.qi8.Int8s())
 	x.qscale.Floats()[0] = qscale
-	tg := 256
-	if tg > x.n {
-		tg = x.n
-	}
-	x.b.runLocked(x.b.gemv, x.n, tg, x.codes, x.qi8, x.scales, x.kbuf, x.qscale, x.out)
+	// One SIMD-group per row: launch N×W threads, threadgroup a multiple of W so SIMD-groups
+	// never straddle a threadgroup boundary (j = gid/W is then the row, exactly, no bound check).
+	W := x.b.gemvW
+	tg := 8 * W // 256 at W=32; ≤ maxTotalThreadsPerThreadgroup
+	x.b.runLocked(x.b.gemv, x.n*W, tg, x.codes, x.qi8, x.scales, x.kbuf, x.qscale, x.out)
 	copy(dst, x.out.Floats())
 	return nil
 }

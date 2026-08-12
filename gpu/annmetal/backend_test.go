@@ -96,6 +96,59 @@ func TestMetalGEMV_parityWithCPU(t *testing.T) {
 	}
 }
 
+// TestMetalGEMV_offBoundaryShapes is the guard for the SIMD-group-per-row GEMV's new
+// failure mode: a lane's row is j = gid/W, so a K that isn't a multiple of 4 (scalar
+// fallback, not the char4 path), a partial last threadgroup (N×W not a multiple of the
+// threadgroup, i.e. N%8≠0 at W=32/tg=256), and N below one SIMD-group all have to land on
+// exactly the right rows. The int32 dot is exact regardless of lane order, so parity is
+// worst Δ == 0 at every shape, not merely close. The aligned parity test above (n=2000,
+// dim=96) exercises none of these — both divide evenly.
+func TestMetalGEMV_offBoundaryShapes(t *testing.T) {
+	if !ann.HasBackend() {
+		t.Skip("no Metal backend registered (no GPU?)")
+	}
+	rng := rand.New(rand.NewSource(7))
+	Ns := []int{1, 7, 31, 32, 33, 63, 100, 257, 1000}      // tiny, ==W, and N%8≠0 (partial last tg)
+	Ks := []int{1, 3, 4, 5, 7, 96, 97, 255, 256, 257, 768} // char4 (K%4==0) and scalar (K%4≠0)
+	for _, N := range Ns {
+		for _, K := range Ks {
+			vecs := randUnit(rng, N, K)
+			cpu := ann.NewFlatI8(vecs)
+			gpu := ann.NewFlatI8(vecs)
+			if err := gpu.EnableGPU(); err != nil {
+				t.Fatalf("N=%d K=%d EnableGPU: %v", N, K, err)
+			}
+			k := 10
+			if k > N {
+				k = N
+			}
+			worst := 0.0
+			for _, q := range randUnit(rng, 20, K) {
+				want := cpu.Query(q, k)
+				got := gpu.Query(q, k)
+				if len(got) != len(want) {
+					gpu.Close()
+					t.Fatalf("N=%d K=%d: got %d hits, want %d", N, K, len(got), len(want))
+				}
+				for i := range want {
+					if got[i].Index != want[i].Index {
+						gpu.Close()
+						t.Fatalf("N=%d K=%d rank %d: GPU idx %d != CPU idx %d (top-k diverged)", N, K, i, got[i].Index, want[i].Index)
+					}
+					if d := math.Abs(got[i].Score - want[i].Score); d > worst {
+						worst = d
+					}
+				}
+			}
+			gpu.Close()
+			if worst != 0 {
+				t.Errorf("N=%d K=%d: worst score Δ %.3e, want 0 (int32 dot is exact regardless of lane order)", N, K, worst)
+			}
+		}
+	}
+	t.Logf("off-boundary GEMV parity: %d×%d shapes, every GPU≡CPU exact", len(Ns), len(Ks))
+}
+
 // Compile-time proof that the Metal index is a batch index — so FlatI8.QueryBatch
 // takes the batched-GEMM path (ScoreBatch), never the per-query fallback.
 var _ ann.I8BatchIndex = (*metalI8Index)(nil)
