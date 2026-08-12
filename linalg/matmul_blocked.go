@@ -102,6 +102,11 @@ func blockedFill(a, b, dst []float32, M, K, N, nStart, nEnd, mBlock, nBlock, kBl
 						accumRowRange(a, b, dst, i+1, K, N, k0, k4, kSpan, n, nTileEnd)
 					}
 				}
+				// amd64: sweep 3-row groups through the 12-accumulator 3×4 kernel
+				// first (no-op elsewhere, and on arm64 the 2×8 path above has already
+				// taken the row pairs). Whatever it does not consume — 1 or 2 rows —
+				// falls through to the single-row path below.
+				i = blockRows3x4(a, b, dst, i, iEnd, K, N, k0, k4, kSpan, n0, nTileEnd)
 				for ; i < iEnd; i++ {
 					accumRowRange(a, b, dst, i, K, N, k0, k4, kSpan, n0, nTileEnd)
 				}
