@@ -259,16 +259,188 @@ extern "C" __global__ void gemv_w8a8_batch16(
 // scores the LOWER INDEX wins. That tie-break is not decoration — an all-equal-scores
 // index must yield [0..k-1], and the test fixture asserts precisely that.
 //
-// Algorithm: k passes of a block-wide argmax over the query's row, each pass writing
-// -FLT_MAX into the winner's slot so the next pass cannot re-select it. The scores
-// buffer is therefore MUTATED — it is per-call scratch, never the caller's data. k is
-// small (a retrieval k, not a sort), so k*N/threads work per query is cheap next to the
-// GEMM that produced the row.
+// TWO KERNELS, and which one runs is a function of k alone.
 //
-// A slot already consumed reads back as -FLT_MAX and can never win: `v > best` is false
-// against the initial -FLT_MAX sentinel, and the tie-break branch is guarded on a valid
-// index. Real dot-product scores do not reach -FLT_MAX.
+// topk_rows_reg (the default) makes ONE pass over the row. Each thread keeps its own
+// best TKREG candidates in registers, and the block then merges 256 sorted lists by
+// popping heads k times — a merge over 256 elements per pass rather than over N.
+//
+// topk_rows makes k passes over the row, each a block-wide argmax that writes -FLT_MAX
+// into the winner's slot so the next pass cannot re-select it. It is kept for k > TKREG,
+// where the register form's per-thread array would spill.
+//
+// "k*N/threads work per query is cheap next to the GEMM that produced the row" is what
+// the k-pass form used to claim, and it was true when the GEMM was the 16x16 tiled one.
+// Measured against the batch GEMV that replaced it, at N=200k on nvidia-rtx2070s:
+//
+//              gemv    topk (k-pass)
+//   M=8  k=10  0.88 ms   2.57 ms      topk is 2.9x the GEMV
+//   M=64 k=10  4.75      2.98         0.6x
+//   M=256 k=10 18.2      7.46         0.4x
+//   M=256 k=50 18.2     36.0          2.0x
+//
+// The k-dependence is the whole problem: the GEMV's cost does not move with k and this
+// one's is linear in it. Same lesson as the tiled GEMM above — a cost that was genuinely
+// negligible became dominant when the thing it was measured against got faster.
+//
+// THE ORDER IS THE CONTRACT, in both kernels. score DESCENDING, and on equal scores the
+// LOWER INDEX wins, matching ann.FlatI8.topHits exactly — an all-equal-scores index must
+// yield [0..k-1], and the test fixture asserts precisely that. In topk_rows_reg that rule
+// lives in one place (tkBetter) and is used by the per-thread insert, the block merge and
+// the pop, so the three cannot drift apart.
+//
+// Real dot-product scores do not reach -FLT_MAX, which both kernels rely on: it is the
+// k-pass form's "already consumed" marker and the register form's empty-slot sentinel.
 #define TKBLOCK 256
+
+// TKREG is the per-thread candidate count, and therefore the largest k a given
+// instantiation can answer: a thread's own stride may contain the entire global top-k,
+// so it must be able to hold k of them.
+//
+// THREE INSTANTIATIONS, BECAUSE THE COST IS LINEAR IN TKREG AND FLAT IN k. That is the
+// opposite of the k-pass kernel and worth stating plainly. The scan rejects almost
+// every element with one compare, but an ACCEPTED candidate costs a TKREG-long bubble,
+// and accepts are not rare — a thread scanning S elements accepts about TKREG*ln(S) of
+// them, which at S=781 is ~6.7 per slot. So TKREG is the price, and k only decides
+// which price you have to pay. Measured at N=200k, ms per launch:
+//
+//              k<=8   k<=16   k<=32   k<=64      bytes/s at M=256
+//   TKREG=8   0.878    —       —       —         233 GB/s  (57% of the 412 roof)
+//   TKREG=16  1.115   2.17     —       —          95 GB/s
+//   TKREG=32  1.107   2.15    4.89     —          42 GB/s
+//   TKREG=64    —      —       —     19.3         11 GB/s
+//   k-pass    1.11*   2.16*   ~23    36.0         (*extrapolated from k=10: 7.46)
+//
+// (M=256; the M=8 and M=64 rows agree on the ordering.) A single TKREG=32 kernel would
+// have been 2.3x slower at k=10 — the repo's own default — than picking by k.
+//
+// float4 loads are used ONLY at TKREG=8, and that is measured too: they cut it 1.107 ->
+// 0.878 where the scan is close to memory-bound, and cost 15-25% at TKREG=16 and 32
+// where it is not, because the four staged floats add register pressure to a kernel
+// already limited by it.
+#define TKREG_SMALL 8
+#define TKREG_MID 16
+#define TKREG_BIG 32
+#define TKREG_HUGE 64
+
+// tkBetter is THE tie-break, in one place: score descending, lower index wins ties, and
+// an empty slot (idx < 0) loses to anything real. Every comparison in the register
+// kernels — the insert, the block merge and the pop — goes through it, so the three
+// cannot drift apart.
+__device__ __forceinline__ bool tkBetter(float av, int ai, float bv, int bi) {
+    if (bi < 0) return ai >= 0;
+    if (ai < 0) return false;
+    return av > bv || (av == bv && ai < bi);
+}
+
+// tkInsert: offer one candidate to a sorted best-first register array. The array was
+// sorted and only its last element changes, so ONE bubble-up pass restores order. All
+// indices are constant so the array stays in registers; a runtime-indexed version
+// spills to local memory and loses more than the pass it saves.
+template <int TKREG>
+__device__ __forceinline__ void tkInsert(float* kv, int* ki, float v, int idx) {
+    if (!tkBetter(v, idx, kv[TKREG - 1], ki[TKREG - 1])) return;
+    kv[TKREG - 1] = v;
+    ki[TKREG - 1] = idx;
+    #pragma unroll
+    for (int j = TKREG - 1; j >= 1; j--) {
+        if (tkBetter(kv[j], ki[j], kv[j - 1], ki[j - 1])) {
+            float tv = kv[j]; kv[j] = kv[j - 1]; kv[j - 1] = tv;
+            int ti = ki[j]; ki[j] = ki[j - 1]; ki[j - 1] = ti;
+        }
+    }
+}
+
+template <int TKREG, bool VEC4>
+__device__ __forceinline__ void topk_reg_body(
+    const float* __restrict__ scores, int* __restrict__ outIdx,
+    float* __restrict__ outScore, const unsigned int* __restrict__ Mp,
+    const unsigned int* __restrict__ Np, const unsigned int* __restrict__ kp)
+{
+    unsigned int M = *Mp, N = *Np, k = *kp;
+    unsigned int m = blockIdx.x;
+    if (m >= M) return;
+    const float* row = scores + (unsigned long long)m * N;
+
+    float kv[TKREG];
+    int ki[TKREG];
+    #pragma unroll
+    for (int i = 0; i < TKREG; i++) { kv[i] = -3.402823466e+38f; ki[i] = -1; }
+
+    // ONE pass over the row, against the k-pass kernel's k of them.
+    if (VEC4) {
+        unsigned int n4 = N >> 2;
+        const float4* row4 = (const float4*)row;
+        for (unsigned int i = threadIdx.x; i < n4; i += TKBLOCK) {
+            float4 v = row4[i];
+            int b = (int)(i << 2);
+            tkInsert<TKREG>(kv, ki, v.x, b);
+            tkInsert<TKREG>(kv, ki, v.y, b + 1);
+            tkInsert<TKREG>(kv, ki, v.z, b + 2);
+            tkInsert<TKREG>(kv, ki, v.w, b + 3);
+        }
+        for (unsigned int i = (n4 << 2) + threadIdx.x; i < N; i += TKBLOCK) {
+            tkInsert<TKREG>(kv, ki, row[i], (int)i);
+        }
+    } else {
+        for (unsigned int i = threadIdx.x; i < N; i += TKBLOCK) {
+            tkInsert<TKREG>(kv, ki, row[i], (int)i);
+        }
+    }
+
+    // Merge: k rounds of "block-wide argmax over the TKBLOCK heads, winner pops". Each
+    // round reduces over 256 candidates rather than over N, which is why k costs so
+    // little here.
+    __shared__ float sVal[TKBLOCK];
+    __shared__ int sIdx[TKBLOCK];
+    for (unsigned int j = 0; j < k; j++) {
+        sVal[threadIdx.x] = kv[0];
+        sIdx[threadIdx.x] = ki[0];
+        __syncthreads();
+        for (unsigned int off = TKBLOCK / 2; off > 0; off >>= 1) {
+            if (threadIdx.x < off) {
+                if (tkBetter(sVal[threadIdx.x + off], sIdx[threadIdx.x + off],
+                             sVal[threadIdx.x], sIdx[threadIdx.x])) {
+                    sVal[threadIdx.x] = sVal[threadIdx.x + off];
+                    sIdx[threadIdx.x] = sIdx[threadIdx.x + off];
+                }
+            }
+            __syncthreads();
+        }
+        float wv = sVal[0];
+        int wi = sIdx[0];
+        if (threadIdx.x == 0) {
+            outIdx[m * k + j] = wi;
+            outScore[m * k + j] = wv;
+        }
+        // The winner pops its head. Row indices are unique, so exactly one thread
+        // matches — no need to reduce a thread id alongside the value.
+        if (wi >= 0 && ki[0] == wi) {
+            #pragma unroll
+            for (int i = 0; i < TKREG - 1; i++) { kv[i] = kv[i + 1]; ki[i] = ki[i + 1]; }
+            kv[TKREG - 1] = -3.402823466e+38f;
+            ki[TKREG - 1] = -1;
+        }
+        __syncthreads();
+    }
+}
+
+#define TOPK_REG_ENTRY(NAME, TKREG, VEC4)                                      \
+extern "C" __global__ void NAME(                                               \
+    const float* __restrict__ scores, /* [M*N] — read-only, NOT consumed */    \
+    int* __restrict__ outIdx,         /* [M*k] */                              \
+    float* __restrict__ outScore,     /* [M*k] */                              \
+    const unsigned int* __restrict__ Mp,                                       \
+    const unsigned int* __restrict__ Np,                                       \
+    const unsigned int* __restrict__ kp)                                       \
+{                                                                              \
+    topk_reg_body<TKREG, VEC4>(scores, outIdx, outScore, Mp, Np, kp);          \
+}
+
+TOPK_REG_ENTRY(topk_rows_r8, TKREG_SMALL, true)
+TOPK_REG_ENTRY(topk_rows_r16, TKREG_MID, false)
+TOPK_REG_ENTRY(topk_rows_r32, TKREG_BIG, false)
+TOPK_REG_ENTRY(topk_rows_r64, TKREG_HUGE, false)
 
 extern "C" __global__ void topk_rows(
     float* __restrict__ scores,      // [M*N] — MUTATED (winners consumed)

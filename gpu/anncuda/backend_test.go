@@ -8,6 +8,8 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/townsendmerino/aikit/ann"
@@ -413,6 +415,14 @@ func newTestIndex(t *testing.T, vecs [][]float32) *cudaI8Index {
 	}
 	b := &cudaBackend{dev: dev, q: dev.NewCommandQueue(), gemv: gemv,
 		batchSmall: batchSmall, batchWide: batchWide, topk: topk}
+	for i, name := range topkRegKernels {
+		p, err := dev.NewComputePipeline(lib, name)
+		if err != nil {
+			dev.ReleaseObjects()
+			t.Fatalf("%s: %v", name, err)
+		}
+		b.topkReg[i] = p
+	}
 	t.Cleanup(dev.ReleaseObjects)
 
 	// Quantize with the package's own quantizeRowInt8 — byte-identical to what
@@ -537,6 +547,208 @@ func TestCUDAGEMM_batchMatchesQuery(t *testing.T) {
 		}
 	}
 	t.Logf("batch ≡ Query exactly at M ∈ {1,2,7,8,9,16,17,33} (n=%d dim=%d k=%d)", n, dim, k)
+}
+
+// TestCUDATopK_kernelsAgree is the gate the top-k routing rests on: topkPipeline picks
+// among five kernels by k alone, on the claim that they are interchangeable.
+//
+// IT LAUNCHES THE KERNELS DIRECTLY, on a synthetic score matrix, because going through
+// TopKBatch cannot construct the input that discriminates. The four register kernels
+// keep TKREG candidates PER THREAD, and thread t sees only indices t, t+256, t+512, …
+// A kernel is only wrong if one thread's stride holds MORE than TKREG of the global
+// top-k — and on random scores that essentially never happens. Mutation-checked: with
+// a random fixture, routing k≤16 to the 8-wide kernel passed. The clustered row below
+// puts the top 64 values at indices 0, 256, 512, … so thread 0 holds ALL of them, and
+// the same mutation then fails at every k > 8.
+//
+// Three rows, each targeting a different failure:
+//
+//	clustered — the top values all in one thread's stride (per-thread capacity)
+//	tied      — scores from a tiny integer range, so the tie-break decides the order
+//	            and a kernel returning the right SET in the wrong order is still wrong
+//	random    — the ordinary case, which none of the above would notice breaking
+//
+// Comparison is index-for-index against a CPU selection using the same rule the kernels
+// must implement: score descending, lower index wins ties.
+func TestCUDATopK_kernelsAgree(t *testing.T) {
+	dev, err := gpu.CreateSystemDefaultDevice()
+	if err != nil {
+		t.Skipf("no CUDA device: %v", err)
+	}
+	t.Cleanup(dev.ReleaseObjects)
+	lib, err := dev.CompileLibrary(w8a8PTX)
+	if err != nil {
+		t.Fatalf("CompileLibrary: %v", err)
+	}
+	q := dev.NewCommandQueue()
+
+	const N, M = 60_000, 3
+	rng := rand.New(rand.NewSource(23))
+	scores := make([]float32, M*N)
+	for i := range scores[0:N] { // row 0: clustered into thread 0's stride
+		scores[i] = float32(rng.Intn(50))
+	}
+	for j := 0; j < 96; j++ {
+		if j*tkBlockThreads < N {
+			scores[j*tkBlockThreads] = float32(10_000 - j) // strictly above the rest
+		}
+	}
+	for i := N; i < 2*N; i++ { // row 1: tie-dense
+		scores[i] = float32(rng.Intn(5))
+	}
+	for i := 2 * N; i < 3*N; i++ { // row 2: ordinary
+		scores[i] = rng.Float32()
+	}
+
+	kernels := []string{"topk_rows_r8", "topk_rows_r16", "topk_rows_r32", "topk_rows_r64", "topk_rows"}
+	maxK := map[string]int{"topk_rows_r8": 8, "topk_rows_r16": 16, "topk_rows_r32": 32,
+		"topk_rows_r64": 64, "topk_rows": 1 << 30}
+
+	sb := dev.NewBufferFloats(scores)
+	mB := dev.NewBufferU32(uint32(M))
+	nB := dev.NewBufferU32(uint32(N))
+	for _, k := range []int{1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100} {
+		want := cpuTopK(scores, M, N, k)
+		idxB := gpu.NewBufferLenOf[int32](dev, M*k)
+		valB := dev.NewBufferLen(M * k)
+		kB := dev.NewBufferU32(uint32(k))
+		for _, name := range kernels {
+			if k > maxK[name] {
+				continue
+			}
+			p, err := dev.NewComputePipeline(lib, name)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			// topk_rows consumes winners in place, so every kernel gets a fresh row.
+			if err := sb.WriteFloats(scores); err != nil {
+				t.Fatalf("upload: %v", err)
+			}
+			if err := q.Launch(p, gpu.LaunchConfig{
+				GridX: M, GridY: 1, GridZ: 1, BlockX: tkBlockThreads, BlockY: 1, BlockZ: 1,
+			}, gpu.Arg(sb), gpu.Arg(idxB), gpu.Arg(valB),
+				gpu.Arg(mB), gpu.Arg(nB), gpu.Arg(kB)); err != nil {
+				t.Fatalf("%s launch: %v", name, err)
+			}
+			if err := q.Sync(); err != nil {
+				t.Fatalf("%s sync: %v", name, err)
+			}
+			got := make([]int32, M*k)
+			if err := gpu.Download(idxB, got); err != nil {
+				t.Fatalf("%s download: %v", name, err)
+			}
+			rowName := [...]string{"clustered", "tied", "random"}
+			for m := range M {
+				for i := range k {
+					if got[m*k+i] != want[m*k+i] {
+						t.Fatalf("%s k=%d row %q rank %d: index %d, want %d",
+							name, k, rowName[m], i, got[m*k+i], want[m*k+i])
+					}
+				}
+			}
+		}
+		for _, b := range []gpu.Buffer{idxB, valB, kB} {
+			dev.ReleaseBuf(b)
+		}
+	}
+	t.Logf("5 kernels ≡ CPU selection over clustered/tied/random rows at 14 values of k")
+}
+
+// tkBlockThreads is TKBLOCK in gemv_w8a8.cu — the block width every top-k kernel
+// launches with, and therefore the stride that decides which indices a thread sees.
+// The clustered fixture above is built from it.
+const tkBlockThreads = 256
+
+// cpuTopK is the reference selection: score descending, lower index wins ties. Written
+// out rather than reusing ann.topHits so the gate does not depend on the thing it is
+// checking the device against.
+func cpuTopK(scores []float32, M, N, k int) []int32 {
+	out := make([]int32, M*k)
+	for m := range M {
+		row := scores[m*N : (m+1)*N]
+		ord := make([]int32, N)
+		for i := range ord {
+			ord[i] = int32(i)
+		}
+		sort.SliceStable(ord, func(a, b int) bool {
+			ia, ib := ord[a], ord[b]
+			if row[ia] != row[ib] {
+				return row[ia] > row[ib]
+			}
+			return ia < ib
+		})
+		copy(out[m*k:(m+1)*k], ord[:k])
+	}
+	return out
+}
+
+// TestTopKPipelineWidths ties the three things that must agree — the kernel names, the
+// widths the routing uses, and the widths those kernels were actually compiled with —
+// and checks that topkPlan picks the narrowest kernel able to hold k.
+//
+// Routing k to a kernel NARROWER than k is the failure this exists for, and it is
+// invisible to a parity test on ordinary data: a too-narrow kernel still returns a
+// full, sorted, plausible list, missing only entries that happened to share a thread's
+// stride. Mutation-checked — with the earlier hand-written switch, routing k≤16 to the
+// 8-wide kernel passed every parity gate in this file.
+//
+// It needs no GPU, which is the point: on a machine without CUDA every device test here
+// skips, and a skipping test is a passing test.
+func TestTopKPipelineWidths(t *testing.T) {
+	src, err := os.ReadFile("gemv_w8a8.cu")
+	if err != nil {
+		t.Fatalf("read kernel source: %v", err)
+	}
+	if len(topkWidths) != len(topkRegKernels) {
+		t.Fatalf("%d widths but %d kernel names — they are indexed together", len(topkWidths), len(topkRegKernels))
+	}
+	for i, w := range topkWidths {
+		// The name encodes the width, so a reordering of either array shows up here.
+		if want := fmt.Sprintf("topk_rows_r%d", w); topkRegKernels[i] != want {
+			t.Errorf("topkRegKernels[%d] = %q, but topkWidths[%d] = %d implies %q",
+				i, topkRegKernels[i], i, w, want)
+		}
+		// And the kernel really was instantiated at that width.
+		if decl := fmt.Sprintf("TOPK_REG_ENTRY(topk_rows_r%d,", w); !bytes.Contains(src, []byte(decl)) {
+			t.Errorf("gemv_w8a8.cu declares no %q", decl)
+		}
+		if i > 0 && topkWidths[i-1] >= w {
+			t.Errorf("topkWidths is not ascending at %d: %v", i, topkWidths)
+		}
+	}
+	// The .cu's #defines must be the numbers the Go side thinks they are.
+	for _, d := range []string{"#define TKREG_SMALL 8", "#define TKREG_MID 16",
+		"#define TKREG_BIG 32", "#define TKREG_HUGE 64"} {
+		if !bytes.Contains(src, []byte(d)) {
+			t.Errorf("gemv_w8a8.cu has no %q", d)
+		}
+	}
+	if !strings.Contains(fmt.Sprint(topkWidths), "[8 16 32 64]") {
+		t.Errorf("topkWidths %v no longer matches the four TKREG defines above", topkWidths)
+	}
+
+	// The routing invariant: the narrowest kernel that can hold k, and -1 only above
+	// the widest.
+	widest := topkWidths[len(topkWidths)-1]
+	for k := 1; k <= widest+8; k++ {
+		i := topkPlan(k)
+		if k > widest {
+			if i != -1 {
+				t.Errorf("topkPlan(%d) = %d, want -1 (k-pass) — widest register kernel holds %d", k, i, widest)
+			}
+			continue
+		}
+		if i < 0 {
+			t.Errorf("topkPlan(%d) = -1, but the %d-wide kernel can hold it", k, widest)
+			continue
+		}
+		if topkWidths[i] < k {
+			t.Errorf("topkPlan(%d) picked the %d-wide kernel, which CANNOT hold %d candidates", k, topkWidths[i], k)
+		}
+		if i > 0 && topkWidths[i-1] >= k {
+			t.Errorf("topkPlan(%d) picked the %d-wide kernel when the %d-wide one suffices", k, topkWidths[i], topkWidths[i-1])
+		}
+	}
 }
 
 // TestBatchPlan gates the pairing of kernel to geometry. See batchPlan's comment for

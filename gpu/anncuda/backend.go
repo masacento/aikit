@@ -44,7 +44,12 @@ type cudaBackend struct {
 	// queries/tile, batchWide 4 × 16; batchQTile below is the selection rule.
 	batchSmall gpu.Pipeline // M ≤ batchSmallMaxM
 	batchWide  gpu.Pipeline // M >  batchSmallMaxM
-	topk       gpu.Pipeline // per-query top-k on the device (avoids the M×N readback)
+	// The register top-k kernels, INDEXED BY topkWidths — same order, same length.
+	// Keeping them in an array rather than four named fields is what lets the routing
+	// be a lookup instead of a hand-written switch, so there is no second place for the
+	// k -> kernel mapping to be wrong. topk is the k-pass fallback above the widest.
+	topkReg [len(topkWidths)]gpu.Pipeline
+	topk    gpu.Pipeline
 }
 
 // init reaches CUDA and registers the backend. If there is no CUDA device (no
@@ -80,9 +85,19 @@ func init() {
 		dev.ReleaseObjects()
 		return
 	}
+	var topkReg [len(topkWidths)]gpu.Pipeline
+	for i, name := range topkRegKernels {
+		p, err := dev.NewComputePipeline(lib, name)
+		if err != nil {
+			dev.ReleaseObjects()
+			return
+		}
+		topkReg[i] = p
+	}
 	ann.RegisterBackend(&cudaBackend{
 		dev: dev, q: dev.NewCommandQueue(),
-		gemv: gemv, batchSmall: batchSmall, batchWide: batchWide, topk: topk,
+		gemv: gemv, batchSmall: batchSmall, batchWide: batchWide,
+		topk: topk, topkReg: topkReg,
 	})
 }
 
@@ -290,6 +305,51 @@ const topkMinBatch = 8
 // (6.4–12.7×), so there is no longer a tiled route at all.
 const batchSmallMaxM = 8
 
+// topkWidths are the per-thread candidate capacities the register top-k kernels were
+// compiled with (TKREG_SMALL/MID/BIG/HUGE in gemv_w8a8.cu), ascending. Each is the
+// largest k its kernel can answer, because a thread's own stride may hold the entire
+// global top-k — TestCUDATopK_kernelsAgree constructs exactly that case.
+//
+// topkRegKernels is the matching kernel-name list, in the SAME ORDER: the two arrays
+// and cudaBackend.topkReg are indexed together, which is the whole reason the routing
+// below cannot pick a kernel too narrow for k. TestTopKPipelineWidths ties both to the
+// .cu source.
+var (
+	topkWidths     = [...]int{8, 16, 32, 64}
+	topkRegKernels = [...]string{"topk_rows_r8", "topk_rows_r16", "topk_rows_r32", "topk_rows_r64"}
+)
+
+// topkPlan returns the index of the NARROWEST register kernel that can answer k, or -1
+// for the k-pass fallback. Narrowest, because their cost is linear in the per-thread
+// width and flat in k (the table is in gemv_w8a8.cu): a single widest kernel would be
+// 2.3x slower at k=10, the repo's own default.
+//
+// Split out as a pure function, and tested as one, because the failure it guards is
+// invisible to a parity test on ordinary data: routing k to a kernel that cannot hold k
+// candidates still returns a full, sorted, plausible list, just missing entries that
+// happened to share a thread's stride.
+func topkPlan(k int) int {
+	for i, w := range topkWidths {
+		if k <= w {
+			return i
+		}
+	}
+	return -1
+}
+
+// topkPipeline picks the kernel for this k. Every one of them produces IDENTICAL hits —
+// same tie-break, gated by TestCUDATopK_kernelsAgree — so this is purely throughput.
+//
+// Above the widest register kernel the k-pass one runs rather than declining: declining
+// would send the whole M×N score matrix back across PCIe for the host to select from,
+// which is the cost this path exists to avoid.
+func (x *cudaI8Index) topkPipeline(k int) gpu.Pipeline {
+	if i := topkPlan(k); i >= 0 {
+		return x.b.topkReg[i]
+	}
+	return x.b.topk
+}
+
 // TopKBatch implements ann.I8TopKIndex: score the batch on the device, select each
 // query's top-k THERE, and return only M*k hits.
 //
@@ -347,9 +407,9 @@ func (x *cudaI8Index) TopKBatch(queries [][]float32, k int) (hits [][]ann.Hit, e
 	if err := x.launchBatch(qi8Buf, qscaleBuf, scoreBuf, M, N, K); err != nil {
 		return nil, err
 	}
-	// One block per query; the kernel consumes winners in place, so scoreBuf is
-	// scratch by the time it returns.
-	if err := x.b.q.Launch(x.b.topk, gpu.LaunchConfig{
+	// One block per query. The k-pass kernel consumes winners in place, so scoreBuf
+	// is scratch by the time it returns; the register kernel leaves it alone.
+	if err := x.b.q.Launch(x.topkPipeline(k), gpu.LaunchConfig{
 		GridX: uint32(M), GridY: 1, GridZ: 1, BlockX: 256, BlockY: 1, BlockZ: 1,
 	}, gpu.Arg(scoreBuf), gpu.Arg(idxBuf), gpu.Arg(valBuf),
 		gpu.Arg(mBuf), gpu.Arg(x.nbuf), gpu.Arg(kBuf)); err != nil {
