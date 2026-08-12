@@ -14,7 +14,7 @@
 
 The f32 GEMM went from **39% to 52–64%** of this box's FMA peak, the CPU int8 W8A8
 matmul gained **17.4%**, `FlatI8`'s CUDA `Query` got **3.3–6.0×** and its `QueryBatch`
-**2.2–5.4×**. Every win came from measuring a ceiling first; **every prediction made
+**4.5–4.6×** end to end. Every win came from measuring a ceiling first; **every prediction made
 from reading an instruction mix was wrong — four for four.**
 
 ## 0 · Why the ceilings had to be built first
@@ -213,6 +213,54 @@ bandwidth-bound at all — it reaches 110 GB/s of a 412 GB/s roof. The sweep tab
 `gemm_w8a8_tiled` is no longer reachable from this backend at any M, and the naive
 `gemm_w8a8` — dead since `71269fe` rerouted M=1 — is deleted.
 
+## 3c · CUDA: `topk_rows` 3.2–3.4×, and flat in k
+
+The device top-k made **k passes** over the score row. Its own comment said the k passes
+were "cheap next to the GEMM that produced the row" — true when written, and retired by
+§3b. Phase-split with production buffers at N=200k:
+
+| | gemv | topk (k-pass) | |
+|---|--:|--:|--:|
+| M=8, k=10 | 0.88 ms | **2.57** | topk 2.9× the GEMV |
+| M=256, k=10 | 18.2 | 7.46 | 0.4× |
+| M=256, k=50 | 18.2 | **36.0** | 2.0× |
+
+The GEMV's cost does not move with k; this one's was linear in it. Replaced with one
+pass — per-thread candidates in registers, then a block merge over 256 heads per round
+instead of over N. **0.77 / 0.92 / 2.16 ms** at k=10 (3.2–3.4×), and flat in k.
+
+**The cost is linear in the per-thread width and flat in k — the reverse of what it
+replaced, and not what I predicted.** The scan rejects nearly every element with one
+compare, but an *accepted* candidate costs a width-long bubble, and accepts are not rare:
+a thread scanning S elements accepts about `TKREG·ln(S)` of them. So four instantiations
+routed by k: at M=256, width 8 runs at **233 GB/s (57% of the roof)**, 16 at 95, 32 at
+42, 64 at 11. One widest kernel would have been 2.3× slower at k=10 — the repo's default.
+
+`float4` loads help **only at width 8**, where the scan is near memory-bound; at 16 and
+32 they cost 15–25%, adding pressure to a kernel already limited by registers.
+
+## 3d · Crossover, regenerated on both boxes
+
+Neither box's recorded crossover described its own code any more, and neither harness
+timed single-query `Query` at all — only `QueryBatch`, a different kernel. Both now do.
+
+| | CUDA (RTX 2070S) | Metal (M1 Pro) |
+|---|--:|--:|
+| Query(1), N=100k | **2.28×** | 0.70× |
+| Query(1), N=10k | 1.02× | 0.42× |
+| batch 8, N=100k | 6.44× | — |
+| batch 256, N=100k | **36.50×** | 1.36× |
+
+**The two backends now disagree about when `EnableGPU()` pays.** On CUDA a single query
+is worth sending to the GPU at N=100k; on the M1 Pro it is not worth sending at any
+measured size, and batching only pays from 64. A single "use the GPU above X" rule would
+be wrong on one of them.
+
+One reading trap worth recording: at N=10k the CUDA batch speedup **peaks at 8 and
+declines** (4.06 → 3.70 → 3.20), because the CPU baseline itself jumps at batch 64 while
+the GPU is already near its floor. Reading only the largest batch would have suggested
+the advantage grows monotonically with batch size. It does not, at small N.
+
 ## 4 · Negatives and process failures, in full
 
 - **2×4 AVX2 kernel** — 1.33 FMA/load vs 0.89, +4%, not kept. Its disproof is recorded
@@ -267,12 +315,12 @@ denominator before the kernel.
 
 **Unmeasured on this box:**
 
-- **`topk_rows` is now the batch path's largest remaining cost.** At M=256, N=200k the
-  kernel is 15.5 ms of a 26.5 ms end-to-end call; the other 11 ms is host quantization
-  plus a device top-k that runs ONE BLOCK PER QUERY over N=200k, k times. It has never
-  been measured against anything. It is the same shape of problem §3b just fixed — a
-  correctness-first kernel on a production entry point — and it is now the biggest
-  single line item.
+- **The top-k still runs ONE BLOCK PER QUERY.** At M=8 that leaves 8 of 40 SMs busy, and
+  it is the remaining limit at small batches (§3c). Splitting N across several blocks per
+  query needs a second merge pass; not attempted.
+- **k > 64 still takes the k-pass kernel**, at 36 ms where the register form would be
+  ~19. A 128-wide instantiation would spill; a radix-select would not, and is the
+  principled answer if large-k retrieval ever matters.
 - **The single-query GEMV has 22% left, already measured.** The §3b sweep covered
   QTILE=1, and 8 lanes per row beats the shipped 32 at M=1: 0.401 ms against 0.490 at
   N=200k. `gemv_w8a8` is untouched here because it is a separate path with its own
@@ -299,7 +347,8 @@ it only ever timed `QueryBatch`, so it could not answer "is `EnableGPU()` worth 
 one query". Its finding: on the M1 Pro single-query GPU still LOSES to CPU (0.43–0.66×)
 and `EnableGPU()` pays only at batch ≥ 8.
 
-**CUDA's is still stale, and now doubly so** — the batch path moved 2.2–5.4× after
-those points were recorded, on top of the CPU int8 path's 17–38%. It needs the same
-treatment, including the single-query row. That regeneration is arguably worth more
-than another kernel: it is what decides when `EnableGPU()` is worth calling at all.
+**Both are now current** (§3d). One inconsistency is left standing deliberately:
+`crossover-metal.jsonl` labels the M1 Pro "apple" while `vit-metal.jsonl` labels the same
+box "apple-m1pro", so the generated report renders one machine as two and says
+"3 machine(s)". Those records belong to the other box, which was mid-flight; flagged
+there rather than edited across.
