@@ -279,10 +279,10 @@ timed single-query `Query` at all — only `QueryBatch`, a different kernel. Bot
 
 | | CUDA (RTX 2070S) | Metal (M1 Pro) |
 |---|--:|--:|
-| Query(1), N=100k | **2.87×** | 0.65× |
-| Query(1), N=10k | 1.14× | 0.42× |
-| batch 8, N=100k | **13.15×** | 0.56× |
-| batch 256, N=100k | **33.27×** | 1.50× |
+| Query(1), N=100k | **2.77×** | 0.65× |
+| batch 8, N=100k | **13.19×** | 0.56× |
+| batch 64, N=100k | **27.35×** | — |
+| batch 256, N=100k | **35.84×** | 1.50× |
 
 **Read these to one significant figure.** Re-running the CUDA column on an otherwise
 identical tree moved batch-256 from 36.50× to 32.44× and Query(1) from 2.74× to 2.61× —
@@ -300,12 +300,13 @@ is worth sending to the GPU at N=100k (2.61× after §3e); on the M1 Pro it is n
 sending at any measured size, and batching only pays from 64. A single "use the GPU above X" rule would
 be wrong on one of them.
 
-One reading trap worth recording: at N=10k the CUDA batch speedup is **not monotone in
-batch size** — 4.63 → 4.14 → 5.01 across batches 8/64/256 — because the CPU baseline
-itself nearly doubles at batch 64 while the GPU is already near its floor. Before §3f the
-same row read 4.78 → 3.80 → 3.19, i.e. a clear decline. Neither shape is an artifact;
-both are the ratio of two curves that bend in different places, which is why a dispatch
-rule wants the crossover point and not the ratio.
+**The N=10k rows are quoted only at N=100k above, deliberately.** Across runs of the
+*same build* the N=10k CPU baseline came back at both ~5.4k and ~10.5k queries/s — a
+factor of two, bimodal rather than noisy — which swings every N=10k speedup by the same
+factor and is why that row has changed shape three times in this document (declining,
+then non-monotone, then declining again). The GPU side of those rows is stable; the
+denominator is not. Chasing why the CPU path is bimodal at small N is an open item, and
+until it is settled no dispatch rule should be built on an N=10k ratio.
 
 ## 3e · CUDA: the single-query GEMV group width, 15–34%
 
@@ -408,29 +409,61 @@ were most of the M=1 cost. Small batches now reuse per-index scratch, bounded to
 a one-off wide batch cannot pin a 1 GB score matrix for the process's life. That bound
 costs nothing: the allocations only mattered where the kernels were cheap.
 
-## 3h · The batch GEMV: measured, and NOT changed
+## 3h · The batch GEMV: what the 38% actually was
 
-Two things were open on it. Both are now measured; neither produced a change worth
-shipping, which is the useful part.
+Three things were open on it. One produced a change worth shipping, one produced a
+correction to this document, and one produced a measured negative.
 
-**Its byte path does not invert the (LANES, QTILE) ranking.** §3e found that the
-single-query GEMV's `k%4 != 0` column reversed its lane-count ranking, and flagged that
-the batch kernels had only ever been swept at K=768. Swept at K ∈ {768, 256, 255, 383}:
-the shipped choice is best or within 7% everywhere. The two kernels differ because each
-loaded byte here feeds QTILE MACs, so the batch form is far less load-bound and the
-ranking is set by the reduction/compute balance instead of by coalescing.
+**The byte path does not invert the (LANES, QTILE) ranking.** §3e found the single-query
+GEMV's `k%4 != 0` column reversed its lane-count ranking, and flagged that the batch
+kernels had only ever been swept at K=768. Swept at K ∈ {768, 256, 255, 383}: the shipped
+choice is best or within 7% everywhere. The two differ because each loaded byte here feeds
+QTILE MACs, so the batch form is far less load-bound and the ranking is set by the
+reduction/compute balance rather than by coalescing.
 
-**It is not traffic-bound, so the obvious lever does nothing.** The kernel reads the
-corpus `ceil(M/QTILE)` times and sits at 38% of the 412 GB/s roof, which reads like a
-bandwidth problem. Doubling QTILE to 32 **halves the DRAM traffic and changes the time by
-4%** (M=32: 1.86 ms against 1.79). So the passes are not what binds, and the redesign that
-argument would have justified is off the table.
+**It is not traffic-bound, so the obvious lever does nothing.** Doubling QTILE to 32
+halves the DRAM traffic and changes the time by 4% (M=32: 1.86 ms against 1.79). The
+redesign that argument would have justified is off the table.
 
-A transposed query tile — staging `qs[i][t]` so the QTILE query words for one k-step load
-as `QTILE/4` `int4`s instead of QTILE scalars — is worth **9–12%** at M > 8, and only at
-LANES=2. Not shipped: it needs a third batch kernel plus a `k%4` route, it is *slower* on
-the byte path, and 10% does not buy that. Recorded here so the next person does not
-re-derive it.
+**And "38% of the roof" was against the wrong denominator.** Nsight's counters are
+admin-restricted on this box, so the kernel was ablated instead — one component removed
+at a time, each variant keeping a runtime loop bound and a store so nothing folds away.
+At N=200k K=768 M=64, against 4.68 ms:
+
+| component | ms | share |
+|---|--:|--:|
+| corpus stream, nothing else | 1.87 | 40% |
+| shared query-tile loads | 1.12 | 24% |
+| query-tile staging + barrier | 0.63 | 14% |
+| `__dp4a` | 0.49 | 10% |
+| cross-lane reduction | 0.03 | 1% |
+
+The stream alone runs at **328 GB/s, 80% of the roof** — and an isolated scan with this
+kernel's exact access pattern (4 lanes per row, one `int` each) reaches **386 GB/s, 94%**.
+The 412 GB/s probe reads `int4` per lane; a kernel that reads one `int` per lane was never
+going to reach it. **Same class of error as the GEMM benchmark dividing by an M1's peak,
+one level subtler: right machine, right roof, wrong access pattern.** There was no
+2.6× sitting there; there was a stream near its own ceiling plus three overheads.
+
+Measured ceiling by lanes-per-row, which is the number that was missing:
+
+| lanes/row | bytes per row-group | GB/s | % of 412 |
+|--:|--:|--:|--:|
+| 2 | 8 | 223 | 54% |
+| 4 | 16 | 386 | 94% |
+| 8 | 32 | 390 | 95% |
+| 16 | 64 | 391 | 95% |
+| 32 | 128 | 354 | 86% |
+
+**The staging line was actionable and is now fixed.** Every block re-staged the whole
+query tile and hit a barrier to do 64 rows of work; the kernel now strides over rows, so
+one staging serves as many rows as the launch gives it. M=16 1.230 → 1.111 ms, M=64
+4.659 → 3.552, M=256 15.49 → 13.87 (10–24%).
+
+What remains is the 24% of shared-memory query loads. The transposed tile attacks exactly
+that and measures 9–12% — consistent with imperfectly attacking a 24% component — but it
+needs a third batch kernel and a `k%4` route, and is slower on the byte path. Still not
+shipped; recorded so it is not re-derived.
 
 ## 4 · Negatives and process failures, in full
 
@@ -491,9 +524,15 @@ denominator before the kernel.
   principled answer if large-k retrieval ever matters.
 - **Readback + host top-k is 43% of the single-query path** (§3e) and needs a top-k that
   splits N across blocks before a device selection can beat it.
-- **The batch GEMV sits at 38% of bandwidth and is not bandwidth-bound** (§3h), so what
-  binds it is unidentified. That is the one place left on this device where a roof was
-  measured and the kernel's distance from it is still unexplained.
+- **The batch GEMV's remaining 24% is shared-memory query loads** (§3h). The transposed
+  tile is the known 9–12% answer and is not shipped; anything larger needs a different
+  data layout, not a tuning constant.
+- **The CPU baseline at N=10k is bimodal** — ~5.4k vs ~10.5k queries/s across runs of the
+  same build. That is a CPU-side question this campaign never opened, and it makes every
+  N=10k crossover ratio unreliable in both directions.
+- **Nsight counters are unavailable on this box** (ERR_NVGPUCTRPERM). Everything above
+  was ablated instead, which works but costs a compile per hypothesis. Enabling
+  `NVreg_RestrictProfilingToAdminUsers=0` would make the next investigation much cheaper.
 - CPU f32 remains at ~63% and int8 at 78% of their ceilings. The rest is loop overhead,
   the 12 horizontal reductions, and cache — diminishing returns.
 
