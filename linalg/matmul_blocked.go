@@ -117,20 +117,19 @@ func accumRowRange(a, b, dst []float32, i, K, N, k0, k4, kSpan, nStart, nEnd int
 	aRowPtr := &a[i*K+k0]
 	n := nStart
 	nEndAligned8 := nStart + ((nEnd-nStart)/8)*8
-	var sums8 [32]float32
+	// dot8ColsInto returns the eight totals directly. On amd64 dotFMA8 already
+	// reduces in-register, so the old [32]float32 partial-sum round trip was 128
+	// bytes of zeroing plus 32 adds of which 24 added literal 0.0 (~7.4% of the
+	// kernel at K=768). On arm64 the four lanes per column are real partial sums and
+	// dot8ColsInto folds them in this same left-to-right order.
+	var cols [8]float32
 	for ; n < nEndAligned8; n += 8 {
-		Dot8x4(aRowPtr,
+		dot8ColsInto(aRowPtr,
 			&b[n*K+k0], &b[(n+1)*K+k0], &b[(n+2)*K+k0], &b[(n+3)*K+k0],
 			&b[(n+4)*K+k0], &b[(n+5)*K+k0], &b[(n+6)*K+k0], &b[(n+7)*K+k0],
-			k4, &sums8)
-		s0 := sums8[0] + sums8[1] + sums8[2] + sums8[3]
-		s1 := sums8[4] + sums8[5] + sums8[6] + sums8[7]
-		s2 := sums8[8] + sums8[9] + sums8[10] + sums8[11]
-		s3 := sums8[12] + sums8[13] + sums8[14] + sums8[15]
-		s4 := sums8[16] + sums8[17] + sums8[18] + sums8[19]
-		s5 := sums8[20] + sums8[21] + sums8[22] + sums8[23]
-		s6 := sums8[24] + sums8[25] + sums8[26] + sums8[27]
-		s7 := sums8[28] + sums8[29] + sums8[30] + sums8[31]
+			k4, &cols)
+		s0, s1, s2, s3 := cols[0], cols[1], cols[2], cols[3]
+		s4, s5, s6, s7 := cols[4], cols[5], cols[6], cols[7]
 		for k := k4 * 4; k < kSpan; k++ {
 			av := a[i*K+k0+k]
 			s0 += av * b[n*K+k0+k]
