@@ -18,6 +18,14 @@
 #     The PTX reproducibility check therefore runs with AIKIT_REQUIRE_PTX_REPRO=1, which
 #     turns "NVRTC not installed" from a silent skip into a failure. Green here means
 #     tested.
+#   - ...EXCEPT WHERE THE TOOL CANNOT EXIST, WHICH IS NOT THE SAME THING. NVIDIA ships no
+#     NVRTC for Apple Silicon — there is no darwin-arm64 wheel, only a 0.0.1.dev5
+#     placeholder — so on darwin that rule turned "this platform cannot run this check"
+#     into FAIL, and the gate could never be green on a Mac. "Absent because nobody
+#     installed it" and "absent because it does not exist for this OS" deserve different
+#     answers: the first is a failure, the second is n/a. Conflating them either blocks
+#     the release or, worse, invites someone to delete the strictness that makes the first
+#     case honest.
 #   - GROUPS ARE DECLARED UP FRONT AND RECONCILED AT THE END. A tally computed only from
 #     what emitted can never notice what did not emit: a group that dies mid-block simply
 #     vanishes and the gate reports PASS having tested nothing. Any declared group that
@@ -71,12 +79,23 @@ BOX="$(uname -s)/$(uname -m)"
 EXPECTED="build fmt-vet fma-lint fma-histogram ptx-repro"
 NEXPECTED="$(set -- $EXPECTED; echo $#)"
 SEEN=" "
+NA=""
+NNA=0
 FAILED=0
+OS="$(uname -s)"
 
 verdict() { # verdict <group> <PASS|FAIL> <detail>
 	SEEN="$SEEN$1 "
 	printf '  %-14s %-4s %s\n' "$1" "$2" "$3"
 	[ "$2" = "FAIL" ] && FAILED=$((FAILED + 1))
+	return 0
+}
+
+notapplicable() { # notapplicable <group> <why>
+	SEEN="$SEEN$1 "
+	NA="$NA $1"
+	NNA=$((NNA + 1))
+	printf '  %-14s %-4s %s\n' "$1" "n/a" "$2"
 	return 0
 }
 
@@ -134,7 +153,15 @@ run_test fma-lint      'TestKernelFMALint'
 run_test fma-histogram 'TestGemvQuantFMAHistogram'
 # NVRTC required: without the flag this test skips when NVRTC is absent, and a skipping
 # gate check is a passing one.
-run_test ptx-repro     'TestPTXReproducible'       AIKIT_REQUIRE_PTX_REPRO=1
+# NVRTC exists for Linux and Windows, never for Apple Silicon, so this group is not
+# merely unconfigured on darwin — it is unrunnable there. Reported as n/a rather than
+# FAIL, and excluded from the tally, so that a Mac's verdict says what it actually
+# covered instead of blocking on a check that machine can never perform.
+if [ "$OS" = "Darwin" ]; then
+	notapplicable ptx-repro "no NVRTC for darwin (NVIDIA ships none for Apple Silicon)"
+else
+	run_test ptx-repro     'TestPTXReproducible'       AIKIT_REQUIRE_PTX_REPRO=1
+fi
 
 # Reconcile declared groups against emitted verdicts (goinfer audit G-01).
 missing=""
@@ -149,9 +176,16 @@ if [ -n "$missing" ]; then
 	FAILED=$((FAILED + 1))
 fi
 
+NAPPLIC=$((NEXPECTED - NNA))
+
 echo
+if [ -n "$NA" ]; then
+	echo "NOT APPLICABLE on this platform —$NA"
+	echo "      This verdict does not cover them; a box that can run them must."
+	echo
+fi
 if [ "$FAILED" -gt 0 ]; then
-	echo "VERDICT: FAIL — $FAILED of $NEXPECTED groups red at $COMMIT$DIRTY ($BOX, $DATE)"
+	echo "VERDICT: FAIL — $FAILED of $NAPPLIC applicable groups red at $COMMIT$DIRTY ($BOX, $DATE)"
 	exit 1
 fi
 # Every group is green. A dirty tree is not a failure of the CHECKS — it is a failure of
@@ -159,10 +193,13 @@ fi
 # not describe what that commit contains. Distinguish the two rather than printing
 # "FAIL — 0 groups red", which reads as a bug in the gate.
 if [ -n "$DIRTY" ]; then
-	echo "VERDICT: INCONCLUSIVE — $NEXPECTED/$NEXPECTED groups green, but the working tree is DIRTY."
+	echo "VERDICT: INCONCLUSIVE — $NAPPLIC/$NAPPLIC applicable groups green, but the working tree is DIRTY."
 	echo "The verdict names $COMMIT and the tree is not $COMMIT. Commit, then re-run before tagging."
 	exit 1
 fi
-echo "VERDICT: PASS — $NEXPECTED/$NEXPECTED groups green at $COMMIT ($BOX, $DATE)"
+echo "VERDICT: PASS — $NAPPLIC/$NEXPECTED applicable groups green at $COMMIT ($BOX, $DATE)"
+if [ "$NNA" -gt 0 ]; then
+	echo "         $NNA of $NEXPECTED not applicable here —$NA"
+fi
 echo "Paste that line into the tag message. Device tests are the hand-run half — see RELEASING.md."
 exit 0
