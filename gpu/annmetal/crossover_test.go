@@ -59,6 +59,17 @@ func envInts(key string, def []int) []int {
 
 // TestMetalANNCrossover runs the sweep and appends records. Skips cleanly without the env
 // gate, the model, or a device — so a normal `go test ./...` on any Mac stays green.
+// NOTE (2026-08-12, from the Linux box): the timing loops here used a fixed 10
+// iterations, which at small batch sizes is a window SHORTER THAN A GO GC CYCLE — the
+// prelude above leaves ~120 MB live, and the cycle that lands during the first shapes
+// measured halves their throughput. On CUDA that made the N=10k CPU baseline read 5.4k
+// or 10.5k queries/s depending on where the cycle fell. They now use bench.MinDuration,
+// which also runs for a minimum wall time. Diagnosis and the ruled-out alternatives
+// (cold cache, clock/thermal) are in docs/internal/roofline-2026-08.md §3i.
+//
+// THE RECORDS IN docs/bench-records/crossover-metal.jsonl PREDATE THIS FIX and carry the
+// same error at batch=1 and batch=8 — which is exactly where the "single-query GPU loses,
+// EnableGPU pays only at batch >= 8" finding lives. Re-run on the device to regenerate.
 func TestMetalANNCrossover(t *testing.T) {
 	if os.Getenv("AIKIT_GPU_BENCH") == "" {
 		t.Skip("periodic GPU pass — set AIKIT_GPU_BENCH=1 to run (docs/BENCH-gpu.md)")
@@ -117,15 +128,8 @@ func TestMetalANNCrossover(t *testing.T) {
 			for range warmup {
 				fi8.QueryBatch(qs, kTop)
 			}
-			best := time.Hour
 			var hits [][]ann.Hit
-			for range iters {
-				t0 := time.Now()
-				hits = fi8.QueryBatch(qs, kTop)
-				if d := time.Since(t0); d < best {
-					best = d
-				}
-			}
+			best := bench.MinDuration(iters, func() { hits = fi8.QueryBatch(qs, kTop) })
 			cpuThr[b] = float64(b) / best.Seconds()
 			cpuRecall[b] = meanRecall(hits, truth)
 			cpuHitsByBatch[b] = hits
@@ -183,15 +187,8 @@ func TestMetalANNCrossover(t *testing.T) {
 			for range warmup {
 				fi8.QueryBatch(qs, kTop)
 			}
-			best := time.Hour
 			var hits [][]ann.Hit
-			for range iters {
-				t0 := time.Now()
-				hits = fi8.QueryBatch(qs, kTop)
-				if d := time.Since(t0); d < best {
-					best = d
-				}
-			}
+			best := bench.MinDuration(iters, func() { hits = fi8.QueryBatch(qs, kTop) })
 			wallMs := float64(best.Nanoseconds()) / 1e6
 			gpuThr := float64(b) / best.Seconds()
 			gRecall := meanRecall(hits, truth)
@@ -257,18 +254,16 @@ func timeSingleQuery(f *ann.FlatI8, qs [][]float32, k int) (float64, [][]ann.Hit
 			f.Query(q, k)
 		}
 	}
-	best := time.Hour
 	var hits [][]ann.Hit
-	for range iters {
+	best := bench.MinDuration(iters, func() {
 		h := make([][]ann.Hit, len(qs))
-		t0 := time.Now()
 		for i, q := range qs {
 			h[i] = f.Query(q, k)
 		}
-		if d := time.Since(t0) / time.Duration(len(qs)); d < best {
-			best, hits = d, h
-		}
-	}
+		hits = h
+	})
+	// MinDuration times the whole sweep of len(qs) queries; report per query.
+	best /= time.Duration(len(qs))
 	return 1.0 / best.Seconds(), hits
 }
 
