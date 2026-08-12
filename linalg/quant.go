@@ -240,9 +240,7 @@ func MatmulBTW8A8Pre(ws *Workspace, aq []int8, aScales []float32, bQ []int8, bSc
 // bit-identical for any M.
 func w8a8Span(aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, M, K, N, j0, j1 int) {
 	// ONE COLUMN OF B AT A TIME, CONTIGUOUS. This is not the naive form; it is the
-	// form that was measured to be faster at the shapes that matter, and the
-	// eight-column kernel it replaced is still in the tree (dotI8Cols8) with the
-	// evidence for why it is not wired here.
+	// form that was measured to be faster at the shapes that matter.
 	//
 	// v1.17.0 shipped an eight-column version: dotI8Cols8 scores columns j..j+7
 	// against one widened a-row, so the a-row is widened once per group instead of
@@ -274,6 +272,11 @@ func w8a8Span(aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, M
 	// trade the access pattern for it — widening the a-row ONCE per span into an
 	// int16 scratch and keeping this linear walk would get both. That is the redo,
 	// and BenchmarkW8A8SpanShapes exists so it cannot be evaluated at one shape again.
+	//
+	// The eight-column kernel itself (dotI8Cols8, dotI8x8AVX2 and their tests) is
+	// DELETED rather than left sitting unused: it is recoverable from v1.17.0, the
+	// redo wants a different shape of kernel anyway, and unused assembly with no
+	// caller is exactly the kind of machinery this repo does not keep.
 	for j := j0; j < j1; j++ {
 		bj := bQ[j*K : j*K+K]
 		bScale := bScales[j]

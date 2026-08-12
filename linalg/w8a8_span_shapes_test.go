@@ -9,7 +9,8 @@ import (
 // BenchmarkW8A8SpanShapes exists because v1.17.0 shipped a W8A8 regression that a
 // single-shape benchmark could not see, and it covers BOTH regimes on purpose.
 //
-// The eight-column kernel (dotI8Cols8) was measured at K=768 with a small N — where
+// The eight-column kernel v1.17.0 shipped (dotI8Cols8, deleted in v1.17.1) was
+// measured at K=768 with a small N — where
 // B is cache-resident — and reported +30%. At the shapes production actually uses,
 // where B is far larger than L3 and is streamed from DRAM, the same kernel was 3.5-5%
 // SLOWER, because it advances eight streams K bytes apart where the shipped span walks
