@@ -131,12 +131,52 @@ func TestMetalANNCrossover(t *testing.T) {
 			cpuHitsByBatch[b] = hits
 		}
 
+		// --- single-query FlatI8.Query — the path gemv_w8a8 serves (NOT QueryBatch, which
+		// takes the tiled GEMM even at batch 1). This is what decides whether EnableGPU is
+		// worth calling for one query. CPU baseline first. ---
+		sq := qpool[:min(64, queryPool)]
+		cpuQThr, cpuQHits := timeSingleQuery(fi8, sq, kTop)
+		cpuQRecall := meanRecall(cpuQHits, truth[:len(sq)])
+
 		// --- residency (one-time), then Metal QueryBatch ---
 		t0 := time.Now()
 		if err := fi8.EnableGPU(); err != nil {
 			t.Skipf("EnableGPU: %v (no Metal device?)", err)
 		}
 		oneTimeMs := float64(time.Since(t0).Nanoseconds()) / 1e6
+
+		// --- single-query FlatI8.Query on Metal (gemv_w8a8, SIMD-group per row) ---
+		gpuQThr, gpuQHits := timeSingleQuery(fi8, sq, kTop)
+		gpuQRecall := meanRecall(gpuQHits, truth[:len(sq)])
+		qParityOK, qMaxDelta := parity(gpuQHits, cpuQHits, cpuQRecall, gpuQRecall)
+		if !qParityOK {
+			t.Errorf("PARITY(Query): N=%d single-query Metal ranking diverged from CPU int8 — a bug, not a knob.", N)
+		}
+		qsp := gpuQThr / cpuQThr
+		qShape := bench.Shape{N: N, Dim: dim, Batch: 1, K: kTop}
+		cpuQR, gpuQR := cpuQRecall, gpuQRecall
+		cpuQRec := bench.Record{
+			Workload: "ann.FlatI8.Query", Backend: "cpu-simd", Precision: "int8",
+			Device: cpuDev, Shape: qShape,
+			Timing:     bench.Timing{Compute: msPer(cpuQThr, 1), Wall: msPer(cpuQThr, 1)},
+			Throughput: cpuQThr, ThroughputUnit: "queries/s",
+			Quality: bench.Quality{RecallAtK: &cpuQR, ParityOK: true},
+			Meta:    meta,
+		}
+		gpuQRec := bench.Record{
+			Workload: "ann.FlatI8.Query", Backend: "metal", Precision: "int8",
+			Device: gpuDev, Shape: qShape,
+			Timing:     bench.Timing{OneTime: oneTimeMs, Compute: msPer(gpuQThr, 1), Wall: msPer(gpuQThr, 1)},
+			Throughput: gpuQThr, ThroughputUnit: "queries/s",
+			Quality:      bench.Quality{RecallAtK: &gpuQR, ParityOK: qParityOK, MaxDeltaVsCPU: qMaxDelta},
+			SpeedupVsCPU: &qsp,
+			Meta:         meta,
+		}
+		if err := bench.AppendRecords(recordsPath, cpuQRec, gpuQRec); err != nil {
+			t.Fatalf("append query records: %v", err)
+		}
+		t.Logf("N=%-7d Query(1)    cpu %8.0f q/s  metal %8.0f q/s  %5.2f×  recall cpu %.4f metal %.4f  parity %v",
+			N, cpuQThr, gpuQThr, qsp, cpuQR, gpuQR, qParityOK)
 
 		for _, b := range batches {
 			qs := qpool[:b]
@@ -206,6 +246,30 @@ func msPer(thr float64, batch int) float64 {
 		return 0
 	}
 	return float64(batch) / thr * 1000
+}
+
+// timeSingleQuery times FlatI8.Query ONE query at a time (min per-query over iters),
+// returning queries/s and the best pass's hits. This is the gemv_w8a8 path — distinct
+// from QueryBatch, which takes the tiled GEMM even at batch 1.
+func timeSingleQuery(f *ann.FlatI8, qs [][]float32, k int) (float64, [][]ann.Hit) {
+	for range warmup {
+		for _, q := range qs {
+			f.Query(q, k)
+		}
+	}
+	best := time.Hour
+	var hits [][]ann.Hit
+	for range iters {
+		h := make([][]ann.Hit, len(qs))
+		t0 := time.Now()
+		for i, q := range qs {
+			h[i] = f.Query(q, k)
+		}
+		if d := time.Since(t0) / time.Duration(len(qs)); d < best {
+			best, hits = d, h
+		}
+	}
+	return 1.0 / best.Seconds(), hits
 }
 
 // genCorpus/genQueries produce distinct, REAL Model2Vec embeddings (not random vectors, which
