@@ -31,8 +31,9 @@
 //
 //   - gemv_w8a8 (FlatI8.Query) was thread-per-row, so adjacent threads read addresses
 //     K bytes apart and a warp's load touched 32 cache lines to use one byte of each.
-//     25-28 GB/s against a measured 412 GB/s streaming ceiling. Now warp-per-row with
-//     __dp4a: 3.3-6.0x (be90aec).
+//     25-28 GB/s against a measured 412 GB/s streaming ceiling. Now a coalesced lane
+//     group per row with __dp4a: 3.3-6.0x (be90aec), and a further 15-34% from sweeping
+//     the group width rather than assuming a full warp.
 //   - The batch path (FlatI8.QueryBatch) ran gpu/vit.cu's 16x16 gemm_w8a8_tiled, whose
 //     cost depends on ceil(M/16) rather than M — 6.79 ms at N=200k for every M from 1
 //     to 16. Now the lane-group batch GEMV below: 6.4-12.7x, and the tiled kernel is
@@ -49,7 +50,29 @@
 //     a CUDA launch rounds up to whole blocks, where Metal's dispatchThreads
 //     launches exactly n (gpu/cuda.go, divergence 2).
 
-// gemv_w8a8: out[j] = dot(qi8, codes[j]) * qscale * scales[j], one WARP per row.
+// GEMV_LANES is how many threads cooperate on one corpus row. It was 32 (one full
+// warp), which is the obvious choice and not the best one: a warp of 32 lanes reducing
+// one row pays a 5-deep shuffle tree per row, and at K=768 each lane only gets 6 loads
+// to amortize it against.
+//
+// SWEPT, and the answer is not the fastest single number. ms per launch at N=200k:
+//
+//            K=768   K=256   K=255 (byte path)
+//   L4       0.418   0.151   0.495
+//   L8       0.398   0.144   0.325
+//   L16      0.400   0.150   0.260
+//   L32      0.491   0.229   0.305
+//
+// L8 wins the two k%4==0 columns — but only by 0-4%, and it LOSES the byte path by 25%,
+// because there each lane loads a single byte and 8 lanes cover only 8 of a 32-byte
+// sector. L16 is within 4% of the best on every shape measured, including the one that
+// is not the common case. Robustness across shapes is worth more here than 4% on the
+// shapes we happen to benchmark, and it avoids a K-dependent second kernel.
+//
+// Against the old 32: 19% at K=768, 34% at K=256, 15% at K=255.
+#define GEMV_LANES 16
+
+// gemv_w8a8: out[j] = dot(qi8, codes[j]) * qscale * scales[j], one LANE GROUP per row.
 extern "C" __global__ void gemv_w8a8(
     const signed char* __restrict__ codes,  // [N*K] int8, row-major
     const signed char* __restrict__ qi8,    // [K]   int8 query (host-quantized)
@@ -59,40 +82,46 @@ extern "C" __global__ void gemv_w8a8(
     float* __restrict__ out,                // [N]   scores
     const unsigned int* __restrict__ N)     // row count (the launch bound)
 {
-    // ONE WARP PER ROW. The 32 lanes walk the SAME row, so a warp's load covers 32
-    // consecutive addresses — one fully-used transaction, against the 32 partly-used
-    // ones the thread-per-row form issued. The launch therefore dispatches N*32
-    // threads (see cudaI8Index.Score); j is the global WARP index, not thread index.
-    unsigned int warpsPerBlock = blockDim.x >> 5;
-    unsigned int j = blockIdx.x * warpsPerBlock + (threadIdx.x >> 5);
+    // GEMV_LANES threads walk the SAME row, so their loads coalesce — one fully-used
+    // transaction against the 32 partly-used ones the original thread-per-row form
+    // issued. The launch dispatches N*GEMV_LANES threads (see cudaI8Index.Score); j is
+    // the global LANE-GROUP index, not a thread index.
+    unsigned int groupsPerBlock = blockDim.x / GEMV_LANES;
+    unsigned int j = blockIdx.x * groupsPerBlock + (threadIdx.x / GEMV_LANES);
     if (j >= *N) return;
-    unsigned int lane = threadIdx.x & 31u;
+    unsigned int lane = threadIdx.x & (unsigned int)(GEMV_LANES - 1);
     unsigned int k = *K;
     const signed char* row = codes + (unsigned long long)j * k;
 
     int acc = 0;
     if ((k & 3u) == 0) {
         // 4 int8 MACs per instruction via __dp4a, and 4 bytes per lane per load, so a
-        // warp moves 128 bytes at a time. Safe because k%4==0 makes every row start
-        // 4-byte aligned (the base allocation is 256-byte aligned).
+        // group moves GEMV_LANES*4 bytes at a time. Safe because k%4==0 makes every row
+        // start 4-byte aligned (the base allocation is 256-byte aligned).
         const int* row4 = (const int*)row;
         const int* q4 = (const int*)qi8;
         unsigned int k4 = k >> 2;
-        for (unsigned int i = lane; i < k4; i += 32) {
+        for (unsigned int i = lane; i < k4; i += GEMV_LANES) {
             acc = __dp4a(row4[i], q4[i], acc);
         }
     } else {
-        // Byte path for k%4 != 0: still coalesced (32 consecutive bytes per warp),
-        // just one MAC per lane per step instead of four.
-        for (unsigned int i = lane; i < k; i += 32) {
+        // Byte path for k%4 != 0: still coalesced, just one MAC per lane per step
+        // instead of four. This is the column GEMV_LANES=16 is chosen to protect.
+        for (unsigned int i = lane; i < k; i += GEMV_LANES) {
             acc += (int)qi8[i] * (int)row[i];
         }
     }
 
-    // Warp reduction. Integer addition is associative, so this is EXACTLY the
-    // sequential sum — the reason this kernel can be reshaped at all, and why it
-    // stays BIT-IDENTITY-EXEMPT rather than needing a contract.
-    for (int off = 16; off > 0; off >>= 1) {
+    // Reduction over the group. The shuffles are warp-wide but the tree is only
+    // log2(GEMV_LANES) deep, so the other groups sharing this warp reduce their own rows
+    // in the same instructions; lanes above the group boundary read across it and their
+    // results are discarded, since only lane 0 stores.
+    //
+    // Integer addition is associative, so this is EXACTLY the sequential sum — the
+    // reason the group width is a free parameter at all, and why this kernel stays
+    // BIT-IDENTITY-EXEMPT rather than needing a contract. TestCUDAGEMV_parityWithCPU
+    // holds that to exact equality.
+    for (int off = GEMV_LANES / 2; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
     if (lane == 0) {

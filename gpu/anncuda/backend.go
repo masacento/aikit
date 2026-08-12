@@ -176,10 +176,11 @@ func (x *cudaI8Index) Score(q []float32, dst []float32) error {
 	if err := x.qscale.WriteFloats([]float32{qscale}); err != nil {
 		return err
 	}
-	// gemv_w8a8 is WARP-per-row, not thread-per-row: 32 lanes cooperate on one row so
-	// their loads coalesce. The dispatch is therefore n*32 threads, and the kernel's
-	// own bound check compares the global WARP index against n.
-	if err := x.b.q.Run1D(x.b.gemv, x.n*32, 256, x.codes, x.qi8, x.scales, x.kbuf, x.qscale, x.out, x.nbuf); err != nil {
+	// gemv_w8a8 puts a LANE GROUP on each row, not a thread: gemvLanes threads
+	// cooperate on one row so their loads coalesce. The dispatch is therefore
+	// n*gemvLanes threads, and the kernel's own bound check compares the global
+	// lane-group index against n.
+	if err := x.b.q.Run1D(x.b.gemv, x.n*gemvLanes, batchBlock, x.codes, x.qi8, x.scales, x.kbuf, x.qscale, x.out, x.nbuf); err != nil {
 		return err
 	}
 	return x.out.ReadFloats(dst)
@@ -453,7 +454,7 @@ func (x *cudaI8Index) launchBatch(qi8Buf, qscaleBuf, outBuf gpu.Buffer, M, N, K 
 		// because batch8 computes 8 accumulators to store 1. The layouts already
 		// agree — qscaleBuf is [1] here, which is what gemv's scalar qscale binding
 		// expects, and out[j] is the same [N] row.
-		return x.b.q.Run1D(x.b.gemv, x.n*32, batchBlock,
+		return x.b.q.Run1D(x.b.gemv, x.n*gemvLanes, batchBlock,
 			x.codes, qi8Buf, x.scales, x.kbuf, qscaleBuf, outBuf, x.nbuf)
 	}
 	wide, lanes, qtile := batchPlan(M)
@@ -495,6 +496,12 @@ func batchPlan(M int) (wide bool, lanes, qtile int) {
 // duplicated from gemv_w8a8.cu because the launch geometry depends on them and PTX
 // carries no way to ask; TestBatchKernelConstantsMatchSource keeps the two in step.
 const (
+	// gemvLanes mirrors GEMV_LANES in gemv_w8a8.cu — the threads that cooperate on one
+	// corpus row in the single-query kernel, and so the multiplier on its launch width.
+	// A value larger than the kernel's over-launches (absorbed by the row bound check);
+	// smaller silently leaves the tail of the corpus unscored.
+	gemvLanes = 16
+
 	batchLanesSmall = 8
 	batchQTileSmall = 8
 	batchLanesWide  = 4

@@ -279,24 +279,65 @@ timed single-query `Query` at all — only `QueryBatch`, a different kernel. Bot
 
 | | CUDA (RTX 2070S) | Metal (M1 Pro) |
 |---|--:|--:|
-| Query(1), N=100k | **2.28×** | 0.65× |
-| Query(1), N=10k | 1.02× | 0.42× |
+| Query(1), N=100k | **2.74×** | 0.65× |
+| Query(1), N=10k | 1.04× | 0.42× |
 | batch 8, N=100k | 6.44× | 0.56× |
 | batch 256, N=100k | **36.50×** | 1.50× |
 
-The Metal column is post-§3c(Metal): its `QueryBatch` numbers moved up with the topk_rows
-rewrite (batch 256 at N=100k 1.36 → 1.50×), while the single-query rows sit on the
-unchanged `gemv_w8a8` path and drift only with run-to-run variance.
+Both columns are post-rewrite on their own box. Metal's `QueryBatch` rows moved up with
+its topk_rows rewrite (batch 256 at N=100k 1.36 → 1.50×) while its single-query rows sit
+on an unchanged `gemv_w8a8`; CUDA's single-query rows moved up with §3e (2.28 → 2.74×)
+while its batch rows were already current.
 
 **The two backends now disagree about when `EnableGPU()` pays.** On CUDA a single query
-is worth sending to the GPU at N=100k; on the M1 Pro it is not worth sending at any
-measured size, and batching only pays from 64. A single "use the GPU above X" rule would
+is worth sending to the GPU at N=100k (2.74× after §3e); on the M1 Pro it is not worth
+sending at any measured size, and batching only pays from 64. A single "use the GPU above X" rule would
 be wrong on one of them.
 
 One reading trap worth recording: at N=10k the CUDA batch speedup **peaks at 8 and
 declines** (4.06 → 3.70 → 3.20), because the CPU baseline itself jumps at batch 64 while
 the GPU is already near its floor. Reading only the largest batch would have suggested
 the advantage grows monotonically with batch size. It does not, at small N.
+
+## 3e · CUDA: the single-query GEMV group width, 15–34%
+
+The last kernel still assuming a full warp per row. It was 32 lanes, which is the
+obvious choice and not the best one: a 32-lane reduction is a 5-deep shuffle tree, and
+at K=768 each lane gets only 6 loads to amortize it against.
+
+Swept, ms per launch at N=200k:
+
+| lanes | K=768 | K=256 | K=255 (byte path) |
+|---|--:|--:|--:|
+| 4 | 0.418 | 0.151 | 0.495 |
+| 8 | **0.398** | **0.144** | 0.325 |
+| 16 | 0.400 | 0.150 | **0.260** |
+| 32 | 0.491 | 0.229 | 0.305 |
+
+**The fastest column-winner is not the right answer.** L8 takes both `k%4==0` columns —
+by 0–4% — and loses the byte path by 25%, because there each lane loads a single byte and
+8 lanes cover only 8 of a 32-byte sector. L16 is within 4% of the best on *every* shape,
+including the one that is not the common case, and needs no K-dependent second kernel.
+Chose L16: 19% at K=768, 34% at K=256, 15% at K=255.
+
+Worth stating because it cuts against the rest of this document: everywhere else the
+sweep produced a clear winner and I took it. Here taking the winner would have bought
+4% on the shapes we benchmark and paid 25% on a shape we don't.
+
+**Where `FlatI8.Query`'s time now goes** (N=200k, warm index, 0.755 ms total):
+
+| | ms | |
+|---|--:|--:|
+| GEMV kernel | 0.402 | 53% |
+| readback of N scores | 0.178 | 24% |
+| host top-k | 0.147 | 19% |
+| upload + quantize | 0.026 | 3% |
+
+So the kernel is now barely half of it, and **readback + host selection is 43%** — the
+obvious next target, and the reason it is not done here is measured too: a device top-k
+for one query would launch ONE block over the whole corpus (§3c), which at N=200k costs
+more than the 0.325 ms it would save. It needs the multi-block top-k first, not a
+routing change.
 
 ## 4 · Negatives and process failures, in full
 
@@ -352,16 +393,18 @@ denominator before the kernel.
 
 **Unmeasured on this box:**
 
-- **The top-k still runs ONE BLOCK PER QUERY.** At M=8 that leaves 8 of 40 SMs busy, and
-  it is the remaining limit at small batches (§3c). Splitting N across several blocks per
-  query needs a second merge pass; not attempted.
+- **The top-k still runs ONE BLOCK PER QUERY.** At M=8 that leaves 8 of 40 SMs busy; at
+  M=1 it leaves 1, which is what blocks §3e's remaining 43%. Splitting N across several
+  blocks per query needs a second merge pass; not attempted. This is now the single
+  highest-value open item on this device.
 - **k > 64 still takes the k-pass kernel**, at 36 ms where the register form would be
   ~19. A 128-wide instantiation would spill; a radix-select would not, and is the
   principled answer if large-k retrieval ever matters.
-- **The single-query GEMV has 22% left, already measured.** The §3b sweep covered
-  QTILE=1, and 8 lanes per row beats the shipped 32 at M=1: 0.401 ms against 0.490 at
-  N=200k. `gemv_w8a8` is untouched here because it is a separate path with its own
-  gates; the change is a constant.
+- **Readback + host top-k is 43% of the single-query path** (§3e) and needs a top-k that
+  splits N across blocks before a device selection can beat it.
+- **The batch kernels' byte path (`K%4 != 0`) is unmeasured.** Their (LANES, QTILE)
+  sweep ran only at K=768, and §3e shows that column can invert a ranking — L8 won every
+  `k%4==0` shape and lost the byte path by 25%. Correctness is gated; throughput is not.
 - CPU f32 remains at ~63% and int8 at 78% of their ceilings. The rest is loop overhead,
   the 12 horizontal reductions, and cache — diminishing returns.
 

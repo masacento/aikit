@@ -794,6 +794,12 @@ func TestBatchKernelConstantsMatchSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read kernel source: %v", err)
 	}
+	// The single-query kernel's group width, which sets its launch multiplier.
+	if decl := fmt.Sprintf("#define GEMV_LANES %d", gemvLanes); !bytes.Contains(src, []byte(decl)) {
+		t.Errorf("gemv_w8a8.cu has no %q — Score dispatches n*%d threads on that assumption, "+
+			"and a kernel compiled for fewer would leave the tail of the corpus unscored",
+			decl, gemvLanes)
+	}
 	for _, want := range []struct {
 		call         string
 		lanes, qtile int
