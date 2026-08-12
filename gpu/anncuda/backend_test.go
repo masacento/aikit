@@ -415,13 +415,23 @@ func newTestIndex(t *testing.T, vecs [][]float32) *cudaI8Index {
 	}
 	b := &cudaBackend{dev: dev, q: dev.NewCommandQueue(), gemv: gemv,
 		batchSmall: batchSmall, batchWide: batchWide, topk: topk}
-	for i, name := range topkRegKernels {
-		p, err := dev.NewComputePipeline(lib, name)
-		if err != nil {
-			dev.ReleaseObjects()
-			t.Fatalf("%s: %v", name, err)
+	b.sm = dev.SMCount()
+	for i, w := range topkWidths {
+		for _, load := range []struct {
+			name string
+			dst  *gpu.Pipeline
+		}{
+			{topkKernelName("rows", w), &b.topkReg[i]},
+			{topkKernelName("split", w), &b.topkSplit[i]},
+			{topkKernelName("merge", w), &b.topkMerge[i]},
+		} {
+			p, err := dev.NewComputePipeline(lib, load.name)
+			if err != nil {
+				dev.ReleaseObjects()
+				t.Fatalf("%s: %v", load.name, err)
+			}
+			*load.dst = p
 		}
-		b.topkReg[i] = p
 	}
 	t.Cleanup(dev.ReleaseObjects)
 
@@ -690,6 +700,143 @@ func cpuTopK(scores []float32, M, N, k int) []int32 {
 	return out
 }
 
+// TestCUDATopK_splitMatchesOneBlock gates the split/merge pair against the one-block
+// kernel it replaces, launching both directly so the comparison does not depend on
+// whichever route topkSplitParts happens to choose.
+//
+// The split is exact for a structural reason — the global top k is contained in the
+// union of the per-chunk top k, since a candidate excluded from its own chunk's top k
+// has k better candidates in that chunk alone — so equality is the right bar, not a
+// tolerance. What can still break is the plumbing: chunk boundaries that skip or double
+// an element, a partials stride that overlaps between queries, and blocks that fall
+// entirely past the end of the row.
+//
+// PARTS IS SWEPT PAST THE USEFUL RANGE ON PURPOSE. parts=1000 over N=60000 gives every
+// block a 64-element chunk and leaves most of them with nothing at all, which is the
+// case where a block must still reach tkEmit's barriers and emit sentinels rather than
+// return early. topkSplitParts would never choose it; that is exactly why the gate has
+// to.
+func TestCUDATopK_splitMatchesOneBlock(t *testing.T) {
+	dev, err := gpu.CreateSystemDefaultDevice()
+	if err != nil {
+		t.Skipf("no CUDA device: %v", err)
+	}
+	t.Cleanup(dev.ReleaseObjects)
+	lib, err := dev.CompileLibrary(w8a8PTX)
+	if err != nil {
+		t.Fatalf("CompileLibrary: %v", err)
+	}
+	q := dev.NewCommandQueue()
+	rng := rand.New(rand.NewSource(31))
+
+	for _, N := range []int{60_000, 60_001, 60_003, 4_099} {
+		for _, M := range []int{1, 3} {
+			scores := make([]float32, M*N)
+			for i := range scores {
+				// Tie-dense: the tie-break has to survive being applied twice, once
+				// per chunk and once across chunks.
+				scores[i] = float32(rng.Intn(64))
+			}
+			sb := dev.NewBufferFloats(scores)
+			mB := dev.NewBufferU32(uint32(M))
+			nB := dev.NewBufferU32(uint32(N))
+			for wi, w := range topkWidths {
+				for _, k := range []int{1, w} {
+					want := cpuTopK(scores, M, N, k)
+					kB := dev.NewBufferU32(uint32(k))
+					ib := gpu.NewBufferLenOf[int32](dev, M*k)
+					vb := dev.NewBufferLen(M * k)
+					for _, parts := range []int{1, 2, 3, 7, 48, 1000} {
+						split, err := dev.NewComputePipeline(lib, topkKernelName("split", w))
+						if err != nil {
+							t.Fatal(err)
+						}
+						merge, err := dev.NewComputePipeline(lib, topkKernelName("merge", w))
+						if err != nil {
+							t.Fatal(err)
+						}
+						pi := gpu.NewBufferLenOf[int32](dev, M*parts*k)
+						pv := dev.NewBufferLen(M * parts * k)
+						pB := dev.NewBufferU32(uint32(parts * k))
+						if err := q.Launch(split, gpu.LaunchConfig{
+							GridX: uint32(parts), GridY: uint32(M), GridZ: 1,
+							BlockX: topkBlockThreads, BlockY: 1, BlockZ: 1,
+						}, gpu.Arg(sb), gpu.Arg(pi), gpu.Arg(pv),
+							gpu.Arg(mB), gpu.Arg(nB), gpu.Arg(kB)); err != nil {
+							t.Fatalf("split N=%d M=%d w=%d k=%d parts=%d: %v", N, M, w, k, parts, err)
+						}
+						if err := q.Launch(merge, gpu.LaunchConfig{
+							GridX: uint32(M), GridY: 1, GridZ: 1,
+							BlockX: topkBlockThreads, BlockY: 1, BlockZ: 1,
+						}, gpu.Arg(pi), gpu.Arg(pv), gpu.Arg(ib), gpu.Arg(vb),
+							gpu.Arg(mB), gpu.Arg(pB), gpu.Arg(kB)); err != nil {
+							t.Fatalf("merge N=%d M=%d w=%d k=%d parts=%d: %v", N, M, w, k, parts, err)
+						}
+						if err := q.Sync(); err != nil {
+							t.Fatalf("sync N=%d parts=%d: %v", N, parts, err)
+						}
+						got := make([]int32, M*k)
+						if err := gpu.Download(ib, got); err != nil {
+							t.Fatal(err)
+						}
+						for i := range want {
+							if got[i] != want[i] {
+								t.Fatalf("split N=%d (N%%4=%d) M=%d width=%d k=%d parts=%d: hit %d index %d, want %d",
+									N, N%4, M, w, k, parts, i, got[i], want[i])
+							}
+						}
+						for _, b := range []gpu.Buffer{pi, pv, pB} {
+							dev.ReleaseBuf(b)
+						}
+					}
+					for _, b := range []gpu.Buffer{ib, vb, kB} {
+						dev.ReleaseBuf(b)
+					}
+				}
+				_ = wi
+			}
+			for _, b := range []gpu.Buffer{sb, mB, nB} {
+				dev.ReleaseBuf(b)
+			}
+		}
+	}
+	t.Log("split+merge ≡ CPU selection over 4 N (incl. N%4≠0 and N<one chunk), 4 widths, 6 part counts incl. 1000")
+}
+
+// TestTopKSplitParts pins the split plan's two invariants without a GPU: never split
+// when one block per query already fills the device, and never leave a block with less
+// than a useful chunk of the row.
+func TestTopKSplitParts(t *testing.T) {
+	const sm = 40
+	for _, M := range []int{sm, sm + 1, 128, 4096} {
+		if p := topkSplitParts(M, 1<<20, sm); p != 1 {
+			t.Errorf("topkSplitParts(M=%d) = %d, want 1 — M >= sm already fills the device", M, p)
+		}
+	}
+	for _, tc := range []struct{ M, N int }{{1, 200_000}, {2, 200_000}, {8, 500_000}, {32, 500_000}} {
+		p := topkSplitParts(tc.M, tc.N, sm)
+		if p < 1 {
+			t.Fatalf("topkSplitParts(%d, %d) = %d", tc.M, tc.N, p)
+		}
+		if chunk := tc.N / p; chunk < topkSplitChunk {
+			t.Errorf("topkSplitParts(M=%d, N=%d) = %d leaves %d elements per block, below topkSplitChunk %d",
+				tc.M, tc.N, p, chunk, topkSplitChunk)
+		}
+		if blocks := tc.M * p; blocks > topkSplitMaxBlocks {
+			t.Errorf("topkSplitParts(M=%d, N=%d) = %d gives %d blocks, above topkSplitMaxBlocks %d",
+				tc.M, tc.N, p, blocks, topkSplitMaxBlocks)
+		}
+	}
+	// A tiny corpus must not be split into slivers.
+	if p := topkSplitParts(1, 100, sm); p != 1 {
+		t.Errorf("topkSplitParts(M=1, N=100) = %d, want 1", p)
+	}
+	// An unknown SM count must still produce a legal plan.
+	if p := topkSplitParts(1, 200_000, 0); p < 1 {
+		t.Errorf("topkSplitParts with sm=0 returned %d", p)
+	}
+}
+
 // TestTopKPipelineWidths ties the three things that must agree — the kernel names, the
 // widths the routing uses, and the widths those kernels were actually compiled with —
 // and checks that topkPlan picks the narrowest kernel able to hold k.
@@ -707,18 +854,15 @@ func TestTopKPipelineWidths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read kernel source: %v", err)
 	}
-	if len(topkWidths) != len(topkRegKernels) {
-		t.Fatalf("%d widths but %d kernel names — they are indexed together", len(topkWidths), len(topkRegKernels))
-	}
 	for i, w := range topkWidths {
-		// The name encodes the width, so a reordering of either array shows up here.
-		if want := fmt.Sprintf("topk_rows_r%d", w); topkRegKernels[i] != want {
-			t.Errorf("topkRegKernels[%d] = %q, but topkWidths[%d] = %d implies %q",
-				i, topkRegKernels[i], i, w, want)
-		}
-		// And the kernel really was instantiated at that width.
-		if decl := fmt.Sprintf("TOPK_REG_ENTRY(topk_rows_r%d,", w); !bytes.Contains(src, []byte(decl)) {
-			t.Errorf("gemv_w8a8.cu declares no %q", decl)
+		// Every kernel the routing can reach must exist in the source it is compiled
+		// from. The names are derived from the widths, so this is what ties the two.
+		for _, kind := range []string{"rows", "split", "merge"} {
+			if decl := fmt.Sprintf("TOPK_%s_ENTRY(%s,", strings.ToUpper(map[string]string{
+				"rows": "reg", "split": "split", "merge": "merge",
+			}[kind]), topkKernelName(kind, w)); !bytes.Contains(src, []byte(decl)) {
+				t.Errorf("gemv_w8a8.cu declares no %q", decl)
+			}
 		}
 		if i > 0 && topkWidths[i-1] >= w {
 			t.Errorf("topkWidths is not ascending at %d: %v", i, topkWidths)

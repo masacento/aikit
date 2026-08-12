@@ -110,6 +110,25 @@ func (d *Device) Name() string {
 	return n
 }
 
+// SMCount reports the device's multiprocessor count, or 0 if the driver will not say.
+//
+// It exists so a launch can size its grid against THIS device rather than against a
+// constant measured on one. A kernel that puts one block on each unit of work is
+// starved whenever that work count is below the SM count — gpu/anncuda's top-k is
+// exactly that shape, and splits each query across several blocks below this threshold.
+// Hardcoding 40 (an RTX 2070 SUPER) would be the same mistake as the GEMM benchmark
+// that divided by another machine's peak for months, or gemmTileMinM, which was correct
+// when written and silently wrong once the kernel it was compared against got faster.
+//
+// Callers must tolerate 0: it means "unknown", not "no SMs".
+func (d *Device) SMCount() int {
+	n, err := d.dev.Attribute(gc.DeviceAttributeMultiprocessorCount)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return int(n)
+}
+
 // Context exposes the underlying gocudrv context, for consumers that need driver
 // surface this layer does not wrap (events, graphs, cooperative launch). goinfer's
 // tuned decode kernels are the intended caller when they re-point onto this layer.

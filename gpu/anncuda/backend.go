@@ -49,7 +49,12 @@ type cudaBackend struct {
 	// be a lookup instead of a hand-written switch, so there is no second place for the
 	// k -> kernel mapping to be wrong. topk is the k-pass fallback above the widest.
 	topkReg [len(topkWidths)]gpu.Pipeline
-	topk    gpu.Pipeline
+	// The split/merge pair, same widths and same order. Used when one block per query
+	// would leave the device idle — see topkSplitParts.
+	topkSplit [len(topkWidths)]gpu.Pipeline
+	topkMerge [len(topkWidths)]gpu.Pipeline
+	sm        int // multiprocessor count, 0 if the driver would not say
+	topk      gpu.Pipeline
 }
 
 // init reaches CUDA and registers the backend. If there is no CUDA device (no
@@ -85,19 +90,29 @@ func init() {
 		dev.ReleaseObjects()
 		return
 	}
-	var topkReg [len(topkWidths)]gpu.Pipeline
-	for i, name := range topkRegKernels {
-		p, err := dev.NewComputePipeline(lib, name)
-		if err != nil {
-			dev.ReleaseObjects()
-			return
+	var topkReg, topkSplit, topkMerge [len(topkWidths)]gpu.Pipeline
+	for i, w := range topkWidths {
+		for _, load := range []struct {
+			name string
+			dst  *gpu.Pipeline
+		}{
+			{topkKernelName("rows", w), &topkReg[i]},
+			{topkKernelName("split", w), &topkSplit[i]},
+			{topkKernelName("merge", w), &topkMerge[i]},
+		} {
+			p, err := dev.NewComputePipeline(lib, load.name)
+			if err != nil {
+				dev.ReleaseObjects()
+				return
+			}
+			*load.dst = p
 		}
-		topkReg[i] = p
 	}
 	ann.RegisterBackend(&cudaBackend{
 		dev: dev, q: dev.NewCommandQueue(),
 		gemv: gemv, batchSmall: batchSmall, batchWide: batchWide,
-		topk: topk, topkReg: topkReg,
+		topk: topk, topkReg: topkReg, topkSplit: topkSplit, topkMerge: topkMerge,
+		sm: dev.SMCount(),
 	})
 }
 
@@ -284,13 +299,28 @@ func quantizeRowInt8(a []float32, dst []int8) (scale float32) {
 // platforms cross over in different places. See docs/BENCH-gpu-results.md.
 const topkMinN = 50_000
 
-// topkMinBatch is the second half of the device-top-k gate, and it is about OCCUPANCY
-// rather than transfer. topk_rows runs ONE BLOCK PER QUERY, so a batch of 1 occupies a
-// single SM of 40 while the rest of the card idles — and the readback it saves at that
-// size (N floats) is small anyway. Measured: at N=100k, batch=1 went 0.79x -> 0.43x with
-// device top-k unconditionally on, while batch=8 went 0.88x -> 3.93x. So the kernel
-// needs a real batch behind it.
-const topkMinBatch = 8
+// topkMinBatch WAS 8, and the reason it existed is gone.
+//
+// It was about occupancy: topk_rows ran ONE BLOCK PER QUERY, so a batch of 1 occupied a
+// single SM of 40 while the rest idled. Measured then: at N=100k, batch=1 went 0.79x ->
+// 0.43x with device top-k unconditionally on, while batch=8 went 0.88x -> 3.93x. So the
+// kernel needed a real batch behind it.
+//
+// It does not any more. topkSplitParts splits one query's row across as many blocks as
+// the device has room for, which is precisely the case this constant was excluding.
+// Re-measured at N=200k k=10, device top-k against ScoreBatch + host selection (the
+// fallback this gate hands work to):
+//
+//	M=1   1.02 ms vs 1.20   1.18x      M=16   2.05 vs  5.55   2.71x
+//	M=2   1.18 vs 1.54      1.31x      M=64   6.47 vs 29.94   4.63x
+//	M=8   1.44 vs 3.15      2.18x      M=256 24.56 vs 79.20   3.22x
+//
+// Device selection now wins at every width, so the gate is 1: decline nothing on batch
+// size. A constant that encodes a kernel's limitation has to be re-derived when the
+// limitation is removed — this file has now produced three of those (gemmTileMinM,
+// topkMinBatch, and gemv's warp width), which is an argument for deriving such things
+// from a measurement rather than storing them.
+const topkMinBatch = 1
 
 // batchSmallMaxM is where the wider query tile starts to pay, and both halves of the
 // choice were swept rather than reasoned (the table is in gemv_w8a8.cu). The narrow
@@ -311,14 +341,17 @@ const batchSmallMaxM = 8
 // largest k its kernel can answer, because a thread's own stride may hold the entire
 // global top-k — TestCUDATopK_kernelsAgree constructs exactly that case.
 //
-// topkRegKernels is the matching kernel-name list, in the SAME ORDER: the two arrays
-// and cudaBackend.topkReg are indexed together, which is the whole reason the routing
-// below cannot pick a kernel too narrow for k. TestTopKPipelineWidths ties both to the
-// .cu source.
-var (
-	topkWidths     = [...]int{8, 16, 32, 64}
-	topkRegKernels = [...]string{"topk_rows_r8", "topk_rows_r16", "topk_rows_r32", "topk_rows_r64"}
-)
+// The kernel names are DERIVED from the widths rather than kept in a parallel list.
+// An earlier version kept both and gated that they agreed; deriving them makes a
+// mis-pairing impossible to write, which is strictly better than catching it.
+// TestTopKPipelineWidths still ties the derived names to the .cu source.
+var topkWidths = [...]int{8, 16, 32, 64}
+
+// topkKernelName is the entry point for one (kind, width) pair, where kind is
+// "rows" (one block per query), "split" (many blocks per query) or "merge".
+func topkKernelName(kind string, width int) string {
+	return fmt.Sprintf("topk_%s_r%d", kind, width)
+}
 
 // topkPlan returns the index of the NARROWEST register kernel that can answer k, or -1
 // for the k-pass fallback. Narrowest, because their cost is linear in the per-thread
@@ -337,6 +370,101 @@ func topkPlan(k int) int {
 	}
 	return -1
 }
+
+// topkSplitParts is how many blocks to put on ONE query's row: 1 means the one-block
+// kernel, more means split-then-merge.
+//
+// Two independent limits, both measured at N=200k and N=500k, k=10:
+//
+//   - Splitting only pays while one block per query cannot fill the device. At M >= sm
+//     there are already at least as many blocks as multiprocessors and the second launch
+//     is pure overhead: at N=500k, M=64 the split form was 5% SLOWER than one block, and
+//     at M=256 it was 48% slower. Below that the win is large — 13x at M=1, 5.4x at M=8.
+//   - Each block still needs enough of the row to amortize its own k-round emit.
+//     topkSplitChunk elements is where that stopped improving; at M=1, N=200k, going from
+//     3125 elements per block (64 parts) to 781 (256 parts) cost 44%.
+//
+// and a cap on total blocks, because past ~1024 the emits outweigh the extra
+// parallelism (M=32, N=500k: 32 parts 0.815 ms, 122 parts 0.90).
+//
+// sm comes from the driver, not from a constant — see gpu.Device.SMCount. A hardcoded 40
+// would be this file's own gemmTileMinM: right on the box it was measured on, silently
+// wrong everywhere else.
+func topkSplitParts(M, N, sm int) int {
+	if sm <= 0 {
+		sm = topkSMFallback
+	}
+	if M >= sm {
+		return 1
+	}
+	parts := N / topkSplitChunk
+	if cap := topkSplitMaxBlocks / M; parts > cap {
+		parts = cap
+	}
+	if parts < 1 {
+		return 1
+	}
+	return parts
+}
+
+const (
+	// Elements per block below which the per-block emit stops being amortized.
+	topkSplitChunk = 4096
+	// Total blocks past which more parallelism costs more than it returns.
+	topkSplitMaxBlocks = 1024
+	// Used only when the driver will not report a multiprocessor count. Deliberately
+	// small: under-splitting costs throughput, over-splitting can cost correctness of
+	// the performance claim on a device we know nothing about.
+	topkSMFallback = 16
+)
+
+// launchTopK selects each query's top k from the [M*N] score matrix, either with one
+// block per query or split across several with a merge pass (see topkSplitParts). Both
+// routes return identical hits — the split is exact because the global top k is
+// contained in the union of the per-chunk top k — so this is purely throughput.
+//
+// The k-pass kernel consumes winners in place, so scoreBuf is scratch by the time it
+// returns; the register kernels leave it alone.
+func (x *cudaI8Index) launchTopK(scoreBuf, idxBuf, valBuf, mBuf, kBuf gpu.Buffer, M, N, k int) error {
+	block := uint32(topkBlockThreads)
+	parts := topkSplitParts(M, N, x.b.sm)
+	if parts <= 1 || topkPlan(k) < 0 {
+		// One block per query. The k-pass fallback (topkPlan < 0) has no split form:
+		// above the widest register width it is already the slow path, and splitting
+		// a kernel that re-reads the row k times would multiply the partials too.
+		return x.b.q.Launch(x.topkPipeline(k), gpu.LaunchConfig{
+			GridX: uint32(M), GridY: 1, GridZ: 1, BlockX: block, BlockY: 1, BlockZ: 1,
+		}, gpu.Arg(scoreBuf), gpu.Arg(idxBuf), gpu.Arg(valBuf),
+			gpu.Arg(mBuf), gpu.Arg(x.nbuf), gpu.Arg(kBuf))
+	}
+	w := topkPlan(k)
+	// Partials: k candidates per (query, chunk). Small next to the score matrix this
+	// is selecting from — M*parts*k against M*N — so it is allocated per call rather
+	// than cached, like the rest of TopKBatch's scratch.
+	partIdx := gpu.NewBufferLenOf[int32](x.b.dev, M*parts*k)
+	partVal := x.b.dev.NewBufferLen(M * parts * k)
+	pBuf := x.b.dev.NewBufferU32(uint32(parts * k))
+	defer func() {
+		for _, b := range []gpu.Buffer{partIdx, partVal, pBuf} {
+			x.b.dev.ReleaseBuf(b)
+		}
+	}()
+	if err := x.b.q.Launch(x.b.topkSplit[w], gpu.LaunchConfig{
+		GridX: uint32(parts), GridY: uint32(M), GridZ: 1, BlockX: block, BlockY: 1, BlockZ: 1,
+	}, gpu.Arg(scoreBuf), gpu.Arg(partIdx), gpu.Arg(partVal),
+		gpu.Arg(mBuf), gpu.Arg(x.nbuf), gpu.Arg(kBuf)); err != nil {
+		return err
+	}
+	return x.b.q.Launch(x.b.topkMerge[w], gpu.LaunchConfig{
+		GridX: uint32(M), GridY: 1, GridZ: 1, BlockX: block, BlockY: 1, BlockZ: 1,
+	}, gpu.Arg(partIdx), gpu.Arg(partVal), gpu.Arg(idxBuf), gpu.Arg(valBuf),
+		gpu.Arg(mBuf), gpu.Arg(pBuf), gpu.Arg(kBuf))
+}
+
+// topkBlockThreads is TKBLOCK in gemv_w8a8.cu. Every top-k kernel is written against
+// it — it sets both the reduction tree depth and the stride a thread scans with — so a
+// launch at any other width would silently select from a subset of the row.
+const topkBlockThreads = 256
 
 // topkPipeline picks the kernel for this k. Every one of them produces IDENTICAL hits —
 // same tie-break, gated by TestCUDATopK_kernelsAgree — so this is purely throughput.
@@ -408,12 +536,7 @@ func (x *cudaI8Index) TopKBatch(queries [][]float32, k int) (hits [][]ann.Hit, e
 	if err := x.launchBatch(qi8Buf, qscaleBuf, scoreBuf, M, N, K); err != nil {
 		return nil, err
 	}
-	// One block per query. The k-pass kernel consumes winners in place, so scoreBuf
-	// is scratch by the time it returns; the register kernel leaves it alone.
-	if err := x.b.q.Launch(x.topkPipeline(k), gpu.LaunchConfig{
-		GridX: uint32(M), GridY: 1, GridZ: 1, BlockX: 256, BlockY: 1, BlockZ: 1,
-	}, gpu.Arg(scoreBuf), gpu.Arg(idxBuf), gpu.Arg(valBuf),
-		gpu.Arg(mBuf), gpu.Arg(x.nbuf), gpu.Arg(kBuf)); err != nil {
+	if err := x.launchTopK(scoreBuf, idxBuf, valBuf, mBuf, kBuf, M, N, k); err != nil {
 		return nil, err
 	}
 	if err := x.b.q.Sync(); err != nil {

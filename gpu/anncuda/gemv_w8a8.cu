@@ -380,53 +380,59 @@ __device__ __forceinline__ void tkInsert(float* kv, int* ki, float v, int idx) {
     }
 }
 
-template <int TKREG, bool VEC4>
-__device__ __forceinline__ void topk_reg_body(
-    const float* __restrict__ scores, int* __restrict__ outIdx,
-    float* __restrict__ outScore, const unsigned int* __restrict__ Mp,
-    const unsigned int* __restrict__ Np, const unsigned int* __restrict__ kp)
-{
-    unsigned int M = *Mp, N = *Np, k = *kp;
-    unsigned int m = blockIdx.x;
-    if (m >= M) return;
-    const float* row = scores + (unsigned long long)m * N;
-
-    float kv[TKREG];
-    int ki[TKREG];
+// tkInit seeds a per-thread array with empty slots.
+template <int TKREG>
+__device__ __forceinline__ void tkInit(float* kv, int* ki) {
     #pragma unroll
     for (int i = 0; i < TKREG; i++) { kv[i] = -3.402823466e+38f; ki[i] = -1; }
+}
 
-    // ONE pass over the row, against the k-pass kernel's k of them.
-    //
-    // THE ALIGNMENT GUARD IS LOAD-BEARING, not defensive. row is scores + m*N, so a
-    // float4 read of it is only legal when that pointer is 16-byte aligned — which the
-    // 256-byte-aligned base allocation gives only when m*N is a multiple of 4. At
-    // N=60001 every odd row is off by one float and the kernel takes
-    // CUDA_ERROR_MISALIGNED_ADDRESS, which kills the whole context, not just the launch.
-    // Checking the pointer rather than reasoning about N keeps that self-evident.
+// tkScan folds row[lo:hi) into a per-thread array, one pass, threads striding by TKBLOCK.
+//
+// THE ALIGNMENT GUARD IS LOAD-BEARING, not defensive. row is scores + m*N, so a float4
+// read of it is only legal when that pointer is 16-byte aligned — which the 256-byte
+// aligned base allocation gives only when m*N is a multiple of 4. At N=60001 every odd
+// row is off by one float and the kernel takes CUDA_ERROR_MISALIGNED_ADDRESS, which
+// kills the whole context, not just the launch. Checking the pointer rather than
+// reasoning about N keeps that self-evident. lo is always a multiple of 4 (the caller
+// rounds chunk boundaries), so it cannot reintroduce a misalignment.
+template <int TKREG, bool VEC4>
+__device__ __forceinline__ void tkScan(const float* __restrict__ row,
+                                       unsigned int lo, unsigned int hi,
+                                       float* kv, int* ki)
+{
     if (VEC4 && ((((unsigned long long)row) & 15ull) == 0)) {
-        unsigned int n4 = N >> 2;
-        const float4* row4 = (const float4*)row;
-        for (unsigned int i = threadIdx.x; i < n4; i += TKBLOCK) {
-            float4 v = row4[i];
+        unsigned int e4 = hi >> 2;
+        const float4* r4 = (const float4*)row;
+        for (unsigned int i = (lo >> 2) + threadIdx.x; i < e4; i += TKBLOCK) {
+            float4 v = r4[i];
             int b = (int)(i << 2);
             tkInsert<TKREG>(kv, ki, v.x, b);
             tkInsert<TKREG>(kv, ki, v.y, b + 1);
             tkInsert<TKREG>(kv, ki, v.z, b + 2);
             tkInsert<TKREG>(kv, ki, v.w, b + 3);
         }
-        for (unsigned int i = (n4 << 2) + threadIdx.x; i < N; i += TKBLOCK) {
+        for (unsigned int i = (e4 << 2) + threadIdx.x; i < hi; i += TKBLOCK) {
             tkInsert<TKREG>(kv, ki, row[i], (int)i);
         }
     } else {
-        for (unsigned int i = threadIdx.x; i < N; i += TKBLOCK) {
+        for (unsigned int i = lo + threadIdx.x; i < hi; i += TKBLOCK) {
             tkInsert<TKREG>(kv, ki, row[i], (int)i);
         }
     }
+}
 
-    // Merge: k rounds of "block-wide argmax over the TKBLOCK heads, winner pops". Each
-    // round reduces over 256 candidates rather than over N, which is why k costs so
-    // little here.
+// tkEmit drains the block's per-thread arrays into k sorted winners: k rounds of
+// "block-wide argmax over the TKBLOCK heads, winner pops". Each round reduces over 256
+// candidates rather than over N, which is why k costs so little here.
+//
+// EVERY THREAD IN THE BLOCK MUST REACH THIS, including threads whose scan found nothing
+// — the barriers are block-wide. Callers that skip the scan (a split block past the end
+// of the row) still call tkEmit, and correctly emit sentinels.
+template <int TKREG>
+__device__ __forceinline__ void tkEmit(float* kv, int* ki, unsigned int k,
+                                       int* __restrict__ outIdx, float* __restrict__ outVal)
+{
     __shared__ float sVal[TKBLOCK];
     __shared__ int sIdx[TKBLOCK];
     for (unsigned int j = 0; j < k; j++) {
@@ -445,12 +451,9 @@ __device__ __forceinline__ void topk_reg_body(
         }
         float wv = sVal[0];
         int wi = sIdx[0];
-        if (threadIdx.x == 0) {
-            outIdx[m * k + j] = wi;
-            outScore[m * k + j] = wv;
-        }
-        // The winner pops its head. Row indices are unique, so exactly one thread
-        // matches — no need to reduce a thread id alongside the value.
+        if (threadIdx.x == 0) { outIdx[j] = wi; outVal[j] = wv; }
+        // The winner pops its head. Candidate indices are unique within a query, so
+        // exactly one thread matches — no need to reduce a thread id alongside the value.
         if (wi >= 0 && ki[0] == wi) {
             #pragma unroll
             for (int i = 0; i < TKREG - 1; i++) { kv[i] = kv[i + 1]; ki[i] = ki[i + 1]; }
@@ -459,6 +462,102 @@ __device__ __forceinline__ void topk_reg_body(
         }
         __syncthreads();
     }
+}
+
+// topk_reg_body: ONE block per query over the whole row.
+template <int TKREG, bool VEC4>
+__device__ __forceinline__ void topk_reg_body(
+    const float* __restrict__ scores, int* __restrict__ outIdx,
+    float* __restrict__ outScore, const unsigned int* __restrict__ Mp,
+    const unsigned int* __restrict__ Np, const unsigned int* __restrict__ kp)
+{
+    unsigned int M = *Mp, N = *Np, k = *kp;
+    unsigned int m = blockIdx.x;
+    if (m >= M) return;
+    float kv[TKREG];
+    int ki[TKREG];
+    tkInit<TKREG>(kv, ki);
+    tkScan<TKREG, VEC4>(scores + (unsigned long long)m * N, 0, N, kv, ki);
+    tkEmit<TKREG>(kv, ki, k, outIdx + (unsigned long long)m * k,
+                  outScore + (unsigned long long)m * k);
+}
+
+// ---------------------------------------------------------------------------
+// SPLIT + MERGE — the same selection across MANY blocks per query.
+//
+// WHY. topk_reg_body puts one block on a query, so a batch of M occupies M of this
+// device's 40 SMs: at M=8 that is 20% of the machine and at M=1 it is 2.5%. Measured at
+// N=200k k=10, the one-block form costs 0.77 ms at M=8 and 2.16 ms at M=256 — barely 3x
+// for 32x the work, which is the signature of a launch that was starved and then filled
+// up. The batch GEMV in front of it has no such limit.
+//
+// Splitting also unblocks the single-query path. ann.FlatI8.Query currently reads all N
+// scores back and selects on the host (readback 0.178 ms + host top-k 0.147 at N=200k,
+// together 43% of the call). A device selection could replace both, but only if it beats
+// 0.325 ms — which one block over the whole corpus does not.
+//
+// Phase 1 (topk_split_*): grid (parts, M). Block (c, m) selects the top k of its own
+// chunk of row m and writes them to partials[m][c][0:k].
+// Phase 2 (topk_merge_*): grid (M). Block m selects the top k of its parts*k partials.
+//
+// Chunk boundaries are rounded UP to a multiple of 4 so tkScan's float4 path stays
+// aligned inside the row; the last blocks may therefore get nothing, which tkEmit
+// handles by emitting sentinels that lose to everything in phase 2.
+//
+// EXACTNESS SURVIVES THE SPLIT because selection is decomposable in a way summation is
+// not: the global top k is contained in the union of the per-chunk top k, since a
+// candidate excluded from its own chunk's top k has k better candidates in that chunk
+// alone. Both phases use the same tkBetter, so the tie-break is the same rule applied
+// twice rather than two rules that must agree.
+// ---------------------------------------------------------------------------
+
+template <int TKREG, bool VEC4>
+__device__ __forceinline__ void topk_split_body(
+    const float* __restrict__ scores, int* __restrict__ partIdx,
+    float* __restrict__ partVal, const unsigned int* __restrict__ Mp,
+    const unsigned int* __restrict__ Np, const unsigned int* __restrict__ kp)
+{
+    unsigned int M = *Mp, N = *Np, k = *kp;
+    unsigned int c = blockIdx.x, m = blockIdx.y;
+    if (m >= M) return;
+    unsigned int parts = gridDim.x;
+    unsigned int chunk = (((N + parts - 1) / parts) + 3u) & ~3u;
+    unsigned int lo = c * chunk;
+    unsigned int hi = lo + chunk;
+    if (hi > N) hi = N;
+
+    float kv[TKREG];
+    int ki[TKREG];
+    tkInit<TKREG>(kv, ki);
+    // Block-uniform: every thread here takes the same branch, so skipping the scan
+    // cannot strand anyone at tkEmit's barriers.
+    if (lo < hi) {
+        tkScan<TKREG, VEC4>(scores + (unsigned long long)m * N, lo, hi, kv, ki);
+    }
+    unsigned long long slot = ((unsigned long long)m * parts + c) * k;
+    tkEmit<TKREG>(kv, ki, k, partIdx + slot, partVal + slot);
+}
+
+template <int TKREG>
+__device__ __forceinline__ void topk_merge_body(
+    const int* __restrict__ partIdx, const float* __restrict__ partVal,
+    int* __restrict__ outIdx, float* __restrict__ outScore,
+    const unsigned int* __restrict__ Mp, const unsigned int* __restrict__ Pp,
+    const unsigned int* __restrict__ kp)
+{
+    unsigned int M = *Mp, P = *Pp, k = *kp; // P = parts*k candidates per query
+    unsigned int m = blockIdx.x;
+    if (m >= M) return;
+    const int* pi = partIdx + (unsigned long long)m * P;
+    const float* pv = partVal + (unsigned long long)m * P;
+    float kv[TKREG];
+    int ki[TKREG];
+    tkInit<TKREG>(kv, ki);
+    for (unsigned int i = threadIdx.x; i < P; i += TKBLOCK) {
+        tkInsert<TKREG>(kv, ki, pv[i], pi[i]);
+    }
+    tkEmit<TKREG>(kv, ki, k, outIdx + (unsigned long long)m * k,
+                  outScore + (unsigned long long)m * k);
 }
 
 #define TOPK_REG_ENTRY(NAME, TKREG, VEC4)                                      \
@@ -473,10 +572,39 @@ extern "C" __global__ void NAME(                                               \
     topk_reg_body<TKREG, VEC4>(scores, outIdx, outScore, Mp, Np, kp);          \
 }
 
+#define TOPK_SPLIT_ENTRY(NAME, TKREG, VEC4)                                    \
+extern "C" __global__ void NAME(                                               \
+    const float* __restrict__ scores, int* __restrict__ partIdx,               \
+    float* __restrict__ partVal, const unsigned int* __restrict__ Mp,          \
+    const unsigned int* __restrict__ Np, const unsigned int* __restrict__ kp)  \
+{                                                                              \
+    topk_split_body<TKREG, VEC4>(scores, partIdx, partVal, Mp, Np, kp);        \
+}
+
+#define TOPK_MERGE_ENTRY(NAME, TKREG)                                          \
+extern "C" __global__ void NAME(                                               \
+    const int* __restrict__ partIdx, const float* __restrict__ partVal,        \
+    int* __restrict__ outIdx, float* __restrict__ outScore,                    \
+    const unsigned int* __restrict__ Mp, const unsigned int* __restrict__ Pp,  \
+    const unsigned int* __restrict__ kp)                                       \
+{                                                                              \
+    topk_merge_body<TKREG>(partIdx, partVal, outIdx, outScore, Mp, Pp, kp);    \
+}
+
 TOPK_REG_ENTRY(topk_rows_r8, TKREG_SMALL, true)
 TOPK_REG_ENTRY(topk_rows_r16, TKREG_MID, false)
 TOPK_REG_ENTRY(topk_rows_r32, TKREG_BIG, false)
 TOPK_REG_ENTRY(topk_rows_r64, TKREG_HUGE, false)
+
+TOPK_SPLIT_ENTRY(topk_split_r8, TKREG_SMALL, true)
+TOPK_SPLIT_ENTRY(topk_split_r16, TKREG_MID, false)
+TOPK_SPLIT_ENTRY(topk_split_r32, TKREG_BIG, false)
+TOPK_SPLIT_ENTRY(topk_split_r64, TKREG_HUGE, false)
+
+TOPK_MERGE_ENTRY(topk_merge_r8, TKREG_SMALL)
+TOPK_MERGE_ENTRY(topk_merge_r16, TKREG_MID)
+TOPK_MERGE_ENTRY(topk_merge_r32, TKREG_BIG)
+TOPK_MERGE_ENTRY(topk_merge_r64, TKREG_HUGE)
 
 extern "C" __global__ void topk_rows(
     float* __restrict__ scores,      // [M*N] — MUTATED (winners consumed)
