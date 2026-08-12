@@ -28,6 +28,11 @@ settle the question, and the specific ways ours have failed.
 4. **A per-kernel benchmark cannot see what a change does to the kernels around
    it.** It is evidence about the kernel, never about the program.
 5. **Write the gate before you trust the number**, and mutation-check the gate.
+6. **Measure the ceiling before optimising toward it**, by varying ONE thing in
+   isolation. In the 2026-08 roofline campaign every prediction made from reading an
+   instruction mix (load ports, uop counts) was wrong, and every ceiling measured this
+   way was right — including one that showed a shipped benchmark had been dividing by
+   another machine's constant for months. See [`roofline-2026-08.md`](roofline-2026-08.md).
 
 ---
 
@@ -1044,6 +1049,12 @@ was already known — §1.29's rule, applied to a lint instead of a benchmark.
 ---
 
 ## 5 · Keeping this current
+
+> Later campaigns that produced entries here: the 2026-08 roofline work
+> ([`roofline-2026-08.md`](roofline-2026-08.md)) — CPU f32 39%→52–64% of a *measured*
+> FMA peak, CPU int8 +17.4%, CUDA `FlatI8.Query` 3.3–6.0×. Its one-line lesson belongs
+> at the top of this doc: **every prediction made from reading an instruction mix was
+> wrong; every ceiling measured by varying one thing in isolation was right.**
 
 Add to this doc when:
 
