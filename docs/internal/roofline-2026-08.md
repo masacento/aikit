@@ -300,13 +300,11 @@ is worth sending to the GPU at N=100k (2.61× after §3e); on the M1 Pro it is n
 sending at any measured size, and batching only pays from 64. A single "use the GPU above X" rule would
 be wrong on one of them.
 
-**The N=10k rows are quoted only at N=100k above, deliberately.** Across runs of the
-*same build* the N=10k CPU baseline came back at both ~5.4k and ~10.5k queries/s — a
-factor of two, bimodal rather than noisy — which swings every N=10k speedup by the same
-factor and is why that row has changed shape three times in this document (declining,
-then non-monotone, then declining again). The GPU side of those rows is stable; the
-denominator is not. Chasing why the CPU path is bimodal at small N is an open item, and
-until it is settled no dispatch rule should be built on an N=10k ratio.
+**The N=10k baseline was bimodal, and it was the harness, not the CPU.** See §3i — the
+timed window was shorter than a GC cycle. Fixed; those rows are stable now, and the
+answer they give is worth stating because it is not the one the contaminated data gave:
+at N=10k a **1-query batch is not worth the GPU** (0.90×, consistently), while batch 8 is
+2.6–2.9× and batch 256 is 4.4–4.9×.
 
 ## 3e · CUDA: the single-query GEMV group width, 15–34%
 
@@ -465,6 +463,57 @@ that and measures 9–12% — consistent with imperfectly attacking a 24% compon
 needs a third batch kernel and a `k%4` route, and is slower on the byte path. Still not
 shipped; recorded so it is not re-derived.
 
+## 3i · The benchmark harness was wrong by 2×, and the mechanism is worth knowing
+
+§3h flagged the N=10k CPU baseline as bimodal — ~5.4k and ~10.5k queries/s across runs of
+the same build — and called finding out why an open item. It was not the CPU. It was the
+harness, and it had been mismeasuring since long before this campaign.
+
+The timing loop ran a fixed 10 iterations and kept the fastest. At small batch sizes one
+iteration is ~0.1 ms, so **the entire 10-iteration window fit inside a single Go GC
+cycle**. After the harness's own prelude — building an exact index and computing truth
+sets over a 10k corpus, leaving ~120 MB live — background marking and mutator assists
+halved throughput for the duration of that cycle. The first two shapes measured came back
+at half speed; by the third the cycle had finished and the numbers were right.
+
+That is why the effect looked bimodal: it depended on where a GC cycle happened to fall.
+
+Diagnosed by varying one thing at a time, and the first two hypotheses were both wrong:
+
+| hypothesis | test | result |
+|---|---|---|
+| cold cache / warm-up | 200 warmup iterations | recovered — but not monotonically, so not a clean ramp |
+| clock or thermal | sleep 500 ms, then measure | **no effect** (5280 vs 5334 control) |
+| GC | disable the GC for the window | **recovered** (10274 vs 4726) |
+| GC | force a cycle first, then measure | no effect — a new cycle starts on allocation |
+| GC | widen the window to 200 iterations | recovered (10261); 50 iterations did not (5453) |
+
+**Taking the minimum is already the right defence against transient interference. It just
+cannot work when the interference outlasts the sample.** The fix is `bench.MinDuration`,
+which runs at least `iters` times *and* for at least 50 ms of wall clock, so a slow shape
+still runs its iteration count and a fast one runs enough of them to contain a GC cycle
+and find a gap between them.
+
+Before and after, N=10k CPU batch=1, across runs of the same build:
+
+```
+before   5445   5464   5517   10467     (bimodal, 2x)
+after   10598  10266                    (stable)
+```
+
+Every ratio in `docs/BENCH-gpu-results.md` at small batch was affected in whichever
+direction the GC happened to fall — including GPU rows, whose sub-millisecond iterations
+have the same exposure. Query(1) at N=100k had read 2.45×, 2.61×, 2.74×, 2.77× and 2.87×
+across recent runs; that spread is now largely explained rather than attributed to noise.
+
+**The uncomfortable part.** Every optimization in this document was accepted or rejected
+on measurements, and this harness produced some of them. The kernel-level numbers are
+unaffected — those come from direct launches timed around a `Sync`, with no Go allocation
+in the loop — but the crossover table, which is the artifact that decides *when to use the
+GPU at all*, was wrong by up to 2× at small batch for its entire existence. A measurement
+that is only wrong sometimes is worse than one that is always wrong: it survives being
+re-run.
+
 ## 4 · Negatives and process failures, in full
 
 - **2×4 AVX2 kernel** — 1.33 FMA/load vs 0.89, +4%, not kept. Its disproof is recorded
@@ -527,9 +576,9 @@ denominator before the kernel.
 - **The batch GEMV's remaining 24% is shared-memory query loads** (§3h). The transposed
   tile is the known 9–12% answer and is not shipped; anything larger needs a different
   data layout, not a tuning constant.
-- **The CPU baseline at N=10k is bimodal** — ~5.4k vs ~10.5k queries/s across runs of the
-  same build. That is a CPU-side question this campaign never opened, and it makes every
-  N=10k crossover ratio unreliable in both directions.
+- **gpu/annmetal's crossover has the same harness bug** (§3i) and its records carry it.
+  The fix is in `bench.MinDuration`, which that harness can adopt in three lines; the
+  Apple rows should be regenerated after it does.
 - **Nsight counters are unavailable on this box** (ERR_NVGPUCTRPERM). Everything above
   was ablated instead, which works but costs a compile per hypothesis. Enabling
   `NVreg_RestrictProfilingToAdminUsers=0` would make the next investigation much cheaper.

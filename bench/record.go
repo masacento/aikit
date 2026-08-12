@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"time"
 
 	"github.com/townsendmerino/aikit/ann"
 )
@@ -187,4 +188,46 @@ func Percentiles(latenciesMs []float64) (p50, p95, p99, mean float64) {
 	s := append([]float64(nil), latenciesMs...)
 	sort.Float64s(s)
 	return pct(s, 50), pct(s, 95), pct(s, 99), meanOf(s)
+}
+
+// MinWindow is how long a timed loop must run before its minimum can be trusted, and
+// it exists because of a 2x measurement error this harness shipped.
+//
+// The GPU crossover timed 10 iterations and kept the fastest. At small batch sizes one
+// iteration is ~0.1 ms, so the whole 10-iteration window fit INSIDE a single Go GC
+// cycle — and after the harness's own prelude (building an exact index and computing
+// truth sets over a 10k corpus, leaving ~120 MB live) the background marking and
+// mutator assists halved throughput for the duration. The measured CPU baseline came
+// back at 5.4k queries/s where the true figure was 10.5k, and it recovered by the third
+// shape measured, because by then the cycle had finished. Every N=10k speedup in
+// docs/BENCH-gpu-results.md was wrong by up to 2x, in whichever direction the GC
+// happened to fall.
+//
+// Taking the MINIMUM is already the right defence against transient interference — it
+// just cannot work when the interference outlasts the sample. Verified by varying one
+// thing: sleeping 500 ms before measuring did NOT help (a GC cycle is triggered by
+// allocation, not by time), disabling the GC for the window DID (10.3k vs 4.7k), and
+// widening the window to 200 iterations did (10.3k) while 50 did not (5.5k).
+//
+// 50 ms is comfortably longer than a cycle over a heap of this size and still short
+// enough that a slow shape runs the iteration count instead.
+const MinWindow = 50 * time.Millisecond
+
+// MinDuration runs f at least iters times AND for at least MinWindow of wall time,
+// returning the shortest single run.
+//
+// Prefer this to a bare `for range iters` loop for anything sub-millisecond. Callers
+// that need a result from the run should assign it inside f; every iteration computes
+// the same thing, so the last one is as good as the fastest.
+func MinDuration(iters int, f func()) time.Duration {
+	best := time.Duration(1) << 62
+	start := time.Now()
+	for i := 0; i < iters || time.Since(start) < MinWindow; i++ {
+		t0 := time.Now()
+		f()
+		if d := time.Since(t0); d < best {
+			best = d
+		}
+	}
+	return best
 }

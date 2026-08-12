@@ -116,15 +116,8 @@ func TestCUDAANNCrossover(t *testing.T) {
 			for range warmup {
 				fi8.QueryBatch(qs, kTop)
 			}
-			best := time.Hour
 			var hits [][]ann.Hit
-			for range iters {
-				t0 := time.Now()
-				hits = fi8.QueryBatch(qs, kTop)
-				if d := time.Since(t0); d < best {
-					best = d
-				}
-			}
+			best := bench.MinDuration(iters, func() { hits = fi8.QueryBatch(qs, kTop) })
 			cpuThr[b] = float64(b) / best.Seconds()
 			cpuRecall[b] = meanRecall(hits, truth)
 			cpuHitsByBatch[b] = hits
@@ -181,15 +174,8 @@ func TestCUDAANNCrossover(t *testing.T) {
 			for range warmup {
 				fi8.QueryBatch(qs, kTop)
 			}
-			best := time.Hour
 			var hits [][]ann.Hit
-			for range iters {
-				t0 := time.Now()
-				hits = fi8.QueryBatch(qs, kTop)
-				if d := time.Since(t0); d < best {
-					best = d
-				}
-			}
+			best := bench.MinDuration(iters, func() { hits = fi8.QueryBatch(qs, kTop) })
 			wallMs := float64(best.Nanoseconds()) / 1e6
 			gpuThr := float64(b) / best.Seconds()
 			gRecall := meanRecall(hits, truth)
@@ -249,18 +235,16 @@ func timeSingleQuery(f *ann.FlatI8, qs [][]float32, k int) (float64, [][]ann.Hit
 			f.Query(q, k)
 		}
 	}
-	best := time.Hour
 	var hits [][]ann.Hit
-	for range iters {
+	best := bench.MinDuration(iters, func() {
 		h := make([][]ann.Hit, len(qs))
-		t0 := time.Now()
 		for i, q := range qs {
 			h[i] = f.Query(q, k)
 		}
-		if d := time.Since(t0) / time.Duration(len(qs)); d < best {
-			best, hits = d, h
-		}
-	}
+		hits = h
+	})
+	// MinDuration times the whole sweep of len(qs) queries; report per query.
+	best /= time.Duration(len(qs))
 	return 1.0 / best.Seconds(), hits
 }
 
