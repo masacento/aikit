@@ -5,7 +5,7 @@
 > absolute numbers are never placed in adjacent columns — the CPU baselines are
 > different chips; compare within a machine, or via the normalized summary.
 
-aikit `70c0455` · 44 records · 2 machine(s)
+aikit `70c0455` · 40 records · 2 machine(s)
 
 ## Per-machine tables (apples-to-apples, same box)
 
@@ -13,18 +13,16 @@ aikit `70c0455` · 44 records · 2 machine(s)
 
 | workload | shape | precision | cpu-arm64 q/s | metal q/s | speedup | recall@k | parity |
 |---|---|---|--:|--:|--:|--:|:--:|
-| ann.FlatI8.Query | N=10k dim=256 batch=1 k=10 | int8 | 9.2k queries/s | 3.9k queries/s | 0.42× | 0.9922 | ✅ |
-| ann.FlatI8.Query | N=100k dim=256 batch=1 k=10 | int8 | 2.5k queries/s | 1.6k queries/s | 0.65× | 0.9781 | ✅ |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=1 k=10 | int8 | 9.4k queries/s | 1.7k queries/s | 0.18× | 1.0000 | ✅ |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=8 k=10 | int8 | 9.4k queries/s | 10.9k queries/s | 1.16× | 0.9875 | ✅ |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=64 k=10 | int8 | 9.2k queries/s | 23.2k queries/s | 2.53× | 0.9922 | ✅ |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=256 k=10 | int8 | 9.1k queries/s | 25.2k queries/s | 2.76× | 0.9883 | ✅ |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=1 k=10 | int8 | 2.7k queries/s | 207.8 queries/s | 0.08× | 1.0000 | ✅ |
+| ann.FlatI8.Query | N=10k dim=256 batch=1 k=10 | int8 | 9.1k queries/s | 4.1k queries/s | 0.44× | 0.9922 | ✅ |
+| ann.FlatI8.Query | N=100k dim=256 batch=1 k=10 | int8 | 2.3k queries/s | 194.8 queries/s | 0.09× | 0.9781 | ✅ |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=1 k=10 | int8 | 9.4k queries/s | 1.6k queries/s | 0.17× | 1.0000 | ✅ |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=8 k=10 | int8 | 9.3k queries/s | 11.1k queries/s | 1.19× | 0.9875 | ✅ |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=64 k=10 | int8 | 9.3k queries/s | 15.7k queries/s | 1.69× | 0.9922 | ✅ |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=256 k=10 | int8 | 9.1k queries/s | 21.0k queries/s | 2.31× | 0.9883 | ✅ |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=1 k=10 | int8 | 2.8k queries/s | 205.4 queries/s | 0.07× | 1.0000 | ✅ |
 | ann.FlatI8.QueryBatch | N=100k dim=256 batch=8 k=10 | int8 | 2.7k queries/s | 1.5k queries/s | 0.56× | 0.9750 | ✅ |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=64 k=10 | int8 | 2.5k queries/s | 3.4k queries/s | 1.35× | 0.9781 | ✅ |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=256 k=10 | int8 | 2.4k queries/s | 3.6k queries/s | 1.50× | 0.9754 | ✅ |
-| vision.SigLIP.Forward | dim=512 patches=196 | int8 | 4.4 images/s | 6.1 images/s | 1.37× | 0.9999 | ✅ |
-| vision.SigLIP.Forward | dim=768 patches=576 | int8 | 0.7 images/s | 1.1 images/s | 1.54× | 0.9999 | ✅ |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=64 k=10 | int8 | 2.3k queries/s | 3.4k queries/s | 1.48× | 0.9781 | ✅ |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=256 k=10 | int8 | 2.2k queries/s | 3.5k queries/s | 1.58× | 0.9754 | ✅ |
 
 ### nvidia-rtx2070s Ryzen 7 3700X amd64 · GPU NVIDIA GeForce RTX 2070 SUPER (sm_75)
 
@@ -48,18 +46,16 @@ The only honest all-backends view: absolute ms don't compare across machines, bu
 
 | workload | shape | precision | cuda ×vs-cpu | metal ×vs-cpu |
 |---|---|---|--:|--:|
-| ann.FlatI8.Query | N=10k dim=256 batch=1 k=10 | int8 | 1.14× | 0.42× |
-| ann.FlatI8.Query | N=100k dim=256 batch=1 k=10 | int8 | 2.62× | 0.65× |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=1 k=10 | int8 | 0.90× | 0.18× |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=8 k=10 | int8 | 2.90× | 1.16× |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=64 k=10 | int8 | 4.22× | 2.53× |
-| ann.FlatI8.QueryBatch | N=10k dim=256 batch=256 k=10 | int8 | 4.44× | 2.76× |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=1 k=10 | int8 | 2.13× | 0.08× |
+| ann.FlatI8.Query | N=10k dim=256 batch=1 k=10 | int8 | 1.14× | 0.44× |
+| ann.FlatI8.Query | N=100k dim=256 batch=1 k=10 | int8 | 2.62× | 0.09× |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=1 k=10 | int8 | 0.90× | 0.17× |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=8 k=10 | int8 | 2.90× | 1.19× |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=64 k=10 | int8 | 4.22× | 1.69× |
+| ann.FlatI8.QueryBatch | N=10k dim=256 batch=256 k=10 | int8 | 4.44× | 2.31× |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=1 k=10 | int8 | 2.13× | 0.07× |
 | ann.FlatI8.QueryBatch | N=100k dim=256 batch=8 k=10 | int8 | 13.26× | 0.56× |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=64 k=10 | int8 | 27.30× | 1.35× |
-| ann.FlatI8.QueryBatch | N=100k dim=256 batch=256 k=10 | int8 | 39.78× | 1.50× |
-| vision.SigLIP.Forward | dim=512 patches=196 | int8 | — | 1.37× |
-| vision.SigLIP.Forward | dim=768 patches=576 | int8 | — | 1.54× |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=64 k=10 | int8 | 27.30× | 1.48× |
+| ann.FlatI8.QueryBatch | N=100k dim=256 batch=256 k=10 | int8 | 39.78× | 1.58× |
 
 ## Dispatch thresholds (the crossover — the input to backend dispatch)
 

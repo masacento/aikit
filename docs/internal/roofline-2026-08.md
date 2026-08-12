@@ -279,10 +279,10 @@ timed single-query `Query` at all — only `QueryBatch`, a different kernel. Bot
 
 | | CUDA (RTX 2070S) | Metal (M1 Pro) |
 |---|--:|--:|
-| Query(1), N=100k | **2.77×** | 0.65× |
+| Query(1), N=100k | **2.77×** | 0.09× |
 | batch 8, N=100k | **13.19×** | 0.56× |
-| batch 64, N=100k | **27.35×** | — |
-| batch 256, N=100k | **35.84×** | 1.50× |
+| batch 64, N=100k | **27.35×** | 1.48× |
+| batch 256, N=100k | **35.84×** | 1.58× |
 
 **Read these to one significant figure.** Re-running the CUDA column on an otherwise
 identical tree moved batch-256 from 36.50× to 32.44× and Query(1) from 2.74× to 2.61× —
@@ -290,10 +290,15 @@ about 10% run-to-run, since each cell is a min-of-10 over a whole GPU pipeline i
 transfers. The crossover *points* are stable; the ratios are not precise to the two
 decimals the generated table prints.
 
-Both columns are post-rewrite on their own box. Metal's `QueryBatch` rows moved up with
-its topk_rows rewrite (batch 256 at N=100k 1.36 → 1.50×) while its single-query rows sit
-on an unchanged `gemv_w8a8`; CUDA's single-query rows moved up with §3e (2.28 → 2.74×)
-while its batch rows were already current.
+Both columns are post-rewrite and re-run on the GC-fixed harness (§3i). Metal's
+`QueryBatch` rows moved up with its topk_rows rewrite (batch 256 at N=100k 1.36 → 1.58×);
+its single-query row moved the other way, **0.65 → 0.09× at N=100k** — and that is a
+correction, not a regression. The earlier 0.65× was the same short-window GC artifact §3i
+describes: a min-of-10 that happened to catch a pre-collection iteration on the
+`gemv_w8a8` path, which did not change. The true figure sharpens the finding rather than
+softening it — a single query is not worth the GPU here by an order of magnitude, not a
+coin-flip. CUDA's single-query rows moved up with §3e (2.28 → 2.74×) while its batch rows
+were already current.
 
 **The two backends now disagree about when `EnableGPU()` pays.** On CUDA a single query
 is worth sending to the GPU at N=100k (2.61× after §3e); on the M1 Pro it is not worth
@@ -598,14 +603,15 @@ denominator before the kernel.
   numbers in `cpu-acceleration.md` (~95 GFLOPS ceiling, 68–73%) can be re-derived rather
   than trusted.
 
-**Crossover, one side done.** The M1 Pro's `crossover_test.go` was regenerated
-(`ab803ab`) after the Metal fix, and gained a single-query row the old harness lacked —
-it only ever timed `QueryBatch`, so it could not answer "is `EnableGPU()` worth it for
-one query". Its finding: on the M1 Pro single-query GPU still LOSES to CPU (0.43–0.66×)
-and `EnableGPU()` pays only at batch ≥ 8.
+**Crossover, both sides current (§3d).** The M1 Pro's harness gained a single-query row it
+lacked — it only ever timed `QueryBatch`, so it could not answer "is `EnableGPU()` worth
+it for one query" — and after the GC fix (§3i) that row reads its true value: single-query
+GPU LOSES to CPU by an order of magnitude at N=100k (**0.09×**) and stays below 1× at
+N=10k (0.44×), while `QueryBatch` pays only from **batch 64** at N=100k and batch 8 at
+N=10k. The earlier "loses 0.43–0.66×, pays from batch 8 everywhere" was the same
+short-window artifact §3i caught — a min-of-10 over a window shorter than a GC cycle.
 
-**Both are now current** (§3d). One inconsistency is left standing deliberately:
-`crossover-metal.jsonl` labels the M1 Pro "apple" while `vit-metal.jsonl` labels the same
-box "apple-m1pro", so the generated report renders one machine as two and says
-"3 machine(s)". Those records belong to the other box, which was mid-flight; flagged
-there rather than edited across.
+The label split flagged here is resolved: `crossover-metal.jsonl` now carries
+`apple-m1pro` / `Apple M1 Pro` to match `vit-metal.jsonl` (`a122098`), and the harness
+default was corrected so a re-run no longer re-introduces it — `machineKey` groups on
+Machine alone, so the one box renders as one machine.

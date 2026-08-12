@@ -89,8 +89,13 @@ func TestMetalANNCrossover(t *testing.T) {
 		gpuName = dev.Name()
 		dev.ReleaseObjects()
 	}
-	machine := envStr("AIKIT_BENCH_MACHINE", "apple")
-	chip := envStr("AIKIT_BENCH_CHIP", "")
+	// Default to the canonical M1 Pro label (matches vit-metal.jsonl and bench's
+	// record_test fixture). machineKey groups report rows by Machine alone, so a bare
+	// "apple" here renders this one box as a second machine next to "apple-m1pro" — the
+	// label split a122098 had to repair by hand. Defaulting correctly stops a re-run from
+	// re-introducing it. Override both for any other Apple box.
+	machine := envStr("AIKIT_BENCH_MACHINE", "apple-m1pro")
+	chip := envStr("AIKIT_BENCH_CHIP", "Apple M1 Pro")
 	recordsPath := envStr("AIKIT_BENCH_RECORDS", "../../docs/bench-records/crossover-metal.jsonl")
 	_ = os.MkdirAll(filepath.Dir(recordsPath), 0o755)
 	_ = os.Remove(recordsPath) // fresh file per run; benchreport merges machines' files
