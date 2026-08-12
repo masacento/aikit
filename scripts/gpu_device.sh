@@ -65,15 +65,33 @@ for m in $mods; do
 	nmod=$((nmod + 1))
 	# -v so skips are visible: a module whose every test skipped still prints "ok",
 	# which is the single most important thing this script must not launder.
-	out="$(cd "$m" && CGO_ENABLED=0 go test -v ./... 2>&1)"
-	rc=$?
-	# No buildable packages for this GOOS — the other platform's module. Exits 1, but
-	# it is not a failure and must not be counted as a pass either.
-	if echo "$out" | grep -q "matched no packages"; then
+	# Applicability is decided by `go list`, NOT by matching text in `go test` output.
+	# An earlier version grepped for "matched no packages" and got it wrong on darwin,
+	# where the same situation surfaced as `[setup failed]` — parsing English from a
+	# toolchain is a bug waiting for a different platform to find it.
+	#
+	# `go list ./...` distinguishes the two cases that matter:
+	#   exit 0, no output  -> nothing buildable here. The other platform's module: n/a.
+	#   exit != 0          -> the packages exist but could not be LOADED (a module or
+	#                         go.sum problem). That is a real failure and is reported as
+	#                         one, with the loader's own message, rather than excused as
+	#                         a platform difference.
+	pkgs="$(cd "$m" && CGO_ENABLED=0 go list ./... 2>/dev/null)"
+	lrc=$?
+	if [ $lrc -eq 0 ] && [ -z "$pkgs" ]; then
 		nap="$nap $m"
-		printf '  %-24s n/a  (no packages on this platform)\n' "$m"
+		printf '  %-24s n/a  (no buildable packages on this platform)\n' "$m"
 		continue
 	fi
+	if [ $lrc -ne 0 ]; then
+		napplic=$((napplic + 1))
+		failed="$failed $m"
+		printf '  %-24s FAIL (cannot load packages)\n' "$m"
+		(cd "$m" && CGO_ENABLED=0 go list ./... 2>&1 >/dev/null) | head -4 | sed 's/^/      /'
+		continue
+	fi
+	out="$(cd "$m" && CGO_ENABLED=0 go test -v ./... 2>&1)"
+	rc=$?
 	napplic=$((napplic + 1))
 	if [ $rc -ne 0 ]; then
 		failed="$failed $m"
