@@ -76,6 +76,14 @@ linters:
       - path: _test\.go
         linters: [errcheck]
         text: "Error return value of `binary\\.Write` is not checked"
+      # GPU backend tests defer Close on their backends (encmetal.Backend,
+      # encoder.Backend, the CPU/GPU encoders) to tear the device down; the close
+      # releases GPU objects with nothing to flush — the same release-side posture
+      # as the reader Closes in exclude-functions above, across too many one-off
+      # types for a per-type entry. Test-only, gpu tree only.
+      - path: gpu/.*_test\.go
+        linters: [errcheck]
+        text: "Error return value of `.*\\.Close` is not checked"
 
 issues:
   # Show every finding so the cleanup pass can't miss any. Default is 50

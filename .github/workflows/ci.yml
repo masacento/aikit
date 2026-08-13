@@ -154,59 +154,40 @@ jobs:
         run: scripts/vulncheck.sh
 
   gpu-kernels:
-    name: gpu kernel gates (CUDA sources — no GPU required)
-    runs-on: ubuntu-latest
+    name: gpu mechanical gate (${{ matrix.os }})
+    # The mechanical half of the gpu pre-tag ritual, run in CI on BOTH OSes so CI and the
+    # ritual run the IDENTICAL gate (tools/gpugate) — one check set, nothing to drift. The
+    # union covers all nine gpu modules: the four *metal build and lint only on darwin, the
+    # four *cuda only on Linux. golangci-lint across the nine modules is now actually RUN
+    # here (it was installed-but-never-invoked before — a check that could not fail); the
+    # gate pins its BUILD via `go run @v2.11.4`, so its bundled staticcheck matches every box.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.26.x"
-      # NVRTC compiles CUDA C++ -> PTX with no host compiler and no device, so the
-      # whole gate runs on a stock runner. The version is PINNED to the one the
-      # committed artifacts record in their own headers (V12.9.86): comparing PTX
-      # bytes across toolchain versions would report drift that is really a version
-      # difference, so the test skips rather than fails when they disagree — and
-      # AIKIT_REQUIRE_PTX_REPRO below turns any skip into a failure, because a
-      # skipping test is a passing test.
+          go-version-file: go.mod # pin the Go that builds golangci-lint → deterministic staticcheck
+      # NVRTC (Linux only) lets the gate's ptx-repro group rebuild PTX and compare bytes.
+      # Pinned to the version the committed artifacts record (V12.9.86); on macOS the group is
+      # n/a (NVIDIA ships no NVRTC for Apple Silicon) and this step is skipped. These are
+      # NAMESPACE packages, so __file__ is None and __path__ is the thing to read.
       - name: install pinned NVRTC 12.9.86
+        if: runner.os == 'Linux'
         run: |
           python3 -m pip install --quiet \
             nvidia-cuda-nvrtc-cu12==12.9.86 nvidia-cuda-runtime-cu12==12.9.79
-          # Ask the packages where they landed rather than guessing a site-packages
-          # path: site.getsitepackages()[0] is not where pip necessarily installs
-          # (it named /usr/local/lib/.../dist-packages on the runner while the wheels
-          # went elsewhere, and lib64 vs lib locally). These are NAMESPACE packages,
-          # so __file__ is None and __path__ is the thing to read.
           lib="$(python3 -c 'import nvidia.cuda_nvrtc as m; print(m.__path__[0])')/lib"
           inc="$(python3 -c 'import nvidia.cuda_runtime as m; print(m.__path__[0])')/include"
-          # Fail HERE, with the path, if the layout is not what we expect — otherwise
-          # the first symptom is an OSError from ctypes inside a test, which reads as
-          # a broken test rather than a broken install step.
           test -e "$lib/libnvrtc.so.12" || { echo "no libnvrtc.so.12 under $lib"; ls -la "$lib" || true; exit 1; }
           test -e "$inc/cuda_fp16.h"    || { echo "no cuda_fp16.h under $inc";    ls -la "$inc" || true; exit 1; }
           echo "NVRTC_LIB=$lib" >> "$GITHUB_ENV"
           echo "CUDA_INC=$inc" >> "$GITHUB_ENV"
-      # Three gates, in increasing order of what they need:
-      #   TestKernelFMALint*        source only — the PRIMARY check
-      #   TestGemvQuantFMAHistogram committed PTX only
-      #   TestPTXReproducible       NVRTC rebuild
-      # The nine gpu modules are NOT covered by the root job's golangci-lint — it runs
-      # in the root module only, and `./...` stops at module boundaries. That gap is
-      # how a reverted kernel sat unused in linalg and was caught only by luck of it
-      # being in the root module; the same mistake in gpu/anncuda would have shipped.
-      # Required, not advisory: the gate treats a missing linter as a failure.
-      - name: golangci-lint (nine gpu modules)
-        run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      - name: kernel gates
-        working-directory: gpu
-        env:
-          AIKIT_REQUIRE_PTX_REPRO: "1"
-        run: |
-          go vet ./...
-          go test -run 'TestKernelFMALint|TestGemvQuantFMAHistogram|TestPTXReproducible' -v ./...
+      - name: gpu mechanical gate
+        run: go run -C tools ./gpugate
 
   windows:
     name: windows (pure-Go core)

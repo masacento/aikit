@@ -1,5 +1,7 @@
 //go:build darwin
 
+// Package annmetal is the native-Metal ann.Backend — int8 corpus GEMV and GEMM plus
+// on-device top-k on Apple GPUs, the seam ann.FlatI8.EnableGPU() plugs into.
 package annmetal
 
 import (

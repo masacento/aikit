@@ -35,7 +35,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 
@@ -136,13 +135,20 @@ func checkFmtVet(root string) gate.Cell {
 	return cell("fmt-vet", gate.OK, "gofmt clean, go vet clean")
 }
 
-// (3) lint — golangci-lint across the nine modules. A MISSING LINTER IS A FAILURE, NOT A
-// SKIP: golangci-lint installs everywhere (unlike NVRTC on darwin), so "not installed" means
-// unchecked and reads red. Modules with no buildable packages on this OS have nothing to lint.
+// golangciLint is the PINNED linter. `go run pkg@ver` compiles golangci-lint with THIS
+// module's Go toolchain, so its bundled staticcheck behaves identically on every box and in
+// CI — closing the drift where a Mac (golangci-lint built with an older Go) went red while
+// CI stayed green. Pinning the version alone did not pin that; the build does.
+const golangciLint = "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4"
+
+// (3) lint — the pinned golangci-lint across the nine modules. A preflight `version` run
+// separates "the linter could not be built or run" (INCONCLUSIVE — could not judge, e.g. no
+// network to fetch it) from "the linter found issues" (FAIL); it also warms the build cache
+// so the per-module runs are fast. Modules with no buildable packages on this OS (go list
+// empty) have nothing to lint and are skipped.
 func checkLint(root string, mods []string) gate.Cell {
-	gcl := findGolangciLint()
-	if gcl == "" {
-		return cell("lint", gate.Fail, "golangci-lint not installed — install it, do not skip it (CI pins v2.11.4)")
+	if out, rc := gpumod.Go(root, ".", nil, "run", golangciLint, "version"); rc != 0 {
+		return cell("lint", gate.Inconclusive, "could not build the pinned golangci-lint: "+firstLine(out))
 	}
 	var bad []string
 	n := 0
@@ -152,14 +158,14 @@ func checkLint(root string, mods []string) gate.Cell {
 			continue // n/a on this OS — nothing to lint
 		}
 		n++
-		if _, rc := gpumod.Exec(root, m, nil, gcl, "run"); rc != 0 {
+		if _, rc := gpumod.Go(root, m, nil, "run", golangciLint, "run"); rc != 0 {
 			bad = append(bad, m)
 		}
 	}
 	if len(bad) > 0 {
 		return cell("lint", gate.Fail, "golangci-lint issues in: "+strings.Join(bad, " "))
 	}
-	return cell("lint", gate.OK, fmt.Sprintf("%d applicable modules clean", n))
+	return cell("lint", gate.OK, fmt.Sprintf("%d applicable modules clean (pinned v2.11.4)", n))
 }
 
 var reTestLine = regexp.MustCompile(`_test\.go:[0-9]+`)
@@ -239,19 +245,6 @@ func word(o gate.Outcome) string {
 	default:
 		return string(o)
 	}
-}
-
-func findGolangciLint() string {
-	if p, err := exec.LookPath("golangci-lint"); err == nil {
-		return p
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		cand := home + "/go/bin/golangci-lint"
-		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
-			return cand
-		}
-	}
-	return ""
 }
 
 func countTests(out string) (nrun, npass, nskip int) {
