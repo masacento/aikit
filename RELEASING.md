@@ -38,10 +38,15 @@ anything red. The release ritual is the enforcement, so do not skip it:
 
 Concretely:
 
-0. **Before any of this: `scripts/preflight.sh`.** It runs what CI's root-module job
+0. **Before any of this: `go run -C tools ./preflight`.** It runs what CI's root-module job
    runs — gofmt, build, vet, golangci-lint, cgo-free build, tests — in about a minute,
-   and treats a MISSING linter as a failure rather than a skip. Install it as a hook so
-   it is not a thing to remember: `ln -sf ../../scripts/preflight.sh .git/hooks/pre-push`.
+   pinned GOWORK=off per check, and treats a MISSING linter (or one it cannot build) as
+   INCONCLUSIVE rather than a silent skip. Install it as a pre-push hook so it is not a
+   thing to remember — the hook is one line, orchestrate-one-command residue, not shell:
+   ```
+   printf '#!/bin/sh\nexec go run -C tools ./preflight\n' > .git/hooks/pre-push
+   chmod +x .git/hooks/pre-push
+   ```
 
    > Added 2026-08-12, after using CI as a first linter rather than a last check cost
    > three round trips in one evening — one of them a genuine `unused` finding that the

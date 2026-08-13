@@ -135,11 +135,9 @@ func checkFmtVet(root string) gate.Cell {
 	return cell("fmt-vet", gate.OK, "gofmt clean, go vet clean")
 }
 
-// golangciLint is the PINNED linter. `go run pkg@ver` compiles golangci-lint with THIS
-// module's Go toolchain, so its bundled staticcheck behaves identically on every box and in
-// CI — closing the drift where a Mac (golangci-lint built with an older Go) went red while
-// CI stayed green. Pinning the version alone did not pin that; the build does.
-const golangciLint = "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4"
+// golangciLint is the pinned linter (gpumod.GolangciLint) — see there for why the BUILD,
+// not just the version, is pinned.
+const golangciLint = gpumod.GolangciLint
 
 // (3) lint — the pinned golangci-lint across the nine modules. A preflight `version` run
 // separates "the linter could not be built or run" (INCONCLUSIVE — could not judge, e.g. no
