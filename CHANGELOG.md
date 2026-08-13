@@ -10,6 +10,13 @@ it.
 
 ## [Unreleased]
 
+### Changed
+
+- **Require Go 1.26.6** (was 1.26.5). Picks up the go1.26.6 standard-library security
+  fixes for `net/http`, `crypto/tls`, `net/url`, and `encoding/asn1`
+  (GO-2026-5026/6090/6218/5972) — govulncheck flagged them reachable in the internal
+  `benchmarks` harness; every shipped module scanned clean either way.
+
 ## [1.17.1] — 2026-08-12
 
 ### Fixed
