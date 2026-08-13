@@ -36,7 +36,7 @@ jobs:
             echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
           fi
       - name: Release-gate checks
-        run: ./scripts/release-gate.sh "${{ steps.ver.outputs.version }}"
+        run: go run -C tools ./releasegate "${{ steps.ver.outputs.version }}"
       - name: Create GitHub Release from the CHANGELOG section
         if: github.event_name == 'push'
         env:
