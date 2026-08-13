@@ -14,7 +14,7 @@
 #   gofmt -> build -> vet -> golangci-lint -> cgo-free build -> go test
 #
 # It does NOT run -race (CI does; it roughly triples the test time) and does not touch
-# the nine gpu modules — those have scripts/gpu_gate.sh and scripts/gpu_device.sh.
+# the nine gpu modules — those have `go run -C tools ./gpugate` and `./gpudevice`.
 #
 # Usage:
 #   scripts/preflight.sh              # everything below

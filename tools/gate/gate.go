@@ -4,12 +4,12 @@
 // arithmetic, and the exit-code contract live in ONE place, so a gate is defined by the
 // []Check it supplies rather than by re-implementing "how do I count and what do I exit".
 //
-// THE SEAM. consumergate is the first user. gpu_gate.sh and gpu_device.sh are the intended
-// next ones: their groups are already the same shape — a named unit that is ok, n/a, or
-// FAIL, tallied so that a skip is never a pass and no single machine has to cover a matrix
-// alone. Moving them onto this runner means writing their groups as []Check and deleting
-// their bespoke reconciliation; it does not mean changing what they decide. This package
-// migrates nothing on its own — it is the shape the migration would target.
+// THE SEAM. consumergate was the first user; tools/gpugate and tools/gpudevice followed,
+// each supplying its groups as []Check and deleting its bespoke reconciliation without
+// changing what it decides. Their shape is the same — a named unit that is ok, n/a, or
+// FAIL, tallied so a skip is never a pass and no single machine has to cover a matrix
+// alone. A further gate (preflight, release-gate, vulncheck are the runner-shape
+// candidates) joins the same way.
 package gate
 
 import "fmt"
@@ -95,10 +95,30 @@ type Report struct {
 // run's fraction describes what this machine could actually judge.
 func (r Report) Applicable() int { return r.Total - r.NA }
 
-// Reconcile applies the one precedence rule that keeps a skip from reading as a pass:
-// any INCONCLUSIVE makes the whole run INCONCLUSIVE (exit 2); else any FAIL is FAIL
-// (exit 1); else OK (exit 0). NA cells are excluded from the tally entirely.
-func Reconcile(cells []Cell) Report {
+// Precedence decides the run's outcome when cells disagree — the one place a gate's policy
+// about "a defect versus a thing I could not judge" lives. Both keep the invariant that NA
+// is excluded and a skip is never a pass; they differ only on which of FAIL / INCONCLUSIVE
+// dominates when both are present.
+type Precedence int
+
+const (
+	// InconclusiveWins: a cell that could not be judged dominates a cell that failed. The
+	// consumer gate wants this — a proxy it could not reach must not be reported as a
+	// module defect. This is the default (Reconcile).
+	InconclusiveWins Precedence = iota
+	// FailWins: a real defect dominates a cell that could not be judged. The gpu gates want
+	// this — a broken build or a failed test is worse news than "NVRTC absent, repro
+	// unchecked", and must not be masked by it.
+	FailWins
+)
+
+// Reconcile tallies cells under the default InconclusiveWins precedence. NA cells are
+// excluded from the tally entirely.
+func Reconcile(cells []Cell) Report { return ReconcileWith(cells, InconclusiveWins) }
+
+// ReconcileWith tallies cells and picks the run outcome under the given precedence:
+// exit 2 for INCONCLUSIVE, 1 for FAIL, 0 for OK. NA never contributes to either.
+func ReconcileWith(cells []Cell, p Precedence) Report {
 	r := Report{Total: len(cells)}
 	for _, c := range cells {
 		switch c.Outcome {
@@ -112,11 +132,15 @@ func Reconcile(cells []Cell) Report {
 			r.Pass++
 		}
 	}
+	fail := func() { r.Outcome, r.Exit = Fail, 1 }
+	incon := func() { r.Outcome, r.Exit = Inconclusive, 2 }
 	switch {
+	case p == FailWins && r.Fail > 0:
+		fail()
 	case r.Incon > 0:
-		r.Outcome, r.Exit = Inconclusive, 2
+		incon()
 	case r.Fail > 0:
-		r.Outcome, r.Exit = Fail, 1
+		fail()
 	default:
 		r.Outcome, r.Exit = OK, 0
 	}

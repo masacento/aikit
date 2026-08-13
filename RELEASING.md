@@ -50,46 +50,26 @@ Concretely:
    > CDN (a 503, then a socket hang up), which is why CI now installs it through the Go
    > module proxy (`install-mode: goinstall`) instead.
 
-0b. **Run the mechanical gate: `scripts/gpu_gate.sh`.** Five groups — all nine gpu
-   modules build cgo-free, `gofmt`/`vet` on `gpu/`, and the three kernel assertions
-   (FMA lint, fma histogram, PTX reproducibility). Paste its `VERDICT:` line into the
-   tag message. It needs NVRTC but **no GPU**, so it runs on any box:
-   `pip install nvidia-cuda-nvrtc-cu12==12.9.86 nvidia-cuda-runtime-cu12`, or point
-   `NVRTC_LIB` at an existing install.
+0b. **Run the mechanical gate: `go run -C tools ./gpugate`.** Paste its `VERDICT:` line
+   into the tag message. It needs NVRTC but **no GPU**, so it runs on any box; if the PTX
+   group reports NVRTC unfindable, `pip install nvidia-cuda-nvrtc-cu12==12.9.86
+   nvidia-cuda-runtime-cu12` or point `NVRTC_LIB` at an existing install. On darwin that
+   group is n/a — NVIDIA ships no NVRTC for Apple Silicon — so a Mac's verdict covers the
+   rest and says so.
 
-   The gate refuses to report PASS on a dirty tree (a verdict names a commit, and an
-   uncommitted edit means it does not describe that commit), and it treats a **skip as
-   a failure** — `go test` prints `ok` for a package whose tests all skipped, so
-   "NVRTC not installed" must not read as "reproducibility verified".
+   The `gpu-kernels` CI job runs the same kernel assertions on every push; the gate is
+   still the enforcement point (CI is advisory here by choice — see the note at the end).
+1. **Run the device half: `go run -C tools ./gpudevice`, on BOTH a Mac and an NVIDIA
+   box.** Paste both `VERDICT:` lines into the tag message — this is the half the
+   mechanical gate cannot do for you. It runs all nine gpu modules' suites and reports
+   each ok / n/a / FAIL; the `n/a` state (the four `*metal` on Linux, the four `*cuda` on
+   darwin) is why **no single machine can cover all nine** — a Mac's verdict and an NVIDIA
+   box's are different halves, and a `gpu/vX.Y.Z` tag needs both.
 
-   The `gpu-kernels` CI job runs the same three assertions on every push. The gate is
-   still the enforcement point: CI is advisory here by choice — see the note at the
-   end of this section.
-1. **Run the device half: `scripts/gpu_device.sh`, on BOTH a Mac and an NVIDIA box.**
-   Paste both `VERDICT:` lines into the tag message. This is the half `gpu_gate.sh`
-   cannot do for you.
-
-   > This step used to read `cd gpu && CGO_ENABLED=0 go test ./...`, and **`./...` stops
-   > at module boundaries** — so it tested one of the nine gpu modules and silently
-   > skipped the other eight. Found on 2026-08-12 by running the step as written and
-   > noticing `gpu/annmetal` had never been covered. The eight it missed are the same
-   > eight that had never been tagged (below): both are what you get when a tree of
-   > sibling modules is treated as one module out of habit.
-
-   The script iterates all nine modules — the same enumeration `gpu_gate.sh` uses for its
-   build group — and distinguishes three states, which is the point:
-
-   - **ok** — tests ran and passed, with the passed/skipped counts shown, because a
-     module whose every test skipped also prints `ok`.
-   - **n/a** — no buildable packages on this OS. The four `*metal` modules on Linux and
-     the four `*cuda` modules on darwin. `go test` exits 1 for these, which is neither
-     red nor green, so they are excluded from the tally rather than counted either way.
-   - **FAIL** — with the first failing lines.
-
-   Because of the `n/a` state the arithmetic is honest about something the old command
-   hid: **no single machine can cover all nine.** A Mac reports 5/5 applicable, an NVIDIA
-   box reports a different 5/5, and a `gpu/vX.Y.Z` tag needs both lines. One verdict alone
-   covers a bit over half the tree.
+   > It replaced `cd gpu && CGO_ENABLED=0 go test ./...`, whose `./...` stopped at module
+   > boundaries and so tested one of the nine modules and silently skipped the other eight
+   > (found 2026-08-12). The eight it missed are the same eight that had never been tagged
+   > (below): both are what you get when a tree of sibling modules is treated as one.
 2. Push as `townsendmerino` (a second account on this machine 403s on `townsendmerino`
    repos), and author commits as `townsendmerino@gmail.com`.
 
@@ -116,7 +96,7 @@ Concretely:
    so this is the only check that sees what a consumer sees. CI's `consumer-resolution` job
    runs the same thing on the pushed tag; run it locally if you want the answer before CI does.
 
-A local `pre-push` hook that runs `scripts/gpu_device.sh` when a `gpu/v*` tag is being
+A local `pre-push` hook that runs `go run -C tools ./gpudevice` when a `gpu/v*` tag is being
 pushed would enforce this by construction and is welcome — but one machine can only ever
 produce one of the two verdicts, so the checklist above is the portable minimum: it turns a habit into a step
 someone can visibly fail to complete.
