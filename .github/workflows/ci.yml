@@ -146,12 +146,12 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
       # Reachability-filtered, so a finding means a symbol THIS build reaches is
       # affected — not merely that a vulnerable version is somewhere in the graph.
-      # The script fails on "could not scan" as loudly as on "vulnerable": six of the
-      # thirteen modules were unscannable until 2026-08-11 (stale go.mod, or
-      # darwin-only sources matching zero packages on Linux), and a clean report that
-      # silently covers half a repo implies the other half.
+      # Fails on "could not scan" as loudly as on "vulnerable": six of the modules were
+      # unscannable until 2026-08-11 (stale go.mod, or darwin-only sources matching zero
+      # packages on Linux), and a clean report that silently covers half a repo implies
+      # the other half.
       - name: scan
-        run: scripts/vulncheck.sh
+        run: go run -C tools ./vulncheck
 
   gpu-kernels:
     name: gpu mechanical gate (${{ matrix.os }})

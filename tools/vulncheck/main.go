@@ -1,0 +1,216 @@
+// Command vulncheck is the vulnerability STATEMENT for every module in this repo — the
+// release-notes deliverable RELEASING.md step 3 pastes into the notes, not hygiene. It
+// replaces scripts/vulncheck.sh, expressed as a gate.Check matrix over tools/gate.
+//
+// WHY A DELIVERABLE. aikit's pitch is a single static binary scp'd somewhere and run
+// offline; whoever deploys it cannot patch it in place. "What is in it, and is any of it
+// known-vulnerable" is part of that claim, the same way cgo-free and dependency-light are.
+// govulncheck earns a gate because it is REACHABILITY-FILTERED: it reports a vulnerability
+// only when a symbol the build actually reaches is affected, so "no vulnerabilities found"
+// is a statement about this binary, not about the dependency list.
+//
+// CONTRACTS CARRIED FROM THE SHELL:
+//   - EVERY module is enumerated from the tree (now 14, including tools/ itself), never a
+//     list — a scanner that silently covers half a repo is worse than none.
+//   - UNSCANNABLE IS A FAILURE, distinct from clean. "Could not load packages" must never
+//     read as "no vulnerabilities". Both a reachable vulnerability and an unscannable module
+//     make the STATEMENT INCOMPLETE.
+//   - The four *metal modules are scanned under GOOS=darwin (their sources are entirely
+//     behind //go:build darwin and would otherwise contribute zero packages and a green
+//     tick on Linux).
+//   - govulncheck itself missing is INCONCLUSIVE — could not judge — never a pass.
+//
+// It inherits the ambient toolchain environment exactly as the shell did — no GOWORK
+// override — so a scan on the Linux/CI target (no go.work) is byte-identical to
+// scripts/vulncheck.sh; only the *metal GOOS is forced.
+//
+// Usage:  go run -C tools ./vulncheck
+// Env:    GOVULNCHECK   path to the binary (default: govulncheck on PATH, else
+//
+//	$(go env GOPATH)/bin/govulncheck)
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/townsendmerino/aikit/tools/gate"
+	"github.com/townsendmerino/aikit/tools/gpumod"
+)
+
+// reVuln matches govulncheck's per-vulnerability header, e.g. "Vulnerability #1: GO-2024-…".
+var reVuln = regexp.MustCompile(`Vulnerability #[0-9]+:`)
+
+func main() { os.Exit(run()) }
+
+func run() int {
+	root, err := gpumod.RepoRoot()
+	if err != nil {
+		fmt.Println("STATEMENT: INCONCLUSIVE — cannot locate repo root: " + err.Error())
+		return 2
+	}
+	gvc := findGovulncheck()
+	if gvc == "" {
+		fmt.Println("STATEMENT: INCONCLUSIVE — govulncheck not found (go install golang.org/x/vuln/cmd/govulncheck@latest); nothing scanned")
+		return 2
+	}
+	p := gpumod.Provenance(root)
+	prov := p.Commit + p.Dirty
+	fmt.Printf("aikit vulnerability scan — %s — %s\n", prov, p.Date)
+	fmt.Printf("scanner: %s\n\n", scannerVersion(gvc))
+
+	mods := allModuleDirs(root)
+	checks := make([]gate.Check, 0, len(mods))
+	for _, m := range mods {
+		m := m
+		checks = append(checks, gate.Check{Name: m, Run: func() gate.Cell { return scanModule(root, gvc, m) }})
+	}
+	cells := gate.RunAll(checks)
+
+	var clean, vuln, unscanned int
+	for _, c := range cells {
+		status := field(c, "status")
+		switch status {
+		case "CLEAN":
+			clean++
+			fmt.Printf("  %-30s CLEAN\n", c.Name)
+		case "VULNERABLE":
+			vuln++
+			fmt.Printf("  %-30s VULNERABLE (%s reachable)\n", c.Name, field(c, "count"))
+			for _, f := range c.Fields {
+				if f.Key == "line" {
+					fmt.Printf("      %s\n", f.State)
+				}
+			}
+		default: // UNSCANNED
+			unscanned++
+			fmt.Printf("  %-30s UNSCANNED — %s\n", c.Name, field(c, "detail"))
+		}
+	}
+	total := clean + vuln + unscanned
+
+	fmt.Println()
+	if vuln == 0 && unscanned == 0 {
+		fmt.Printf("STATEMENT: no reachable vulnerabilities in %d/%d modules at %s (%s)\n", clean, total, prov, p.Date)
+		return 0
+	}
+	if unscanned > 0 {
+		fmt.Printf("  %d module(s) could not be scanned — that is not a clean result.\n", unscanned)
+	}
+	if vuln > 0 {
+		fmt.Printf("  %d module(s) have reachable vulnerabilities.\n", vuln)
+	}
+	fmt.Printf("STATEMENT: INCOMPLETE — %d clean, %d vulnerable, %d unscanned, of %d at %s\n", clean, vuln, unscanned, total, prov)
+	return 1
+}
+
+// scanModule runs govulncheck in one module and classifies the result the way the shell
+// did: a "No vulnerabilities found" with exit 0 is CLEAN; any "Vulnerability #N:" is
+// VULNERABLE; anything else is UNSCANNED (the scan itself failed) — never mistaken for a pass.
+func scanModule(root, gvc, m string) gate.Cell {
+	cmd := exec.Command(gvc, "./...")
+	cmd.Dir = filepath.Join(root, m)
+	cmd.Env = os.Environ()
+	if strings.HasSuffix(m, "metal") {
+		// darwin-only sources contribute zero packages under the host GOOS on Linux;
+		// scanning them under GOOS=darwin is what the shell did to avoid a vacuous pass.
+		cmd.Env = append(cmd.Env, "GOOS=darwin", "GOARCH=arm64")
+	}
+	outB, _ := cmd.CombinedOutput()
+	out := string(outB)
+
+	switch {
+	case strings.Contains(out, "No vulnerabilities found"):
+		return gate.Cell{Name: m, Outcome: gate.OK, Fields: []gate.Field{{Key: "status", State: "CLEAN"}}}
+	case reVuln.MatchString(out):
+		n := len(reVuln.FindAllString(out, -1))
+		c := gate.Cell{Name: m, Outcome: gate.Fail, Fields: []gate.Field{
+			{Key: "status", State: "VULNERABLE"},
+			{Key: "count", State: fmt.Sprintf("%d", n)},
+		}}
+		for _, ln := range strings.Split(out, "\n") {
+			t := strings.TrimSpace(ln)
+			if reVuln.MatchString(ln) || strings.HasPrefix(t, "Found in:") || strings.HasPrefix(t, "Fixed in:") {
+				c.Fields = append(c.Fields, gate.Field{Key: "line", State: t})
+			}
+		}
+		return c
+	default:
+		return gate.Cell{Name: m, Outcome: gate.Fail, Fields: []gate.Field{
+			{Key: "status", State: "UNSCANNED"},
+			{Key: "detail", State: firstNonEmpty(out)},
+		}}
+	}
+}
+
+// allModuleDirs enumerates every module in the tree (root as ".", others relative), sorted —
+// the same set `find . -name go.mod` produces, minus .git and .venv.
+func allModuleDirs(root string) []string {
+	var dirs []string
+	filepath.WalkDir(root, func(pth string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() && (d.Name() == ".git" || d.Name() == ".venv") {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() && d.Name() == "go.mod" {
+			rel, _ := filepath.Rel(root, filepath.Dir(pth))
+			dirs = append(dirs, rel)
+		}
+		return nil
+	})
+	sort.Strings(dirs)
+	return dirs
+}
+
+func findGovulncheck() string {
+	if v := os.Getenv("GOVULNCHECK"); v != "" {
+		return v
+	}
+	if p, err := exec.LookPath("govulncheck"); err == nil {
+		return p
+	}
+	if out, err := exec.Command("go", "env", "GOPATH").Output(); err == nil {
+		cand := filepath.Join(strings.TrimSpace(string(out)), "bin", "govulncheck")
+		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+			return cand
+		}
+	}
+	return ""
+}
+
+func scannerVersion(gvc string) string {
+	out, err := exec.Command(gvc, "-version").Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.Join(strings.Fields(string(out)), " ")
+}
+
+func field(c gate.Cell, key string) string {
+	for _, f := range c.Fields {
+		if f.Key == key {
+			return f.State
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(s string) string {
+	for _, ln := range strings.Split(s, "\n") {
+		if strings.TrimSpace(ln) != "" {
+			t := strings.TrimSpace(ln)
+			if len(t) > 70 {
+				t = t[:70]
+			}
+			return t
+		}
+	}
+	return ""
+}
