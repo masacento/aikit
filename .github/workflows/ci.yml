@@ -135,7 +135,7 @@ jobs:
           go test ./...
 
   vulncheck:
-    name: govulncheck (all 13 modules)
+    name: govulncheck (all 14 modules)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

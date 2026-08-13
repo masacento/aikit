@@ -1,0 +1,95 @@
+name: consumer-resolution
+
+# The CONSUMER-RESOLUTION GATE: verify that every published aikit module resolves and
+# builds from a consumer's position, through the public Go module proxy, with none of this
+# repo's replace directives or dev go.work in scope. It runs the Go tool in tools/
+# (go run -C tools ./consumergate); the same check by hand is in RELEASING.md.
+#
+# WHY A WHOLE WORKFLOW. On 2026-08-12 the eight gpu backend modules were found not to
+# resolve for consumers at all (a 404 on their `require .../gpu v0.0.0`), and NOTHING in
+# the repo could see it: replaces and go.work mask it locally by construction. So the check
+# must run from outside — which also means it needs no GPU, so unlike the device tests it
+# is fully automatable on stock runners. This is that automation.
+#
+# WHAT IT CANNOT DO — and the job name must not imply otherwise. A Go module tag is
+# IMMUTABLE once the proxy fetches it, so a red run here cannot unpublish a bad tag. It
+# shortens detection of the "does not resolve for consumers" class from "a consumer
+# complains" to "minutes after push"; the fix is a follow-up tag. PREVENTION lives in the
+# ordered tagging steps of RELEASING.md, not here. This gate reports; it does not prevent.
+#
+# TWO OSes ON PURPOSE. The compile tier is platform-dependent: the four *metal modules have
+# no packages on Linux and the four *cuda none on macOS, reported n/a (not FAIL) there. No
+# single runner compiles all nine, so both jobs fan out across ubuntu + macOS and the union
+# covers the tree — the same n/a arithmetic scripts/gpu_device.sh uses.
+#
+# EXIT CODES. The tool's contract is PASS=0, FAIL=1, INCONCLUSIVE=2 (proxy unreachable /
+# unmappable tag — never green). `go run` collapses any non-zero child to 1, so a step
+# fails on both FAIL and INCONCLUSIVE (correct — neither is green) and the two are told
+# apart by the VERDICT line in the log, not the exit code.
+
+on:
+  push:
+    tags:
+      - 'v*'                      # root: github.com/townsendmerino/aikit
+      - 'gpu/v*'                  # gpu substrate
+      - 'gpu/*/v*'                # the eight backends
+      - 'chunk/treesitter/v*'     # treesitter chunker
+  schedule:
+    - cron: '0 6 * * 1'           # weekly, Mondays 06:00 UTC — the standing watch. Weekly is
+                                  # the floor; nightly ('0 6 * * *') costs little (Francis decides).
+  workflow_dispatch: {}           # manual run of the watch (both OS legs). NOTE (found 2026-08-13):
+                                  # workflow_dispatch only fires for a workflow that exists on the
+                                  # DEFAULT branch, so a new workflow cannot be dry-run from its
+                                  # feature branch — it must land on main first, then be dispatched.
+
+permissions:
+  contents: read
+
+env:
+  # GOWORK=off so `go run -C tools` resolves the tools module standalone, never through a
+  # dev workspace — the same property the checks enforce for consumers. Harmless in CI
+  # (no go.work is checked out) and required locally, so the command is identical everywhere.
+  # Quoted: unquoted `off` is a YAML boolean and would set GOWORK=false.
+  GOWORK: "off"
+
+jobs:
+  # Tag-triggered: map the just-pushed tag to its one module@version and check that pair.
+  # Runs on both OSes so the right one compiles it and the other reports n/a — a *metal tag
+  # is compile-verified on macOS, a *cuda tag on ubuntu, and either way resolve is checked.
+  tag:
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false            # never lose the count: one OS red must not cancel the other
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Consumer gate for ${{ github.ref_name }}
+        env:
+          # A freshly pushed tag can lag on the proxy; retry with bounded backoff
+          # (10,20,40,80,160s ≈ 5 min) then go red — never green-by-timeout.
+          CONSUMER_GATE_ATTEMPTS: '6'
+          CONSUMER_GATE_BACKOFF: '10'
+        run: go run -C tools ./consumergate --tag "${{ github.ref_name }}"
+
+  # Scheduled standing watch (also the workflow_dispatch dry-run target): every published
+  # module @latest, on both OSes, whose union covers all nine gpu modules no single runner
+  # can. This is what catches a module that silently stops resolving between releases.
+  watch:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Consumer gate — all published modules @latest
+        run: go run -C tools ./consumergate

@@ -111,6 +111,10 @@ Concretely:
    ```
    Bump the **patch** for a fix/hardening with no API change, the **minor** for new
    exported surface.
+4. **After the push, verify from outside: `GOWORK=off go run -C tools ./consumergate --tag
+   gpu/vX.Y.Z`.** The in-tree gates cannot see a broken `require` — the replaces mask it —
+   so this is the only check that sees what a consumer sees. CI's `consumer-resolution` job
+   runs the same thing on the pushed tag; run it locally if you want the answer before CI does.
 
 A local `pre-push` hook that runs `scripts/gpu_device.sh` when a `gpu/v*` tag is being
 pushed would enforce this by construction and is welcome — but one machine can only ever
@@ -164,7 +168,13 @@ The window in between is not a regression: these modules do not resolve for cons
 today either.
 
 Verify from outside afterwards, not from inside the repo — the replaces make an in-tree
-check meaningless. A scratch module, `go build`, and no `replace` of your own.
+check meaningless. That check is now a Go tool: **`GOWORK=off go run -C tools ./consumergate
+--tag <tag>`** resolves and builds the tag's module from a scratch module with no replaces,
+`GOWORK=off`, and the public proxy as the only source. The `consumer-resolution` CI job
+(`.github/workflows/consumer.yml`) runs it on every release tag, and a weekly job runs the
+whole published set at `@latest` — so the "does not resolve for consumers" class is a
+standing watch, not a thing to remember on release day. A red run cannot unpublish an
+immutable tag; it shortens detection to minutes, and the fix is a follow-up tag (above).
 
 ### How to tell whether a fix is already released
 
