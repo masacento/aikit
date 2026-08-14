@@ -220,6 +220,25 @@ func TestEmbedderCoverage_gatesExist(t *testing.T) {
 // against the actual checkpoints, so pooling/dims can't drift from reality. Skips
 // per-row when a model isn't present (CI); a developer with the weights gets every
 // present row checked.
+// requireCheckpointsOrSkip closes the "verified zero rows, still green" gap (AK5). `checked`
+// is 0 ONLY when no checkpoint was present at all — a present row always increments it — so
+// zero coverage is either a box without the pinned models (CI, where the checkpoints are
+// gitignored) or a real bug that matched nothing. It is turned into a visible SKIP by default,
+// so AK3's skip census counts it rather than a bare `ok` hiding it; and into a hard FAIL when
+// AIKIT_REQUIRE_COVERAGE is set — the same "a skip cannot hide" escape hatch
+// ptx_reproducible_test.go uses with AIKIT_REQUIRE_PTX_REPRO, for a release box that pins the
+// checkpoints and wants zero-coverage to be red.
+func requireCheckpointsOrSkip(t *testing.T, checked int) {
+	t.Helper()
+	if checked > 0 {
+		return
+	}
+	if os.Getenv("AIKIT_REQUIRE_COVERAGE") != "" {
+		t.Fatal("AIKIT_REQUIRE_COVERAGE set, but no local checkpoint was verified — this run proved no coverage")
+	}
+	t.Skip("no local checkpoints present; coverage verified nothing on this box (set AIKIT_REQUIRE_COVERAGE=1 to require)")
+}
+
 func TestEmbedderCoverage_propertiesMatchCheckpoints(t *testing.T) {
 	checked := 0
 	for _, r := range coverageRows {
@@ -261,6 +280,7 @@ func TestEmbedderCoverage_propertiesMatchCheckpoints(t *testing.T) {
 		})
 	}
 	t.Logf("verified %d/%d rows against local checkpoints", checked, len(coverageRows))
+	requireCheckpointsOrSkip(t, checked)
 }
 
 // TestEmbedderCoverage_matryoshka verifies the Truncatable column by MEASUREMENT
@@ -359,6 +379,7 @@ func TestEmbedderCoverage_matryoshka(t *testing.T) {
 		return float64(hits) / float64(len(vecs))
 	}
 
+	ran := 0
 	for _, r := range coverageRows {
 		if r.Pooling == "—" { // bare LM: no sentence embedding to speak of
 			continue
@@ -366,6 +387,7 @@ func TestEmbedderCoverage_matryoshka(t *testing.T) {
 		if _, err := os.Stat(r.Dir + "/model.safetensors"); err != nil {
 			continue
 		}
+		ran++
 		t.Run(r.Model, func(t *testing.T) {
 			vecs := embedAll(t, r)
 			fullR := pairRecall(vecs, r.Dims)
@@ -391,6 +413,7 @@ func TestEmbedderCoverage_matryoshka(t *testing.T) {
 			}
 		})
 	}
+	requireCheckpointsOrSkip(t, ran)
 }
 
 // TestMatryoshkaFloors_matchCoverage is the drift guard for the EXPORTED MRL registry

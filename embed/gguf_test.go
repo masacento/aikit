@@ -175,33 +175,39 @@ func TestDequantRange_streamMatchesWhole(t *testing.T) {
 		{"IQ4_NL", ggmlTypeIQ4NL, 18}, {"IQ4_XS", ggmlTypeIQ4XS, 136},
 		{"IQ2_S", ggmlTypeIQ2S, 82}, {"IQ3_S", ggmlTypeIQ3S, 110},
 	}
+	// t.Run PER QUANT TYPE, so the covered axis is named in the output (AK5): `go test -v`
+	// lists all 14 as subtests, and a green states which quant types it proved rather than
+	// only that some count passed. The table is a static literal, so the axis cannot silently
+	// shrink at runtime — but a green must still say what it covered.
 	for _, tc := range types {
-		bs, _ := ggmlBlockElems(tc.typ)
-		const nBlocks = 5
-		n := nBlocks * bs
-		raw := make([]byte, nBlocks*tc.blkByte)
-		for i := range raw {
-			raw[i] = byte(rng.Intn(256))
-		}
-		whole := make([]float32, n)
-		dequantRange(tc.typ, raw, 0, whole, bs)
+		t.Run(tc.name, func(t *testing.T) {
+			bs, _ := ggmlBlockElems(tc.typ)
+			const nBlocks = 5
+			n := nBlocks * bs
+			raw := make([]byte, nBlocks*tc.blkByte)
+			for i := range raw {
+				raw[i] = byte(rng.Intn(256))
+			}
+			whole := make([]float32, n)
+			dequantRange(tc.typ, raw, 0, whole, bs)
 
-		// Re-dequant in chunks of 1, 2, then the rest of the blocks, at successive
-		// block-aligned starts — exercising the offset arithmetic.
-		streamed := make([]float32, n)
-		for start, step := 0, bs; start < n; start += step {
-			if start == 2*bs {
-				step = (nBlocks - 2) * bs // jump to the tail in one go
+			// Re-dequant in chunks of 1, 2, then the rest of the blocks, at successive
+			// block-aligned starts — exercising the offset arithmetic.
+			streamed := make([]float32, n)
+			for start, step := 0, bs; start < n; start += step {
+				if start == 2*bs {
+					step = (nBlocks - 2) * bs // jump to the tail in one go
+				}
+				end := min(start+step, n)
+				dequantRange(tc.typ, raw, start, streamed[start:end], bs)
 			}
-			end := min(start+step, n)
-			dequantRange(tc.typ, raw, start, streamed[start:end], bs)
-		}
-		for i := range whole {
-			if math.Float32bits(whole[i]) != math.Float32bits(streamed[i]) {
-				t.Errorf("%s[%d]: streamed %x != whole %x", tc.name, i, math.Float32bits(streamed[i]), math.Float32bits(whole[i]))
-				break
+			for i := range whole {
+				if math.Float32bits(whole[i]) != math.Float32bits(streamed[i]) {
+					t.Errorf("%s[%d]: streamed %x != whole %x", tc.name, i, math.Float32bits(streamed[i]), math.Float32bits(whole[i]))
+					break
+				}
 			}
-		}
+		})
 	}
 }
 
