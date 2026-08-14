@@ -223,7 +223,7 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
    import-free GPU-export seam; deps are `embed`+`linalg` only and it adds
    **no** external dependency (image codecs are stdlib). aikit is now the
    only **cgo-free** image-embedding library. The full decision/scoping
-   record is `docs/internal/vision-move-decision.md`.
+   record is `docs/internal/archive/vision-move-decision.md`.
    *Gate:* the stated trigger (launch feedback / an adopter asking for
    image or multimodal retrieval) had **not** fired — the move proceeded as
    **Francis's owner override**, recorded in the decision doc + CHANGELOG.

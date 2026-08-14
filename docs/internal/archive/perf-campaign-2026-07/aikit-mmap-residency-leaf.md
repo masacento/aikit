@@ -1,109 +1,134 @@
-# aikit task: an mmap + madvise + span-residency leaf (and page the FlatI8 index with it)
+# Plan (aikit): an mmap + residency leaf — and page the FlatI8 index with it
 
-## Context
+> **Status: DONE (landed in `7128644` "Add mmap leaf, WeightMat.MappedSpan, and
+> paged FlatI8 index"; hardened since by audit #9/#13).** Everything below shipped:
+> the `github.com/townsendmerino/aikit/mmap` leaf (`MapReadOnly`/`Unmap`/`Advise`/
+> `SpanCache[K]`/`PageAlignedInterior`/`AutoBudget`/`AvailableRAM`, stdlib-only and
+> aikit-import-free), `linalg.WeightMat.MappedSpan`, and the §3 payoff —
+> `ann.LoadFlatI8MmapPaged(path, budget)` paging int8 codes through the SpanCache
+> under a RAM budget (`scorePaged` + `PageStats`). `ann` and `embed` both import
+> the leaf; the three duplicated `mmapReadOnly` copies are deleted. Gates green:
+> the SpanCache eviction/refault unit tests (`mmap/spancache_test.go`,
+> `TestMadvise_dontneedRefaultsIntact`) and the §6 lossless-paging gate
+> `TestLoadFlatI8MmapPaged_matchesResidentAndEvicts` (paged recall == resident,
+> eviction count > 0). Retained below as the design record.
+>
+> ---
+>
+> _Original plan (Status was: DEFERRED — written now, executed later):_ the aikit
+> half of a two-repo extraction (goinfer half:
+> `goinfer/docs/task-aikit-substrate-extraction.md`) of goinfer's weight-memory
+> substrate (mmap + madvise + a span-residency cache).
 
-goinfer built a weight-paging substrate (mmap a read-only `.giw`, then page
-weights in/out under a RAM budget via `madvise`) to run a 35B-A3B MoE on ~16 GB.
-The *mechanism* is generic and cgo-free; only the *demand signal* (which expert /
-layer to fault, when) is goinfer-specific. This task **lifts the generic mechanism
-into a new `aikit/mmap` leaf**, dedups the mmap primitive aikit already duplicates,
-and — the payoff — **gives `ann.FlatI8Mmap` a paged mode** so aikit can query an
-int8 index larger than RAM. goinfer then refactors its pagers onto this leaf
-(goinfer side: `goinfer/docs/task-aikit-substrate-extraction.md`).
+## Trigger (when to execute)
 
-This is **new public surface ⇒ Experimental tier** (like `FlatI8`, `vision`,
-`linalg`). Ship it in the next aikit minor after **v1.8.1**; goinfer bumps its
-`require` and refactors only after you tag.
+Execute when **both** hold:
 
-## Why now / why aikit
+1. **goinfer weight-memory Phase 1 is stable** — `expertPager` / `layerPager` have
+   gone one goinfer minor without an API-shape change, and GGUF Phase 2 (#1
+   zero-copy GGUF) has either landed or been explicitly shelved (so we know
+   whether the span-cache needs to serve heap-backed *and* mapping-backed spans).
+2. **aikit has a reuse pull** — concretely, a "FlatI8 index too big for RAM"
+   ask (the paid-off payoff in §3), or a third in-tree duplication of the mmap
+   primitive lands. Until one of those is real, the duplication is cheaper to
+   carry than the wrong abstraction.
 
-- The read-only mmap primitive is **already byte-duplicated inside aikit**:
-  `ann/mmap_unix.go` and `embed/mmap_unix.go` are identical (`ann`'s own comment
-  says it copies rather than import `embed` to avoid an `ann→embed` edge). goinfer
-  has a third identical copy. A zero-dep leaf both `ann` and `embed` import kills
-  the duplication without the bad edge.
-- aikit has **no `madvise` anywhere**, and `ann.LoadFlatI8Mmap` (int8 codes aliased
-  from a read-only mapping — the *same substrate* as goinfer's expert weights) has
-  `Close()` but **no residency control**: a large embedded index relies entirely on
-  the OS page cache, with no prefetch and no RAM-budget cap. The `SpanCache` below
-  fixes that.
+Re-read the goinfer pager code at trigger time before designing the API — don't
+design it from this doc's snapshot.
 
-## Deliverable 1 — the `aikit/mmap` leaf (stdlib-only, no cgo, no aikit imports)
+## 1. Why aikit, and why now-the-plan
 
-A new package `github.com/townsendmerino/aikit/mmap`. **Leaf invariant: imports
-only stdlib** (so `ann` and `embed` can both import it with zero cycle risk). Build
-tags `unix` / `!unix`, mirroring the existing loaders; CI must build the `!unix`
-fallback (software path) as aikit already does.
+The mmap read-only primitive is **already duplicated inside aikit** — `ann/mmap_unix.go`
+and `embed/mmap_unix.go` are byte-for-byte identical, and `ann`'s own comment says
+why:
 
-- **`MapReadOnly(path string) ([]byte, error)` / `Unmap([]byte) error`** — lift the
-  identical `mmapReadOnly`/`munmap` from `ann/mmap_unix.go` (+ `mmap_other.go`).
-  Refactor `ann` and `embed` to call these and **delete their local copies**.
+> *"This mirrors embed's mmap loader. ann keeps its own copy rather than importing
+> embed — an ann→embed edge would couple the index package to the embedding one."*
+
+So aikit consciously accepted duplication to avoid a bad dependency edge. goinfer's
+`decoder/mmap_unix.go` is now a **third** identical copy across the ecosystem. A
+zero-dependency **leaf** package is the clean resolution: `ann` and `embed` both
+import it (no `ann→embed` edge), and goinfer drops its copy. Three copies → one.
+
+Two things ride in alongside it that aikit **does not have today**: `madvise`
+(residency hints — absent ecosystem-wide) and a generic **span-residency cache**
+(the demand-signal-agnostic core of goinfer's `expertPager`). Both are generic OS
+mechanism with nothing model-specific in them.
+
+## 2. Scope — what lands in aikit
+
+A new leaf, proposed `github.com/townsendmerino/aikit/mmap` (stdlib `syscall`
+only, no cgo, `//go:build unix` + `!unix` fallback — exactly aikit's existing
+shape, so the pure-Go promise is unaffected):
+
+- **`MapReadOnly(path) ([]byte, error)` / `Unmap([]byte) error`** — lifted from the
+  three identical `mmapReadOnly`/`munmap` copies. `ann` and `embed` refactor to
+  call it; their local copies delete.
 - **`Advise(span []byte, willNeed bool) error`** — `MADV_WILLNEED` / `MADV_DONTNEED`
-  over a page-aligned span. Port goinfer's `madvise_unix.go` **and its
-  `madvise_darwin.go`** — the darwin nuance matters: `MADV_DONTNEED` is firm on
-  Linux but weaker on darwin (`MADV_FREE`), so document "firm on Linux, best-effort
-  elsewhere." `!unix` is a no-op.
-- **`SpanCache`** — the generic core of goinfer's `expertPager` (`moepaging.go`):
-  an **LRU of page-aligned spans within a mapping, bounded by a byte budget**.
-  `Touch(spans)` faults a member in (WILLNEED) and releases the LRU tail (DONTNEED)
-  to stay under budget; tracks resident bytes by summed span length.
-  **Demand-signal-agnostic — the caller supplies spans and decides when to Touch.**
-  Do NOT bake in MoE / layer / any model logic (that stays in goinfer). This is the
-  hard-won contract: goinfer's router-driven and layer-order policies are thin
-  wrappers over this.
-- **`PageAlignedInterior(raw []byte) []byte`** (round a byte slice up/down to page
-  boundaries — goinfer's alignment math) and a small **available-RAM helper**
-  (goinfer's `/proc/meminfo` reader + `~half-of-RAM` auto-budget; 0 elsewhere).
+  over a page-aligned span (goinfer's `madviseBytes`). Firm on Linux, best-effort
+  on darwin (`MADV_FREE`) — document it, as goinfer already does.
+- **`SpanCache`** — the generic core of `expertPager`: an LRU of page-aligned spans
+  within a mapping, bounded by a byte budget, faulting in on `Touch` (WILLNEED) and
+  releasing the tail (DONTNEED). **Demand-signal-agnostic** — the caller supplies
+  spans and decides when to `Touch`. goinfer's MoE-router and layer-order logic do
+  **not** come along.
+- **`PageAlignedInterior(start uintptr, raw []byte) []byte`** + a small system
+  helper for available-RAM budgeting (goinfer's `availableRAMBytes` /proc/meminfo
+  reader + auto-budget). Generic; co-locate.
 
-## Deliverable 2 — `linalg.WeightMat.MappedSpan(base, end uintptr) []byte`
+A companion in **`linalg`** (not the leaf, since it touches the aikit type):
+`WeightMat.MappedSpan(base, end uintptr) []byte` — goinfer's `alignedMappedSpan`
+reaches into `WeightMat.Int8()/Int4()` to find a tensor's quantized backing bytes
+inside a mapping. Because aikit **owns `WeightMat`**, that extraction belongs in
+`linalg`; the page-rounding math it calls belongs in the leaf.
 
-goinfer's `alignedMappedSpan` reaches into `WeightMat.Int8()/Int4()` to find a
-tensor's quantized backing bytes and tests whether they lie inside a `[base,end)`
-mapping. Because aikit **owns `WeightMat`**, that extraction belongs in `linalg` as
-a method: return the page-aligned interior of the WeightMat's backing bytes *iff*
-they alias the given mapping, else nil (heap-backed → skip). The page-rounding it
-calls is `mmap.PageAlignedInterior`. (linalg may import the leaf — leaf is stdlib-
-only, no cycle.)
+## 3. The payoff that justifies the lift: page the FlatI8 index
 
-## Deliverable 3 — the payoff: page the FlatI8 index
+This is the part that makes the extraction *aikit's* win, not just goinfer
+hygiene. `ann.LoadFlatI8Mmap` already aliases int8 codes from a read-only mapping —
+**the identical substrate as goinfer's expert weights** — but today it has only
+`Close()`: **no residency control at all.** A large embedded index relies purely on
+the OS page cache, with no prefetch and no RAM-budget cap.
 
-Wire `SpanCache` into `FlatI8` (or a paged sibling loader) so a `LoadFlatI8Mmap`
-index can be queried under a RAM budget: the int8 code block is the span set, the
-query path `Touch`es the rows/blocks it scores, cold blocks re-fault from the
-read-only mapping. Result: **a larger-than-RAM int8 ANN index** — the capability
-`FlatI8Mmap` has been missing, delivered by the same mechanism goinfer proved on
-35B-A3B experts. Keep the existing non-paged `LoadFlatI8Mmap` behavior the default;
-paging is opt-in (a budget arg / option).
+Wire `SpanCache` into FlatI8 (or a paged sibling loader) and aikit gains a
+**larger-than-RAM int8 ANN index**: query an index whose codes exceed RAM, paged
+under a budget, the cold rows re-faulting from the read-only mapping. FlatI8Mmap is
+aikit's flagship "embed a huge index" feature; this is the capability it's been
+missing, delivered by the same mechanism goinfer already proved on 35B-A3B experts.
 
-## Gates
+## 4. Stability tier + release coordination
 
-- **Pure-refactor for `ann`/`embed`:** lifting `mmapReadOnly` must be byte-for-byte
-  behavior-preserving — existing `OpenSafetensorsMmap` / `FlatI8Mmap` tests stay
-  green **unchanged**.
-- **`SpanCache`:** an LRU/eviction unit test (eviction count > 0 when over budget) +
-  a **model-free property test**: `MADV_DONTNEED` a span, re-read, assert
-  byte-identical, then `MADV_WILLNEED` + read again (port goinfer's always-on
-  `TestMadvise_dontneedRefaultsIntact` — this is the correctness keystone: a
-  read-only file-backed mapping re-faults identical bytes, so eviction is lossless).
-- **FlatI8 paged == resident:** recall@k of a budget-paged index is **identical** to
-  the fully-resident index over the same queries, with eviction count > 0 to prove
-  the budget fired (paging is lossless — the cap costs faults, never wrong codes).
-- **`!unix` builds** (the fallback path), as aikit CI already enforces.
+- **New public surface ⇒ Experimental.** The leaf and `WeightMat.MappedSpan` ship
+  *outside* the v1.0 Hard-tier guarantee (like `FlatI8`, `vision`, `linalg`
+  itself) — settling, may change in a minor. Say so in the README package table.
+- **Leaf invariant:** stdlib-only, no aikit imports, no cgo — so `ann` and `embed`
+  importing it can never create a cycle. CI builds the `!unix` fallback (the
+  software path) as aikit already does.
+- **Release:** the leaf ships in an aikit minor (call it the next after v1.7.3).
+  goinfer bumps its `require` to that version and refactors **after** it's tagged —
+  never against an untagged aikit (the goinfer plan gates on this).
 
-## Non-goals
+## 5. Non-goals (stay out of aikit)
 
-- No model/LLM logic in the leaf (no MoE, no layers) — `SpanCache` is span+budget
-  only; the demand signal stays in goinfer.
-- Not Hard-tier — ships Experimental; note it in the README package table.
-- Don't change the default `LoadFlatI8Mmap` behavior — paging is additive/opt-in.
+- The transformer-specific pagers themselves (router demand signal, layer-order
+  prefetch, `LayerWeights`/`expertWeights`) — those stay in goinfer; only the
+  `SpanCache` substrate they sit on moves.
+- The `.giw` weight format / goinfer's `serialize.go` payload. **Soft watch only:**
+  the magic/version/CRC/lazy-fallback *envelope* is triplicated (aikit `ann` persist
+  + `format_errors.go`, goinfer's `serialize.go` "mirrors ken's index_serialize.go",
+  ken). A shared `blob` envelope could de-dup the scaffolding — but the payloads
+  genuinely differ and aikit already has `ErrFormat`, so it's lower value than the
+  mmap/madvise/span work. Don't bundle it into this lift; note it and move on.
 
-## Reference (goinfer source to mirror)
+## 6. Gates
 
-- `goinfer/decoder/mmap_unix.go` + `mmap_other.go` — the `MapReadOnly`/`Unmap` body.
-- `goinfer/decoder/madvise_unix.go` + `madvise_darwin.go` + `madvise_other.go` —
-  the `Advise` split (mind the darwin `MADV_FREE` nuance).
-- `goinfer/decoder/moepaging.go` — `expertPager` is the `SpanCache` to generalize
-  (LRU + byte budget + Touch); `alignedMappedSpan` + `availableRAMBytes` /
-  `autoWeightBudget` are the helpers to lift (`MappedSpan` → linalg, the rest → leaf).
-- aikit: `ann/mmap_unix.go` (the dup to delete), `ann/flat_i8_mmap.go` (the paging
-  target — `bq`/`scales`/`mmap` fields, `Close`/`finalizeMmap`).
+- **Pure-refactor for ann/embed:** lifting `mmapReadOnly` into the leaf must be
+  byte-for-byte behavior-preserving — existing `OpenSafetensorsMmap` / `FlatI8Mmap`
+  tests stay green unchanged.
+- **`SpanCache` correctness:** an LRU/eviction unit test + a model-free "DONTNEED
+  then re-read is byte-identical" property test (goinfer already has the latter as
+  `TestMadvise_dontneedRefaultsIntact` — bring it down with the code).
+- **FlatI8 paged == resident:** recall@k of a budget-paged FlatI8 index is
+  **identical** to the fully-resident index over the same queries (paging is
+  lossless — the cap costs faults, never wrong codes), with eviction count > 0 to
+  prove the budget fired.

@@ -526,7 +526,8 @@ is now **2.6×** there and **6.3×** at 8590 MFLOP.
 - The CUDA f32 GEMM: Metal's `gemm_f32_sg_big` does **not** port as `wmma` — NVIDIA Tensor Cores
   have no fp32×fp32 path, and a tf32-input wmma (~10-bit mantissa, ~1e-3 relative) cannot meet the
   encoder's 2e-4 bound. The CUDA analogue is a **non-Tensor-Core register-blocked f32 kernel**; the
-  kickoff prompt is [`prompts/cuda-f32-gemm.md`](prompts/cuda-f32-gemm.md). tf32 would need its own
+  kickoff prompt is [`internal/archive/cuda-f32-gemm.md`](internal/archive/cuda-f32-gemm.md) (done;
+  archived). tf32 would need its own
   deliberately-relaxed, separately documented gate and must stay off the parity-exact path.
 
 **Ruled out — not deferred:** `embed` (Model2Vec). This is a **settled decision, not a phase
