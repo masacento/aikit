@@ -54,9 +54,13 @@ func benchGEMM(b *testing.B, tiled bool, M, N, K int) {
 		p, cfg = v.GEMMW8A8Tiled, TileGrid(M, N)
 	}
 	run := func() {
-		_ = q.Launch(p, cfg, Arg(dA), Arg(dAs), Arg(dB), Arg(dBs), Arg(dC),
-			ArgValue(int32(M)), ArgValue(int32(N)), ArgValue(int32(K)))
-		_ = q.Sync()
+		if err := q.Launch(p, cfg, Arg(dA), Arg(dAs), Arg(dB), Arg(dBs), Arg(dC),
+			ArgValue(int32(M)), ArgValue(int32(N)), ArgValue(int32(K))); err != nil {
+			b.Fatalf("Launch: %v", err)
+		}
+		if err := q.Sync(); err != nil {
+			b.Fatalf("Sync: %v", err)
+		}
 	}
 	for range 5 { // warm: JIT, caches, clocks
 		run()

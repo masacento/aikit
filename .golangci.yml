@@ -76,20 +76,52 @@ linters:
 
   exclusions:
     rules:
-      # errcheck (including check-blank) is scoped to PRODUCTION code. check-blank
-      # exists to guard the launch/copy/synchronise/download paths — the shape that
-      # cost the sibling goinfer 35 discards on its decode forward path — and those
-      # are production. A test's error-discards are the test's own concern: its
-      # assertions are the check, and `_ = m.Encode(x)` / `_ = f.MarshalBinary()` /
-      # `_ = filepath.WalkDir(...)` in a test are called for effect, timing, or
-      # setup, not for a result whose error is load-bearing. Blank-checking those 60+
-      # sites would be pure noise, so errcheck does not run on _test.go at all.
-      # (This subsumes the earlier per-pattern test exclusions — binary.Write corpus
-      # builders and the gpu backend-teardown Closes — with one honest rule. The
-      # trade-off: a genuinely-unchecked non-blank error in a test is no longer
-      # flagged here; that is accepted, tests being self-asserting.)
+      # check-blank IS enforced in tests, but only where a swallowed error turns into a
+      # SILENT ZERO instead of a loud failure — the GPU launch / copy / synchronise / download
+      # and device-forward calls (q.Launch, q.Sync, gpuMatmul, a gpu backend's Encode/Forward,
+      # Download/Upload/Synchronize). goinfer's A13 was exactly that shape — four blank discards
+      # of a device call in a test — and it cost most of a day of investigation. Those are NOT
+      # excluded below, so `_ = q.Launch(...)` in a test reddens the lint.
+      #
+      # Everything else in a test is the test's own concern: its assertions are the check, and
+      # `_ = f.MarshalBinary()` / `_ = m.Encode(x)` (CPU) / `_ = filepath.WalkDir(...)` are
+      # called for effect, timing, or setup. Those benign families are declared here by
+      # message, so the noise stays out while the load-bearing device calls stay checked.
+      - path: _test\.go # teardown Close — nothing to flush
+        linters: [errcheck]
+        text: "Error return value of `.*\\.Close` is not checked"
+      - path: _test\.go # corpus/round-trip serialization into an in-memory buffer
+        linters: [errcheck]
+        text: "Error return value of `(.*\\.MarshalBinary|.*\\.WriteTo|binary\\.Write|json\\.Marshal)` is not checked"
+      - path: _test\.go # filesystem walk / temp-dir setup+cleanup / test munmap
+        linters: [errcheck]
+        text: "Error return value of `(filepath\\.(WalkDir|Glob|Rel)|os\\.(MkdirAll|Remove|RemoveAll)|syscall\\.Munmap)` is not checked"
+      - path: _test\.go # image encode into a buffer / discard sink
+        linters: [errcheck]
+        text: "Error return value of `((png|jpeg)\\.Encode|io\\.Discard\\.Write)` is not checked"
+      - path: _test\.go # safetensors/tensor accessors probed in accessor tests
+        linters: [errcheck]
+        text: "Error return value of `.*\\.(Float16sToF32|Float32s|SubF32|Tensor)` is not checked"
+      - path: _test\.go # chunk helper called for effect
+        linters: [errcheck]
+        text: "Error return value of `chunk\\.ChunkFile` is not checked"
+      # CPU encoder/tokenizer forward called for effect/timing — scoped to the root encoder and
+      # embed tests, so a GPU backend's Encode/Forward (gpu/*_test.go) is NOT covered and still
+      # reddens the lint.
+      - path: (embed|encoder)/.*_test\.go
+        linters: [errcheck]
+        text: "Error return value of `.*\\.(Encode|EncodeBatch|EncodeWithSpecials)` is not checked"
+      # Unnamed returns errcheck could not attribute (method values, multi-assign) in root-module
+      # tests — benign discards in parse/mmap/registry tests. The GPU device calls this rule set
+      # keeps checked are all NAMED (q.Launch, gpuMatmul, …), so they are not matched here.
       - path: _test\.go
         linters: [errcheck]
+        text: "^Error return value is not checked$"
+      # vision CPU forward in a scratch/fuzz benchmark (vision.Encoder is CPU; the GPU vision
+      # forward lives in gpu/visionmetal + gpu/visioncuda and is not covered here).
+      - path: vision/.*_test\.go
+        linters: [errcheck]
+        text: "Error return value of `.*\\.Forward` is not checked"
       # gpu/cuda.go closes cuda handles (device buffers, modules, contexts) on the
       # release/error path — the same release-side posture as the reader Closes in
       # exclude-functions above, across several one-off cuda handle types too specific for

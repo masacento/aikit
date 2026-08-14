@@ -919,9 +919,13 @@ func BenchmarkGEMMF32(b *testing.B) {
 		out := NewBufferLenOf[float32](d, s.M*s.N)
 		gflop := 2.0 * float64(s.M) * float64(s.N) * float64(s.K) / 1e9
 		run := func(p Pipeline, cfg LaunchConfig) {
-			_ = q.Launch(p, cfg, Arg(dA), Arg(dB), Arg(out),
-				ArgValue(int32(s.M)), ArgValue(int32(s.N)), ArgValue(int32(s.K)))
-			_ = q.Sync()
+			if err := q.Launch(p, cfg, Arg(dA), Arg(dB), Arg(out),
+				ArgValue(int32(s.M)), ArgValue(int32(s.N)), ArgValue(int32(s.K))); err != nil {
+				b.Fatalf("Launch: %v", err)
+			}
+			if err := q.Sync(); err != nil {
+				b.Fatalf("Sync: %v", err)
+			}
 		}
 		name := fmt.Sprintf("M%d_N%d_K%d", s.M, s.N, s.K)
 		b.Run(name+"/tiled", func(b *testing.B) {

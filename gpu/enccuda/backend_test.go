@@ -189,10 +189,14 @@ func BenchmarkEncoderMatmulBT(b *testing.B) {
 		b.Run(name+"/gpu", func(b *testing.B) {
 			// force the device path regardless of the threshold, so the sweep shows
 			// where the crossing actually is rather than where we guessed it is
-			_ = gb.gpuMatmul(a, w, dst, s.M, s.K, s.N)
+			if err := gb.gpuMatmul(a, w, dst, s.M, s.K, s.N); err != nil {
+				b.Fatalf("gpuMatmul warm: %v", err)
+			}
 			b.ResetTimer()
 			for range b.N {
-				_ = gb.gpuMatmul(a, w, dst, s.M, s.K, s.N)
+				if err := gb.gpuMatmul(a, w, dst, s.M, s.K, s.N); err != nil {
+					b.Fatalf("gpuMatmul: %v", err)
+				}
 			}
 			b.ReportMetric(mf/1e3/(b.Elapsed().Seconds()/float64(b.N)), "GFLOP/s")
 		})

@@ -86,12 +86,20 @@ func oneViT(t *testing.T, modelDir, recordsPath string) bool {
 
 	timeForward := func() (out []float32, best time.Duration) {
 		for range 2 { // warm
-			out, _ = enc.Forward(px)
+			o, err := enc.Forward(px)
+			if err != nil {
+				t.Fatalf("Forward: %v", err)
+			}
+			out = o
 		}
 		best = time.Hour
 		for range 8 {
 			t0 := time.Now()
-			out, _ = enc.Forward(px)
+			o, err := enc.Forward(px)
+			if err != nil {
+				t.Fatalf("Forward: %v", err)
+			}
+			out = o
 			if d := time.Since(t0); d < best {
 				best = d
 			}

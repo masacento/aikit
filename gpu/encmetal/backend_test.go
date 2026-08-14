@@ -204,13 +204,17 @@ func TestEncMetal_endToEnd(t *testing.T) {
 	// Wall-clock: median of a few runs each (a forward is ~72 sequential MatmulBT calls).
 	timeEncode := func(b *encoder.BERT) time.Duration {
 		for range 2 { // warm
-			_, _ = b.Encode(text)
+			if _, err := b.Encode(text); err != nil {
+				t.Fatalf("Encode warm: %v", err)
+			}
 		}
 		const reps = 20
 		best := time.Hour
 		for range reps {
 			t0 := time.Now()
-			_, _ = b.Encode(text)
+			if _, err := b.Encode(text); err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
 			if d := time.Since(t0); d < best {
 				best = d
 			}
@@ -418,10 +422,14 @@ func BenchmarkEncoderMatmulBT(b *testing.B) {
 		b.Run(name+"/gpu", func(b *testing.B) {
 			// force the device path regardless of the threshold, so the sweep shows where
 			// the crossing actually is rather than where we guessed it
-			_ = gb.gpuMatmul(a, w, dst, s.M, s.K, s.N)
+			if err := gb.gpuMatmul(a, w, dst, s.M, s.K, s.N); err != nil {
+				b.Fatalf("gpuMatmul warm: %v", err)
+			}
 			b.ResetTimer()
 			for range b.N {
-				_ = gb.gpuMatmul(a, w, dst, s.M, s.K, s.N)
+				if err := gb.gpuMatmul(a, w, dst, s.M, s.K, s.N); err != nil {
+					b.Fatalf("gpuMatmul: %v", err)
+				}
 			}
 			b.ReportMetric(mf/1e3/(b.Elapsed().Seconds()/float64(b.N)), "GFLOP/s")
 		})

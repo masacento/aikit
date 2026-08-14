@@ -159,7 +159,7 @@ func TestCUDA_explicitGeometrySharedMem(t *testing.T) {
 	// being sent to the driver and not dropped on the floor.
 	huge := GridOne(block, 1<<30) // 1 GiB of dynamic shared memory: far past any limit
 	if err := q.Launch(p, huge, Arg(dx), Arg(out), ArgValue(int32(n))); err == nil {
-		_ = q.Sync()
+		_ = q.Sync() //nolint:errcheck // draining the unexpectedly-accepted launch before the assertion below
 		t.Error("a 1 GiB dynamic shared-memory request was accepted — SharedMemBytes is not reaching the driver")
 	}
 }
