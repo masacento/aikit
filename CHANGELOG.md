@@ -18,10 +18,12 @@ it.
   decoder — a leftover from the split). The reference generators now live in `scripts/oracle/` (the
   34 PyTorch/HF golden pins + `gen_iq_grids.py`, which dumps llama.cpp's ggml tables), and the one
   cost-basis exception in `scripts/fixtures/` (`prep_beir.py`, an HF-parquet fetch for a manual
-  benchmark). `tools/pyguard` (CI) fails on any `.py` directly under `scripts/`, so the boundary is
+  benchmark). `tools/scriptsguard` (CI) enforces both campaigns' claims by directory: every `.py`
+  under `scripts/` must be in `oracle/` or `fixtures/`, and NO `.sh` may live under `scripts/`
+  (deciding-shell gates are Go commands under `tools/`) — so neither residue can silently regress,
   derived by directory rather than a hand-kept list. Skip-message and doc references to the pin
-  scripts moved with them. (The gpu/ CUDA build helper `nvrtc_compile.py` is separate build
-  infrastructure, out of this scope.)
+  scripts moved with them. (The gpu/ CUDA build toolchain — `build_ptx.sh` + `nvrtc_compile.py` —
+  is separate build infrastructure, out of this scope.)
 
 ## [1.18.0] — 2026-08-14
 
