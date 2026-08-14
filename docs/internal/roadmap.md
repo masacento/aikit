@@ -1,18 +1,24 @@
-# aikit roadmap v4 — post-1.5.0
+# aikit roadmap v5 — post-1.5.0
 
-> Rewritten 2026-06-11, after v1.5.0. History: v1 (at v1.1.0) and v2 (at
-> v1.2.0) were engineering roadmaps; v3 (at v1.4.0) predicted the backlog
-> would empty into adoption work; v1.5.0 made that literal. Annotated prior
-> versions live in git history (`git log -- docs/internal/roadmap.md`).
+> Rewritten 2026-06-11, after v1.5.0; revised 2026-08-14 to drop the
+> adoption campaign. History: v1 (at v1.1.0) and v2 (at v1.2.0) were
+> engineering roadmaps; v3 (at v1.4.0) predicted the backlog would empty
+> into adoption work; v1.5.0 made that literal (v4's §1 was that campaign —
+> r/golang, Show HN, awesome-go, a named adopter). **v5 retires it: aikit is
+> not separately promoted.** Promotion effort goes to goinfer and ken; aikit
+> is their dependency and gains users transitively, not through its own
+> outreach. (r/golang specifically had stopped taking anything past the
+> small-project category — not a channel worth chasing further.) Annotated
+> prior versions, including the full campaign text, live in git history
+> (`git log -- docs/internal/roadmap.md`).
 >
-> **There are zero unblocked engineering items.** Four releases in three days
-> (v1.2.0 → v1.5.0) shipped the full 2026 hybrid-retrieval bar — dense
-> f32/int8 + lexical + learned-sparse, bi- and cross-encoder reranking,
-> persistence/mmap/`//go:embed`, parity pins on every model path, fuzzing,
-> benchmarks, an automated release gate. This document is now an adoption
-> campaign and a list of triggers. **The standing rule: new engineering
-> enters only through §2's triggers or §1's feedback. If a future session
-> finds itself adding kernels while §1 is unstarted, stop and do §1.**
+> **There is no live work.** Four releases in three days (v1.2.0 → v1.5.0)
+> shipped the full 2026 hybrid-retrieval bar — dense f32/int8 + lexical +
+> learned-sparse, bi- and cross-encoder reranking, persistence/mmap/
+> `//go:embed`, parity pins on every model path, fuzzing, benchmarks, an
+> automated release gate. **The standing rule: new engineering enters only
+> through §2's triggers.** If a future session finds itself adding kernels
+> with no trigger fired, stop.
 
 ## Scorecard (cumulative, v1.2.0 → v1.5.0)
 
@@ -28,37 +34,7 @@ knobs, pool deleted, surface audit (deliberate keep), format policy
 
 ---
 
-## 1. The adoption campaign — the only live work
-
-In order. Items 1–3 are a sequence, not a menu; each feeds the next.
-
-1. **Post the announcement** — [high / trivial]. The r/golang draft was written
-   as `r-golang-post.md` (repo root — strip the posting-notes footer), but that
-   file is **not in the repo** as of 2026-07-27 (never committed; regenerate or
-   locate before posting). Post it; optionally follow with Show HN a few days later (HN
-   wants a different lead: the war story or the `//go:embed` demo, not the
-   feature list). Submit to awesome-go the same week (its bar: API docs,
-   coverage, CI — all already met).
-2. **Work the response** — [high / reactive]. Answer every comment and
-   issue fast for the first two weeks; the prepped Q&A (footer of the post
-   draft) covers the four predictable threads. Triage feature requests
-   against §2's triggers rather than accepting them reflexively — but a
-   request that *matches* a trigger (e.g. a Windows consumer, a >1M-vector
-   corpus) is the trigger firing, and unblocks that item immediately.
-3. **Land one named adopter** — [high / not-engineering]. The strategic
-   item the last three roadmap versions agreed on. Shapes, best first: an
-   external Go service wiring in semantic search (offer hands-on help, as
-   the post does); an MCP server `//go:embed`-ing a docs corpus (build it
-   *with* someone, not speculatively); ken publicly badged as built-on-aikit
-   (first-party, so it half-counts, but it's honest social proof and free).
-   Ship v1.6 *with* the adopter named in the README.
-4. **The recall war-story blog post** — [medium / low]. Separate asset from
-   the announcement: "synthetic vectors can't measure recall" (0.99 → 0.68
-   → 1.00) is a standalone engineering post that travels on its own and
-   back-links the repo. Write after #1's response settles, using what the
-   comments reveal about which framing lands.
-
-## 1b. Unblocked items (from the 2026-06-12 goinfer cross-repo review + external kernel review)
+## 1. Unblocked items (from the 2026-06-12 goinfer cross-repo review + external kernel review)
 
 The review's headline: **the split is holding** — goinfer consumes aikit's
 loaders/kernels properly, deps point inward only, no container-format
@@ -102,7 +78,7 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
    removed so `MatmulBT`'s per-output result is M-invariant — the threshold switched
    reduction order at the M=1↔M=K boundary, an avoidable f32-reassociation footgun. All
    M now route through the blocked kernel, which measured faster at small-M decode/
-   attention shapes anyway. Gated by `TestMatmulBT_MConsistent`; see §1b.4 for the
+   attention shapes anyway. Gated by `TestMatmulBT_MConsistent`; see §1.4 for the
    over-attribution that prompted it.)*
 
    Then the 46% itself was chased and mostly closed: the large-K shortfall wasn't tile
@@ -122,7 +98,7 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
    **DONE (v1.7.2), with a correction.** [high / low]. A consumer (goinfer) reported a
    same-model speculative-decoding parity failure (`TestSpeculativeGreedyParity`,
    acceptance 0.893 vs ~1.0) after bumping its pin, and it was **mis-attributed to
-   aikit**: the theory was that §1b.3's naive/blocked threshold in `MatmulBT` made the
+   aikit**: the theory was that §1.3's naive/blocked threshold in `MatmulBT` made the
    f32 result M-dependent (M=1 naive vs M=K blocked → ~1e-5 reassociation → flipped
    argmax). We removed the threshold so `MatmulBT` is now **M-invariant** (every output
    bit-identical regardless of M; all M route through the one blocked-kernel order,
@@ -176,8 +152,10 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
 7. **Experimental→Hard graduation** — *new, the long-game item:* BERT /
    SPLADE / CrossEncoder / int8 indexes / persistence graduate to the
    semver tier once they survive two quiet consecutive minors under an
-   external consumer (the same bar the original Hard tier met). Trigger:
-   §1.3's adopter + that stability window.
+   external consumer (the same bar the original Hard tier met). Trigger: an
+   external consumer using the tier in production, organically found — not
+   chased; aikit is not separately promoted (see the top-of-file note) — plus
+   that stability window.
    *Note (§2.8), updated 2026-07-27:* `WeightMat.MatmulBTInto`'s f32/W8A8
    paths route through the `Workspace`-scoped matmul (honoring
    `SetThreshold`/`SetWorkers`), and are now **consumed in-repo** — the
@@ -244,7 +222,7 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
    which neither repo has); `rmsnorm`/`rope` (small, intentional
    duplication per the split); constrain/chat/sampler/serve/gpu.
 11. **AMX** — out of scope.
-12. **3-level (Goto) f32 GEMM for large-M prefill** — *new (from the §1b.3 packing
+12. **3-level (Goto) f32 GEMM for large-M prefill** — *new (from the §1.3 packing
    work).* B-panel packing took large-K shapes to ~69% at M≤~1024, but large M
    (≥~2048) recovers less (≈53%): the a-panel is re-read once per output column-group.
    Closing it needs full Goto blocking — an L2-resident packed B panel reused across
@@ -295,7 +273,7 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
 
 ---
 
-## 3. Speculative backlog — post-adoption, not triggered
+## 3. Speculative backlog — not triggered
 
 *Folded in from the former `docs/internal/ideas.md` (2026-08-14): 0 code
 citations, not linked from anywhere, drifting as an orphan doc alongside the
@@ -560,8 +538,8 @@ Unchanged from v3 in substance; deltas only:
 - **hugot** — the last pipeline gap closed (cross-encoder, same checkpoint,
   Δ5e-6). The comparison is now fully head-to-head and framed honestly in
   the README (deployment tradeoff, not a drag race). Their Go-SIMD bet
-  matures with archsimd (§2.5's trigger) — the announcement window is open
-  *now* and narrows when that graduates.
+  matures with archsimd (§2.5's trigger) — worth re-checking the comparison
+  when that graduates.
 - **Antfly/Termite** (Zig core), **coder/hnsw** (measured 0.22 vs 0.995),
   **Bleve/chromem-go/sqlite-vec** (index-only), **Ollama** (server) — all
   unchanged; the README table and capability matrix carry these.
