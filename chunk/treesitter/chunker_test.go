@@ -136,7 +136,7 @@ int main() {
 	}
 }
 
-// TestSupportedLanguages confirms every language in KenToTreeSitter is
+// TestSupportedLanguages confirms every language in languageGrammars is
 // reported, and the set is non-empty (we'd notice a typo or missing
 // init() pretty quick because ChunkFile routes via this list).
 //

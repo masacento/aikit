@@ -5,7 +5,7 @@ import (
 )
 
 // TestStats_UnsupportedLanguageIncrementsFallback exercises the
-// language-not-in-KenToTreeSitter branch of Chunk — the silent
+// language-not-in-languageGrammars branch of Chunk — the silent
 // fallback path the OSS-demo playbook needs to be able to quantify.
 // Asserts that:
 //
@@ -21,7 +21,7 @@ import (
 func TestStats_UnsupportedLanguageIncrementsFallback(t *testing.T) {
 	c := New()
 
-	// Pick a language name guaranteed to miss KenToTreeSitter so we
+	// Pick a language name guaranteed to miss languageGrammars so we
 	// hit poolFor()==nil. "shell" is the documented fallback-only
 	// language (bash grammar too slow); this sentinel is a
 	// never-was-supported name so the test can't ever be invalidated

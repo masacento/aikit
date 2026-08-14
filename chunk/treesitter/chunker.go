@@ -1,4 +1,4 @@
-// Package treesitter is ken's v0.2.0 chunker: a pure-Go tree-sitter
+// Package treesitter is aikit's tree-sitter chunker: a pure-Go tree-sitter
 // runtime via github.com/odvcencio/gotreesitter, with chunk boundaries
 // determined by the cAST split-then-merge algorithm (arXiv 2506.15655 —
 // the same algorithm Chonkie uses). Registers itself as "treesitter" in
@@ -62,7 +62,7 @@
 //   - **Deliberate language omissions** (languages.go). The C# grammar
 //     OOMs on real-world C# (1.7+ GB RSS → SIGKILL); bash grammar is
 //     too slow even with the timeout. Both are absent from
-//     KenToTreeSitter and auto-fall-back to the line chunker, matching
+//     languageGrammars and auto-fall-back to the line chunker, matching
 //     the regex chunker's behavior for those languages. Revisit when
 //     gotreesitter ships bounded-memory C# or a faster bash grammar.
 package treesitter
@@ -165,8 +165,8 @@ func (*Chunker) Name() string { return "treesitter" }
 // this is exhaustive of what the treesitter chunker can handle, not a
 // curated subset.
 func (*Chunker) SupportedLanguages() []string {
-	out := make([]string, 0, len(KenToTreeSitter))
-	for k := range KenToTreeSitter {
+	out := make([]string, 0, len(languageGrammars))
+	for k := range languageGrammars {
 		out = append(out, k)
 	}
 	return out
@@ -190,7 +190,7 @@ func (c *Chunker) poolFor(kenLang string) *gotreesitter.ParserPool {
 	if v, ok := c.pools.Load(kenLang); ok {
 		return v.(*gotreesitter.ParserPool)
 	}
-	tsName, ok := KenToTreeSitter[kenLang]
+	tsName, ok := languageGrammars[kenLang]
 	if !ok {
 		return nil
 	}
@@ -241,7 +241,7 @@ const parseTimeoutMicros uint64 = 1_000_000
 // fields in order reproduces source exactly (the byte-fidelity
 // invariant from internal/chunk/regex).
 //
-// If the language is not in KenToTreeSitter, the grammar isn't
+// If the language is not in languageGrammars, the grammar isn't
 // registered, or the parser times out / fails, the chunker degrades
 // to the registered "line" chunker — NOT to a single whole-file
 // chunk. Whole-file fallback is catastrophic for BM25 (the entire
@@ -342,7 +342,7 @@ func newlineOffsets(source []byte) []uint32 {
 }
 
 // fallback delegates to the registered "line" chunker. This is the
-// graceful-degrade path when (a) the language isn't in KenToTreeSitter
+// graceful-degrade path when (a) the language isn't in languageGrammars
 // (e.g. csharp, deliberately omitted), (b) the grammar isn't
 // registered, (c) the parse timed out, or (d) the parse returned a nil
 // tree. Whole-file fallback was the original v0.2.0 behavior; it
