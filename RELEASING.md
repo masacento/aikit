@@ -47,6 +47,13 @@ Automated and CI-enforced.
 4. Push the prep commit, wait for **root CI green**, then push the tag `vX.Y.Z`.
    `.github/workflows/release.yml` re-runs the gate on the tag and publishes the GitHub
    Release from the CHANGELOG section.
+5. **Immediately after the tag lands, run `go run -C tools ./gpupins --fix`, commit, and push.**
+   The new root tag `vX.Y.Z` is now the latest, so the eight `gpu/*` backends — which pinned the
+   *previous* root tag — are stale, and the `gpu-pins` CI gate goes red on the next push. That red
+   is correct (it says "finish the release"), but it is avoidable: `--fix` rewrites the eight from
+   git in one command, so closing it here means the gate never reddens for a known, self-inflicted
+   reason. Commit e.g. `release: bump gpu backends to aikit vX.Y.Z (gpupins --fix)`. (This is the
+   root-release counterpart of the gpu-submodule ritual's step 3, which already runs `--fix`.)
 
 ## GPU submodule — `github.com/townsendmerino/aikit/gpu` (tags `gpu/vX.Y.Z`)
 
