@@ -108,7 +108,7 @@ aikit was extracted so the retrieval core could make a semver promise while
 the LLM runtime keeps moving (the split is recorded in goinfer's
 [`migration-plan.md`](https://github.com/townsendmerino/goinfer/blob/main/docs/migration-plan.md);
 the motivating critique in
-[`internal/road-to-1.0-critique.md`](./internal/road-to-1.0-critique.md)).
+[`internal/archive/road-to-1.0-critique.md`](./internal/archive/road-to-1.0-critique.md)).
 Dependencies point inward only: goinfer and ken import aikit; aikit imports
 neither.
 

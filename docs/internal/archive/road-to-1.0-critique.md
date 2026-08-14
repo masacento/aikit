@@ -1,5 +1,13 @@
 # Road to 1.0 — critique & punch-list (ken + aikit)
 
+> **Status, aikit side: DONE (2026-08-14).** All 5 items below are satisfied,
+> including "cut v1.0.0" — aikit is now at v1.18.0, well past that bar. The 4
+> remaining unchecked boxes in this doc are **ken's**, not aikit's; they belong
+> to ken's own roadmap/tracking, out of scope for this repo. Archived rather
+> than left in `docs/internal/` looking like open aikit work.
+>
+> ---
+>
 > Captured 2026-06-04. Source: external review of both repos. The engineering
 > quality in both is well past most projects' 1.0 bar (ADRs for every decision,
 > parity-gated numerics, honest limitation docs, clean TODO hygiene). The
@@ -108,7 +116,7 @@ inference with no Python/cgo. But it isn't packaged or marketed for that person.
       the **Experimental** tier (excluded from the 1.0 promise, may evolve).
       Verified backward-compatible across 0.4.x↔0.5.x with `apidiff` (zero
       incompatible changes) — the two-consecutive-minors bar is met.
-- [ ] Cut `v1.0.0` (maintainer's go).
+- [x] Cut `v1.0.0` (maintainer's go) — done; aikit is at v1.18.0.
 
 ### One-sentence version
 ken's gap to 1.0 is **distribution and recall, not code**; aikit's gap is
