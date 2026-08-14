@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// The A1 go/no-go (task-q8k-integer-accum.md §5.4): does the native Q6_K/Q4_K integer-accum GEMV
+// The A1 go/no-go (docs/internal/archive/task-q8k-integer-accum.md §5.4): does the native Q6_K/Q4_K integer-accum GEMV
 // beat the current decode path — dequant→int8-requant→W8A8, which at decode time is just
 // MatmulBTW8A8 over the already-int8 resident weight — by ≥1.3× at M=1? The native path reads fewer
 // weight bytes (Q6_K 210 B/256 = 0.82 B/w, Q4_K 144/256 = 0.56 B/w, vs int8's 1 B/w) but pays a

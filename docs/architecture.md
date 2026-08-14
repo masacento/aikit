@@ -57,11 +57,12 @@ graph TD
         chunk["chunk (+ regex, markdown, line)<br/><i>chunker registry</i>"]
         linalg["linalg<br/><i>SIMD f32/int8/int4 kernels</i>"]
         embed["embed<br/><i>Model2Vec + safetensors/GGUF loaders</i>"]
-        encoder["encoder<br/><i>CodeRankEmbed reranker</i>"]
+        encoder["encoder<br/><i>BERT-family embedders (9 architectures) +<br/>SPLADE expansion + cross-encoder reranker</i>"]
         vision["vision<br/><i>SigLIP/ViT image encoder (Experimental)</i>"]
         bench["bench<br/><i>recall + latency harness</i>"]
         encoder --> embed
         encoder --> linalg
+        encoder --> sparse
         vision --> embed
         vision --> linalg
         ann --> linalg
@@ -71,6 +72,10 @@ graph TD
         bench --> ann
     end
     ts["chunk/treesitter<br/><i>separate module</i>"] -.->|implements chunk.Chunker| chunk
+    gpu["gpu/* — 8 native CUDA/Metal backends<br/><i>separate modules, cgo, ~14.6k LOC</i>"]
+    gpu -.->|EnableGPU| ann
+    gpu -.->|RegisterBackend #quot;cuda#quot;/#quot;metal#quot;| encoder
+    gpu -.->|RegisterResident| vision
     ts --> gts["gotreesitter<br/>(pure Go, large grammars)"]
     embed --> xtext["golang.org/x/text"]
 ```
@@ -80,13 +85,21 @@ Everything not shown depending on something depends only on the stdlib.
 `bm25`, `sparse`) use `topk` for selection, and since v1.2 `ann` scores
 through `linalg`'s SIMD dot kernels; `embed` adds the one external dependency
 (`golang.org/x/text`, for tokenizer normalization); `encoder`, `vision`, and
-`bench` are the composites. `vision` (the SigLIP/ViT image encoder) is a new leaf
-consumer on `embed`+`linalg` and adds **no** external dependency — its image
-decode uses only stdlib codecs (`image/jpeg`, `image/png`), and like `encoder` it
-exposes an import-free GPU-export seam (`GPUWeights`) plus a `RegisterResident`
-inversion so goinfer's WebGPU backend plugs in without the core importing it. The
-dotted edge is registry-based, not an import: the
-`chunk/treesitter` module registers itself via `chunk.Register` on import.
+`bench` are the composites. `encoder` also imports `sparse` directly:
+`encoder.SPLADE.Expand` produces the `sparse.SparseVec` values the `sparse`
+package indexes, so the SPLADE loop (BERT + masked-LM head → sparse vector →
+inverted index) runs end-to-end in-process. `vision` (the SigLIP/ViT image
+encoder) is a new leaf consumer on `embed`+`linalg` and adds **no** external
+dependency — its image decode uses only stdlib codecs (`image/jpeg`,
+`image/png`), and like `encoder` it exposes an import-free GPU-export seam
+(`GPUWeights`) plus a `RegisterResident` inversion so a WebGPU backend (e.g.
+goinfer's) plugs in without the core importing it. The dotted edges are
+registry-based, not imports: `chunk/treesitter` registers itself via
+`chunk.Register` on import, and each `gpu/*` backend registers itself via the
+matching seam (`FlatI8.EnableGPU`, `encoder.RegisterBackend`,
+`vision.RegisterResident`) on import — see § Quarantines and
+[`docs/task-native-gpu.md`](task-native-gpu.md) for the full backend-by-backend
+detail (device substrate, per-seam kernels, parity gates).
 
 ## Repo ecosystem
 
@@ -122,24 +135,31 @@ RoPE, softmax, and elementwise ops always run on CPU; only the big weight
 matmuls route through the `Backend` interface.
 
 The default `"cpu"` backend (pure-Go SIMD) is compiled in. GPU is an
-*inversion*: `goinfer/gpu`, built with `-tags gpu`, calls
-`encoder.RegisterBackend("webgpu", …)` from its `init()`. aikit gains GPU
-acceleration without the cgo WebGPU dependency ever entering its module
-graph — and `NewBackend("webgpu")` on a non-GPU build degrades to CPU with
-an explanatory error rather than failing.
+*inversion*: an external package calls `encoder.RegisterBackend(name, …)`
+from its `init()`, and aikit gains GPU acceleration without the cgo
+dependency ever entering its module graph. Two implementations exist: an
+external one (`goinfer/gpu`, registers `"webgpu"`) and aikit's own native
+ones (`gpu/enccuda`/`gpu/encmetal`, in this repo, register `"cuda"`/`"metal"`
+— see § Quarantines). `NewBackend(name)` on a build that never imported a
+registering package degrades to CPU with an explanatory error rather than
+failing. `ann` and `vision` have analogous inversions of their own
+(`FlatI8.EnableGPU`, `vision.RegisterResident`) that aikit's `gpu/anncuda`
+family also plugs into — same pattern, different interface, because `ann`'s
+and `vision`'s hot paths aren't a single matmul the way `encoder`'s is.
 
-Why only matmul: it's the hot path by a wide margin, and keeping everything
-else on CPU avoids a host↔device round-trip per layer.
+Why only matmul for `encoder`: it's the hot path by a wide margin, and
+keeping everything else on CPU avoids a host↔device round-trip per layer.
 
 ## Quarantines
 
-Two dependencies are deliberately kept out of the core module graph, each by
-a different mechanism (CI enforces both):
+Three kinds of dependency are deliberately kept out of the core module graph,
+each by a different mechanism (CI enforces all three):
 
 | Dependency | Why quarantined | Mechanism |
 |---|---|---|
-| `cogentcore/webgpu` (cgo) | would break the no-cgo promise | inverted behind `encoder.Backend`; lives in `goinfer/gpu` |
+| `cogentcore/webgpu` (cgo) | would break the no-cgo promise | inverted behind `encoder.Backend`; lives in `goinfer/gpu`, not this repo |
 | `gotreesitter` (pure Go, ~large embedded grammars; pre-1.0 upstream) | payload size + upstream churn risk | separate module `chunk/treesitter`, registers via `chunk.Register`; versioned in lockstep with the core |
+| CUDA/Metal bindings (cgo) — aikit's own native GPU backends | would break the no-cgo promise | `gpu/*`: a shared device-substrate module (`gpu`) plus 8 one-backend-per-module leaves (`anncuda`/`annmetal` → `FlatI8.EnableGPU`; `enccuda`/`encmetal` → `encoder.RegisterBackend("cuda"/"metal", …)`, the same seam `goinfer/gpu` uses; `qwencuda`/`qwenmetal` and `visioncuda`/`visionmetal` → `vision.RegisterResident`); each versioned in lockstep with the core (the two-tag-series, `tools/gpupins`); full detail in [`docs/task-native-gpu.md`](task-native-gpu.md) |
 
 ## Retrieval pipeline (how a consumer composes it)
 

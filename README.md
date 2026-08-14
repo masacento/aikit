@@ -30,10 +30,10 @@ large embedded-grammar payload) — is quarantined in the separate
 | `linalg` | SIMD `f32` dot/matmul (NEON on arm64, AVX2/FMA on amd64) + int8/int4 quant kernels | — |
 | `mmap` *(Experimental)* | read-only file mapping + `madvise` residency hints + a demand-signal-agnostic `SpanCache` (LRU spans under a byte budget) — the substrate `ann`/`embed` mmap loaders sit on; cgo-free, `!unix` heap fallback | `golang.org/x/sys` *(darwin only)* |
 | `embed` | Model2Vec inference: WordPiece tokenizer + safetensors loader + L2-norm | `golang.org/x/text` |
-| `encoder` | CodeRankEmbed (NomicBert) + MiniLM-class BERT embedder + SPLADE expansion + cross-encoder reranker — transformer inference scored by cosine / sparse dot / relevance logit; pluggable matmul `Backend` | `embed`, `linalg`, `sparse` |
+| `encoder` | BERT/RoBERTa/XLM-R/GTE/nomic-bert(+MoE) embedder family (12 certified models, `docs/embedder-coverage.md`, incl. CodeRankEmbed) + SPLADE expansion + cross-encoder reranker — transformer inference scored by cosine / sparse dot / relevance logit; pluggable matmul `Backend` | `embed`, `linalg`, `sparse` |
 | `vision` *(Experimental)* | SigLIP / ViT image encoder — decode → preprocess → pure-Go transformer forward → image embeddings (f32 or int8 W8A8), parity-pinned to HF `SiglipVisionModel`; stdlib image codecs, no cgo | `embed`, `linalg` |
 | `chunk` | language-aware chunker registry + `regex`, `markdown`, `line` chunkers | — |
-| `gpu` *(Experimental, darwin; separate module)* | cgo-free native-GPU device substrate — `Device`/`Buffer`/`Queue`/`Pipeline`/`Encoder` + a runtime MSL compiler over Metal; the GPU analogue of `linalg`'s CPU role. `gpu/annmetal` registers an `ann.Backend` that scores `FlatI8`'s int8 corpus GEMV on the GPU (`FlatI8.EnableGPU`). Device tests are hand-run (no GPU CI); the default aikit build never imports it and stays pure-Go. | `github.com/ebitengine/purego` *(darwin)* |
+| `gpu` *(Experimental, darwin+linux; separate modules)* | cgo-free native-GPU device substrate — `Device`/`Buffer`/`Queue`/`Pipeline`/`Encoder` over Metal (darwin, runtime MSL compiler) or CUDA (linux, embedded PTX); the GPU analogue of `linalg`'s CPU role. 8 one-backend-per-module leaves plug into 3 seams: `anncuda`/`annmetal` → `FlatI8.EnableGPU`; `enccuda`/`encmetal` → `encoder.RegisterBackend("cuda"/"metal", …)`; `qwencuda`/`qwenmetal` + `visioncuda`/`visionmetal` → `vision.RegisterResident`. Device tests are hand-run (no GPU CI); the default aikit build never imports any of them and stays pure-Go. | `github.com/ebitengine/purego` *(darwin)*, `github.com/eitamring/gocudrv` *(linux)* |
 | `chunk/treesitter` *(submodule)* | tree-sitter-backed syntactic chunker | `gotreesitter`, `…/aikit` |
 
 `chunk/treesitter` is a **separate Go module** (`…/aikit/chunk/treesitter`) so the
@@ -234,9 +234,9 @@ settles.
 - `embed.Truncate` — new Matryoshka (MRL) embedding truncate + L2-renormalize
   helper; pairs with `ann.FlatI8` for compounded memory reduction.
 - `sparse` — the whole package is new (learned-sparse / SPLADE retrieval). The
-  `SparseVec` / `Index` / `Query` shape is settled, but it ships only the index +
-  scorer half (an in-process masked-LM expansion head is a planned follow-up that
-  may extend the surface), so it stays Experimental until that lands.
+  `SparseVec` / `Index` / `Query` shape is settled; `encoder.SPLADE` (below) now
+  provides the in-process masked-LM expansion head, closing the index+scorer
+  package end-to-end. Stays Experimental — new surface, settling.
 - `encoder.LoadQ8` / `encoder.ModelQ8` (int8 quant) — alternate precision path.
 - `encoder.LoadBERT` / `encoder.BERT` / `BERT.Encode` — MiniLM-class BERT encoder
   (learned positions + GELU FFN + mean pooling), cgo-free, parity-pinned to

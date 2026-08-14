@@ -66,11 +66,10 @@ func (w *Weights) forwardTokens(ids []int32) []float32 {
 //
 // Token-id boundaries: with isQuery=true the token sequence is
 // "[CLS] <prefix tokens…> <query tokens…> [SEP]". Callers that want
-// to exclude the instruction prefix can find its boundary via
-// EncodeQueryPrefixIDs (TODO if needed) or by re-encoding just the
-// prefix and counting; for v0 the MaxSim probe in ken handles the
-// exclusion by looking up well-known [CLS]/[SEP] ids and the prefix
-// token sequence directly.
+// to exclude the instruction prefix can find its boundary by
+// re-encoding just the prefix and counting; ken's MaxSim rerank
+// probe instead handles the exclusion by looking up well-known
+// [CLS]/[SEP] ids and the prefix token sequence directly.
 //
 // Used by ken's MaxSim rerank probe; mirror of Encode but returning
 // every position instead of CLS-pooling.

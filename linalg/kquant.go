@@ -9,7 +9,7 @@ package linalg
 // the decision is reproducible (BenchmarkGEMV_*) and so a future revisit (e.g. a bandwidth-bound
 // Q4_K variant, ceiling 1.78×) starts from a validated base rather than scratch.
 //
-// EXPERIMENTAL tier (docs/internal/task-q8k-integer-accum.md). This is the algorithm cpubrrr took
+// EXPERIMENTAL tier (docs/internal/archive/task-q8k-integer-accum.md). This is the algorithm cpubrrr took
 // from llama.cpp's ARM path to beat it on Q4_K: quantize activations to Q8_K, accumulate the
 // sub-block integer dot products weighted by the integer sub-scales in int32, and convert to float
 // ONCE per 256-value superblock. The inner loop never leaves the integer domain, so it maps onto

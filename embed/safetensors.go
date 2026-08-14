@@ -779,7 +779,6 @@ func dtypeSize(dtype string) (int, bool) {
 	}
 }
 
-// Elements returns the total number of elements (product of shape).
 // Elements returns the total number of elements (product of Shape), or -1 if
 // the product overflows int or any dim is negative. For a known dtype the H2
 // parse check already guarantees a sane shape, but parseSafetensors stores an

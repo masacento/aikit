@@ -13,10 +13,10 @@
 //
 // This package is the index + scorer HALF: New and Query operate on PRE-COMPUTED
 // SparseVec values, produced by any SPLADE-family model out of band (e.g. a
-// Python export, or a future in-process expansion head). A masked-LM expansion
-// head that produces the vectors in-process — reusing encoder's NomicBert
-// machinery — is a planned follow-up; until then sparse retrieval is fully usable
-// by indexing vectors you compute elsewhere.
+// Python export) or in-process via encoder.SPLADE, which reuses encoder's BERT
+// machinery to produce the vectors directly — see encoder.LoadSPLADE /
+// SPLADE.Expand. Both paths produce the same SparseVec shape, so sparse retrieval
+// is equally usable with vectors computed elsewhere or in-process.
 //
 // # Fusing with dense and lexical
 //

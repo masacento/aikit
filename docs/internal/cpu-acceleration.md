@@ -231,7 +231,7 @@ see `goinfer/gpu` and goinfer's perf docs.
 
 ## Native K-quant matmul (Q4_K/Q6_K × Q8_K) — evaluated, NOT shipped
 
-**Result: negative for the stated gate.** `task-q8k-integer-accum.md` asked whether a
+**Result: negative for the stated gate.** `docs/internal/archive/task-q8k-integer-accum.md` asked whether a
 native integer-accumulation K-quant kernel (the cpubrrr / llama.cpp `ggml_vec_dot_q6_K_q8_K`
 algorithm — quantize activations to Q8_K, accumulate sub-block int dot products weighted by
 the integer sub-scales, convert to float once per 256-superblock) beats the current decode
