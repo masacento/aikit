@@ -10,6 +10,15 @@ it.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The eight `gpu/*` backend modules pinned a stale root version and now track the tag.**
+  Each `require`d `aikit v1.17.0` while the root series had advanced to `v1.17.1` — the
+  two-series scheme restated by hand in eight go.mod files, and one release forgot. The new
+  `tools/gpupins` gate (CI, every push) asserts each backend names the latest `vX.Y.Z` and
+  `gpu/vX.Y.Z` tag; `go run -C tools ./gpupins --fix` rewrites them from git, replacing the
+  hand-edit in RELEASING.md step 3.
+
 ### Changed
 
 - **Require Go 1.26.6** (was 1.26.5). Picks up the go1.26.6 standard-library security

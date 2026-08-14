@@ -144,9 +144,14 @@ order is not optional:
 1. **Root** — tag `vX.Y.Z`. Nothing here depends on the rest of the repo.
 2. **`gpu`** — tag `gpu/vX.Y.Z`. Also depends on nothing in-repo (`gpu/go.mod` has no
    replaces).
-3. **The eight** — set `require github.com/townsendmerino/aikit <root tag>` and
-   `require github.com/townsendmerino/aikit/gpu <gpu tag>` in each go.mod, keep the
-   replaces, commit, then tag `gpu/anncuda/vX.Y.Z` and so on.
+3. **The eight** — run **`go run -C tools ./gpupins --fix`**. It reads the latest `vX.Y.Z`
+   and `gpu/vX.Y.Z` tags and sets `require github.com/townsendmerino/aikit <root tag>` and
+   `require github.com/townsendmerino/aikit/gpu <gpu tag>` in all eight go.mod files (keeping
+   the replaces), so the version is derived from git rather than restated by hand in eight
+   places. Commit, then tag `gpu/anncuda/vX.Y.Z` and so on. `gpupins` (no `--fix`) is a CI
+   gate on every push — the eight pinning a stale tag is the drift that shipped once (root at
+   `v1.17.1`, backends still on `v1.17.0`); it is the HOME of the two-series fact, so if this
+   bites a fifth time, read `tools/gpupins/main.go` first.
 
 Step 3 cannot be done before steps 1 and 2, because the versions it names have to exist.
 The window in between is not a regression: these modules do not resolve for consumers

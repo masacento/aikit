@@ -153,6 +153,23 @@ jobs:
       - name: scan
         run: go run -C tools ./vulncheck
 
+  gpu-pins:
+    name: gpu backend version pins
+    # AK1: the eight gpu/* backend modules each `require` the root and gpu series by an exact
+    # version — static go.mod text MVS reads, not derivable at build. This gate asserts each
+    # names the LATEST vX.Y.Z and gpu/vX.Y.Z tag, so the drift that shipped once (root at
+    # v1.17.1, backends still pinning v1.17.0) goes red on push, not on a consumer's build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # gpupins reads `git tag`; a shallow checkout has none
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: gpu backend pins
+        run: go run -C tools ./gpupins
+
   gpu-kernels:
     name: gpu mechanical gate (${{ matrix.os }})
     # The mechanical half of the gpu pre-tag ritual, run in CI on BOTH OSes so CI and the
