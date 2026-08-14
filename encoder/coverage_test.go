@@ -1,6 +1,6 @@
 package encoder
 
-// Generated embedder-coverage table (docs/task-embedding-coverage.md,
+// Generated embedder-coverage table (docs/internal/archive/task-embedding-coverage.md,
 // "Coverage claim, generated not hand-maintained").
 //
 // A hand-maintained support list rots, so this one is defended three ways:

@@ -1,5 +1,17 @@
 # Embedding-model coverage — broaden `encoder` to the popular embedders
 
+> **Status: DONE, aikit side (2026-08-14).** All 12 originally-scoped models are certified
+> except `embeddinggemma`, which is blocked externally (HF repo still gated, HTTP 401) and
+> tracked in goinfer's `docs/task-decoder-as-embedder.md` — not aikit's to close. Two models
+> (`granite-embedding`, `snowflake-arctic-embed2`) turned out to need genuinely new primitives
+> (byte-level BPE tokenizer, a RoPE+GeGLU `gte` architecture) beyond the original "config-only"
+> assumption, and both landed. The one remaining loose end — goinfer's `/v1/embeddings`
+> `resolveDimensions` should consult the per-model `Truncatable` column instead of blindly
+> truncating any model — is also goinfer-side. Archived with both handed off as a goinfer
+> prompt rather than left looking like open aikit work.
+>
+> ---
+>
 > **BLUF.** The serving surface already exists (goinfer's `/v1/embeddings` + `--embed-model`
 > + `aikit/encoder`), so this is **coverage breadth, not new plumbing**. aikit *is* the
 > retrieval/embedding toolkit, and today it runs essentially **one** embedder
