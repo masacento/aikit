@@ -60,19 +60,20 @@ const (
 )
 
 type config struct {
-	prevTag   string
-	pkg       string
-	benchRe   string
-	benchtime string
-	visits    int
-	floorK    float64
-	minFloor  float64
+	prevTag     string
+	pkg         string
+	benchRe     string
+	benchtime   string
+	visits      int
+	floorK      float64
+	minFloor    float64
+	targetClass float64 // the regression magnitude this gate exists to catch (percent)
 }
 
 func main() { os.Exit(run(os.Args[1:])) }
 
 func run(args []string) int {
-	cfg := config{pkg: defaultPkg, benchRe: defaultBench, benchtime: "200ms", visits: 6, floorK: 3.0, minFloor: 2.0}
+	cfg := config{pkg: defaultPkg, benchRe: defaultBench, benchtime: "200ms", visits: 6, floorK: 3.0, minFloor: 2.0, targetClass: 5.0}
 	var pos []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -88,6 +89,9 @@ func run(args []string) int {
 		case "--pkg":
 			i++
 			cfg.pkg = args[i]
+		case "--target":
+			i++
+			cfg.targetClass, _ = strconv.ParseFloat(args[i], 64)
 		default:
 			pos = append(pos, args[i])
 		}
@@ -106,8 +110,8 @@ func run(args []string) int {
 
 	p := gpumod.Provenance(root)
 	fmt.Printf("aikit perf gate — %s%s vs %s — %s/%s — %s\n", p.Commit, p.Dirty, cfg.prevTag, p.OSName, p.Arch, p.Date)
-	fmt.Printf("instrument: %s %s   visits: %d   benchtime: %s   floor: max(%.1f%%, %.1f·σ)\n\n",
-		cfg.pkg, cfg.benchRe, cfg.visits, cfg.benchtime, cfg.minFloor, cfg.floorK)
+	fmt.Printf("instrument: %s %s   visits: %d   benchtime: %s   floor: max(%.1f%%, %.1f·σ)   targets: %.1f%% regressions\n\n",
+		cfg.pkg, cfg.benchRe, cfg.visits, cfg.benchtime, cfg.minFloor, cfg.floorK, cfg.targetClass)
 
 	// Build both arms. The working tree (uncommitted changes included — that is how the
 	// acceptance reconstruction is measured) and the previous tag in a detached worktree.
@@ -170,6 +174,24 @@ func run(args []string) int {
 	}
 	rep := gate.ReconcileWith(cells, gate.FailWins)
 
+	// SENSITIVITY. A green here is "no regression above each shape's floor", not "no
+	// regression". State how many shapes actually resolve the target class, and name the ones
+	// that do not — on those, a green is only evidence against a LARGER regression.
+	below, blind := 0, []string{}
+	for _, sh := range shapes {
+		if floors[sh] <= cfg.targetClass {
+			below++
+		} else {
+			blind = append(blind, fmt.Sprintf("%s(±%.1f%%)", shortShape(sh), floors[sh]))
+		}
+	}
+	fmt.Println()
+	fmt.Printf("sensitivity: %d/%d shapes have a floor ≤ %.1f%% (the class this gate targets)\n", below, len(shapes), cfg.targetClass)
+	if len(blind) > 0 {
+		fmt.Printf("  BLIND to the %.1f%% class on %d shape(s): %s — a green there is only evidence against a larger regression.\n",
+			cfg.targetClass, len(blind), strings.Join(blind, " "))
+	}
+
 	fmt.Println()
 	switch rep.Outcome {
 	case gate.Fail:
@@ -179,8 +201,17 @@ func run(args []string) int {
 		fmt.Println(gate.Verdict(gate.Inconclusive, "a shape could not be measured"))
 		return 2
 	}
-	fmt.Println(gate.Verdict(gate.OK, fmt.Sprintf("no regression vs %s — %d shapes within floor", cfg.prevTag, rep.Total)))
+	fmt.Println(gate.Verdict(gate.OK, fmt.Sprintf("no regression vs %s above each shape's floor — %d/%d shapes resolve the %.1f%% class",
+		cfg.prevTag, below, rep.Total, cfg.targetClass)))
 	return 0
+}
+
+// shortShape trims the family prefix for the blind-list, keeping the K/N that identifies it.
+func shortShape(s string) string {
+	if i := strings.LastIndex(s, "/"); i >= 0 {
+		return s[i+1:]
+	}
+	return s
 }
 
 // judge applies the three fixed branches to one shape.
@@ -192,11 +223,19 @@ func judge(shape string, curV, prevV []map[string]float64, floor float64, cfg co
 	}
 	mc, mp := median(cur), median(prev)
 	delta := (mc - mp) / mp * 100 // + = current slower
+	// covers: whether this shape's floor is tight enough to catch the target regression class.
+	// A green on a shape whose floor is ABOVE the target only means "no regression bigger than
+	// this floor" — a much weaker statement than "no regression", and it must say so.
+	covers := "5%✓"
+	if floor > cfg.targetClass {
+		covers = fmt.Sprintf(">%.0f%% BLIND", cfg.targetClass)
+	}
 	f := []gate.Field{
 		{Key: "cur", State: fmt.Sprintf("%.3gms", mc/1e6)},
 		{Key: "prev", State: fmt.Sprintf("%.3gms", mp/1e6)},
 		{Key: "Δ", State: fmt.Sprintf("%+.2f%%", delta)},
 		{Key: "floor", State: fmt.Sprintf("±%.2f%%", floor)},
+		{Key: "covers", State: covers},
 	}
 	switch {
 	case delta > floor:

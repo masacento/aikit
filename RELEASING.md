@@ -18,14 +18,25 @@ Automated and CI-enforced.
    change (session drift on the reference box was ~5%, larger than the 3% regression v1.17.0
    shipped). The per-shape floor is derived from a characterization pass and fixed before the
    first comparison sample; a shape slower than the previous tag by more than its floor is a
-   FAIL. Paste the `VERDICT:` line into the release notes. The regime axis is the point:
+   FAIL. It also prints its own SENSITIVITY — per shape whether the derived floor is ≤ the 5%
+   class it targets, and a summary (`N/M shapes have a floor ≤ 5.0%`). Read a green as "no
+   regression above each shape's floor", NOT "no regression": on a shape whose floor is >5%,
+   the green is only evidence against a larger regression. Paste the `VERDICT:` and the
+   sensitivity line into the release notes. The regime axis is the point:
    `BenchmarkW8A8SpanShapes` samples both cache-resident and streamed B, because v1.17.0's
-   regression was invisible at the one resident shape it was measured at. A quiet box gives a
-   tight floor (catches the 3% class); the `perf-smoke` CI job only executes the benchmarks
-   (catches a panic/OOM), it does not judge timing. The faithful v1.17.0 reconstruction is an
-   amd64 exercise — its regression was the AVX2 eight-column kernel; arm64 fell back to a
-   sequential path and never regressed — so, like `gpudevice`, the tight-floor acceptance lives
-   on the amd64 box.
+   regression was invisible at the one resident shape it was measured at. The `perf-smoke` CI
+   job only executes the benchmarks (catches a panic/OOM); it does not judge timing.
+
+   > **ACCEPTANCE STATUS — OWED (2026-08-13).** perfgate is installed and its plumbing is
+   > verified: on an M1 Pro, the working tree vs the previous tag is flat, and a reconstructed
+   > access-pattern regression drives every shape red (the mechanism works). It has NOT yet
+   > been shown to catch the ~5% class it exists for, because that reconstruction is amd64-only
+   > — v1.17.0's regression was the AVX2 eight-column kernel, and arm64 fell back to a
+   > sequential path that never regressed. Until the amd64 acceptance runs (pre-registered in
+   > [`docs/perfgate-acceptance-preregistration.md`](docs/perfgate-acceptance-preregistration.md),
+   > owed on the nobara box, same two-box pattern as `gpudevice`), **a green from perfgate is
+   > not evidence at the 5% class** — only that no regression larger than each shape's derived
+   > floor was seen. State that scope wherever the verdict is quoted.
 3. Run `go run -C tools ./vulncheck` and **put its `STATEMENT:` line in the release notes.**
    This is a deliverable, not hygiene: aikit's pitch is a static binary someone scps
    somewhere and runs offline, and a binary deployed that way cannot be patched in
