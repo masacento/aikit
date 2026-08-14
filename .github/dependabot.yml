@@ -1,0 +1,19 @@
+# Dependabot configuration.
+#
+# The only entry here EXCLUDES the govulncheck canary fixture from updates. Its go.mod pins
+# golang.org/x/text v0.3.5 ON PURPOSE: that version carries advisory GO-2021-0113, which the
+# canary in tools/vulncheck relies on to prove govulncheck actually scans before any "no
+# reachable vulnerabilities" is trusted (see docs/analyzer-canaries.md). An automatic bump of
+# x/text here would silently disarm the positive control — the canary would then report
+# cannot-evaluate, and the natural-but-wrong response to a confusing cannot-evaluate is to
+# delete the canary rather than restore the pin. So: no version or security PRs for this
+# directory. The stale pin is deliberate; do not "fix" it.
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/tools/canary/vulnfixture"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0 # never open a bump PR for the canary fixture
+    ignore:
+      - dependency-name: "golang.org/x/text" # the vulnerable pin is the positive control
