@@ -110,9 +110,12 @@ func MatmulBTQ8Into(ws *Workspace, a []float32, bQ []int8, bScales []float32, ds
 func q8Span(a []float32, bQ []int8, bScales, dst []float32, M, K, N, j0, j1 int, deq []float32) {
 	for j := j0; j < j1; j++ {
 		bq := bQ[j*K : j*K+K]
-		for k := range K {
-			deq[k] = float32(bq[k])
-		}
+		// SIMD int8→f32 widen (was a scalar convert loop the compiler does not vectorize; at
+		// M=1 on the LM head it is ~68% of this function — P2). BIT-IDENTICAL by construction:
+		// dequantRowInt8 is a per-element widen×scale with no reassociation, and scale 1.0 is
+		// an exact IEEE-754 multiply, so deq matches float32(bq[k]) byte-for-byte. The row
+		// scale s stays applied AFTER the dot, unchanged — nothing reassociates.
+		dequantRowInt8(deq, bq, 1.0)
 		s := bScales[j]
 		for i := range M {
 			dst[i*N+j] = dotF32(a[i*K:i*K+K], deq) * s

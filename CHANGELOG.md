@@ -10,6 +10,17 @@ it.
 
 ## [Unreleased]
 
+### Changed
+
+- **The q8 weight-only matmul (`MatmulBTQ8`) is ~2× faster at M=1 on a large-vocabulary LM
+  head.** `q8Span` widened each int8 weight row to f32 with a scalar loop the compiler does not
+  vectorize; at M=1 that widen was ~68% of the function (measured, K∈{2048,3584}, N∈{152064,
+  262144}). It now uses the existing SIMD widen (`dequantRowInt8`, AVX2/NEON) with scale 1.0.
+  **Bit-identical** — the widen is a per-element convert×scale with no reassociation and ×1.0 is
+  exact, so the output is byte-for-byte unchanged (asserted by `TestQ8Span_bitIdenticalToScalarWiden`
+  across serial, parallel, SIMD-tail, and prefill paths). Measured working-tree vs pre-change
+  with `tools/perfgate`: Δ ≈ −50% on all three shapes, above each shape's noise floor.
+
 ### Fixed
 
 - **The eight `gpu/*` backend modules pinned a stale root version and now track the tag.**
