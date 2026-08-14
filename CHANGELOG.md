@@ -10,6 +10,19 @@ it.
 
 ## [Unreleased]
 
+### Added
+
+- **`MatmulBTAcc64Strided` — a strided-second-operand attention matmul, so a decoder can attend
+  a KV-cache head-block in place instead of re-copying/re-transposing it into scratch every
+  token.** The KV cache is `[nKeys, nKV·hd]` interleaved; QKᵀ wants a head's `[nKeys,hd]`
+  (strided rows) and scores·V wants its transpose `[hd,nKeys]` (strided elements), and both are
+  expressible as `b[j][k] = bMat[bOff + j·bRowStride + k·bElemStride]`. Only b's addressing
+  changes — the sequential float64 reduction order is identical to `MatmulBTAcc64` — so it is
+  **byte-for-byte identical** to running `MatmulBTAcc64` on a packed/transposed copy
+  (`TestMatmulBTAcc64Strided_bitIdenticalToPacked`). Additive; the existing primitives are
+  unchanged. Motivated by goinfer's decode, where that gather is a measured ~10% of per-token
+  time at 1.5B/4k context, rising with model size and context (P1).
+
 ### Changed
 
 - **The q8 weight-only matmul (`MatmulBTQ8`) is ~2× faster at M=1 on a large-vocabulary LM
