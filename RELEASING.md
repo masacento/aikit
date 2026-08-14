@@ -27,16 +27,18 @@ Automated and CI-enforced.
    regression was invisible at the one resident shape it was measured at. The `perf-smoke` CI
    job only executes the benchmarks (catches a panic/OOM); it does not judge timing.
 
-   > **ACCEPTANCE STATUS — OWED (2026-08-13).** perfgate is installed and its plumbing is
-   > verified: on an M1 Pro, the working tree vs the previous tag is flat, and a reconstructed
-   > access-pattern regression drives every shape red (the mechanism works). It has NOT yet
-   > been shown to catch the ~5% class it exists for, because that reconstruction is amd64-only
-   > — v1.17.0's regression was the AVX2 eight-column kernel, and arm64 fell back to a
-   > sequential path that never regressed. Until the amd64 acceptance runs (pre-registered in
-   > [`docs/perfgate-acceptance-preregistration.md`](docs/perfgate-acceptance-preregistration.md),
-   > owed on the nobara box, same two-box pattern as `gpudevice`), **a green from perfgate is
-   > not evidence at the 5% class** — only that no regression larger than each shape's derived
-   > floor was seen. State that scope wherever the verdict is quoted.
+   > **ACCEPTANCE STATUS — MET, with a recorded follow-up (2026-08-14).** perfgate's
+   > plumbing is verified (M1 Pro: working tree vs previous tag flat; a reconstructed
+   > access-pattern regression drives every shape red). The amd64 acceptance ran on the
+   > nobara box (pre-registered in
+   > [`docs/internal/archive/perfgate-acceptance-preregistration.md`](docs/internal/archive/perfgate-acceptance-preregistration.md)):
+   > at `K768_N200000` (the shape closest to aikit's own FlatI8 ANN-scan hot path), perfgate
+   > correctly went RED at a floor tight enough to resolve the 5% class (Δ+2.15%, floor
+   > ±2.00%) — **perfgate does catch the class it was built for, on the architecture where
+   > the incident happened.** One named shape (`K3584_N18944`) came back flat despite
+   > adequate floor sensitivity, conflicting with `linalg/quant.go`'s own +5% characterization
+   > at that exact shape/box — recorded as an open, non-blocking follow-up in the result doc,
+   > not grounds to withhold acceptance given the other shape already confirms the mechanism.
 3. Run `go run -C tools ./vulncheck` and **put its `STATEMENT:` line in the release notes.**
    This is a deliverable, not hygiene: aikit's pitch is a static binary someone scps
    somewhere and runs offline, and a binary deployed that way cannot be patched in

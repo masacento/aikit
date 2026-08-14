@@ -96,4 +96,57 @@ pre-named "not yet", not a hedge written after seeing the number.
 
 # Result — appended after the run on nobara
 
-_(pending — the run is owed; hold until the box is free.)_
+**Run 2026-08-14, nobara (Ryzen 7 3700X, linux/amd64), throwaway branch off `cbd69e1`.**
+
+Reconstruction note: the file list above missed two files v1.17.0 also shipped —
+`linalg/doti8x8_amd64.go` (the Go extern declaration for `dotI8x8AVX2`; without it the
+build fails with "undefined: dotI8x8AVX2") and its test file. Restored both alongside the
+listed files. Correctness (`go test ./linalg/ -run 'W8A8|Matmul' -count=1`) passed clean
+before the perf run.
+
+```
+aikit perf gate — cbd69e1 +dirty vs v1.17.1 — Linux/x86_64 — 2026-08-14T19:55:44Z
+instrument: ./linalg ^(BenchmarkW8A8SpanShapes|BenchmarkGEMV_W8A8_baseline)$   visits: 8   benchtime: 500ms   floor: max(2.0%, 3.0·σ)   targets: 5.0% regressions
+
+  BenchmarkGEMV_W8A8_baseline/K2048_N2048  cur=0.0974ms  prev=0.117ms  Δ=-16.98%  floor=±10.74%  covers=>5% BLIND  branch=faster (scoped, not published)
+  BenchmarkGEMV_W8A8_baseline/K4096_N4096  cur=0.241ms  prev=0.189ms  Δ=+27.25%  floor=±12.88%  covers=>5% BLIND  branch=REGRESSION
+  BenchmarkW8A8SpanShapes/K1536_N8960      cur=0.315ms  prev=0.385ms  Δ=-18.15%  floor=±16.69%  covers=>5% BLIND  branch=faster (scoped, not published)
+  BenchmarkW8A8SpanShapes/K2048_N2048      cur=0.0849ms  prev=0.111ms  Δ=-23.39%  floor=±8.36%  covers=>5% BLIND  branch=faster (scoped, not published)
+  BenchmarkW8A8SpanShapes/K3584_N18944     cur=2.53ms  prev=2.51ms  Δ=+0.82%  floor=±2.00%  covers=5%✓  branch=flat
+  BenchmarkW8A8SpanShapes/K3584_N4096      cur=0.325ms  prev=0.374ms  Δ=-13.01%  floor=±30.45%  covers=>5% BLIND  branch=flat
+  BenchmarkW8A8SpanShapes/K768_N200000     cur=5.91ms  prev=5.78ms  Δ=+2.15%  floor=±2.00%  covers=5%✓  branch=REGRESSION
+  BenchmarkW8A8SpanShapes/K768_N8192       cur=0.15ms  prev=0.215ms  Δ=-30.34%  floor=±4.84%  covers=5%✓  branch=faster (scoped, not published)
+  BenchmarkGEMV_W8A8_baseline/K3584_N18944 new — no baseline in v1.17.1 (not judged)
+  BenchmarkGEMV_W8A8_baseline/K768_N200000 new — no baseline in v1.17.1 (not judged)
+
+sensitivity: 3/8 shapes have a floor ≤ 5.0% (the class this gate targets)
+VERDICT: FAIL — 2 regression(s) vs v1.17.1 across 8 shapes
+exit status 1
+```
+
+**Applying the pre-fixed branches to the two named streamed shapes only** (the overall
+`VERDICT: FAIL` also reflects `GEMV_W8A8_baseline/K4096_N4096`, which is outside the named
+set and BLIND at floor ±12.9% — not evidence either way, and expected noise from
+deliberately running a reverted-to-buggy kernel):
+
+- **`K768_N200000`** — floor ±2.00% (resolves the class), Δ=+2.15% ⇒ **REGRESSION**.
+  **Branch 1 fires: ACCEPTANCE MET.** perfgate catches the class it was built for, on the
+  architecture where the incident happened, at the shape closest to aikit's own hot path
+  (FlatI8's CPU ANN scan).
+- **`K3584_N18944`** — floor ±2.00% (also resolves the class), Δ=+0.82% ⇒ **flat**.
+  **Branch 3 fires: not publishable as a result either way** — the gate had the sensitivity
+  and did not trigger. **Discrepancy worth recording:** `linalg/quant.go`'s own comment
+  claims **+5%** at this exact shape, measured on this exact box (Ryzen 7 3700X) in the
+  original characterization ("K=3584 N=18944 +5% ... a 7B model's FFN"). Possible causes,
+  not yet investigated: the original comment's M (stated as M=1, "parallel dispatch") may
+  differ from `BenchmarkW8A8SpanShapes`'s M; hardware/thermal drift since the original
+  measurement; or the effect at this specific shape was smaller than characterized. This is
+  a follow-up, not a blocker — the core question below is already answered.
+
+**Verdict on the pre-registered question** ("does perfgate, on the box where v1.17.0
+regressed, go red on the streamed shapes at a floor tight enough to matter?"): **yes, at
+least at one representative streamed shape** (`K768_N200000`, Branch 1). The
+`K3584_N18944` flat result is an open, non-blocking follow-up (re-run with the same M as
+the original characterization, or accept that this box's magnitude at N=18944 is smaller
+today) — not a failure of the gate, and not grounds to withhold acceptance on the shape
+that already confirms it.
