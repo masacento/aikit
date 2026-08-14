@@ -63,9 +63,14 @@ jobs:
           CGO_ENABLED: "0"
         run: go build ./...
 
-      # Model-dependent tests skip cleanly when assets are absent (as on CI).
+      # Model-dependent tests skip cleanly when assets are absent (as on CI) — so the run is
+      # routed through tools/skipcensus (AK3), which runs `go test -json -race ./...`, re-emits
+      # the normal log, and prints the skip tally BY REASON under the verdict. The exit code is
+      # go test's own; this reports a denominator, it does not gate. A green that says
+      # "N passed, M skipped (145 missing asset, …)" is honest; a bare `ok` over M hidden skips
+      # is what this replaces.
       - name: test (race)
-        run: go test -race ./...
+        run: go run -C tools ./skipcensus -race ./...
 
       # Exercise the debug-only quant-kernel contract checks (§3.2): build the
       # checks_on.go path and confirm the real kernels honor their own shape

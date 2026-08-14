@@ -29,6 +29,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,6 +37,7 @@ import (
 
 	"github.com/townsendmerino/aikit/tools/gate"
 	"github.com/townsendmerino/aikit/tools/gpumod"
+	"github.com/townsendmerino/aikit/tools/skips"
 )
 
 func main() { os.Exit(run(os.Args[1:])) }
@@ -121,12 +123,20 @@ func goStep(root, name string, extraEnv []string, args ...string) gate.Cell {
 	return cell(name, gate.OK, strings.Join(env, " "))
 }
 
-// goTest is goStep for `go test ./...`, trimmed to the failing lines on error.
+// goTest runs `go test ./...` through the skip census (AK3), so a green here reports the skip
+// tally by reason as a denominator rather than folding skips into a bare pass. Output is
+// captured (preflight stays concise); on failure the failing lines are surfaced, and either
+// way the census summary is printed under the row.
 func goTest(root string) gate.Cell {
-	out, rc := runIn(root, []string{"GOWORK=off"}, "go", "test", "./...")
-	if rc != 0 {
-		c := cell("go test", gate.Fail, "GOWORK=off")
-		for _, ln := range strings.Split(out, "\n") {
+	var buf bytes.Buffer
+	res, _ := skips.Run(root, []string{"GOWORK=off"}, []string{"./..."}, &buf)
+	outcome := gate.OK
+	if res.ExitCode != 0 {
+		outcome = gate.Fail
+	}
+	c := cell("go test", outcome, "GOWORK=off")
+	if outcome == gate.Fail {
+		for _, ln := range strings.Split(buf.String(), "\n") {
 			if strings.HasPrefix(ln, "---") || strings.HasPrefix(ln, "FAIL") || strings.HasPrefix(ln, "panic") {
 				c.Fields = append(c.Fields, gate.Field{Key: "line", State: strings.TrimRight(ln, "\r")})
 				if countLines(c) >= 8 {
@@ -134,9 +144,11 @@ func goTest(root string) gate.Cell {
 				}
 			}
 		}
-		return c
 	}
-	return cell("go test", gate.OK, "GOWORK=off")
+	for _, ln := range strings.Split("skip census — "+res.Summary(), "\n") {
+		c.Fields = append(c.Fields, gate.Field{Key: "line", State: ln})
+	}
+	return c
 }
 
 // checkLint runs the pinned golangci-lint on the ROOT module. A preflight `version` run
