@@ -10,6 +10,8 @@ it.
 
 ## [Unreleased]
 
+## [1.18.0] — 2026-08-14
+
 ### Added
 
 - **`MatmulBTAcc64Strided` — a strided-second-operand attention matmul, so a decoder can attend
@@ -34,6 +36,11 @@ it.
   across serial, parallel, SIMD-tail, and prefill paths). Measured working-tree vs pre-change
   with `tools/perfgate`: Δ ≈ −50% on all three shapes, above each shape's noise floor.
 
+- **Require Go 1.26.6** (was 1.26.5). Picks up the go1.26.6 standard-library security
+  fixes for `net/http`, `crypto/tls`, `net/url`, and `encoding/asn1`
+  (GO-2026-5026/6090/6218/5972) — govulncheck flagged them reachable in the internal
+  `benchmarks` harness; every shipped module scanned clean either way.
+
 ### Fixed
 
 - **The eight `gpu/*` backend modules pinned a stale root version and now track the tag.**
@@ -42,13 +49,6 @@ it.
   `tools/gpupins` gate (CI, every push) asserts each backend names the latest `vX.Y.Z` and
   `gpu/vX.Y.Z` tag; `go run -C tools ./gpupins --fix` rewrites them from git, replacing the
   hand-edit in RELEASING.md step 3.
-
-### Changed
-
-- **Require Go 1.26.6** (was 1.26.5). Picks up the go1.26.6 standard-library security
-  fixes for `net/http`, `crypto/tls`, `net/url`, and `encoding/asn1`
-  (GO-2026-5026/6090/6218/5972) — govulncheck flagged them reachable in the internal
-  `benchmarks` harness; every shipped module scanned clean either way.
 
 ## [1.17.1] — 2026-08-12
 
@@ -1997,7 +1997,8 @@ broad slice of the open-weights ecosystem.
   golden cosine 1.000000 vs PyTorch+MPS CodeRankEmbed. See
   [README.md](README.md) for stability tiers.
 
-[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.16.0...HEAD
+[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.18.0...HEAD
+[1.18.0]: https://github.com/townsendmerino/aikit/compare/v1.17.1...v1.18.0
 [1.17.1]: https://github.com/townsendmerino/aikit/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/townsendmerino/aikit/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/townsendmerino/aikit/compare/v1.15.0...v1.16.0
