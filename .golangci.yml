@@ -42,6 +42,14 @@ linters:
         - "-ST1003"
 
     errcheck:
+      # check-blank: catch `_ = f()` blank discards of an error, not just an
+      # unassigned error return (AK4). aikit has zero such discards on any
+      # production launch/copy/sync/download path today (govulncheck's sibling
+      # goinfer had 35 on its decode forward path); enabling this is what keeps
+      # that true — a new `_ = q.Launch(...)` or `_ = gpu.Download(...)` on a
+      # production path reddens the lint. The currently-acceptable sites are
+      # declared below (exclude-functions) or scoped out for tests.
+      check-blank: true
       # Don't flag these patterns — they're idiomatic-Go-by-design.
       exclude-functions:
         # Idiomatic deferred-Close on read-side resources where the close
@@ -68,22 +76,20 @@ linters:
 
   exclusions:
     rules:
-      # Fuzz/unit corpus builders write fixture bytes into a bytes.Buffer via
-      # binary.Write. bytes.Buffer.Write never returns a non-nil error (it
-      # panics on OOM instead), so checking it in a table of ~30 field writes
-      # is pure noise. Test-only: a real binary.Write to an io.Writer that can
-      # fail is still flagged in non-test code.
+      # errcheck (including check-blank) is scoped to PRODUCTION code. check-blank
+      # exists to guard the launch/copy/synchronise/download paths — the shape that
+      # cost the sibling goinfer 35 discards on its decode forward path — and those
+      # are production. A test's error-discards are the test's own concern: its
+      # assertions are the check, and `_ = m.Encode(x)` / `_ = f.MarshalBinary()` /
+      # `_ = filepath.WalkDir(...)` in a test are called for effect, timing, or
+      # setup, not for a result whose error is load-bearing. Blank-checking those 60+
+      # sites would be pure noise, so errcheck does not run on _test.go at all.
+      # (This subsumes the earlier per-pattern test exclusions — binary.Write corpus
+      # builders and the gpu backend-teardown Closes — with one honest rule. The
+      # trade-off: a genuinely-unchecked non-blank error in a test is no longer
+      # flagged here; that is accepted, tests being self-asserting.)
       - path: _test\.go
         linters: [errcheck]
-        text: "Error return value of `binary\\.Write` is not checked"
-      # GPU backend tests defer Close on their backends (encmetal.Backend,
-      # encoder.Backend, the CPU/GPU encoders) to tear the device down; the close
-      # releases GPU objects with nothing to flush — the same release-side posture
-      # as the reader Closes in exclude-functions above, across too many one-off
-      # types for a per-type entry. Test-only, gpu tree only.
-      - path: gpu/.*_test\.go
-        linters: [errcheck]
-        text: "Error return value of `.*\\.Close` is not checked"
 
 issues:
   # Show every finding so the cleanup pass can't miss any. Default is 50

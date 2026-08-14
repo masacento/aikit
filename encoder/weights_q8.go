@@ -107,7 +107,7 @@ func LoadWeightsQ8(dir string) (*WeightsQ8, error) {
 	}
 	// The embedding tensors are now copied onto the heap; their mapped pages are
 	// dead weight from here (WordEmb alone is ~92 MB of the checkpoint).
-	_ = w.releasePages(
+	_ = w.releasePages( //nolint:errcheck // best-effort page drop; the heap copy is authoritative
 		"embeddings.word_embeddings.weight",
 		"embeddings.token_type_embeddings.weight",
 		"emb_ln.weight", "emb_ln.bias",
@@ -133,7 +133,7 @@ func LoadWeightsQ8(dir string) (*WeightsQ8, error) {
 		// Those five f32 tensors are now int8 + scales on the heap, and nothing
 		// reads their mapped pages again. Drop them before touching layer i+1 so
 		// only one layer's f32 side is resident at a time.
-		_ = w.releasePages(layerQ8TensorNames(i)...)
+		_ = w.releasePages(layerQ8TensorNames(i)...) //nolint:errcheck // best-effort page drop; the heap copy is authoritative
 	}
 	// Release the underlying mmap (the f32 weights are no longer needed —
 	// we have int8 copies on the heap now).

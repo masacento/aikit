@@ -187,7 +187,7 @@ func (f *FlatI8) Close() error {
 	// Release the device-resident index (EnableGPU) regardless of backing, before
 	// the mmap so no device work can reference unmapped codes.
 	if f.gpu != nil {
-		_ = f.gpu.Close()
+		_ = f.gpu.Close() //nolint:errcheck // teardown: dropping the device index before the mmap, nothing to flush
 		f.gpu = nil
 	}
 	if f.mmap == nil || f.closed {

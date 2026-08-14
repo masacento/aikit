@@ -124,7 +124,7 @@ func (c *SpanCache[K]) Touch(key K) {
 	}
 	c.misses++
 	for _, s := range spans {
-		_ = c.advise(s, true) // WILLNEED: hint the fault we're about to take
+		_ = c.advise(s, true) //nolint:errcheck // WILLNEED: hint the fault we're about to take (advisory)
 	}
 	el := c.lru.PushFront(key)
 	c.pos[key] = el
@@ -152,7 +152,7 @@ func (c *SpanCache[K]) Touch(key K) {
 		c.resident -= c.bytes[victim]
 		c.evictions++
 		for _, s := range c.spans[victim] {
-			_ = c.advise(s, false) // DONTNEED: release the victim's pages
+			_ = c.advise(s, false) //nolint:errcheck // DONTNEED: release the victim's pages (advisory)
 		}
 	}
 }

@@ -155,7 +155,7 @@ func (f *FlatI8) EnableGPU() error {
 		return err
 	}
 	if f.gpu != nil {
-		_ = f.gpu.Close()
+		_ = f.gpu.Close() //nolint:errcheck // releasing the superseded GPU index; the replacement already built
 	}
 	f.gpu = idx
 	return nil

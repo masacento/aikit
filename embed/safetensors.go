@@ -373,7 +373,7 @@ func (f *SafetensorsFile) ReleaseTensors(names ...string) error {
 		if len(f.mmapped) == 0 {
 			continue // heap-backed, or already Closed: nothing resident to drop
 		}
-		_ = mmap.Advise(mmap.PageAlignedInterior(t.raw), false)
+		_ = mmap.Advise(mmap.PageAlignedInterior(t.raw), false) //nolint:errcheck // madvise DONTNEED is an advisory hint on release
 	}
 	return firstErr
 }
