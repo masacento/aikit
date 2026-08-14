@@ -527,8 +527,8 @@ perspective. The default build stays pure-Go CPU with the same one dependency-ti
 
 ### Fixed
 
-Remediation of the 2026-07-25 engineering audit (`docs/AUDIT-2026-07-25.md`, 24
-findings). Each fix ships with a regression test and a break-it-first check.
+Remediation of the 2026-07-25 engineering audit (`docs/internal/archive/AUDIT-2026-07-25.md`,
+24 findings). Each fix ships with a regression test and a break-it-first check.
 
 - **`encoder`: silent-wrong pooling and dropped biases.** `LoadWeights` now reads
   the declared pooling mode instead of always assuming CLS (#1); the batch and Q8
