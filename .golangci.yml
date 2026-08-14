@@ -90,6 +90,16 @@ linters:
       # flagged here; that is accepted, tests being self-asserting.)
       - path: _test\.go
         linters: [errcheck]
+      # gpu/cuda.go closes cuda handles (device buffers, modules, contexts) on the
+      # release/error path — the same release-side posture as the reader Closes in
+      # exclude-functions above, across several one-off cuda handle types too specific for
+      # per-type entries. It is a linux-only file (//go:build linux), so it lints only on the
+      # gpu gate's ubuntu leg, where check-blank (AK4) surfaced these explicit `_ = x.Close()`
+      # discards. Scoped to this one production file, so a Close discard anywhere else still
+      # fires.
+      - path: gpu/cuda\.go
+        linters: [errcheck]
+        text: "Error return value of `.*\\.Close` is not checked"
 
 issues:
   # Show every finding so the cleanup pass can't miss any. Default is 50
