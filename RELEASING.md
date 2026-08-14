@@ -9,10 +9,24 @@ Automated and CI-enforced.
 
 1. Add a `## [X.Y.Z] — <date>` section to `CHANGELOG.md` and its `[X.Y.Z]:` compare
    link at the bottom. Additive changes bump the **minor**; bug fixes the **patch**.
-2. Run the gate locally first: `scripts/release-gate.sh X.Y.Z` — it checks the CHANGELOG
+2. Run the gate locally first: `go run -C tools ./releasegate X.Y.Z` — it checks the CHANGELOG
    section, `golangci-lint`, `apidiff` (no Hard-tier API breakage vs the previous tag),
    and the cgo-free dependency invariant.
-3. Run `scripts/vulncheck.sh` and **put its `STATEMENT:` line in the release notes.**
+2b. **On a real box (not a shared CI runner), run the perf gate: `go run -C tools ./perfgate`.**
+   It builds the working tree and the previous tag into two benchmark binaries and runs them
+   INTERLEAVED in one session — never a stored baseline, which measures the machine, not the
+   change (session drift on the reference box was ~5%, larger than the 3% regression v1.17.0
+   shipped). The per-shape floor is derived from a characterization pass and fixed before the
+   first comparison sample; a shape slower than the previous tag by more than its floor is a
+   FAIL. Paste the `VERDICT:` line into the release notes. The regime axis is the point:
+   `BenchmarkW8A8SpanShapes` samples both cache-resident and streamed B, because v1.17.0's
+   regression was invisible at the one resident shape it was measured at. A quiet box gives a
+   tight floor (catches the 3% class); the `perf-smoke` CI job only executes the benchmarks
+   (catches a panic/OOM), it does not judge timing. The faithful v1.17.0 reconstruction is an
+   amd64 exercise — its regression was the AVX2 eight-column kernel; arm64 fell back to a
+   sequential path and never regressed — so, like `gpudevice`, the tight-floor acceptance lives
+   on the amd64 box.
+3. Run `go run -C tools ./vulncheck` and **put its `STATEMENT:` line in the release notes.**
    This is a deliverable, not hygiene: aikit's pitch is a static binary someone scps
    somewhere and runs offline, and a binary deployed that way cannot be patched in
    place by whoever is running it. "What is in it, and is any of it known-vulnerable"

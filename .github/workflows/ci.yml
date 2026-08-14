@@ -158,6 +158,23 @@ jobs:
       - name: scan
         run: go run -C tools ./vulncheck
 
+  perf-smoke:
+    name: perf benchmarks (execute, no timing assertion)
+    # AK2: the regime-spanning perf benchmarks (BenchmarkW8A8SpanShapes,
+    # BenchmarkGEMV_W8A8_baseline) never ran in CI — `go test` without -bench skips them, so a
+    # benchmark that panics or OOMs was invisible until run by hand. This EXECUTES them once
+    # (-benchtime=1x) and asserts NOTHING about timing: a shared runner cannot measure the 3%
+    # class. The A/B verdict is tools/perfgate, run on a real box in the release ritual, where
+    # the machine-derived noise floor is tight enough to mean something.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: execute perf benchmarks
+        run: go test ./linalg/ -run '^$' -bench '^(BenchmarkW8A8SpanShapes|BenchmarkGEMV_W8A8_baseline)$' -benchtime=1x
+
   gpu-pins:
     name: gpu backend version pins
     # AK1: the eight gpu/* backend modules each `require` the root and gpu series by an exact

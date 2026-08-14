@@ -25,6 +25,19 @@ import (
 //
 // Anything proposing to change w8a8Span should show numbers for every row here, and
 // should expect the two halves to disagree.
+// regimeTag names the memory regime a W8A8 shape falls in from B's byte size (int8 weights,
+// 1 byte each) against a nominal ~32 MB last-level cache. "resident" is where arithmetic
+// efficiency dominates and a wider kernel wins; "streamed" is where the access pattern
+// dominates and the same kernel can lose. The boundary is nominal, not the exact LLC of any
+// one box — the point is that both sides are always sampled, not that the split is precise.
+func regimeTag(K, N int) string {
+	const nominalLLC = 32 << 20 // bytes
+	if K*N < nominalLLC {
+		return "resident"
+	}
+	return "streamed"
+}
+
 func BenchmarkW8A8SpanShapes(b *testing.B) {
 	rng := rand.New(rand.NewSource(1))
 	for _, s := range []struct {
@@ -55,7 +68,11 @@ func BenchmarkW8A8SpanShapes(b *testing.B) {
 		dst := make([]float32, N)
 		var ws Workspace
 		mb := float64(K) * float64(N) / (1 << 20)
-		b.Run(fmt.Sprintf("K%d_N%d", K, N), func(b *testing.B) {
+		// The regime is in the sub-benchmark NAME, not just a log line: the A/B gate
+		// (tools/perfgate) and any benchstat run parse the name, and the whole point of
+		// this benchmark is that the two regimes must be told apart in the output, not
+		// only in a comment. regimeTag keys off B's byte size vs a nominal LLC.
+		b.Run(fmt.Sprintf("K%d_N%d_%s", K, N, regimeTag(K, N)), func(b *testing.B) {
 			b.Logf("B is %.1f MB — %s", mb, s.note)
 			for b.Loop() {
 				MatmulBTW8A8Pre(&ws, aq, as, bq, bs, dst, 1, K, N)

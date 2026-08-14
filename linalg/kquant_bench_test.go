@@ -41,9 +41,22 @@ func BenchmarkGEMV_Q6K_native(b *testing.B) {
 	}
 }
 
+// gemvW8A8Shapes spans BOTH memory regimes on the M=1 GEMV path, the same discipline as
+// BenchmarkW8A8SpanShapes: a cache-resident pair (where the v1.17.0 eight-column kernel was
+// measured and looked like a win) AND a streamed pair (where it was the ~3% decode regression).
+// A GEMV benchmark that samples only the resident regime is exactly what let v1.17.0 tag green.
+func gemvW8A8Shapes() []struct{ K, N int } {
+	return []struct{ K, N int }{
+		{2048, 2048},  // resident
+		{4096, 4096},  // resident
+		{768, 200000}, // streamed — FlatI8's CPU scan over a real corpus
+		{3584, 18944}, // streamed — a 7B model's FFN, where goinfer saw ~3% on decode
+	}
+}
+
 func BenchmarkGEMV_W8A8_baseline(b *testing.B) {
 	rng := rand.New(rand.NewSource(11))
-	for _, s := range benchDecodeShapes() {
+	for _, s := range gemvW8A8Shapes() {
 		a := make([]float32, s.K)
 		for i := range a {
 			a[i] = float32(rng.NormFloat64())
@@ -57,7 +70,7 @@ func BenchmarkGEMV_W8A8_baseline(b *testing.B) {
 			bScales[i] = 0.01
 		}
 		dst := make([]float32, s.N)
-		b.Run(shapeName(s.K, s.N), func(b *testing.B) {
+		b.Run(shapeName(s.K, s.N)+"_"+regimeTag(s.K, s.N), func(b *testing.B) {
 			b.SetBytes(int64(s.N * s.K)) // int8: 1 byte/weight
 			for i := 0; i < b.N; i++ {
 				MatmulBTW8A8(a, bq, bScales, dst, 1, s.K, s.N)
