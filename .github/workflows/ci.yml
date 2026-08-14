@@ -84,10 +84,35 @@ jobs:
       # build. The committed seed + regression corpus runs under the race step
       # above on every push; this adds a brief active-fuzz pass to catch new
       # inputs. A longer nightly run is a follow-up.
+      #
+      # Retry ONCE per target, but ONLY when no reproducer was written — the same
+      # hardening b923814 gave fuzz-nightly.yml after FuzzMarkdownChunk flaked with
+      # "context deadline exceeded" and no crasher (steady exec/sec to the deadline,
+      # empty testdata/fuzz, clean locally — a coordinator shutdown-timing flake, not
+      # a bug). This push-triggered smoke step never got the same fix and hit the
+      # identical signature on 2026-08-14 (FuzzParseGGUF, unrelated docs-only push).
+      # A real find persists a reproducer under testdata/fuzz/<Target>/ that replays
+      # deterministically, so that case still fails immediately — never retrying a
+      # real crasher away.
       - name: fuzz (smoke)
         run: |
           set -e
-          fuzz() { go test "./$1/" -run xxx -fuzz="^$2\$" -fuzztime=15s; }
+          fuzz() {
+            pkg="$1"; fn="$2"
+            crashdir="${pkg}/testdata/fuzz/${fn}"
+            for attempt in 1 2; do
+              if go test "./${pkg}/" -run xxx -fuzz="^${fn}\$" -fuzztime=15s; then
+                return 0
+              fi
+              if compgen -G "${crashdir}/*" >/dev/null 2>&1; then
+                echo "reproducer written under ${crashdir} — real failure, not retrying"
+                return 1
+              fi
+              echo "no reproducer written (shutdown/deadline flake) — retry ${attempt}/2"
+            done
+            echo "fuzz flaked with no reproducer on both attempts"
+            return 1
+          }
           for fn in FuzzParseGGUF FuzzParseSafetensors FuzzParseShardIndex FuzzGGUFDequant; do
             fuzz embed "$fn"
           done
