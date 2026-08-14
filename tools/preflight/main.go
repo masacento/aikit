@@ -33,8 +33,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
+	"github.com/townsendmerino/aikit/tools/canary"
 	"github.com/townsendmerino/aikit/tools/gate"
 	"github.com/townsendmerino/aikit/tools/gpumod"
 	"github.com/townsendmerino/aikit/tools/skips"
@@ -157,6 +159,13 @@ func goTest(root string) gate.Cell {
 func checkLint(root string) gate.Cell {
 	if _, rc := runIn(root, []string{"GOWORK=off"}, "go", "run", gpumod.GolangciLint, "version"); rc != 0 {
 		return cell("golangci-lint", gate.Inconclusive, "GOWORK=off")
+	}
+	// CANARY: a "clean" is trusted only after the linter flags its fixture (see tools/canary).
+	cout, _ := runIn(filepath.Join(root, canary.FixturesDir), []string{"GOWORK=off"}, "go", "run", gpumod.GolangciLint, "run", "--build-tags", "canaryfixture")
+	if res := canary.CheckGolangci(cout); !res.Fired {
+		c := cell("golangci-lint", gate.Inconclusive, "GOWORK=off")
+		c.Fields = append(c.Fields, gate.Field{Key: "line", State: "CANNOT-EVALUATE — " + res.Reason})
+		return c
 	}
 	out, rc := runIn(root, []string{"GOWORK=off"}, "go", "run", gpumod.GolangciLint, "run")
 	if rc != 0 {

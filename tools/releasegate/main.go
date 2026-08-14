@@ -29,6 +29,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/townsendmerino/aikit/tools/canary"
 	"github.com/townsendmerino/aikit/tools/gate"
 	"github.com/townsendmerino/aikit/tools/gpumod"
 )
@@ -119,6 +120,11 @@ func checkLint(root string) gate.Cell {
 	fmt.Println("release-gate: golangci-lint (.golangci.yml)")
 	if _, rc := runIn(root, "go", "run", gpumod.GolangciLint, "version"); rc != 0 {
 		return inconMsg("golangci-lint", "could not build the pinned golangci-lint")
+	}
+	// CANARY: trust a "clean" only after the linter flags its fixture (see tools/canary).
+	cout, _ := runIn(filepath.Join(root, canary.FixturesDir), "go", "run", gpumod.GolangciLint, "run", "--build-tags", "canaryfixture")
+	if res := canary.CheckGolangci(cout); !res.Fired {
+		return inconMsg("golangci-lint", "CANNOT-EVALUATE — "+res.Reason)
 	}
 	out, rc := runIn(root, "go", "run", gpumod.GolangciLint, "run", "./...")
 	if rc != 0 {

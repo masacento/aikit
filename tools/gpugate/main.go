@@ -38,6 +38,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/townsendmerino/aikit/tools/canary"
 	"github.com/townsendmerino/aikit/tools/gate"
 	"github.com/townsendmerino/aikit/tools/gpumod"
 )
@@ -147,6 +148,15 @@ const golangciLint = gpumod.GolangciLint
 func checkLint(root string, mods []string) gate.Cell {
 	if out, rc := gpumod.Go(root, ".", nil, "run", golangciLint, "version"); rc != 0 {
 		return cell("lint", gate.Inconclusive, "could not build the pinned golangci-lint: "+firstLine(out))
+	}
+	// CANARY: prove golangci-lint actually runs AND reports, with the SAME invocation the
+	// per-module runs use, before any "clean" is trusted. A linter that cannot exec (a
+	// cross-GOOS `go run` builds a binary for the wrong platform) or runs but checks nothing
+	// flags no module — indistinguishable from a real pass without this positive control
+	// (which the false-clean of 2026-08-13, twice in one day, is exactly the case for).
+	cout, _ := gpumod.Go(root, canary.FixturesDir, nil, "run", golangciLint, "run", "--build-tags", "canaryfixture")
+	if res := canary.CheckGolangci(cout); !res.Fired {
+		return cell("lint", gate.Inconclusive, "CANNOT-EVALUATE — "+res.Reason)
 	}
 	var bad []string
 	n := 0
