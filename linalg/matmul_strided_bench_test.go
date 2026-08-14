@@ -5,16 +5,25 @@ import (
 	"testing"
 )
 
-// BenchmarkAttnStridedVsPacked answers the P1 "does the strided read earn its place" question
-// at the attention shapes, separately for K and V, without a full decoder. Baseline is what
-// goinfer does today — materialise a packed (K) or transposed (V) copy of a head-block out of
-// the interleaved [nKeys, nKV·hd] KV cache, then MatmulBTAcc64. Strided is MatmulBTAcc64Strided
+// BenchmarkAttnStridedVsPacked times the strided read vs a packed (K) / transposed (V) copy at
+// the attention shapes, without a full decoder. Baseline materialises a head-block out of the
+// interleaved [nKeys, nKV·hd] KV cache, then MatmulBTAcc64; strided is MatmulBTAcc64Strided
 // reading the cache in place. Same result to the bit (matmul_strided_test.go); this times them.
 //
-//	K: gather+matmul   vs  strided     — expected clean win (contiguous inner dot either way,
-//	                                      strided just drops the copy pass)
-//	V: transpose+matmul vs strided     — the real question: the strided read is strided by kvDim,
-//	                                      but the transpose it removes was also a strided write
+// DO NOT DECIDE ADOPTION FROM THIS BENCHMARK — it was MISLEADING IN BOTH DIRECTIONS, and only the
+// on-target end-to-end decode A/B settles the question (see the P1 measurement doc):
+//
+//  1. It does not model the GQA group. A real head-block gather is done ONCE and reused across the
+//     `group` query heads; this times one gather : one matmul. So it overstates the V win (the
+//     transpose it "removes" is amortised across the group in the real forward) and understates the
+//     K loss.
+//  2. It cannot see cache-line geometry, and it runs on whatever box invokes it. The V strided read
+//     has bElemStride = kvDim, so every k lands on its own cache line (~13.7× the line-bytes of the
+//     transpose). Whether that is survivable is an ISA property: on arm64/M1 (128 B lines, ~200 GB/s,
+//     strong prefetch) strided V wins; on x86-64 (64 B lines) it is a ~40% decode regression at 4k.
+//     A benchmark run on one box is not evidence for a portable decision.
+//
+// It is kept only as a shape/allocation smoke; the perf conclusion belongs to the per-ISA A/B.
 func BenchmarkAttnStridedVsPacked(b *testing.B) {
 	rng := rand.New(rand.NewSource(5))
 	for _, s := range []struct {
