@@ -39,6 +39,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/townsendmerino/aikit/tools/canary"
 	"github.com/townsendmerino/aikit/tools/gate"
 	"github.com/townsendmerino/aikit/tools/gpumod"
 )
@@ -63,6 +64,19 @@ func run() int {
 	prov := p.Commit + p.Dirty
 	fmt.Printf("aikit vulnerability scan — %s — %s\n", prov, p.Date)
 	fmt.Printf("scanner: %s\n\n", scannerVersion(gvc))
+
+	// CANARY: prove govulncheck actually scans and reports, with the SAME binary the shipped
+	// scan uses, before any "no reachable vulnerabilities" is trusted. The vulnfixture module
+	// reaches a symbol with a known advisory; if it is not reported, govulncheck examined
+	// nothing (missing binary, no vuln DB, empty graph) and the STATEMENT means nothing. This
+	// catches the case the per-module UNSCANNED=FAIL cannot: a scan that exits 0 with "No
+	// vulnerabilities found" over a graph it never really analysed.
+	cout := scanRaw(root, gvc, canary.VulnFixtureDir)
+	if res := canary.CheckGovulncheck(cout); !res.Fired {
+		fmt.Println("STATEMENT: INCONCLUSIVE — CANNOT-EVALUATE: " + res.Reason + "; nothing trusted")
+		return 2
+	}
+	fmt.Printf("canary: govulncheck reports %s in %s ✓\n\n", canary.CanaryAdvisory, canary.VulnFixtureDir)
 
 	mods := allModuleDirs(root)
 	checks := make([]gate.Check, 0, len(mods))
@@ -109,6 +123,16 @@ func run() int {
 	return 1
 }
 
+// scanRaw runs govulncheck ./... in one module dir and returns its combined output — the raw
+// form the canary inspects, without the CLEAN/VULNERABLE/UNSCANNED classification.
+func scanRaw(root, gvc, m string) string {
+	cmd := exec.Command(gvc, "./...")
+	cmd.Dir = filepath.Join(root, m)
+	cmd.Env = os.Environ()
+	out, _ := cmd.CombinedOutput()
+	return string(out)
+}
+
 // scanModule runs govulncheck in one module and classifies the result the way the shell
 // did: a "No vulnerabilities found" with exit 0 is CLEAN; any "Vulnerability #N:" is
 // VULNERABLE; anything else is UNSCANNED (the scan itself failed) — never mistaken for a pass.
@@ -148,8 +172,10 @@ func scanModule(root, gvc, m string) gate.Cell {
 	}
 }
 
-// allModuleDirs enumerates every module in the tree (root as ".", others relative), sorted —
-// the same set `find . -name go.mod` produces, minus .git and .venv.
+// allModuleDirs enumerates every SHIPPED module in the tree (root as ".", others relative),
+// sorted — the same set `find . -name go.mod` produces, minus .git and .venv, and minus the
+// canary fixture module (tools/canary/vulnfixture pins a deliberately-vulnerable dependency as
+// a govulncheck positive control; it is required by nothing and must never enter this scan).
 func allModuleDirs(root string) []string {
 	var dirs []string
 	filepath.WalkDir(root, func(pth string, d os.DirEntry, err error) error {
@@ -158,6 +184,11 @@ func allModuleDirs(root string) []string {
 		}
 		if d.IsDir() && (d.Name() == ".git" || d.Name() == ".venv") {
 			return filepath.SkipDir
+		}
+		if d.IsDir() {
+			if rel, _ := filepath.Rel(root, pth); rel == canary.VulnFixtureDir {
+				return filepath.SkipDir // the intentionally-vulnerable canary module
+			}
 		}
 		if !d.IsDir() && d.Name() == "go.mod" {
 			rel, _ := filepath.Rel(root, filepath.Dir(pth))

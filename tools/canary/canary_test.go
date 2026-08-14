@@ -31,3 +31,28 @@ func TestCheckGolangci_cannotEvaluateWhenFixtureAbsent(t *testing.T) {
 		t.Fatal("a report that misses the fixture must not count as fired")
 	}
 }
+
+func TestCheckGovulncheck_firesOnAdvisory(t *testing.T) {
+	out := "Vulnerability #1: " + CanaryAdvisory + "\n      #1: vuln.go:18:23: vulnfixture.CanaryVuln calls language.Parse\n"
+	if r := CheckGovulncheck(out); !r.Fired {
+		t.Fatalf("expected Fired on the advisory; got %+v", r)
+	}
+}
+
+func TestCheckGovulncheck_cannotEvaluateOnNoVulns(t *testing.T) {
+	// The scanner ran and exited 0 with "No vulnerabilities found" — but over the fixture that
+	// means it reached nothing. This is the case per-module UNSCANNED=FAIL cannot catch.
+	r := CheckGovulncheck("No vulnerabilities found.\n")
+	if r.Fired {
+		t.Fatal("\"No vulnerabilities found\" on the vuln fixture must be cannot-evaluate")
+	}
+	if !strings.Contains(r.Reason, "examined nothing") {
+		t.Errorf("reason should name the empty scan; got %q", r.Reason)
+	}
+}
+
+func TestCheckGovulncheck_cannotEvaluateOnEmpty(t *testing.T) {
+	if r := CheckGovulncheck(""); r.Fired {
+		t.Fatal("empty output must be cannot-evaluate")
+	}
+}

@@ -137,6 +137,13 @@ func checkLint(root string) gate.Cell {
 
 // (3) apidiff — Hard-tier compatibility vs the previous tag.
 func checkAPIDiff(root, ver string) gate.Cell {
+	// CANARY: prove apidiff actually detects a break here, before any "no incompatible
+	// changes" — including the no-previous-tag skip — is trusted. A baseline comparison with
+	// nothing to compare against reports no breaks, indistinguishable from a real pass; the
+	// fixture pair has a known break apidiff must find, or this is cannot-evaluate.
+	if res := canary.CheckApidiff(apidiffCanaryOut(root)); !res.Fired {
+		return inconMsg("apidiff", "CANNOT-EVALUATE — "+res.Reason)
+	}
 	prev := prevTag(root, ver)
 	if prev == "" {
 		fmt.Println("release-gate: no previous tag — skipping apidiff")
@@ -183,7 +190,13 @@ func checkAPIDiff(root, ver string) gate.Cell {
 
 // (4) core dependency invariant.
 func checkCoreDeps(root string) gate.Cell {
-	out, _ := runIn(root, "go", "list", "-deps", "-f", "{{if not .Standard}}{{.ImportPath}}{{end}}", "./...")
+	out, rc := runIn(root, "go", "list", "-deps", "-f", "{{if not .Standard}}{{.ImportPath}}{{end}}", "./...")
+	// A failed `go list` emits little or nothing, which would filter to "no external deps" and
+	// read as clean — the same examines-nothing false-clean the canaries guard against. rc is
+	// the built-in positive control here: a non-zero go list is cannot-evaluate, not a pass.
+	if rc != 0 {
+		return inconMsg("core-deps", "CANNOT-EVALUATE — `go list -deps` failed: "+firstLine(out))
+	}
 	var ext []string
 	allowed := regexp.MustCompile(`^golang\.org/x/(text|sys)(/|$)`)
 	for _, ln := range strings.Split(out, "\n") {
@@ -198,6 +211,19 @@ func checkCoreDeps(root string) gate.Cell {
 		return failMsg("core-deps", "unexpected external deps: "+strings.Join(ext, " "))
 	}
 	return okCell("core-deps")
+}
+
+// apidiffCanaryOut writes the old fixture's API and compares the new fixture against it, using
+// the SAME `go run apidiff` invocation as the real check, from the tools module dir where the
+// fixture import paths resolve. Its output is handed to canary.CheckApidiff.
+func apidiffCanaryOut(root string) string {
+	toolsDir := filepath.Join(root, "tools")
+	base := filepath.Join(os.TempDir(), "canary-apidiff-old.api")
+	if _, rc := runIn(toolsDir, "go", "run", apidiffPkg, "-w", base, canary.ApidiffFixtureOld); rc != 0 {
+		return "" // could not even record the baseline → not fired → cannot-evaluate
+	}
+	out, _ := runIn(toolsDir, "go", "run", apidiffPkg, "-incompatible", base, canary.ApidiffFixtureNew)
+	return out
 }
 
 // prevTag is the highest v* tag by version, excluding the one being released — so a retracted
