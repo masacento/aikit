@@ -1,5 +1,15 @@
 # ann: route similarity dots through linalg SIMD (prompt for an aikit session)
 
+> **Status: DONE.** Both sites landed: `Flat.Query` uses `linalg.Dot`/`Dot8x4`
+> (documented + the f32-vs-float64 decision below made and recorded in
+> `ann/flat.go`'s header comment — f32, sub-ULP near-ties only, deterministic
+> tie-break). HNSW's `sim()` landed later, as perf-campaign item 15 (commit
+> `3249679`, "ann: batch HNSW neighbour scoring through Dot8x4" — 2.05–2.82×
+> measured; see `docs/internal/archive/perf-campaign-2026-07/perf-campaign-2026-07-28.md`
+> §15). Retained below as the design record.
+>
+> ---
+>
 > Ready-to-paste prompt. Context: drafted 2026-06-09. Follow-on to 58c947b
 > (encoder scores·V vectorization) — same pattern, different package.
 
