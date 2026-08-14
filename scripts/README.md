@@ -29,8 +29,8 @@ Verify it works (loads + embeds, ~90 MB download on first run):
 Each script writes a fixed `testdata/*.json` path; run from the repo root, e.g.:
 
 ```sh
-.venv/bin/python scripts/pin_encoder.py     # → testdata/encoder_golden.json (CodeRankEmbed)
-.venv/bin/python scripts/pin_inference.py   # → the Model2Vec embed golden
+.venv/bin/python scripts/oracle/pin_encoder.py     # → testdata/encoder_golden.json (CodeRankEmbed)
+.venv/bin/python scripts/oracle/pin_inference.py   # → the Model2Vec embed golden
 ```
 
 Models are fetched from the Hugging Face Hub on first run. GGUF dequant scripts
@@ -98,9 +98,9 @@ needs network access, and this is worth knowing before declaring vision work
 blocked on a missing checkpoint (it happened — perf-campaign §7.17):
 
 ```sh
-.venv/bin/python scripts/pin_siglip_vision.py   # -> testdata/siglip-tiny/ + golden (parity)
-.venv/bin/python scripts/pin_qwen25vl_vision.py # -> testdata/qwen25vl-vision-tiny/ + golden
-.venv/bin/python scripts/gen_siglip_bench.py    # -> testdata/siglip-bench{,-l}/ (throughput)
+.venv/bin/python scripts/oracle/pin_siglip_vision.py   # -> testdata/siglip-tiny/ + golden (parity)
+.venv/bin/python scripts/oracle/pin_qwen25vl_vision.py # -> testdata/qwen25vl-vision-tiny/ + golden
+.venv/bin/python scripts/oracle/gen_siglip_bench.py    # -> testdata/siglip-bench{,-l}/ (throughput)
 ```
 
 The `pin_*` pair build TINY random towers (hidden 32, 2 layers) — enough to

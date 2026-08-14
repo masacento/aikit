@@ -88,7 +88,7 @@ script). Trigger: someone actually needs text↔image, not just image→image.
 1. Copy the eight files into `aikit/vision/` with attribution (shared NOTICE
    conventions). The import-free GPU seam (`GPUMat`/`GPULayer`/`GPUWeights`) moves
    intact and **stays import-free**.
-2. Parity assets: `scripts/pin_siglip_vision.py` → aikit `scripts/`;
+2. Parity assets: `scripts/oracle/pin_siglip_vision.py` → aikit `scripts/`;
    `siglip_vision_golden.json` (74 KB of numbers, no image bytes) →
    aikit `testdata/`. The tiny `siglip-tiny` checkpoint stays model-gated
    (not committed); tests **skip-clean** when it is absent (CI has no model). A

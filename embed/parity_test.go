@@ -4,7 +4,7 @@
 //
 // Excluded from `go test ./...` by the `parity` build tag. Run with:
 //
-//	.venv/bin/python scripts/parity_dump.py        # regenerate testdata/parity.jsonl
+//	.venv/bin/python scripts/oracle/parity_dump.py        # regenerate testdata/parity.jsonl
 //	go test -tags=parity ./internal/embed/ -run TestParity -v
 //
 // The dump emits HF's normalize/pre_tokenize/ids per input; this test
@@ -55,7 +55,7 @@ func TestParity(t *testing.T) {
 	f, err := os.Open(parityPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			t.Skip("testdata/parity.jsonl not present; run `.venv/bin/python scripts/parity_dump.py`")
+			t.Skip("testdata/parity.jsonl not present; run `.venv/bin/python scripts/oracle/parity_dump.py`")
 		}
 		t.Fatal(err)
 	}

@@ -8,7 +8,7 @@ import (
 )
 
 // TestBERT_parity pins the MiniLM forward (§2.2) against the sentence-transformers
-// golden (scripts/pin_minilm.py): feeding the golden's input_ids, the Go forward's
+// golden (scripts/oracle/pin_minilm.py): feeding the golden's input_ids, the Go forward's
 // last_hidden_state must match per-element and its mean-pooled L2-normalized
 // embedding must match by cosine. Model-gated (skips without testdata/minilm-model).
 func TestBERT_parity(t *testing.T) {

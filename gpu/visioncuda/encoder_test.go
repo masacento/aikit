@@ -11,7 +11,7 @@ import (
 )
 
 // ckpt is the tiny-random SigLIP tower committed for the CPU parity gate
-// (scripts/pin_siglip_vision.py regenerates it deterministically). Asset-gated: the
+// (scripts/oracle/pin_siglip_vision.py regenerates it deterministically). Asset-gated: the
 // checkpoint directory is not committed, so this skips cleanly without it.
 const ckpt = "../../testdata/siglip-tiny"
 
@@ -30,7 +30,7 @@ func cosine(a, b []float32) float64 {
 func loadTower(t *testing.T) *vision.Encoder {
 	t.Helper()
 	if _, err := os.Stat(ckpt); err != nil {
-		t.Skipf("no siglip-tiny checkpoint (%v); run scripts/pin_siglip_vision.py", err)
+		t.Skipf("no siglip-tiny checkpoint (%v); run scripts/oracle/pin_siglip_vision.py", err)
 	}
 	// quant=true: the resident path requires int8 matmul weights, and gating GPU
 	// against a CPU tower loaded the SAME way isolates the device path as the only

@@ -25,7 +25,7 @@ import (
 //	mlp   = ( gelu(gate) ⊙ up ) · Downᵀ                   // up_gate fused [2I,H]
 //	h     = LayerNorm( h + mlp )                          // post-norm
 //
-// Parity is pinned against arctic-embed-m-v2.0 (TestGTE_parity, scripts/pin_gte.py).
+// Parity is pinned against arctic-embed-m-v2.0 (TestGTE_parity, scripts/oracle/pin_gte.py).
 
 type gteConfig struct {
 	VocabSize    int     `json:"vocab_size"`

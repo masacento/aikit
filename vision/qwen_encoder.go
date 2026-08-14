@@ -18,7 +18,7 @@ import (
 // gelu-tanh MLP), this is DYNAMIC-resolution: pre-flattened patches + grid_thw,
 // 2D rotary, RMSNorm, windowed + full attention, a gated SiLU MLP, and a
 // spatial-merge patch merger. Parity is cosine vs the HF
-// Qwen2_5_VisionTransformerPretrainedModel golden (scripts/pin_qwen25vl_vision.py),
+// Qwen2_5_VisionTransformerPretrainedModel golden (scripts/oracle/pin_qwen25vl_vision.py),
 // gated in two stages: the ViT pre-merge hidden and the merged image features.
 //
 // Forward takes pre-patchified input (the goinfer P5.3 preprocessor does

@@ -15,7 +15,7 @@ import (
 // last_hidden_state, the sequence of patch embeddings the projector turns into
 // image tokens. The attention/FFN projections run f32 or int8 W8A8 (LoadEncoder's
 // quant flag; the patch-embed conv stays f32); parity is cosine vs the HF
-// SiglipVisionModel golden (scripts/pin_siglip_vision.py) — 1.0 for f32, ~0.9999
+// SiglipVisionModel golden (scripts/oracle/pin_siglip_vision.py) — 1.0 for f32, ~0.9999
 // for int8 — the standard the rest of the f32-SIMD attention path meets.
 //
 // Structure (all reused from the text side's primitives): Conv2d patch embedding

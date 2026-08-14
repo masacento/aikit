@@ -8,7 +8,7 @@ package visionmetal_test
 // patch count, so the measurement is throughput-at-a-real-size — the tiny parity fixture
 // (hidden 32) says nothing about throughput, so this needs a real tower.
 //
-// It uses a RANDOM real-sized checkpoint (scripts/gen_siglip_bench.py): throughput does not
+// It uses a RANDOM real-sized checkpoint (scripts/oracle/gen_siglip_bench.py): throughput does not
 // depend on weight values, and parity is gated GPU-vs-CPU on the SAME tower (int8), so random
 // weights are exactly right and need no download. Gated on AIKIT_GPU_BENCH + the checkpoint +
 // a device, so a normal `go test` stays green.
@@ -50,7 +50,7 @@ func TestMetalViTThroughput(t *testing.T) {
 	for _, modelDir := range models {
 		modelDir = strings.TrimSpace(modelDir)
 		if _, err := os.Stat(modelDir + "/model.safetensors"); err != nil {
-			t.Logf("skip %s (run scripts/gen_siglip_bench.py)", modelDir)
+			t.Logf("skip %s (run scripts/oracle/gen_siglip_bench.py)", modelDir)
 			continue
 		}
 		if oneViT(t, modelDir, recordsPath) {
@@ -58,7 +58,7 @@ func TestMetalViTThroughput(t *testing.T) {
 		}
 	}
 	if ran == 0 {
-		t.Skip("no SigLIP bench towers present — run scripts/gen_siglip_bench.py")
+		t.Skip("no SigLIP bench towers present — run scripts/oracle/gen_siglip_bench.py")
 	}
 	t.Logf("records → %s", recordsPath)
 }

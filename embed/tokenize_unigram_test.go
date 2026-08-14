@@ -9,7 +9,7 @@ import (
 // TestUnigram_encodeParity is the end-to-end id-parity gate for the XLM-R
 // (SentencePiece/Unigram) tokenizer: LoadTokenizer must dispatch to the Unigram
 // backend, and EncodeWithSpecials(text) must reproduce HF `tokenizers`' full
-// input_ids (<s> … </s>) id-for-id over the oracle (scripts/pin_xlmr_tokenizer.py:
+// input_ids (<s> … </s>) id-for-id over the oracle (scripts/oracle/pin_xlmr_tokenizer.py:
 // Latin, CJK, RTL, Devanagari, fullwidth, emoji, punctuation, whitespace, code).
 func TestUnigram_encodeParity(t *testing.T) {
 	const path = "../testdata/xlm-roberta-base/tokenizer.json"
@@ -26,7 +26,7 @@ func TestUnigram_encodeParity(t *testing.T) {
 
 	raw, err := os.ReadFile("../testdata/xlmr_encode_golden.json")
 	if err != nil {
-		t.Skip("no encode golden — run scripts/pin_xlmr_tokenizer.py")
+		t.Skip("no encode golden — run scripts/oracle/pin_xlmr_tokenizer.py")
 	}
 	var g struct {
 		Cases []struct {

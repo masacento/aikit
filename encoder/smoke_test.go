@@ -21,7 +21,7 @@ func TestForward_smokeOneCase(t *testing.T) {
 	}
 	b, err := os.ReadFile(goldenPath)
 	if errors.Is(err, fs.ErrNotExist) {
-		t.Skipf("no fixture at %s — regenerate with scripts/pin_encoder.py", goldenPath)
+		t.Skipf("no fixture at %s — regenerate with scripts/oracle/pin_encoder.py", goldenPath)
 	}
 	if err != nil {
 		t.Fatal(err)

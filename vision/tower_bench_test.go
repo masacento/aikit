@@ -7,7 +7,7 @@ import (
 
 // BenchmarkSiglipTower is the arbiter for perf-campaign item 13's vision half.
 //
-// It runs the REAL-SIZED towers from scripts/gen_siglip_bench.py rather than the
+// It runs the REAL-SIZED towers from scripts/oracle/gen_siglip_bench.py rather than the
 // tiny parity fixture (hidden 32, 2 layers), because the share this item targets
 // is a function of tower size: attention softmax is O(patches²) while the
 // projections are O(patches), so the transcendental share only shows up at a
@@ -22,7 +22,7 @@ func BenchmarkSiglipTower(b *testing.B) {
 		{"p576_h768", "../testdata/siglip-bench-l"},
 	} {
 		if _, err := os.Stat(tc.dir); err != nil {
-			b.Skipf("%s not present; run scripts/gen_siglip_bench.py", tc.dir)
+			b.Skipf("%s not present; run scripts/oracle/gen_siglip_bench.py", tc.dir)
 		}
 		e, err := LoadEncoder(tc.dir, false)
 		if err != nil {

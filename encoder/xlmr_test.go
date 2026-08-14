@@ -8,7 +8,7 @@ import (
 )
 
 // TestXLMR_forwardParity certifies aikit's XLM-R position-id-OFFSET path against
-// a real reference (FacebookAI/xlm-roberta-base, scripts/pin_xlmr.py). XLM-R
+// a real reference (FacebookAI/xlm-roberta-base, scripts/oracle/pin_xlmr.py). XLM-R
 // numbers learned positions from padding_idx+1 (posOff = pad_token_id+1 = 2),
 // where BERT starts at 0 — a silent-wrong if mishandled, since it shifts every
 // position embedding by two slots.
@@ -22,7 +22,7 @@ import (
 func TestXLMR_forwardParity(t *testing.T) {
 	const dir = "../testdata/xlm-roberta-base"
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
-		t.Skipf("no xlm-roberta-base model at %s — fetch + run scripts/pin_xlmr.py", dir)
+		t.Skipf("no xlm-roberta-base model at %s — fetch + run scripts/oracle/pin_xlmr.py", dir)
 	}
 	b, err := LoadBERT(dir)
 	if err != nil {

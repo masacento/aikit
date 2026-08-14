@@ -8,13 +8,13 @@ import (
 )
 
 // TestSiglipEncoder_parity gates the pure-Go SigLIP forward against the HF
-// SiglipVisionModel golden (scripts/pin_siglip_vision.py): same tiny checkpoint,
+// SiglipVisionModel golden (scripts/oracle/pin_siglip_vision.py): same tiny checkpoint,
 // same pixel_values → last_hidden_state cosine ≈ 1.0. Asset-gated on
 // testdata/siglip-tiny (committed) + the golden.
 func TestSiglipEncoder_parity(t *testing.T) {
 	const ckpt = "../testdata/siglip-tiny"
 	if _, err := os.Stat(ckpt); err != nil {
-		t.Skipf("no siglip-tiny checkpoint (%v); run scripts/pin_siglip_vision.py", err)
+		t.Skipf("no siglip-tiny checkpoint (%v); run scripts/oracle/pin_siglip_vision.py", err)
 	}
 	raw, err := os.ReadFile("../testdata/siglip_vision_golden.json")
 	if err != nil {

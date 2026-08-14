@@ -37,7 +37,7 @@ func maxAbs(a, b []float32) float64 {
 func load(t *testing.T, quant bool) *vision.QwenVisionEncoder {
 	t.Helper()
 	if _, err := os.Stat(ckpt); err != nil {
-		t.Skipf("no qwen25vl-vision-tiny checkpoint (%v); run scripts/pin_qwen25vl_vision.py", err)
+		t.Skipf("no qwen25vl-vision-tiny checkpoint (%v); run scripts/oracle/pin_qwen25vl_vision.py", err)
 	}
 	e, err := vision.LoadQwenVisionEncoder(ckpt, quant)
 	if err != nil {

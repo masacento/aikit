@@ -19,7 +19,7 @@ import (
 //
 // Weights are PyTorch [out, in], so each linear is h·Wᵀ via matmulBT (A·Bᵀ); the
 // shared layerNorm / softmaxRow / poolOne primitives are reused. Parity is pinned
-// against all-MiniLM-L6-v2 (TestBERT_parity, golden from scripts/pin_minilm.py).
+// against all-MiniLM-L6-v2 (TestBERT_parity, golden from scripts/oracle/pin_minilm.py).
 
 type bertConfig struct {
 	VocabSize    int     `json:"vocab_size"`

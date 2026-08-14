@@ -11,7 +11,7 @@ import (
 // reuse the already-built architectures (learned-absolute BERT + WordPiece, or a
 // BERT-shaped model + Unigram). Each is config/tokenizer wiring plus a gate, not
 // new architecture — so they share one parity harness. Goldens come from
-// scripts/pin_coverage.py; the checkpoints are gitignored, so each gate skips
+// scripts/oracle/pin_coverage.py; the checkpoints are gitignored, so each gate skips
 // unless the model is present locally.
 
 // assertBERTParity is the shared oracle: load the model, verify its declared
@@ -22,7 +22,7 @@ import (
 func assertBERTParity(t *testing.T, dir, goldenPath string, wantPool pooling, wantPosOff int) {
 	t.Helper()
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
-		t.Skipf("no model at %s — fetch + run scripts/pin_coverage.py", dir)
+		t.Skipf("no model at %s — fetch + run scripts/oracle/pin_coverage.py", dir)
 	}
 	b, err := LoadBERT(dir)
 	if err != nil {
@@ -37,7 +37,7 @@ func assertBERTParity(t *testing.T, dir, goldenPath string, wantPool pooling, wa
 
 	raw, err := os.ReadFile(goldenPath)
 	if err != nil {
-		t.Skip("no golden — run scripts/pin_coverage.py")
+		t.Skip("no golden — run scripts/oracle/pin_coverage.py")
 	}
 	var g struct {
 		Cases []struct {

@@ -11,7 +11,7 @@ func TestCategory_reasonsFromCensus(t *testing.T) {
 	cases := []struct {
 		reason, cat string
 	}{
-		{"no bge-small model at testdata/ — fetch + run scripts/pin_bge.py", "missing asset"},
+		{"no bge-small model at testdata/ — fetch + run scripts/oracle/pin_bge.py", "missing asset"},
 		{"testdata/model/ not present; see testdata/README.md", "missing asset"},
 		{"no Metal device: Metal is not available", "no GPU device"},
 		{"no CUDA backend registered (no GPU?)", "no GPU device"},

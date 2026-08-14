@@ -8,7 +8,7 @@ import (
 )
 
 // TestCrossEncoder_parity pins the reranker (§1 v3) against the Python golden
-// (scripts/pin_crossencoder.py): feeding the golden's input_ids + token_type_ids,
+// (scripts/oracle/pin_crossencoder.py): feeding the golden's input_ids + token_type_ids,
 // scoreIDs must reproduce the classification logit, and the live Score(query, doc)
 // pipeline (aikit's own pair tokenization) must match too. Model-gated.
 func TestCrossEncoder_parity(t *testing.T) {

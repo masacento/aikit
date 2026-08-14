@@ -10,7 +10,7 @@ import (
 // TestStaticModel_potionRetrieval pins embed's standard (no-mapping) Model2Vec path
 // against minishlab/potion-retrieval-32M, whose safetensors holds only `embeddings`
 // (no `mapping`/`weights`): token ids index rows directly, pooling is a plain mean.
-// Golden from scripts/pin_retrieval.py; model-gated.
+// Golden from scripts/oracle/pin_retrieval.py; model-gated.
 func TestStaticModel_potionRetrieval(t *testing.T) {
 	const dir = "../testdata/retrieval-model"
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {

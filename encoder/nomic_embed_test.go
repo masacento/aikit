@@ -16,7 +16,7 @@ import (
 func TestNomicEmbed_parity(t *testing.T) {
 	const dir = "../testdata/nomic-embed"
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
-		t.Skipf("no nomic-embed model at %s — fetch + run scripts/pin_nomic_embed.py", dir)
+		t.Skipf("no nomic-embed model at %s — fetch + run scripts/oracle/pin_nomic_embed.py", dir)
 	}
 	m, err := Load(dir)
 	if err != nil {

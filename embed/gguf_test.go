@@ -19,11 +19,11 @@ import (
 // super-blocks (raw_hex) and the reference dequantization (expected); dequantRange
 // must reproduce them. Codebook quants have no convenient small-model f32 oracle,
 // so this pins the kernel directly (every value, not just a forward cosine).
-// Regenerate: .venv/bin/python scripts/pin_iq_dequant.py
+// Regenerate: .venv/bin/python scripts/oracle/pin_iq_dequant.py
 func TestIQDequant_matchesReference(t *testing.T) {
 	raw, err := os.ReadFile("../testdata/iq_dequant_golden.json")
 	if errors.Is(err, fs.ErrNotExist) {
-		t.Skip("no IQ golden — regenerate with scripts/pin_iq_dequant.py")
+		t.Skip("no IQ golden — regenerate with scripts/oracle/pin_iq_dequant.py")
 	}
 	if err != nil {
 		t.Fatalf("read golden: %v", err)

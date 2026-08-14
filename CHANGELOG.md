@@ -10,6 +10,19 @@ it.
 
 ## [Unreleased]
 
+### Changed
+
+- **Python is now boundaried by directory, and the residue is gone.** The four non-oracle scripts
+  in `scripts/` are resolved: `m0_ceiling.py` struck; `shard_checkpoint.py` moved to goinfer (it
+  generates a sharded fixture goinfer's `decoder/sharded_test.go` consumes and references goinfer's
+  decoder — a leftover from the split). The reference generators now live in `scripts/oracle/` (the
+  34 PyTorch/HF golden pins + `gen_iq_grids.py`, which dumps llama.cpp's ggml tables), and the one
+  cost-basis exception in `scripts/fixtures/` (`prep_beir.py`, an HF-parquet fetch for a manual
+  benchmark). `tools/pyguard` (CI) fails on any `.py` directly under `scripts/`, so the boundary is
+  derived by directory rather than a hand-kept list. Skip-message and doc references to the pin
+  scripts moved with them. (The gpu/ CUDA build helper `nvrtc_compile.py` is separate build
+  infrastructure, out of this scope.)
+
 ## [1.18.0] — 2026-08-14
 
 ### Added

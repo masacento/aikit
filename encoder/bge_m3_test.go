@@ -8,7 +8,7 @@ import (
 )
 
 // TestBGEM3_parity certifies BAAI/bge-m3 — the flagship multilingual retriever —
-// full-stack against its sentence-transformers reference (scripts/pin_bge_m3.py).
+// full-stack against its sentence-transformers reference (scripts/oracle/pin_bge_m3.py).
 // It reuses the exact path multilingual-e5-base certified (XLM-R posOff=2 +
 // SentencePiece/Unigram tokenizer + forward), but CLS pooling instead of mean and
 // at 24 layers / 1024 dim — so it independently gates the CLS reduction on the
@@ -17,7 +17,7 @@ import (
 func TestBGEM3_parity(t *testing.T) {
 	const dir = "../testdata/bge-m3"
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
-		t.Skipf("no bge-m3 at %s — fetch, convert bin→safetensors, run scripts/pin_bge_m3.py", dir)
+		t.Skipf("no bge-m3 at %s — fetch, convert bin→safetensors, run scripts/oracle/pin_bge_m3.py", dir)
 	}
 	b, err := LoadBERT(dir)
 	if err != nil {
@@ -35,7 +35,7 @@ func TestBGEM3_parity(t *testing.T) {
 
 	raw, err := os.ReadFile("../testdata/bge_m3_golden.json")
 	if err != nil {
-		t.Skip("no golden — run scripts/pin_bge_m3.py")
+		t.Skip("no golden — run scripts/oracle/pin_bge_m3.py")
 	}
 	var g struct {
 		Cases []struct {

@@ -1,7 +1,7 @@
 // Command beir evaluates aikit's retrieval quality on the BeIR/scifact test slice:
 // potion-retrieval-32M embeddings (aikit's pure-Go embed) + exact Flat cosine ANN,
 // scored by nDCG@10 — a cross-referenceable standard-benchmark number (SciFact is a
-// canonical BEIR task). Prep the data first with scripts/prep_beir.py.
+// canonical BEIR task). Prep the data first with scripts/fixtures/prep_beir.py.
 //
 //	cd benchmarks && GOWORK=off go run ./beir
 package main
@@ -27,7 +27,7 @@ type dataset struct {
 func main() {
 	raw, err := os.ReadFile("../testdata/beir-scifact/scifact.json")
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "beir: no data — run scripts/prep_beir.py first:", err)
+		fmt.Fprintln(os.Stderr, "beir: no data — run scripts/fixtures/prep_beir.py first:", err)
 		os.Exit(1)
 	}
 	var d dataset

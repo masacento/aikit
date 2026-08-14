@@ -238,7 +238,7 @@ machines in the one normalized summary: CUDA up to **15.25×** (N=1e5, batch 256
 **~2.8×**, every point parity-exact. Two more `BENCH-gpu.md` slices, same harness/record/report:
 
 - **ViT throughput — ✅ DONE (Metal), a modest win that grows with size.** A real-sized random
-  SigLIP tower (`scripts/gen_siglip_bench.py` — random weights, since throughput is value-blind
+  SigLIP tower (`scripts/oracle/gen_siglip_bench.py` — random weights, since throughput is value-blind
   and parity is gated GPU-vs-CPU on the same tower) run CPU vs the Metal resident encoder:
   **1.33×** at hidden 512 / 196 patches, **1.53×** at hidden 768 / 576 patches. It grows with the
   tower because the resident encoder does **per-op command buffers** (~12 layers × ~10 ops, each a

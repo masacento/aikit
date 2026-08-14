@@ -175,6 +175,20 @@ jobs:
       - name: execute perf benchmarks
         run: go test ./linalg/ -run '^$' -bench '^(BenchmarkW8A8SpanShapes|BenchmarkGEMV_W8A8_baseline)$' -benchtime=1x
 
+  python-boundary:
+    name: python boundary (oracle | fixtures)
+    # Zero-Python campaign: every .py under scripts/ must be a declared external-reference
+    # generator (scripts/oracle/) or a declared fixture (scripts/fixtures/); a stray .py directly
+    # under scripts/ is residue and fails. Derived by directory, so nothing is hand-enumerated.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: pyguard
+        run: go run -C tools ./pyguard
+
   gpu-pins:
     name: gpu backend version pins
     # AK1: the eight gpu/* backend modules each `require` the root and gpu series by an exact

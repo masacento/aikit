@@ -236,8 +236,8 @@ before designing against it. Cross-machine comparisons belong in the normalized
 
 Item 13's vision half was deferred with "no vision checkpoint on this box to
 re-verify parity against". Both fixtures were already present, and neither is a
-download: `scripts/pin_siglip_vision.py` **generates** a tiny random
-`SiglipVisionModel` locally, and `scripts/gen_siglip_bench.py` generates the
+download: `scripts/oracle/pin_siglip_vision.py` **generates** a tiny random
+`SiglipVisionModel` locally, and `scripts/oracle/gen_siglip_bench.py` generates the
 real-sized towers. `TestSiglipEncoder_parity` had been passing the whole time.
 
 The same session then fetched a cross-encoder checkpoint and found the largest

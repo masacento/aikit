@@ -138,7 +138,7 @@ embeddings + exact Flat cosine — scores **nDCG@10 0.638** (300 queries, 5183 d
 That's a cross-referenceable number: SciFact + nDCG@10 is the standard MTEB/BEIR
 protocol (the model's overall MTEB retrieval score is 35.06), and 0.638 is right where
 a strong static retriever lands — near all-MiniLM-L6-v2's own SciFact nDCG@10, at a
-fraction of the cost and pure-Go. Reproduce: `scripts/prep_beir.py`, then
+fraction of the cost and pure-Go. Reproduce: `scripts/fixtures/prep_beir.py`, then
 `cd benchmarks && GOWORK=off go run ./beir`.
 
 ### Inference throughput (vs hugot)
@@ -345,8 +345,8 @@ download-model [--rerank] --to <dir>` fetches the same snapshots.)
 Regenerate the committed golden fixtures:
 
 ```bash
-.venv/bin/python scripts/pin_inference.py    # Model2Vec → testdata/golden.json
-.venv/bin/python scripts/pin_encoder.py      # CodeRankEmbed → testdata/encoder_golden.json
+.venv/bin/python scripts/oracle/pin_inference.py    # Model2Vec → testdata/golden.json
+.venv/bin/python scripts/oracle/pin_encoder.py      # CodeRankEmbed → testdata/encoder_golden.json
 ```
 
 ---

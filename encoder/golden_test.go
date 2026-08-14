@@ -11,7 +11,7 @@ import (
 	"github.com/townsendmerino/aikit/embed"
 )
 
-// Golden fixture produced by scripts/pin_encoder.py. Stored in
+// Golden fixture produced by scripts/oracle/pin_encoder.py. Stored in
 // testdata/ (not gitignored — it's small, ~450 KB, and pins the
 // reference for future change-control). Forward-pass parity (cosine)
 // arrives in M2; M1 pins schema + tokenizer parity.
@@ -42,7 +42,7 @@ func loadGolden(t *testing.T) *goldenPayload {
 	t.Helper()
 	b, err := os.ReadFile(goldenPath)
 	if errors.Is(err, fs.ErrNotExist) {
-		t.Skipf("no fixture at %s — regenerate with scripts/pin_encoder.py", goldenPath)
+		t.Skipf("no fixture at %s — regenerate with scripts/oracle/pin_encoder.py", goldenPath)
 	}
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)

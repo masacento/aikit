@@ -51,7 +51,7 @@ func TestSPLADE_endToEnd(t *testing.T) {
 }
 
 // TestSPLADE_parity pins the SPLADE expansion (§2.3) against the Python reference
-// (scripts/pin_splade.py): feeding the golden's input_ids, expandIDs must produce
+// (scripts/oracle/pin_splade.py): feeding the golden's input_ids, expandIDs must produce
 // the same sparse term-weight vector (compared by cosine; term-set agreement logged).
 // Model-gated.
 func TestSPLADE_parity(t *testing.T) {

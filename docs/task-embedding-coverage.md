@@ -106,17 +106,17 @@ green.**
   (a) the **Unigram/SentencePiece tokenizer** (`embed/tokenize_unigram.go`) reproduces HF
   id-for-id — byte-exact Precompiled normalization over the full U+0000..U+2FFFF sweep and
   id-exact `encode` over a broad multilingual/emoji/code set, with break-it-first
-  (`embed/tokenize_unigram_test.go`, `scripts/pin_xlmr_tokenizer.py`); (b) the **position-id
+  (`embed/tokenize_unigram_test.go`, `scripts/oracle/pin_xlmr_tokenizer.py`); (b) the **position-id
   offset** forward holds at `posOff=2`, hidden-state maxΔ 1.7e-05, offset-zeroing break-it-first
   (`encoder/xlmr_test.go`). `LoadBERT` wires the tokenizer, so `Encode(text)→hidden` is certified.
 - **Phase 2 — first multilingual embedder certified full-stack.** `intfloat/multilingual-e5-base`
   (genuine XLM-R + SentencePiece + mean-pool + a real sentence-transformers head) is certified
   end-to-end at **cosine 1.000000** over 11 cases (Latin, CJK, Cyrillic, Arabic, German ß/umlaut):
   hidden-state parity AND `Encode(text)` — tokenizer + `posOff=2` + mean pooling + forward in one
-  gate — with CLS-vs-mean and offset break-it-first (`encoder/e5_test.go`, `scripts/pin_e5.py`).
+  gate — with CLS-vs-mean and offset break-it-first (`encoder/e5_test.go`, `scripts/oracle/pin_e5.py`).
 - **Phase 2 — `bge-m3` certified full-stack (CLS).** The flagship multilingual retriever (24-layer
   XLM-R, 1024-dim, CLS pooling) is certified at **cosine 1.000000** over 13 cases
-  (`encoder/bge_m3_test.go`, `scripts/pin_bge_m3.py`). It exercises two config-driven tokenizer
+  (`encoder/bge_m3_test.go`, `scripts/oracle/pin_bge_m3.py`). It exercises two config-driven tokenizer
   variations the parser now handles generically: a normalizer `Sequence[Precompiled,
   Replace(" {2,}"→" ")]` and a **bare Metaspace** pre-tokenizer (no WhitespaceSplit) — validated
   id-exact against the raw HF tokenizer including trailing-▁ / multi-space edge cases
@@ -130,7 +130,7 @@ green.**
   `goinfer/docs/task-decoder-as-embedder.md`.
 - **Phase 4 (Bucket C, MoE) — done, certified.** `nomic-embed-text-v2-moe` is certified full-stack
   at **cosine 1.000000** over 9 cases, worst hidden maxΔ 3.2e-05 (`encoder/nomic_moe_test.go`,
-  `scripts/pin_nomic_moe.py`), with break-it-first on the routing itself (top-1 instead of top-2,
+  `scripts/oracle/pin_nomic_moe.py`), with break-it-first on the routing itself (top-1 instead of top-2,
   and forcing every token to one expert — both diverge by ~2–7 vs 2e-05).
 
   Reading the config first paid off again: the bucket called this "one new primitive," but it is
@@ -148,7 +148,7 @@ green.**
   tensors into a plausible-looking wrong model.
 - **Bucket A breadth — four more certified (2026-07-27), no new architecture.** With every
   architecture already built, the remaining named Bucket-A models are pure config/tokenizer
-  wiring plus a gate, so they share one harness (`scripts/pin_coverage.py`,
+  wiring plus a gate, so they share one harness (`scripts/oracle/pin_coverage.py`,
   `encoder/coverage_bert_test.go`): **`BAAI/bge-large-en-v1.5`** and
   **`mixedbread-ai/mxbai-embed-large-v1`** (1024-dim CLS-BERT), **`Snowflake/snowflake-arctic-embed-m`**
   (768-dim CLS-BERT), and **`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`** (a
@@ -174,7 +174,7 @@ green.**
     Unigram (already supported). Certified at cosine 1.000000, worst hidden maxΔ 7.8e-06, Matryoshka
     to 256. `TestGTE_parity` + `TestGTE_encodeEndToEnd`. (Pinning note: the HF reference's RoPE
     `inv_freq` is a non-persistent buffer left uninitialized by the custom code — its own RoPE is a
-    silent no-op unless the cache is rebuilt; `scripts/pin_gte.py` reconstructs it.)
+    silent no-op unless the cache is rebuilt; `scripts/oracle/pin_gte.py` reconstructs it.)
 
 ## Coverage claim, generated not hand-maintained
 

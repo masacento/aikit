@@ -9,7 +9,7 @@ import (
 
 // TestNomicMoE_parity certifies nomic-embed-text-v2-moe — Bucket C, the one
 // mixture-of-experts entry — full-stack against its sentence-transformers
-// reference (scripts/pin_nomic_moe.py). It gates three new pieces at once:
+// reference (scripts/oracle/pin_nomic_moe.py). It gates three new pieces at once:
 //
 //   - the top-2-of-8 MoE FFN on the ODD layers (router softmax over all experts,
 //     weights NOT renormalized, W2 applied untransposed, one shared output bias),
@@ -22,7 +22,7 @@ import (
 func TestNomicMoE_parity(t *testing.T) {
 	const dir = "../testdata/nomic-moe"
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
-		t.Skipf("no nomic-embed-text-v2-moe at %s — fetch + run scripts/pin_nomic_moe.py", dir)
+		t.Skipf("no nomic-embed-text-v2-moe at %s — fetch + run scripts/oracle/pin_nomic_moe.py", dir)
 	}
 	m, err := Load(dir)
 	if err != nil {
@@ -44,7 +44,7 @@ func TestNomicMoE_parity(t *testing.T) {
 
 	raw, err := os.ReadFile("../testdata/nomic_moe_golden.json")
 	if err != nil {
-		t.Skip("no golden — run scripts/pin_nomic_moe.py")
+		t.Skip("no golden — run scripts/oracle/pin_nomic_moe.py")
 	}
 	var g struct {
 		Cases []struct {

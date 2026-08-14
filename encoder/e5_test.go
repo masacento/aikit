@@ -9,7 +9,7 @@ import (
 
 // TestMultilingualE5_parity is the CAPSTONE multilingual gate: it certifies the
 // whole stack at once against a real sentence-transformers reference
-// (intfloat/multilingual-e5-base, scripts/pin_e5.py) — the SentencePiece/Unigram
+// (intfloat/multilingual-e5-base, scripts/oracle/pin_e5.py) — the SentencePiece/Unigram
 // tokenizer, the XLM-R position-id offset (posOff=2), mean pooling, and the
 // forward — where the earlier xlm-roberta-base gate could only check the
 // forward+offset (bare LM, no pooling head). Three layers:
@@ -20,7 +20,7 @@ import (
 func TestMultilingualE5_parity(t *testing.T) {
 	const dir = "../testdata/multilingual-e5-base"
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
-		t.Skipf("no multilingual-e5-base at %s — fetch + run scripts/pin_e5.py", dir)
+		t.Skipf("no multilingual-e5-base at %s — fetch + run scripts/oracle/pin_e5.py", dir)
 	}
 	b, err := LoadBERT(dir)
 	if err != nil {
@@ -38,7 +38,7 @@ func TestMultilingualE5_parity(t *testing.T) {
 
 	raw, err := os.ReadFile("../testdata/e5_golden.json")
 	if err != nil {
-		t.Skip("no golden — run scripts/pin_e5.py")
+		t.Skip("no golden — run scripts/oracle/pin_e5.py")
 	}
 	var g struct {
 		Cases []struct {

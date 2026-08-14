@@ -8,7 +8,7 @@ import (
 )
 
 // TestGTE_parity certifies the GTE forward (Snowflake/snowflake-arctic-embed-m-v2.0,
-// Alibaba gte-multilingual-base) against its HF reference (scripts/pin_gte.py). GTE
+// Alibaba gte-multilingual-base) against its HF reference (scripts/oracle/pin_gte.py). GTE
 // is a post-norm BERT-family encoder with three axes the other paths don't exercise
 // together: RoPE positions, a PACKED qkv projection, and a gated-GELU (GeGLU) MLP.
 // Break-it-first pools MEAN instead of the declared CLS — it must diverge, proving
@@ -16,7 +16,7 @@ import (
 func TestGTE_parity(t *testing.T) {
 	const dir = "../testdata/arctic2-m"
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
-		t.Skipf("no arctic-embed-m-v2.0 at %s — fetch + run scripts/pin_gte.py", dir)
+		t.Skipf("no arctic-embed-m-v2.0 at %s — fetch + run scripts/oracle/pin_gte.py", dir)
 	}
 	g, err := LoadGTE(dir)
 	if err != nil {
@@ -28,7 +28,7 @@ func TestGTE_parity(t *testing.T) {
 
 	raw, err := os.ReadFile("../testdata/gte_golden.json")
 	if err != nil {
-		t.Skip("no golden — run scripts/pin_gte.py")
+		t.Skip("no golden — run scripts/oracle/pin_gte.py")
 	}
 	var gld struct {
 		Cases []struct {

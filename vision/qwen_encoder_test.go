@@ -7,14 +7,14 @@ import (
 )
 
 // TestQwenVisionEncoder_parity gates the pure-Go Qwen2.5-VL vision tower against the
-// HF Qwen2_5_VisionTransformerPretrainedModel golden (scripts/pin_qwen25vl_vision.py):
+// HF Qwen2_5_VisionTransformerPretrainedModel golden (scripts/oracle/pin_qwen25vl_vision.py):
 // same tiny checkpoint, same pixel_values + grid_thw, two stage-isolated cosines —
 // the ViT pre-merge hidden and the merged image features — both ≥ 0.9999 (fp32).
 // Asset-gated on testdata/qwen25vl-vision-tiny + the golden.
 func TestQwenVisionEncoder_parity(t *testing.T) {
 	const ckpt = "../testdata/qwen25vl-vision-tiny"
 	if _, err := os.Stat(ckpt); err != nil {
-		t.Skipf("no qwen25vl-vision-tiny checkpoint (%v); run scripts/pin_qwen25vl_vision.py", err)
+		t.Skipf("no qwen25vl-vision-tiny checkpoint (%v); run scripts/oracle/pin_qwen25vl_vision.py", err)
 	}
 	raw, err := os.ReadFile("../testdata/qwen25vl_vision_golden.json")
 	if err != nil {

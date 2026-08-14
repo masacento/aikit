@@ -8,7 +8,7 @@ import (
 )
 
 // TestBGE_parity certifies the CLS-pooled BERT embedder against a real reference
-// (BAAI/bge-small-en-v1.5, scripts/pin_bge.py). bge-small is the same
+// (BAAI/bge-small-en-v1.5, scripts/oracle/pin_bge.py). bge-small is the same
 // architecture as all-MiniLM (learned-absolute positions, GELU FFN, WordPiece)
 // but pools CLS instead of mean, so this is the end-to-end gate for the
 // declared-pooling work: LoadBERT must read pooling_mode_cls_token from
@@ -16,7 +16,7 @@ import (
 func TestBGE_parity(t *testing.T) {
 	const dir = "../testdata/bge-small"
 	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
-		t.Skipf("no bge-small model at %s — fetch + run scripts/pin_bge.py", dir)
+		t.Skipf("no bge-small model at %s — fetch + run scripts/oracle/pin_bge.py", dir)
 	}
 	b, err := LoadBERT(dir)
 	if err != nil {
