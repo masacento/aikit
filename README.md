@@ -73,6 +73,15 @@ index → query → top-K) — the in-process, no-Python pipeline behind the
 fused hybrid search the same way `examples/rag`'s dense and lexical signals
 do, via `fuse.Keys(sparseHits, func(h sparse.Hit) int { return h.Index })`.
 
+For the "only cgo-free image embedder" claim below,
+[`examples/vision/`](examples/vision) indexes a corpus that mixes code chunks
+and images: each image's caption joins the fused dense+lexical search as just
+another chunk (image-as-document indexing), and landing on an image hit pivots
+into "visually similar images" via its own SigLIP embedding index
+(image→image similarity) — the two capabilities the vision package actually
+provides, deliberately not a cross-modal text→image search (aikit has no
+joint text/image embedding space).
+
 ---
 
 ## Platforms
