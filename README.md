@@ -35,7 +35,7 @@ large embedded-grammar payload) — is quarantined in the separate
 | `encoder` | BERT/RoBERTa/XLM-R/GTE/nomic-bert(+MoE) embedder family (12 certified models, `docs/embedder-coverage.md`, incl. CodeRankEmbed) + SPLADE expansion + cross-encoder reranker — transformer inference scored by cosine / sparse dot / relevance logit; pluggable matmul `Backend` | `embed`, `linalg`, `sparse` |
 | `vision` *(Experimental)* | SigLIP / ViT image encoder — decode → preprocess → pure-Go transformer forward → image embeddings (f32 or int8 W8A8), parity-pinned to HF `SiglipVisionModel`; stdlib image codecs, no cgo | `embed`, `linalg` |
 | `chunk` | language-aware chunker registry + `regex`, `markdown`, `line` chunkers | — |
-| `gpu` *(Experimental, darwin+linux; separate modules)* | cgo-free native-GPU device substrate — `Device`/`Buffer`/`Queue`/`Pipeline`/`Encoder` over Metal (darwin, runtime MSL compiler) or CUDA (linux, embedded PTX); the GPU analogue of `linalg`'s CPU role. 8 one-backend-per-module leaves plug into 3 seams: `anncuda`/`annmetal` → `FlatI8.EnableGPU`; `enccuda`/`encmetal` → `encoder.RegisterBackend("cuda"/"metal", …)`; `qwencuda`/`qwenmetal` + `visioncuda`/`visionmetal` → `vision.RegisterResident`. Device tests are hand-run (no GPU CI); the default aikit build never imports any of them and stays pure-Go. | `github.com/ebitengine/purego` *(darwin)*, `github.com/eitamring/gocudrv` *(linux)* |
+| `gpu` *(Experimental, darwin+linux; separate modules)* | cgo-free native-GPU device substrate — `Device`/`Buffer`/`Queue`/`Pipeline`/`Encoder` over Metal (darwin, runtime MSL compiler) or CUDA (linux, embedded PTX); the GPU analogue of `linalg`'s CPU role. 8 one-backend-per-module leaves plug into 3 seams: `anncuda`/`annmetal` → `FlatI8.EnableGPU`; `enccuda`/`encmetal` → `encoder.RegisterBackend("cuda"/"metal", …)`; `qwencuda`/`qwenmetal` + `visioncuda`/`visionmetal` → `vision.RegisterResident`. Device tests are hand-run (no GPU CI); the default aikit build never imports any of them and stays pure-Go. See [`examples/gpu-ann`](examples/gpu-ann) for the `FlatI8.EnableGPU` seam end to end. | `github.com/ebitengine/purego` *(darwin)*, `github.com/eitamring/gocudrv` *(linux)* |
 | `chunk/treesitter` *(submodule)* | tree-sitter-backed syntactic chunker | `gotreesitter`, `…/aikit` |
 
 `chunk/treesitter` is a **separate Go module** (`…/aikit/chunk/treesitter`) so the
@@ -97,6 +97,36 @@ per-token vectors — `encoder.Model.EncodeTokens`, built for exactly this — a
 each query token independently finds its best-matching document token) instead
 of `encoder.CrossEncoder`'s one joint forward per pair. Run both examples on
 the same query to compare.
+
+[`examples/gpu-ann/`](examples/gpu-ann) is the native-GPU path
+(`docs/task-native-gpu.md`) made visible: the same `ann.FlatI8` int8 index,
+queried once on the CPU and once with `EnableGPU()`, checking the two agree
+exactly and timing both. It's its own Go module (like `examples/embedded-corpus`)
+since the GPU backends pull in `purego`/`gocudrv`, exactly what the core
+module's cgo-free promise keeps out — see "Platforms" below. Needs no model:
+`FlatI8` just quantizes whatever vectors it's given, so this runs on synthetic
+data. Run on both backends this repo ships:
+
+- **Metal** (M1 Pro — the same chip `gpu/annmetal`'s own kernel comments cite
+  for their bench numbers, an integrated GPU): `go run ./examples/gpu-ann` (1M
+  vectors, dim 256, 256 queries) came out close to parity with the CPU across
+  repeated one-shot runs — roughly 0.97–1.2×, not the larger wins
+  `docs/task-native-gpu.md` reports from its own (presumably iterated/averaged)
+  benchmark harness — while a small corpus (`-n 50000 -queries 8`) has the GPU
+  clearly **losing** (dispatch overhead dominates).
+- **CUDA** (a discrete RTX 2070 SUPER, verified over SSH): the same run
+  measured **~69× over CPU** at 1M vectors, and still **~20× at 50k vectors /
+  8 queries** — the small-scale regime where the integrated Metal GPU above
+  loses outright. A discrete GPU's dispatch overhead is proportionally far
+  smaller against its own much higher raw throughput, so "GPU loses below some
+  N" is a property of the *hardware class*, not a fixed threshold in the code.
+
+Both backends are correct, not just directionally plausible: every run's GPU
+top-k was bit-identical to the CPU's, on both machines, at every scale tried —
+this example checks that itself, and `gpu/anncuda`'s own test suite (run on
+the same box) adds a much more exhaustive parity gate on top. The real lesson
+here is the tradeoff `gpu/annmetal`'s large-N gating exists for, and that it's
+hardware-dependent, not a cherry-picked best number from either box.
 
 ---
 
