@@ -54,6 +54,20 @@ type Cell struct {
 	Outcome Outcome
 }
 
+// Field returns the State of the Field named key, or "" if no Field has that
+// key. Gate commands report their per-check details through Fields rather
+// than a typed struct, so this linear-scan accessor is how a caller reads
+// one back out; it was copy-pasted into gpudevice, preflight, vulncheck, and
+// perfgate's own test before landing here.
+func (c Cell) Field(key string) string {
+	for _, f := range c.Fields {
+		if f.Key == key {
+			return f.State
+		}
+	}
+	return ""
+}
+
 // Check is one unit of work — data, not control flow. A gate is a []Check.
 type Check struct {
 	Name string

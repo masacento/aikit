@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"github.com/townsendmerino/aikit/tools/gate"
+	"github.com/townsendmerino/aikit/tools/gpumod"
 )
 
 func main() {
@@ -62,19 +63,26 @@ func run(args []string) int {
 		backoff:  time.Duration(envInt("CONSUMER_GATE_BACKOFF", 5)) * time.Second,
 		goos:     goos,
 	}
-	commit, dirty := provenance()
-	prov := commit + dirty
-	box := hostname() + " " + goEnv("GOOS") + "/" + goEnv("GOARCH")
-	date := nowUTC()
+	// root, prov, box, date computed before the repoRoot error check below, same as before:
+	// gpumod.Provenance("") still resolves commit/dirty (git auto-discovers the repo from
+	// cwd; cmd.Dir="" is the same "inherit cwd" behavior this tool always had), so the error
+	// path can still report full provenance rather than degrading to bare strings.
+	root, rootErr := gpumod.RepoRoot()
+	p := gpumod.Provenance(root)
+	prov := p.Commit + p.Dirty
+	// Host, not gpumod's uname-based OSName/Arch: those report the box gpumod's OWN gpu
+	// gates build ON, but this gate's whole point is testing a PLATFORM UNDER TEST that
+	// varies per run (goEnv("GOOS")/("GOARCH") below), which uname can't answer.
+	box := p.Host + " " + goEnv("GOOS") + "/" + goEnv("GOARCH")
+	date := p.Date
 
 	fmt.Printf("aikit consumer gate — %s — %s — proxy=%s — %s\n\n", prov, box, cfg.proxy, date)
 
 	// Classification runs ALWAYS, even for --tag and explicit pairs: it is the integrity
 	// check ("no module skips the gate") and it is what validates a tag against the
 	// published set. A guard failure is a hard FAIL, distinct from a module defect.
-	root, err := repoRoot()
-	if err != nil {
-		return incon(fmt.Sprintf("cannot locate repo root: %v (at %s, %s, %s)", err, prov, box, date))
+	if rootErr != nil {
+		return incon(fmt.Sprintf("cannot locate repo root: %v (at %s, %s, %s)", rootErr, prov, box, date))
 	}
 	pub, total, err := classifyTree(root)
 	if err != nil {
@@ -219,26 +227,3 @@ func goEnv(k string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
-
-func provenance() (commit, dirty string) {
-	commit = "?"
-	if out, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output(); err == nil {
-		commit = strings.TrimSpace(string(out))
-	}
-	if out, err := exec.Command("git", "status", "--porcelain").Output(); err == nil && strings.TrimSpace(string(out)) != "" {
-		dirty = " +dirty"
-	}
-	return commit, dirty
-}
-
-func hostname() string {
-	h, err := os.Hostname()
-	if err != nil {
-		return "unknown"
-	}
-	return h
-}
-
-// nowUTC formats the current UTC time. It is the one place a wall-clock is read; kept
-// isolated so a caller that must be reproducible can see exactly where time enters.
-func nowUTC() string { return time.Now().UTC().Format("2006-01-02T15:04:05Z") }

@@ -88,14 +88,14 @@ func run() int {
 
 	var clean, vuln, unscanned int
 	for _, c := range cells {
-		status := field(c, "status")
+		status := c.Field("status")
 		switch status {
 		case "CLEAN":
 			clean++
 			fmt.Printf("  %-30s CLEAN\n", c.Name)
 		case "VULNERABLE":
 			vuln++
-			fmt.Printf("  %-30s VULNERABLE (%s reachable)\n", c.Name, field(c, "count"))
+			fmt.Printf("  %-30s VULNERABLE (%s reachable)\n", c.Name, c.Field("count"))
 			for _, f := range c.Fields {
 				if f.Key == "line" {
 					fmt.Printf("      %s\n", f.State)
@@ -103,7 +103,7 @@ func run() int {
 			}
 		default: // UNSCANNED
 			unscanned++
-			fmt.Printf("  %-30s UNSCANNED — %s\n", c.Name, field(c, "detail"))
+			fmt.Printf("  %-30s UNSCANNED — %s\n", c.Name, c.Field("detail"))
 		}
 	}
 	total := clean + vuln + unscanned
@@ -222,15 +222,6 @@ func scannerVersion(gvc string) string {
 		return "unknown"
 	}
 	return strings.Join(strings.Fields(string(out)), " ")
-}
-
-func field(c gate.Cell, key string) string {
-	for _, f := range c.Fields {
-		if f.Key == key {
-			return f.State
-		}
-	}
-	return ""
 }
 
 func firstNonEmpty(s string) string {

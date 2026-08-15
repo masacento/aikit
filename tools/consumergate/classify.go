@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -36,31 +35,6 @@ var internal = map[string]bool{
 	rootPath + "/benchmarks":               true,
 	rootPath + "/examples/embedded-corpus": true,
 	rootPath + "/tools":                    true,
-}
-
-// repoRoot finds the checkout root so enumeration works regardless of the tool's cwd (it
-// is normally run as `go run -C tools ./consumergate`, whose cwd is tools/). git is the
-// authority; a walk up to a .git directory is the fallback for a detached tree.
-func repoRoot() (string, error) {
-	if out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output(); err == nil {
-		if p := strings.TrimSpace(string(out)); p != "" {
-			return p, nil
-		}
-	}
-	dir, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	for {
-		if fi, err := os.Stat(filepath.Join(dir, ".git")); err == nil && fi.IsDir() {
-			return dir, nil
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", fmt.Errorf("no repo root (.git) found above cwd")
-		}
-		dir = parent
-	}
 }
 
 // modulePath reads the `module <path>` line of a go.mod.

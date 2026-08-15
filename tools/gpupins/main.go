@@ -42,7 +42,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -268,7 +267,7 @@ func setVersion(indent, modPath, trimmed, ver string) string {
 // prefilter (git's fnmatch lets `*` cross `/`, so `gpu/v*` also matches `gpu/<name>/v…`);
 // re is the real filter that keeps only the module-root series.
 func latestTag(root, glob string, re *regexp.Regexp) string {
-	out, _ := runIn(root, "git", "tag", "--list", glob, "--sort=-v:refname")
+	out, _ := gpumod.Exec(root, "", nil, "git", "tag", "--list", glob, "--sort=-v:refname")
 	for _, ln := range strings.Split(out, "\n") {
 		t := strings.TrimSpace(ln)
 		if re.MatchString(t) {
@@ -276,19 +275,6 @@ func latestTag(root, glob string, re *regexp.Regexp) string {
 		}
 	}
 	return ""
-}
-
-func runIn(dir, name string, args ...string) (string, int) {
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		return string(out), 0
-	}
-	if ee, ok := err.(*exec.ExitError); ok {
-		return string(out), ee.ExitCode()
-	}
-	return string(out), -1
 }
 
 func statusLine(c gate.Cell) string {

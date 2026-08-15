@@ -64,8 +64,8 @@ func run() int {
 
 	var na, skipped []string
 	for _, c := range cells {
-		status := field(c, "status")
-		fmt.Printf("  %-24s %-7s %s\n", c.Name, status, field(c, "inline"))
+		status := c.Field("status")
+		fmt.Printf("  %-24s %-7s %s\n", c.Name, status, c.Field("inline"))
 		for _, f := range c.Fields {
 			if f.Key == "line" {
 				fmt.Printf("      %s\n", f.State)
@@ -162,15 +162,6 @@ func devCell(name string, o gate.Outcome, status, inline string) gate.Cell {
 		{Key: "status", State: status},
 		{Key: "inline", State: inline},
 	}}
-}
-
-func field(c gate.Cell, key string) string {
-	for _, f := range c.Fields {
-		if f.Key == key {
-			return f.State
-		}
-	}
-	return ""
 }
 
 // follow captures the first n non-empty lines of a loader error as indented follow-up.

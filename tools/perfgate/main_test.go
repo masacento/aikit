@@ -7,15 +7,6 @@ import (
 	"github.com/townsendmerino/aikit/tools/gate"
 )
 
-func field(c gate.Cell, key string) string {
-	for _, f := range c.Fields {
-		if f.Key == key {
-			return f.State
-		}
-	}
-	return ""
-}
-
 // parseBench must key on the shape (family + K/N), so a sub-benchmark renamed between tags —
 // v1.17.1's `K768_N8192` vs the working tree's `K768_N8192_resident` — still matches.
 func TestParseBench_keysOnShapeAcrossRename(t *testing.T) {
@@ -59,7 +50,7 @@ func TestJudge_threeBranches(t *testing.T) {
 	if flat.Outcome != gate.OK {
 		t.Errorf("flat: outcome=%v, want ok", flat.Outcome)
 	}
-	if b := field(flat, "branch"); b != "flat" {
+	if b := flat.Field("branch"); b != "flat" {
 		t.Errorf("flat: branch=%q", b)
 	}
 
@@ -74,7 +65,7 @@ func TestJudge_threeBranches(t *testing.T) {
 	if fast.Outcome != gate.OK {
 		t.Errorf("faster: outcome=%v, want ok", fast.Outcome)
 	}
-	if b := field(fast, "branch"); b == "flat" || b == "REGRESSION" {
+	if b := fast.Field("branch"); b == "flat" || b == "REGRESSION" {
 		t.Errorf("faster: branch=%q, want the win text", b)
 	}
 }

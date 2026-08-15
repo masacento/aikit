@@ -9,13 +9,16 @@
 // build → go test.
 //
 // ENVIRONMENT PARITY IS PART OF EACH CHECK. Reproducing a command without its environment is
-// not reproducing the check. Every go step is pinned GOWORK=off explicitly on its own
-// exec.Cmd — a developer's go.work must not decide what this reports — and the cgo-free build
-// adds CGO_ENABLED=0; the env each check ran under is printed next to it. This CORRECTS the
-// shell, which set GOWORK=off once as a global export (correct in effect, but invisible and
-// not per-command) and used whatever golangci-lint was on PATH — a build that drifts by the
-// Go it was compiled with (see gpumod.GolangciLint). This runs the linter build-pinned via
-// `go run @v2.11.4`, the same one CI's goinstall v2.11.4 and the gpu gate resolve to.
+// not reproducing the check. Every go step runs through gpumod.Exec, which pins GOWORK=off
+// and CGO_ENABLED=0 explicitly on its own exec.Cmd for every check, not just the one step
+// literally named for it — a developer's go.work must not decide what this reports, and the
+// dedicated "build (cgo-free)" step is now a label matching ci.yml's own step name, not the
+// only place the pin applies. The env each check ran under is printed next to it. This
+// CORRECTS the shell, which set GOWORK=off once as a global export (correct in effect, but
+// invisible and not per-command) and used whatever golangci-lint was on PATH — a build that
+// drifts by the Go it was compiled with (see gpumod.GolangciLint). This runs the linter
+// build-pinned via `go run @v2.11.4`, the same one CI's goinstall v2.11.4 and the gpu gate
+// resolve to.
 //
 // THE RELATIONSHIP TO ci.yml IS GUARDED. This check list mirrors the core job; a silent
 // second copy drifts. tools/ is stdlib-only (no YAML parser), so a full derivation is out of
@@ -32,7 +35,6 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -59,7 +61,11 @@ func run(args []string) int {
 		{Name: "build", Run: func() gate.Cell { return goStep(root, "build", nil, "build", "./...") }},
 		{Name: "vet", Run: func() gate.Cell { return goStep(root, "vet", nil, "vet", "./...") }},
 		{Name: "golangci-lint", Run: func() gate.Cell { return checkLint(root) }},
-		{Name: "build (cgo-free)", Run: func() gate.Cell { return goStep(root, "build (cgo-free)", []string{"CGO_ENABLED=0"}, "build", "./...") }},
+		// Redundant with "build" above now that gpumod.Exec pins CGO_ENABLED=0 for every
+		// step — kept as its own labeled cell so the report names the specific ci.yml
+		// step it mirrors ("build with cgo disabled"), not because it needs its own
+		// env override anymore.
+		{Name: "build (cgo-free)", Run: func() gate.Cell { return goStep(root, "build (cgo-free)", nil, "build", "./...") }},
 	}
 	if !fast {
 		checks = append(checks, gate.Check{Name: "go test", Run: func() gate.Cell { return goTest(root) }})
@@ -69,7 +75,7 @@ func run(args []string) int {
 	cells := gate.RunAll(checks)
 
 	for _, c := range cells {
-		fmt.Printf("  %-18s %-26s %s\n", c.Name, "["+field(c, "env")+"]", statusWord(c.Outcome))
+		fmt.Printf("  %-18s %-26s %s\n", c.Name, "["+c.Field("env")+"]", statusWord(c.Outcome))
 		for _, f := range c.Fields {
 			if f.Key == "line" {
 				fmt.Printf("      %s\n", f.State)
@@ -94,7 +100,7 @@ func run(args []string) int {
 // checkGofmt: gofmt reports by printing filenames and still exits 0, so EMPTINESS is the
 // check. .venv is not Go source.
 func checkGofmt(root string) gate.Cell {
-	out, _ := runIn(root, nil, "gofmt", "-l", ".")
+	out, _ := gpumod.Exec(root, "", nil, "gofmt", "-l", ".")
 	var bad []string
 	for _, ln := range strings.Split(out, "\n") {
 		ln = strings.TrimSpace(ln)
@@ -112,11 +118,14 @@ func checkGofmt(root string) gate.Cell {
 	return cell("gofmt", gate.OK, "none")
 }
 
-// goStep runs a `go` subcommand with GOWORK=off (+ any extra env), recording the env it ran
-// under. A non-zero exit is a FAIL with the first lines of output.
+// goStep runs a `go` subcommand via gpumod.Exec (GOWORK=off + CGO_ENABLED=0, plus any extra
+// env), recording the env it ran under. A non-zero exit is a FAIL with the first lines of
+// output.
 func goStep(root, name string, extraEnv []string, args ...string) gate.Cell {
-	env := append([]string{"GOWORK=off"}, extraEnv...)
-	out, rc := runIn(root, env, "go", args...)
+	// gpumod.Exec sets GOWORK=off and CGO_ENABLED=0 itself; env here is for the reported
+	// cell field, not a second copy passed to it.
+	env := append([]string{"GOWORK=off", "CGO_ENABLED=0"}, extraEnv...)
+	out, rc := gpumod.Exec(root, "", extraEnv, "go", args...)
 	if rc != 0 {
 		c := cell(name, gate.Fail, strings.Join(env, " "))
 		c.Fields = append(c.Fields, headLines(out, 12)...)
@@ -157,52 +166,27 @@ func goTest(root string) gate.Cell {
 // separates "the linter could not be built/run" (INCONCLUSIVE — an external tool the check
 // depends on) from "the linter found issues" (FAIL). Build-pinned via `go run @v2.11.4`.
 func checkLint(root string) gate.Cell {
-	if _, rc := runIn(root, []string{"GOWORK=off"}, "go", "run", gpumod.GolangciLint, "version"); rc != 0 {
-		return cell("golangci-lint", gate.Inconclusive, "GOWORK=off")
+	if _, rc := gpumod.Exec(root, "", nil, "go", "run", gpumod.GolangciLint, "version"); rc != 0 {
+		return cell("golangci-lint", gate.Inconclusive, "GOWORK=off CGO_ENABLED=0")
 	}
 	// CANARY: a "clean" is trusted only after the linter flags its fixture (see tools/canary).
-	cout, _ := runIn(filepath.Join(root, canary.FixturesDir), []string{"GOWORK=off"}, "go", "run", gpumod.GolangciLint, "run", "--build-tags", "canaryfixture")
+	cout, _ := gpumod.Exec(filepath.Join(root, canary.FixturesDir), "", nil, "go", "run", gpumod.GolangciLint, "run", "--build-tags", "canaryfixture")
 	if res := canary.CheckGolangci(cout); !res.Fired {
-		c := cell("golangci-lint", gate.Inconclusive, "GOWORK=off")
+		c := cell("golangci-lint", gate.Inconclusive, "GOWORK=off CGO_ENABLED=0")
 		c.Fields = append(c.Fields, gate.Field{Key: "line", State: "CANNOT-EVALUATE — " + res.Reason})
 		return c
 	}
-	out, rc := runIn(root, []string{"GOWORK=off"}, "go", "run", gpumod.GolangciLint, "run")
+	out, rc := gpumod.Exec(root, "", nil, "go", "run", gpumod.GolangciLint, "run")
 	if rc != 0 {
-		c := cell("golangci-lint", gate.Fail, "GOWORK=off")
+		c := cell("golangci-lint", gate.Fail, "GOWORK=off CGO_ENABLED=0")
 		c.Fields = append(c.Fields, headLines(out, 12)...)
 		return c
 	}
-	return cell("golangci-lint", gate.OK, "GOWORK=off")
-}
-
-// runIn runs a command in root with os.Environ plus the explicit overrides — the pins are
-// set per-command, not left to an inherited shell export.
-func runIn(root string, extraEnv []string, name string, args ...string) (string, int) {
-	cmd := exec.Command(name, args...)
-	cmd.Dir = root
-	cmd.Env = append(os.Environ(), extraEnv...)
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		return string(out), 0
-	}
-	if ee, ok := err.(*exec.ExitError); ok {
-		return string(out), ee.ExitCode()
-	}
-	return string(out), -1
+	return cell("golangci-lint", gate.OK, "GOWORK=off CGO_ENABLED=0")
 }
 
 func cell(name string, o gate.Outcome, env string) gate.Cell {
 	return gate.Cell{Name: name, Outcome: o, Fields: []gate.Field{{Key: "env", State: env}}}
-}
-
-func field(c gate.Cell, key string) string {
-	for _, f := range c.Fields {
-		if f.Key == key {
-			return f.State
-		}
-	}
-	return ""
 }
 
 func statusWord(o gate.Outcome) string {

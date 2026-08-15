@@ -24,7 +24,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -118,15 +117,15 @@ func checkChangelog(root, ver string) gate.Cell {
 // (2) golangci-lint — pinned build, on the whole root module.
 func checkLint(root string) gate.Cell {
 	fmt.Println("release-gate: golangci-lint (.golangci.yml)")
-	if _, rc := runIn(root, "go", "run", gpumod.GolangciLint, "version"); rc != 0 {
+	if _, rc := gpumod.Exec(root, "", nil, "go", "run", gpumod.GolangciLint, "version"); rc != 0 {
 		return inconMsg("golangci-lint", "could not build the pinned golangci-lint")
 	}
 	// CANARY: trust a "clean" only after the linter flags its fixture (see tools/canary).
-	cout, _ := runIn(filepath.Join(root, canary.FixturesDir), "go", "run", gpumod.GolangciLint, "run", "--build-tags", "canaryfixture")
+	cout, _ := gpumod.Exec(filepath.Join(root, canary.FixturesDir), "", nil, "go", "run", gpumod.GolangciLint, "run", "--build-tags", "canaryfixture")
 	if res := canary.CheckGolangci(cout); !res.Fired {
 		return inconMsg("golangci-lint", "CANNOT-EVALUATE — "+res.Reason)
 	}
-	out, rc := runIn(root, "go", "run", gpumod.GolangciLint, "run", "./...")
+	out, rc := gpumod.Exec(root, "", nil, "go", "run", gpumod.GolangciLint, "run", "./...")
 	if rc != 0 {
 		fmt.Println("::error::release-gate: golangci-lint reported issues")
 		fmt.Println(strings.TrimRight(out, "\n"))
@@ -154,12 +153,12 @@ func checkAPIDiff(root, ver string) gate.Cell {
 	if err != nil {
 		return inconMsg("apidiff", "mktemp: "+err.Error())
 	}
-	if _, rc := runIn(root, "git", "worktree", "add", "-q", "-f", wt, prev); rc != 0 {
+	if _, rc := gpumod.Exec(root, "", nil, "git", "worktree", "add", "-q", "-f", wt, prev); rc != 0 {
 		return inconMsg("apidiff", "git worktree add "+prev+" failed")
 	}
 	defer func() {
-		runIn(root, "git", "worktree", "remove", "--force", wt)
-		runIn(root, "git", "worktree", "prune")
+		gpumod.Exec(root, "", nil, "git", "worktree", "remove", "--force", wt)
+		gpumod.Exec(root, "", nil, "git", "worktree", "prune")
 	}()
 
 	var broken []string
@@ -169,10 +168,10 @@ func checkAPIDiff(root, ver string) gate.Cell {
 		// cannot load the package) — reporting API changes is exit 0. So a non-zero here is
 		// "could not judge", INCONCLUSIVE, never mistaken for a diff. -w writes the previous
 		// tag's API from the worktree; -incompatible compares the current tree against it.
-		if base_out, rc := runIn(wt, "go", "run", apidiffPkg, "-w", base, rootMod+"/"+p); rc != 0 {
+		if base_out, rc := gpumod.Exec(wt, "", nil, "go", "run", apidiffPkg, "-w", base, rootMod+"/"+p); rc != 0 {
 			return inconMsg("apidiff", "apidiff could not record the "+prev+" baseline for "+p+": "+firstLine(base_out))
 		}
-		inc, rc := runIn(root, "go", "run", apidiffPkg, "-incompatible", base, rootMod+"/"+p)
+		inc, rc := gpumod.Exec(root, "", nil, "go", "run", apidiffPkg, "-incompatible", base, rootMod+"/"+p)
 		if rc != 0 {
 			return inconMsg("apidiff", "apidiff could not compare "+p+" against "+prev+": "+firstLine(inc))
 		}
@@ -190,7 +189,7 @@ func checkAPIDiff(root, ver string) gate.Cell {
 
 // (4) core dependency invariant.
 func checkCoreDeps(root string) gate.Cell {
-	out, rc := runIn(root, "go", "list", "-deps", "-f", "{{if not .Standard}}{{.ImportPath}}{{end}}", "./...")
+	out, rc := gpumod.Exec(root, "", nil, "go", "list", "-deps", "-f", "{{if not .Standard}}{{.ImportPath}}{{end}}", "./...")
 	// A failed `go list` emits little or nothing, which would filter to "no external deps" and
 	// read as clean — the same examines-nothing false-clean the canaries guard against. rc is
 	// the built-in positive control here: a non-zero go list is cannot-evaluate, not a pass.
@@ -219,17 +218,17 @@ func checkCoreDeps(root string) gate.Cell {
 func apidiffCanaryOut(root string) string {
 	toolsDir := filepath.Join(root, "tools")
 	base := filepath.Join(os.TempDir(), "canary-apidiff-old.api")
-	if _, rc := runIn(toolsDir, "go", "run", apidiffPkg, "-w", base, canary.ApidiffFixtureOld); rc != 0 {
+	if _, rc := gpumod.Exec(toolsDir, "", nil, "go", "run", apidiffPkg, "-w", base, canary.ApidiffFixtureOld); rc != 0 {
 		return "" // could not even record the baseline → not fired → cannot-evaluate
 	}
-	out, _ := runIn(toolsDir, "go", "run", apidiffPkg, "-incompatible", base, canary.ApidiffFixtureNew)
+	out, _ := gpumod.Exec(toolsDir, "", nil, "go", "run", apidiffPkg, "-incompatible", base, canary.ApidiffFixtureNew)
 	return out
 }
 
 // prevTag is the highest v* tag by version, excluding the one being released — so a retracted
 // old tag (v1.8.0) is never selected for a current-era release.
 func prevTag(root, ver string) string {
-	out, _ := runIn(root, "git", "tag", "--list", "v*", "--sort=-v:refname")
+	out, _ := gpumod.Exec(root, "", nil, "git", "tag", "--list", "v*", "--sort=-v:refname")
 	for _, ln := range strings.Split(out, "\n") {
 		t := strings.TrimSpace(ln)
 		if t != "" && t != "v"+ver {
@@ -275,18 +274,6 @@ func filterExperimental(inc, pkg string) string {
 // runIn runs a command in dir with the ambient environment (release-gate, like its shell,
 // does not override GOWORK — on the Linux/CI target there is no go.work). Returns combined
 // output and exit code.
-func runIn(dir, name string, args ...string) (string, int) {
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		return string(out), 0
-	}
-	if ee, ok := err.(*exec.ExitError); ok {
-		return string(out), ee.ExitCode()
-	}
-	return string(out), -1
-}
 
 func okCell(name string) gate.Cell { return gate.Cell{Name: name, Outcome: gate.OK} }
 func failMsg(name, msg string) gate.Cell {
