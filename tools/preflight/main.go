@@ -3,10 +3,25 @@
 //
 // WHY IT EXISTS. Using CI as a first linter rather than a last check costs a full round trip
 // per mistake (a revert once left an asm kernel with no caller; golangci-lint reports that
-// in three seconds, but it was found from CI, after pushing, twice — 2026-08-12). So this is
-// the same checks in the same order as ci.yml's core job, minus the parts that need the
-// network, a GPU, or the -race triple-time: gofmt → build → vet → golangci-lint → cgo-free
-// build → go test.
+// in three seconds, but it was found from CI, after pushing, twice — 2026-08-12). So this runs
+// every one of ci.yml's core-job steps, in the same order, with exactly two deliberate
+// weakenings: `go test` runs UNRACED (CI's own `-race` pass costs a real multiple of both time
+// and memory — too slow for a pre-push gate) and `fuzz (smoke)` does not run at all (8 targets
+// x 15s x up to 2 retries, also too slow). Every other core step is mirrored exactly, including
+// "no cgo deps in core graph" and "test (aikit_checks)" — both fast, neither needs network or a
+// GPU, and both used to be silent gaps here with no actual justification.
+//
+// THE EXCLUSIONS ARE ENFORCED, NOT JUST STATED. buildChecks's names and main_test.go's
+// notImplemented map are checked against every ci.yml core-job step name
+// (TestCoreStepsAccountedFor): a step landing in neither fails that test, so an exclusion has
+// to be a reviewed, named entry — not a stale prose claim nobody's checking against reality
+// (which is exactly how "no cgo deps in core graph" and "test (aikit_checks)" went unmirrored
+// for a while despite fitting none of the reasons this comment used to give).
+//
+// preflight covers ONLY the core job. arm64, treesitter, vulncheck, perf-smoke,
+// scripts-boundary, gpu-pins, and gpu-kernels are separate ci.yml jobs that genuinely need
+// network, a GPU, another OS, or another module, and aren't attempted here;
+// gpugate/gpudevice/scriptsguard/gpupins are the local tools for the pieces that have one.
 //
 // ENVIRONMENT PARITY IS PART OF EACH CHECK. Reproducing a command without its environment is
 // not reproducing the check. Every go step runs through gpumod.Exec, which pins GOWORK=off
@@ -23,12 +38,13 @@
 // THE RELATIONSHIP TO ci.yml IS GUARDED. This check list mirrors the core job; a silent
 // second copy drifts. tools/ is stdlib-only (no YAML parser), so a full derivation is out of
 // reach — but main_test.go's tripwire reads ci.yml as text and fails if the core job's step
-// names change, so the next check CI gains cannot silently go un-mirrored.
+// names change, so the next check CI gains cannot silently go un-mirrored (and
+// TestCoreStepsAccountedFor, above, catches it going un-mirrored on the implementation side).
 //
 // Usage:
 //
 //	go run -C tools ./preflight            # everything
-//	go run -C tools ./preflight --fast     # skip the test run (fmt/vet/lint/build only)
+//	go run -C tools ./preflight --fast     # skip go test / aikit_checks (fmt/vet/lint/build only)
 package main
 
 import (
@@ -46,6 +62,35 @@ import (
 
 func main() { os.Exit(run(os.Args[1:])) }
 
+// buildChecks constructs the ordered check list run() executes, in ci.yml's core-job
+// step order. Split out from run() so main_test.go's TestCoreStepsAccountedFor can
+// enumerate check NAMES without actually running go build / golangci-lint / etc — a
+// gate.Check's Run closure only executes inside gate.RunAll, so calling buildChecks
+// itself does no I/O.
+func buildChecks(root string, fast bool) []gate.Check {
+	checks := []gate.Check{
+		{Name: "gofmt", Run: func() gate.Cell { return checkGofmt(root) }},
+		{Name: "build", Run: func() gate.Cell { return goStep(root, "build", nil, "build", "./...") }},
+		{Name: "vet", Run: func() gate.Cell { return goStep(root, "vet", nil, "vet", "./...") }},
+		{Name: "golangci-lint", Run: func() gate.Cell { return checkLint(root) }},
+		{Name: "no cgo deps in core graph", Run: func() gate.Cell { return checkNoCgoDeps(root) }},
+		// Redundant with "build" above now that gpumod.Exec pins CGO_ENABLED=0 for every
+		// step — kept as its own labeled cell so the report names the specific ci.yml
+		// step it mirrors ("build with cgo disabled"), not because it needs its own
+		// env override anymore.
+		{Name: "build (cgo-free)", Run: func() gate.Cell { return goStep(root, "build (cgo-free)", nil, "build", "./...") }},
+	}
+	if !fast {
+		checks = append(checks,
+			gate.Check{Name: "go test", Run: func() gate.Cell { return goTest(root) }},
+			gate.Check{Name: "test (aikit_checks)", Run: func() gate.Cell {
+				return goStep(root, "test (aikit_checks)", nil, "test", "-tags", "aikit_checks", "./linalg/")
+			}},
+		)
+	}
+	return checks
+}
+
 func run(args []string) int {
 	fast := len(args) > 0 && args[0] == "--fast"
 	root, err := gpumod.RepoRoot()
@@ -56,23 +101,10 @@ func run(args []string) int {
 	p := gpumod.Provenance(root)
 	fmt.Printf("aikit preflight — %s%s — root module\n\n", p.Commit, p.Dirty)
 
-	checks := []gate.Check{
-		{Name: "gofmt", Run: func() gate.Cell { return checkGofmt(root) }},
-		{Name: "build", Run: func() gate.Cell { return goStep(root, "build", nil, "build", "./...") }},
-		{Name: "vet", Run: func() gate.Cell { return goStep(root, "vet", nil, "vet", "./...") }},
-		{Name: "golangci-lint", Run: func() gate.Cell { return checkLint(root) }},
-		// Redundant with "build" above now that gpumod.Exec pins CGO_ENABLED=0 for every
-		// step — kept as its own labeled cell so the report names the specific ci.yml
-		// step it mirrors ("build with cgo disabled"), not because it needs its own
-		// env override anymore.
-		{Name: "build (cgo-free)", Run: func() gate.Cell { return goStep(root, "build (cgo-free)", nil, "build", "./...") }},
+	if fast {
+		fmt.Println("  (--fast: skipping go test / aikit_checks; CI runs go test with -race)")
 	}
-	if !fast {
-		checks = append(checks, gate.Check{Name: "go test", Run: func() gate.Cell { return goTest(root) }})
-	} else {
-		fmt.Println("  (--fast: skipping go test; CI runs it with -race)")
-	}
-	cells := gate.RunAll(checks)
+	cells := gate.RunAll(buildChecks(root, fast))
 
 	for _, c := range cells {
 		fmt.Printf("  %-18s %-26s %s\n", c.Name, "["+c.Field("env")+"]", statusWord(c.Outcome))
@@ -94,8 +126,36 @@ func run(args []string) int {
 		return 2
 	}
 	fmt.Println(gate.Verdict(gate.OK, fmt.Sprintf("%d/%d clean", rep.Pass, rep.Total)))
-	fmt.Println("         CI still runs -race, the cgo-deps guard, aikit_checks, fuzz, the gpu jobs and vulncheck.")
+	fmt.Println("         CI also runs go test WITH -race and the fuzz (smoke) pass; arm64/treesitter/")
+	fmt.Println("         vulncheck/perf-smoke/scripts-boundary/gpu-pins/gpu-kernels are separate CI jobs.")
 	return 0
+}
+
+// checkNoCgoDeps mirrors ci.yml's "no cgo deps in core graph": the core module must stay
+// pure-Go — no cgo WebGPU, no tree-sitter (migration-plan §7/§9). Those live in the
+// goinfer/gpu and aikit/chunk/treesitter modules respectively.
+func checkNoCgoDeps(root string) gate.Cell {
+	out, rc := gpumod.Exec(root, "", nil, "go", "list", "-deps", "./...")
+	if rc != 0 {
+		c := cell("no cgo deps in core graph", gate.Fail, "GOWORK=off CGO_ENABLED=0")
+		c.Fields = append(c.Fields, headLines(out, 12)...)
+		return c
+	}
+	var leaked []string
+	for _, ln := range strings.Split(out, "\n") {
+		low := strings.ToLower(ln)
+		if strings.Contains(low, "webgpu") || strings.Contains(low, "gotreesitter") {
+			leaked = append(leaked, ln)
+		}
+	}
+	if len(leaked) > 0 {
+		c := cell("no cgo deps in core graph", gate.Fail, "GOWORK=off CGO_ENABLED=0")
+		for _, l := range leaked {
+			c.Fields = append(c.Fields, gate.Field{Key: "line", State: l})
+		}
+		return c
+	}
+	return cell("no cgo deps in core graph", gate.OK, "GOWORK=off CGO_ENABLED=0")
 }
 
 // checkGofmt: gofmt reports by printing filenames and still exits 0, so EMPTINESS is the
