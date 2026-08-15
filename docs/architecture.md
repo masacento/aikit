@@ -186,6 +186,14 @@ graph LR
 Nothing in aikit requires this shape — each stage is independently usable,
 and `fuse` works on any rankings with comparable keys.
 
+The `ann2 --> fuse2 <-- bm252` piece — retrieve both signals, fuse.RRF them —
+is the same four lines in every hybrid-search example (`examples/rag`,
+`examples/colbert`). [`hybrid.Retriever`](../hybrid) is a thin, opt-in wrapper
+around exactly that piece, for callers who'd rather not repeat it; it composes
+already-built indices (doesn't build them, embed, tokenize, chunk, or rerank)
+and stays out of the way of anyone who prefers to hand-wire `fuse.RRF`
+directly, which every example here still does.
+
 ## Where the invariants live
 
 The correctness-critical contracts are documented at the point of use; this

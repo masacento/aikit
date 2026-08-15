@@ -25,6 +25,7 @@ large embedded-grammar payload) — is quarantined in the separate
 | `ann` | cosine ANN over a dense matrix — exact flat scan + approximate HNSW graph | `linalg`, `topk` |
 | `bm25` | identifier-aware BM25 lexical index (Lucene-variant); `Tokenize` (code) + `TokenizePlain` (general text) | `topk` |
 | `fuse` | rank fusion (RRF) + relative-score fusion (RSF) — blend lexical + dense rankings for hybrid search | — |
+| `hybrid` | thin, opt-in wrapper around "retrieve dense + lexical, then `fuse.RRF`" — composes already-built indices, doesn't build/embed/tokenize/rerank | `ann`, `bm25`, `fuse` |
 | `sparse` | learned-sparse (SPLADE) retrieval — inverted index + sparse-dot scoring over vectors from `encoder.SPLADE` (in-process) or precomputed | `topk` |
 | `late` | ColBERT-style late-interaction (MaxSim) reranking over pre-computed per-token vectors (`encoder.Model.EncodeTokens`) — a shortlist reranker, not a corpus-scale index | `linalg`, `topk` |
 | `bench` | reproducible recall + latency harness for the dense indexes (Flat / HNSW / FlatI8) — Experimental tooling | `ann` |
@@ -56,6 +57,12 @@ fused := fuse.RRF(fuse.DefaultK,
     fuse.Keys(den, func(h ann.Hit) int { return h.Index }))
 // …then rerank the fused shortlist with the encoder for final order.
 ```
+
+The retrieve-then-fuse half of that (everything above the rerank line) is one
+call via [`hybrid.Retriever`](hybrid) if you'd rather not hand-wire it:
+`hybrid.New(annIndex, bm25Index).Query(queryVec, bm25.Tokenize(query), 50)`.
+Purely a convenience — `examples/rag` above is unaffected and still hand-wires
+it, and `hybrid` builds neither index nor reranks; see its package doc.
 
 `encoder`'s matmul routes through a `Backend`; the default is pure-Go SIMD CPU.
 A WebGPU backend can be slotted in by importing `goinfer/gpu` under `-tags gpu`
