@@ -10,6 +10,47 @@ it.
 
 ## [Unreleased]
 
+## [1.19.0] — 2026-08-15
+
+### Added
+
+- **`ann.LoadHNSWMmap`** — zero-copy mmap loader for HNSW, mirroring `LoadFlatI8Mmap`'s int8
+  aliasing on the higher-recall index. Bumps the blob format v3→v4: an 8-byte-aligned header
+  (unblocks the float32 vector-block alias; int8-mode codes needed no alignment fix) plus a
+  reserved flags word `Load` didn't have, the anti-churn mechanism for a future additive change
+  without another version bump. `Load`/`LoadHNSWMmap` now share one parser
+  (`loadHNSW(data, alias bool)`) so the copying and aliasing paths can't drift apart.
+- **`ann.FlatBinaryI8`** — binary prefilter + `FlatI8`'s int8 rerank, compounding the memory win
+  over `FlatBinary`'s exact float32 rerank (dim/8 + dim bytes vs. dim/8 + 4·dim) on top of the
+  already-measured 13–26× throughput gain. `FlatBinary`'s own exact-rerank default and contract
+  are unchanged — this is a new sibling type, not a behavior change to an existing one.
+- **`late` package** — ColBERT-style late-interaction (MaxSim) reranking over pre-computed
+  per-token vectors (`encoder.Model.EncodeTokens`, built for exactly this), explicitly scoped as
+  a shortlist reranker rather than a corpus-scale index (a token matrix is ~L× a pooled vector's
+  footprint).
+- **`hybrid` package** — a thin, opt-in wrapper around "retrieve dense + lexical, then
+  `fuse.RRF`", the four lines every hybrid-search example already hand-wires identically. Composes
+  already-built indices; doesn't build them, embed, tokenize, chunk, or rerank.
+- **`bm25.Index.TopKBatch` / `sparse.Index.QueryBatch`** — batch query APIs mirroring
+  `ann.FlatI8.QueryBatch`'s work-stealing goroutine dispatch, for bulk workloads (an eval harness
+  scoring many queries, say) — previously the visible asymmetry against the dense side.
+- **`examples/splade`, `examples/vision`, `examples/colbert`, `examples/gpu-ann`** — four new
+  runnable examples, each making a previously undemonstrated real capability visible: learned-sparse
+  retrieval standalone; the vision package's image-as-document indexing and image→image similarity;
+  ColBERT/MaxSim reranking against the same fused shortlist `examples/rag` uses; and the native-GPU
+  `ann.FlatI8.EnableGPU` seam, verified end-to-end on both Metal (M1 Pro, near CPU parity at 1M
+  vectors) and CUDA (RTX 2070 SUPER, ~69× over CPU at 1M vectors) — every run on both backends
+  bit-identical to the CPU result.
+
+### Fixed
+
+- **`encoder`'s dense-GELU dispatch conflated `gelu_pytorch_tanh`/`gelu_new`/`gelu_fast` with the
+  exact erf `gelu`.** All four activation names routed the dense (non-gated) MLP through the same
+  erf implementation; the three tanh-family names are a different function
+  (`linalg.GELUTanhF32`, already used correctly elsewhere for SigLIP's MLP). No currently-shipping
+  checkpoint was affected — latent for any future Gemma-family-style addition declaring one of the
+  three tanh names.
+
 ### Changed
 
 - **Python is now boundaried by directory, and the residue is gone.** The four non-oracle scripts
@@ -2012,7 +2053,8 @@ broad slice of the open-weights ecosystem.
   golden cosine 1.000000 vs PyTorch+MPS CodeRankEmbed. See
   [README.md](README.md) for stability tiers.
 
-[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.18.0...HEAD
+[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.19.0...HEAD
+[1.19.0]: https://github.com/townsendmerino/aikit/compare/v1.18.0...v1.19.0
 [1.18.0]: https://github.com/townsendmerino/aikit/compare/v1.17.1...v1.18.0
 [1.17.1]: https://github.com/townsendmerino/aikit/compare/v1.17.0...v1.17.1
 [1.17.0]: https://github.com/townsendmerino/aikit/compare/v1.16.0...v1.17.0
