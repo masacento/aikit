@@ -3,7 +3,6 @@ package encoder
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 
@@ -220,7 +219,6 @@ func (g *GTE) forward(ids []int32, clsOnly bool) []float32 {
 	headDim := D / c.Heads
 	I := c.Intermediate
 	eps := c.LNEps
-	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 
 	s := getScratch()
 	s.be = g.be
@@ -247,7 +245,6 @@ func (g *GTE) forward(ids []int32, clsOnly bool) []float32 {
 	}
 	layerNorm(h, g.embLNW, g.embLNB, L, D, eps)
 
-	qkv := s.qkv[:L*3*D]
 	upGate := s.upGate[:L*2*I]
 	for li := range g.layers {
 		l := &g.layers[li]
@@ -260,62 +257,23 @@ func (g *GTE) forward(ids []int32, clsOnly bool) []float32 {
 			mOut = 1
 		}
 
-		// The packed QKV projection stays at FULL L even in the trimmed layer, and
-		// that is a deliberate retreat from the obvious version. Wqkv is
-		// [3D, D] row-major, so Wq/Wk/Wv are contiguous and splitting it to
-		// compute Q for one row is easy — and measurably worse at short input:
-		// three narrower matmuls in place of one wide one cost more than the
-		// L−1 rows of Q they save, and GTEEncode/L16 regressed 10% while L128
-		// and L512 gained 7%. Keeping it packed leaves ~17% of the last layer's
-		// available saving on the table (the projection is 906 of 5235 MFLOP at
-		// L=512) and removes the regression entirely; the MLP, which is 69% of
-		// the layer, is trimmed either way.
-		s.mm(h, l.Wqkv, qkv, L, D, 3*D)
-		addBias(qkv, l.WqkvB, L, 3*D)
-		Q, K, V := s.Q[:L*D], s.K[:L*D], s.V[:L*D]
-		for i := range L {
-			base := i * 3 * D
-			copy(Q[i*D:(i+1)*D], qkv[base:base+D])
-			copy(K[i*D:(i+1)*D], qkv[base+D:base+2*D])
-			copy(V[i*D:(i+1)*D], qkv[base+2*D:base+3*D])
-		}
-		// RoPE on Q and K (rotate_half, full head-dim) — V is untouched.
-		rope.apply(Q, c.Heads)
-		rope.apply(K, c.Heads)
-
-		ctx := s.ctx[:mOut*D]
-		qH, kH := s.qH[:mOut*headDim], s.kH[:L*headDim]
-		vHT := s.vH[:headDim*L]
-		ctxHead := s.ctxHead[:mOut*headDim]
-		scores := s.scores[:mOut*L]
-		for headIdx := 0; headIdx < c.Heads; headIdx++ {
-			for i := range L {
-				src := i*D + headIdx*headDim
-				if i < mOut {
-					copy(qH[i*headDim:(i+1)*headDim], Q[src:src+headDim])
-				}
-				copy(kH[i*headDim:(i+1)*headDim], K[src:src+headDim])
-				for d := range headDim {
-					vHT[d*L+i] = V[src+d]
-				}
-			}
-			s.mm(qH, kH, scores, mOut, headDim, L)
-			for i := range scores {
-				scores[i] *= scale
-			}
-			softmaxRows(scores, mOut, L)
-			s.mm(scores, vHT, ctxHead, mOut, L, headDim)
-			for i := range mOut {
-				copy(ctx[i*D+headIdx*headDim:i*D+headIdx*headDim+headDim], ctxHead[i*headDim:(i+1)*headDim])
-			}
-		}
-		attnOut := s.out[:mOut*D]
-		s.mm(ctx, l.Wo, attnOut, mOut, D, D)
-		addBias(attnOut, l.WoB, mOut, D)
-		h = h[:mOut*D]
-		for i := range h {
-			h[i] += attnOut[i] // residual
-		}
+		// selfAttention's packed QKV projection stays at FULL L even in the
+		// trimmed layer, and that is a deliberate retreat from the obvious
+		// version. Wqkv is [3D, D] row-major, so Wq/Wk/Wv are contiguous and
+		// splitting it to compute Q for one row is easy — and measurably worse
+		// at short input: three narrower matmuls in place of one wide one cost
+		// more than the L−1 rows of Q they save, and GTEEncode/L16 regressed
+		// 10% while L128 and L512 gained 7%. Keeping it packed leaves ~17% of
+		// the last layer's available saving on the table (the projection is
+		// 906 of 5235 MFLOP at L=512) and removes the regression entirely; the
+		// MLP, which is 69% of the layer, is trimmed either way.
+		//
+		// The attention math itself — RoPE, scaled dot-product, output
+		// projection, residual — is shared with the CodeRankEmbed/nomic path
+		// (also packed Wqkv + RoPE) via encoder/attention.go; BERT shares only
+		// the post-projection half (attentionCore), since it has neither RoPE
+		// nor a packed qkv.
+		h = selfAttention(h, l.Wqkv, l.WqkvB, l.Wo, l.WoB, c.Heads, headDim, D, L, mOut, rope, s)
 		layerNorm(h, l.AttnLNW, l.AttnLNB, mOut, D, eps)
 
 		// GeGLU MLP: up_gate = h·UpGateᵀ [L,2I]; split up=[:I], gate=[I:2I];

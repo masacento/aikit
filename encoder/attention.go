@@ -2,9 +2,9 @@ package encoder
 
 import "math"
 
-// selfAttention runs one block's bidirectional multi-head self-attention
-// and adds the output to the residual `h`. Writes the result back into
-// `h` so the caller can apply the post-attention LayerNorm in place
+// selfAttention runs one block's bidirectional multi-head self-attention and
+// adds the output to the residual `h`, returning h resliced to mOut*D rows.
+// Caller applies the post-attention LayerNorm on the returned slice in place
 // (post-norm structure, plan §6.2).
 //
 // Shapes throughout this function:
@@ -14,6 +14,12 @@ import "math"
 //	OutProj:  [D, D]                  attention output projection
 //	heads, headDim: D / heads, D / heads
 //	rope:     precomputed cos/sin for positions 0..L-1
+//
+// mOut trims the OUTPUT rows to the caller's actual need (see attentionCore);
+// forward.go/forward_tokens.go always pass L (every row is read downstream —
+// CLS pooling happens after the full stack, not via a trimmed last layer), so
+// this is a pure signature generalization for them, not a behavior change.
+// gte.go's forward passes L−1-trimming on its final CLS-only layer.
 //
 // M8c: takes a *scratch arena so qkv / Q / K / V / ctx / qH/kH/vH /
 // scores buffers are reused across the 12 layers per forward (and
@@ -25,11 +31,13 @@ import "math"
 // checkpoints (CodeRankEmbed, nomic-embed-text-v1.5) carry none, so they pass nil
 // and the arithmetic is unchanged; nomic-embed-text-v2-moe sets qkv_proj_bias and
 // an out_proj bias, and those rows are broadcast over the sequence.
-func selfAttention(h []float32, Wqkv, WqkvB, OutProj, OutProjB []float32, heads, headDim, D, L int, rope *ropeTable, s *scratch) {
+func selfAttention(h []float32, Wqkv, WqkvB, OutProj, OutProjB []float32, heads, headDim, D, L, mOut int, rope *ropeTable, s *scratch) []float32 {
 	if heads*headDim != D {
 		panic("encoder: heads*headDim != D")
 	}
-	// 1) Project: QKV = h · Wqkvᵀ (+ bias) -> [L, 3D] into scratch.
+	// 1) Project: QKV = h · Wqkvᵀ (+ bias) -> [L, 3D] into scratch, at full L —
+	// see gte.go's forward for why the projection itself is never trimmed to
+	// mOut even when the output rows are.
 	qkv := s.qkv[:L*3*D]
 	s.mm(h, Wqkv, qkv, L, D, 3*D)
 	addRowBias(qkv, WqkvB, L, 3*D)
@@ -48,23 +56,48 @@ func selfAttention(h []float32, Wqkv, WqkvB, OutProj, OutProjB []float32, heads,
 	rope.apply(Q, heads)
 	rope.apply(K, heads)
 
-	// 4) Scaled dot-product attention per head. Scratch holds qH/kH (per-head Q/K
-	// extracts), vHT (V transposed to [headDim, L]) and scores ([L, L]). Both
+	// 4) Scaled dot-product attention, output projection, and residual —
+	// shared with the BERT/GTE hand-rolled paths from this point on.
+	return attentionCore(h, Q, K, V, OutProj, OutProjB, heads, headDim, D, L, mOut, s)
+}
+
+// attentionCore runs multi-head scaled-dot-product attention from already
+// projected Q, K, V ([L, D] row-major each — only rows [0, mOut) of Q are
+// ever read) through the output projection, then adds the result into
+// h[:mOut*D] as the residual and returns that resliced h. Caller applies the
+// post-attention LayerNorm on the returned slice.
+//
+// Shared by selfAttention (fused-qkv + RoPE path: CodeRankEmbed/nomic) and the
+// BERT/GTE forwards, whose QKV *projections* differ (separate Wq/Wk/Wv vs a
+// packed Wqkv, no RoPE vs RoPE) but whose attention math from here on is
+// identical — this is that identical core, extracted once instead of hand-
+// rolled per model.
+//
+// mOut trims the OUTPUT rows only: K and V stay at full L regardless, because
+// attention must read every position no matter how many output rows are
+// needed. mOut < L exists for exactly one case, a CLS-only forward's final
+// layer, where only row 0 is ever read downstream — see BERT.clsHiddenState
+// and GTE.clsHiddenState for the bit-identical contract this must preserve.
+func attentionCore(h []float32, Q, K, V, OutProj, OutProjB []float32, heads, headDim, D, L, mOut int, s *scratch) []float32 {
+	// Scaled dot-product attention per head. Scratch holds qH/kH (per-head Q/K
+	// extracts), vHT (V transposed to [headDim, L]) and scores ([mOut, L]). Both
 	// matmuls go through the SIMD A·Bᵀ kernel: QKᵀ = qH·kHᵀ, then the context
 	// scores·V = scores·(vHT)ᵀ — the latter was a scalar triple-loop and the
 	// single hottest line in Encode before this (≈⅓ of total).
 	scale := float32(1.0 / math.Sqrt(float64(headDim)))
-	ctx := s.ctx[:L*D] // every (i, head) column is written exactly once below
-	qH := s.qH[:L*headDim]
+	ctx := s.ctx[:mOut*D] // every (i, head) column is written exactly once below
+	qH := s.qH[:mOut*headDim]
 	kH := s.kH[:L*headDim]
 	vHT := s.vH[:headDim*L]
-	ctxHead := s.ctxHead[:L*headDim]
-	scores := s.scores[:L*L]
+	ctxHead := s.ctxHead[:mOut*headDim]
+	scores := s.scores[:mOut*L]
 
 	for headIdx := range heads {
 		for i := range L {
 			src := i*D + headIdx*headDim
-			copy(qH[i*headDim:(i+1)*headDim], Q[src:src+headDim])
+			if i < mOut {
+				copy(qH[i*headDim:(i+1)*headDim], Q[src:src+headDim])
+			}
 			copy(kH[i*headDim:(i+1)*headDim], K[src:src+headDim])
 			// V transposed: vHT[d, i] = V[i, head, d], folded into the extract so
 			// scores·V can use the A·Bᵀ matmul (which needs Vᵀ as its b operand).
@@ -72,27 +105,29 @@ func selfAttention(h []float32, Wqkv, WqkvB, OutProj, OutProjB []float32, heads,
 				vHT[d*L+i] = V[src+d]
 			}
 		}
-		s.mm(qH, kH, scores, L, headDim, L)
+		s.mm(qH, kH, scores, mOut, headDim, L)
 		for i := range scores {
 			scores[i] *= scale
 		}
-		softmaxRows(scores, L, L)
-		// ctxHead[L, headDim] = scores[L, L] · V[L, headDim], as scores · (vHT)ᵀ.
-		s.mm(scores, vHT, ctxHead, L, L, headDim)
-		// Scatter this head's context into the interleaved ctx[L, D].
-		for i := range L {
+		softmaxRows(scores, mOut, L)
+		// ctxHead[mOut, headDim] = scores[mOut, L] · V[L, headDim], as scores · (vHT)ᵀ.
+		s.mm(scores, vHT, ctxHead, mOut, L, headDim)
+		// Scatter this head's context into the interleaved ctx[mOut, D].
+		for i := range mOut {
 			dst := i*D + headIdx*headDim
 			copy(ctx[dst:dst+headDim], ctxHead[i*headDim:(i+1)*headDim])
 		}
 	}
 
-	// 5) Output projection into scratch (+ bias).
-	out := s.out[:L*D]
-	s.mm(ctx, OutProj, out, L, D, D)
-	addRowBias(out, OutProjB, L, D)
+	// Output projection into scratch (+ bias).
+	out := s.out[:mOut*D]
+	s.mm(ctx, OutProj, out, mOut, D, D)
+	addRowBias(out, OutProjB, mOut, D)
 
-	// 6) Residual: h += out (in place).
+	// Residual: h[:mOut*D] += out (in place), resliced.
+	h = h[:mOut*D]
 	for i := range h {
 		h[i] += out[i]
 	}
+	return h
 }

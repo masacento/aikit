@@ -3,7 +3,6 @@ package encoder
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 
@@ -329,7 +328,6 @@ func (b *BERT) forward(ids, segs []int32, clsOnly bool) []float32 {
 	}
 	layerNorm(h, b.embLNW, b.embLNB, L, D, eps)
 
-	scale := float32(1.0 / math.Sqrt(float64(headDim)))
 	for li := range b.layers {
 		l := &b.layers[li]
 
@@ -343,7 +341,9 @@ func (b *BERT) forward(ids, segs []int32, clsOnly bool) []float32 {
 			mOut = 1
 		}
 
-		// Self-attention (no RoPE): Q,K,V = hWᵀ + b, into scratch.
+		// Self-attention (no RoPE): Q,K,V = hWᵀ + b, into scratch. Q is
+		// projected only for the mOut rows actually needed; K,V stay full L
+		// since attention reads every position regardless of mOut.
 		Q, K, V := s.Q[:mOut*D], s.K[:L*D], s.V[:L*D]
 		s.mm(h, l.Wq, Q, mOut, D, D)
 		s.mm(h, l.Wk, K, L, D, D)
@@ -352,39 +352,11 @@ func (b *BERT) forward(ids, segs []int32, clsOnly bool) []float32 {
 		addBias(K, l.Bk, L, D)
 		addBias(V, l.Bv, L, D)
 
-		ctx := s.ctx[:mOut*D]
-		qH, kH := s.qH[:mOut*headDim], s.kH[:L*headDim]
-		vHT := s.vH[:headDim*L]
-		ctxHead := s.ctxHead[:mOut*headDim]
-		scores := s.scores[:mOut*L]
-		for headIdx := 0; headIdx < c.Heads; headIdx++ {
-			for i := range L {
-				src := i*D + headIdx*headDim
-				if i < mOut {
-					copy(qH[i*headDim:(i+1)*headDim], Q[src:src+headDim])
-				}
-				copy(kH[i*headDim:(i+1)*headDim], K[src:src+headDim])
-				for d := range headDim {
-					vHT[d*L+i] = V[src+d]
-				}
-			}
-			s.mm(qH, kH, scores, mOut, headDim, L)
-			for i := range scores {
-				scores[i] *= scale
-			}
-			softmaxRows(scores, mOut, L)
-			s.mm(scores, vHT, ctxHead, mOut, L, headDim)
-			for i := range mOut {
-				copy(ctx[i*D+headIdx*headDim:i*D+headIdx*headDim+headDim], ctxHead[i*headDim:(i+1)*headDim])
-			}
-		}
-		attnOut := s.out[:mOut*D]
-		s.mm(ctx, l.Wo, attnOut, mOut, D, D)
-		addBias(attnOut, l.Bo, mOut, D)
-		h = h[:mOut*D]
-		for i := range h {
-			h[i] += attnOut[i] // residual
-		}
+		// Scaled dot-product attention, output projection and residual — shared
+		// with the CodeRankEmbed/nomic and GTE forwards via encoder/attention.go.
+		// BERT has neither RoPE nor a packed qkv projection, so it builds Q/K/V
+		// itself above and calls attentionCore directly rather than selfAttention.
+		h = attentionCore(h, Q, K, V, l.Wo, l.Bo, c.Heads, headDim, D, L, mOut, s)
 		layerNorm(h, l.AttnLNW, l.AttnLNB, mOut, D, eps)
 
 		// GELU FFN: intermediate → gelu → output, residual, LayerNorm.

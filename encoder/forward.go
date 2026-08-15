@@ -91,8 +91,10 @@ func (w *Weights) forwardInner(ids []int32) []float32 {
 	// 4) Twelve transformer blocks (post-norm).
 	for i := 0; i < w.Cfg.NumLayers; i++ {
 		l := &w.Layers[i]
-		// Attention sub-layer + residual (in place on h).
-		selfAttention(h, l.Wqkv, l.WqkvB, l.OutProj, l.OutProjB, heads, headDim, D, L, rope, s)
+		// Attention sub-layer + residual (in place on h). mOut=L: every row is
+		// read downstream (CLS pooling happens after the full stack, not via a
+		// trimmed last layer), so this never actually trims.
+		h = selfAttention(h, l.Wqkv, l.WqkvB, l.OutProj, l.OutProjB, heads, headDim, D, L, L, rope, s)
 		layerNorm(h, l.Norm1W, l.Norm1B, L, D, eps)
 		// MLP sub-layer + residual (SwiGLU, dense GELU, or MoE per layer).
 		applyMLP(w, l, h, D, intermediate, L, s)

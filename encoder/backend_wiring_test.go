@@ -88,8 +88,7 @@ func (f *attnFixture) run(be Backend) []float32 {
 	s.be = be
 	s.ensureLayer(f.L, f.D, 4*f.D, f.heads, f.headDim, f.L)
 	h := append([]float32(nil), f.h...)
-	selfAttention(h, f.wqkv, f.wqkvb, f.outProj, f.outProjB, f.heads, f.headDim, f.D, f.L, f.rope, s)
-	return h
+	return selfAttention(h, f.wqkv, f.wqkvb, f.outProj, f.outProjB, f.heads, f.headDim, f.D, f.L, f.L, f.rope, s)
 }
 
 // TestBackend_isActuallyCalled is the regression gate for the dangling seam: a

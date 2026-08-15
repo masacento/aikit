@@ -47,7 +47,7 @@ func (w *Weights) forwardTokens(ids []int32) []float32 {
 	rope := w.ropeCache.get(L, headDim, w.Cfg.RoPEBase)
 	for i := 0; i < w.Cfg.NumLayers; i++ {
 		l := &w.Layers[i]
-		selfAttention(h, l.Wqkv, l.WqkvB, l.OutProj, l.OutProjB, heads, headDim, D, L, rope, s)
+		h = selfAttention(h, l.Wqkv, l.WqkvB, l.OutProj, l.OutProjB, heads, headDim, D, L, L, rope, s)
 		layerNorm(h, l.Norm1W, l.Norm1B, L, D, eps)
 		applyMLP(w, l, h, D, intermediate, L, s)
 		layerNorm(h, l.Norm2W, l.Norm2B, L, D, eps)
