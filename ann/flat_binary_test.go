@@ -154,8 +154,10 @@ func binClusteredCorpus(nc, per, dim, nq int, spread float64, seed int64) (vecs,
 }
 
 // binRecallAt measures recall@k of an approximate index against the exact scan
-// over the given queries.
-func binRecallAt(flat *Flat, fb *FlatBinary, qs [][]float32, k int) float64 {
+// over the given queries. Takes queryFilterer rather than *FlatBinary
+// specifically so FlatBinaryI8's own recall gates (flat_binary_i8_test.go)
+// reuse it too — same measurement, different index under test.
+func binRecallAt(flat *Flat, fb queryFilterer, qs [][]float32, k int) float64 {
 	hit, total := 0, 0
 	for _, q := range qs {
 		truth := map[int]bool{}
@@ -296,7 +298,7 @@ func TestFlatBinary_shardedMatchesSerial(t *testing.T) {
 	// n >= 32768.
 	vecs := unitVecs(40_000, dim, 3803)
 	fb := NewFlatBinary(vecs)
-	if binQueryWorkers(fb.n, fb.words) <= 1 {
+	if binQueryWorkers(fb.pf.n, fb.pf.words) <= 1 {
 		t.Fatalf("corpus does not reach the parallel path; this test proves nothing")
 	}
 	for qi := range 10 {
@@ -305,12 +307,12 @@ func TestFlatBinary_shardedMatchesSerial(t *testing.T) {
 
 		// Serial reference: one shard over the whole corpus.
 		sc2 := &binScratch{}
-		sc2.qc = ensure(sc2.qc, fb.words)
-		sc2.qf = ensure(sc2.qf, fb.dim)
+		sc2.qc = ensure(sc2.qc, fb.pf.words)
+		sc2.qf = ensure(sc2.qf, fb.pf.dim)
 		packQueryForTest(fb, sc2, q)
 		sc2.parts = append(sc2.parts[:0], nil)
-		fb.scanShard(sc2.qc, sc2, 0, fb.n, k*fb.over, nil, &sc2.parts[0])
-		ids := finishCandidates(sc2.parts, k*fb.over, sc2)
+		fb.pf.scanShard(sc2.qc, &sc2.binPrefilterScratch, 0, fb.pf.n, k*fb.pf.over, nil, &sc2.parts[0])
+		ids := finishCandidates(sc2.parts, k*fb.pf.over, &sc2.binPrefilterScratch)
 		want := fb.rerank(sc2, q, ids, k)
 
 		if len(got) != len(want) {
@@ -325,7 +327,7 @@ func TestFlatBinary_shardedMatchesSerial(t *testing.T) {
 }
 
 func packQueryForTest(f *FlatBinary, sc *binScratch, q []float32) {
-	linalg.PackSignBitsRow(sc.qc, f.centered(sc.qf, q))
+	linalg.PackSignBitsRow(sc.qc, f.pf.centered(sc.qf, q))
 }
 
 // TestFlatBinary_poolIsInert poisons every pooled scratch buffer before a query

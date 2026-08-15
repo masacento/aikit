@@ -249,11 +249,21 @@ settles.
   pinned to ms-marco-MiniLM-L-6-v2. The cross-encoder half of reranking. New surface.
 - The mmap variant of `embed.OpenSafetensors`.
 - `ann.FlatBinary` / `ann.NewFlatBinary` / `ann.NewFlatBinaryOverquery` /
-  `ann.DefaultOverquery` — binary (SimHash) prefilter + exact int8 rerank, 13–26×
-  end-to-end over `FlatI8`. Recall is ≈1.0 on real embeddings but it is an
+  `ann.DefaultOverquery` — binary (SimHash) prefilter + exact **float32** rerank,
+  13–26× end-to-end over `FlatI8`. Recall is ≈1.0 on real embeddings but it is an
   **approximate** first stage, and `DefaultOverquery = 16` is a tuning constant
   chosen from a measured recall curve — both may move. Same `Hit`/`Query` shape as
   `Flat`; new surface, so Experimental, like `FlatI8` before it.
+- `ann.FlatBinaryI8` / `ann.NewFlatBinaryI8` / `ann.NewFlatBinaryI8Overquery` —
+  the same binary prefilter composed with `FlatI8`'s int8 rerank instead of
+  `FlatBinary`'s float32 one: dim/8 + dim bytes per vector rather than dim/8 +
+  4·dim, compounding the memory win on top of the same prefilter throughput gain.
+  Recall is 1.0000 on the real Model2Vec corpus at `DefaultOverquery` (int8
+  quantization costs essentially nothing beyond the prefilter's own
+  approximation on real embeddings — same finding `FlatI8` itself made). Same
+  `Hit`/`Query` shape as `FlatBinary`; shares its prefilter code exactly
+  (`binaryPrefilter`), so the two never drift independently. New surface,
+  Experimental.
 - `ann.HNSW.WriteTo` / `ann.FlatI8.WriteTo` — streaming serialization
   (`io.WriterTo`), avoiding `MarshalBinary`'s full second copy of the index. They
   emit byte-identical output to `MarshalBinary` and inherit its tier: the format is
