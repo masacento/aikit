@@ -26,6 +26,7 @@ large embedded-grammar payload) — is quarantined in the separate
 | `bm25` | identifier-aware BM25 lexical index (Lucene-variant); `Tokenize` (code) + `TokenizePlain` (general text) | `topk` |
 | `fuse` | rank fusion (RRF) + relative-score fusion (RSF) — blend lexical + dense rankings for hybrid search | — |
 | `sparse` | learned-sparse (SPLADE) retrieval — inverted index + sparse-dot scoring over vectors from `encoder.SPLADE` (in-process) or precomputed | `topk` |
+| `late` | ColBERT-style late-interaction (MaxSim) reranking over pre-computed per-token vectors (`encoder.Model.EncodeTokens`) — a shortlist reranker, not a corpus-scale index | `linalg`, `topk` |
 | `bench` | reproducible recall + latency harness for the dense indexes (Flat / HNSW / FlatI8) — Experimental tooling | `ann` |
 | `linalg` | SIMD `f32` dot/matmul (NEON on arm64, AVX2/FMA on amd64) + int8/int4 quant kernels | — |
 | `mmap` *(Experimental)* | read-only file mapping + `madvise` residency hints + a demand-signal-agnostic `SpanCache` (LRU spans under a byte budget) — the substrate `ann`/`embed` mmap loaders sit on; cgo-free, `!unix` heap fallback | `golang.org/x/sys` *(darwin only)* |
@@ -81,6 +82,14 @@ into "visually similar images" via its own SigLIP embedding index
 (image→image similarity) — the two capabilities the vision package actually
 provides, deliberately not a cross-modal text→image search (aikit has no
 joint text/image embedding space).
+
+[`examples/colbert/`](examples/colbert) swaps `examples/rag`'s final rerank
+stage for ColBERT-style late interaction: the same fused dense+lexical
+shortlist, reranked by `late.Index`'s MaxSim (every candidate keeps its own
+per-token vectors — `encoder.Model.EncodeTokens`, built for exactly this — and
+each query token independently finds its best-matching document token) instead
+of `encoder.CrossEncoder`'s one joint forward per pair. Run both examples on
+the same query to compare.
 
 ---
 
