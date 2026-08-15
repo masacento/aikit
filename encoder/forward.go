@@ -7,7 +7,10 @@ package encoder
 // embedding gather. (The old fallback to id 100 assumed a ≥101-token vocab — the
 // repo's own vocab_size:4 fixtures would index WordEmb[400:404] and panic, the
 // exact crash this guards — and that 100 is [UNK] for every drop-in checkpoint.)
-// Shared by all embed-gather sites (single/batched, f32/Q8, MaxSim probe) so the
+// Shared by every embed-gather site in the package — CodeRankEmbed/nomic's
+// single/batched/f32/Q8/MaxSim-probe paths here, and BERT's and GTE's own word-
+// embedding gathers (bert.go, gte.go) despite their otherwise-unshared embedding
+// prologues (learned positions + segments for BERT, RoPE-only for GTE) — so the
 // fallback can't drift between them again.
 func clampTokenID(id int32, vocab int) int {
 	if int(id) < 0 || int(id) >= vocab {

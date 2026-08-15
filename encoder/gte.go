@@ -228,10 +228,7 @@ func (g *GTE) forward(ids []int32, clsOnly bool) []float32 {
 	h := make([]float32, L*D)
 	vocab := len(g.wordEmb) / D
 	for i, id := range ids {
-		if int(id) < 0 || int(id) >= vocab {
-			id = 0
-		}
-		w := g.wordEmb[int(id)*D : int(id)*D+D]
+		w := g.wordEmb[clampTokenID(id, vocab)*D:][:D]
 		row := h[i*D : i*D+D]
 		copy(row, w)
 		if g.typeEmb != nil { // type_vocab_size == 1 → row 0 added to every token

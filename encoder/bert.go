@@ -300,12 +300,7 @@ func (b *BERT) forward(ids, segs []int32, clsOnly bool) []float32 {
 	h := make([]float32, L*D)
 	vocab, typeVocab := len(b.wordEmb)/D, len(b.typeEmb)/D
 	for i, id := range ids {
-		// Defensive: a corrupt tokenizer/checkpoint could emit an OOB id;
-		// substitute row 0 (always in range) rather than panic in the gather.
-		if int(id) < 0 || int(id) >= vocab {
-			id = 0
-		}
-		w := b.wordEmb[int(id)*D : int(id)*D+D]
+		w := b.wordEmb[clampTokenID(id, vocab)*D:][:D]
 		pos := b.posEmb[(i+b.posOff)*D : (i+b.posOff)*D+D]
 		row := h[i*D : i*D+D]
 		for j := range D {
