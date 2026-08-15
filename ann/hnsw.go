@@ -176,6 +176,12 @@ type HNSW struct {
 	bSims []float64
 	bCand []cand
 	bOut2 []int
+
+	// mmap is the backing mapping when built by LoadHNSWMmap (vecs/bq alias it);
+	// nil for a NewHNSW/Add or Load index. closed is set by Close. Same lifetime
+	// contract as FlatI8's identical fields (ann/flat_i8.go).
+	mmap   []byte
+	closed bool
 }
 
 // NewHNSW creates an empty index. Add vectors with Add, or use BuildHNSW
@@ -376,6 +382,9 @@ func (h *HNSW) randomLevel() int {
 // safe for concurrent use. Panics on a dimension mismatch with vectors
 // already added (a programmer error, like topk's negative-k panic).
 func (h *HNSW) Add(vec []float32) int {
+	if h.closed {
+		panic("ann: Add on a closed HNSW (mmap released by Close)")
+	}
 	id := h.count()
 	if id == 0 {
 		h.dim = len(vec)
@@ -564,6 +573,9 @@ func (h *HNSW) QueryFilter(q []float32, k int, keep func(id int) bool) []Hit {
 }
 
 func (h *HNSW) queryEf(q []float32, k, ef int, keep func(int) bool) []Hit {
+	if h.closed {
+		panic("ann: Query on a closed HNSW (mmap released by Close)")
+	}
 	if h.Len() == 0 || k <= 0 || len(q) != h.dim {
 		return nil
 	}

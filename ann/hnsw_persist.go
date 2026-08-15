@@ -13,9 +13,10 @@ import (
 // HNSW serialization. The format is versioned from day one so the on-disk /
 // //go:embed-ed layout can evolve without silently mis-reading old blobs:
 //
-//	magic uint32 | version uint32
+//	magic uint32 | version uint32 | flags uint32 (reserved, always 0 today)
 //	dim, ndocs, m, m0, efConstruction, efSearch, entry, maxLayer  (int32 each)
 //	mL float64 | seed uint64 | heuristic uint8 (0/1) | int8 uint8 (0/1)
+//	pad: 2 zero bytes (so the vector block below starts 8-byte aligned)
 //	vectors:  int8 mode → ndocs×dim int8 codes + ndocs float32 scales;
 //	          else      → ndocs × dim float32 (little-endian, row-major)
 //	graph:    per node — layer int32, then for l in 0..layer:
@@ -28,20 +29,31 @@ import (
 // Format-stability policy (pre-1.0): rebuild-per-minor — a blob is not a stable
 // cross-version interchange format; Load rejects any other version with ErrFormat
 // (loud, never a silent misread), so callers regenerate. See README "Serialized blob
-// formats". FORMAT-BUMP CHECKLIST — the next version bump should bundle, in ONE bump
-// (to curb the v1→v2→v3 churn):
-//  1. a reserved uint32 flags word right after the version, so later additive
-//     changes extend via flags WITHOUT a version bump (the anti-churn mechanism);
-//  2. pad the header so the float32 vector block starts 8-byte aligned, unblocking
-//     zero-copy mmap aliasing of the vectors (the deferred LoadHNSWMmap, mirroring
-//     LoadFlatI8Mmap's int8 aliasing — §3.2).
+// formats".
+//
+// v4's format bump (was v3) bundled the two items the FORMAT-BUMP CHECKLIST had
+// named as one deliberate future bump, so this note documents what landed rather
+// than what's still pending:
+//  1. a reserved uint32 flags word right after the version, so a later additive
+//     change can extend via flags WITHOUT a version bump (the anti-churn
+//     mechanism) — read and ignored today, since no flag bit is defined yet;
+//  2. the header pads to end 8-byte aligned, so the float32 vector block (f32
+//     storage mode) starts 8-byte — and so also 4-byte, the only real requirement
+//     — aligned within any page-aligned mmap. This is what makes LoadHNSWMmap
+//     (hnsw_mmap.go) able to alias vecs/bq directly from the mapping instead of
+//     copying them, mirroring LoadFlatI8Mmap's int8 aliasing. int8-mode codes have
+//     no alignment requirement of their own and were already safe to alias before
+//     this bump; only f32 mode needed it.
 const (
 	hnswMagic   uint32 = 0x484E5357 // "HNSW"
-	hnswVersion uint32 = 3          // v3 added the int8 storage-mode byte (+ int8 codes/scales)
+	hnswVersion uint32 = 4          // v4 added the reserved flags word + alignment pad (see above)
 	// rngSplit matches NewHNSW's PCG seeding so a loaded index re-creates an
 	// equivalently-seeded rng (for Add-after-load).
 	rngSplit uint64 = 0x9e3779b97f4a7c15
 )
+
+// hnswPad is the v4 header's 2-byte alignment pad — always zero.
+var hnswPad [2]byte
 
 // blobSize returns the exact serialized length, which is both MarshalBinary's
 // allocation size and WriteTo's reported total. Header + vectors + graph, where
@@ -62,9 +74,10 @@ func (h *HNSW) blobSize() int {
 	return hnswHeaderBytes + vecBytes + len(h.nodes)*4 + nLayers*4 + nNbr*4
 }
 
-// hnswHeaderBytes is the fixed prefix: magic+version+8 int32 config scalars
-// (10×4), mL and seed (2×8), heuristic and int8 mode (2×1).
-const hnswHeaderBytes = 10*4 + 2*8 + 2
+// hnswHeaderBytes is the fixed prefix: magic+version+flags+8 int32 config
+// scalars (11×4), mL and seed (2×8), heuristic and int8 mode (2×1), then a
+// 2-byte pad — 64 total, a multiple of 8 (see the v4 format note above).
+const hnswHeaderBytes = 11*4 + 2*8 + 2 + 2
 
 // MarshalBinary serializes the built index — graph, vectors, and config — into a
 // versioned byte blob that Load turns back into a query-ready *HNSW. It implements
@@ -127,6 +140,7 @@ const hblobBufSize = 64 << 10
 func (h *HNSW) encode(bw *hblobWriter) {
 	bw.u32(hnswMagic)
 	bw.u32(hnswVersion)
+	bw.u32(0) // reserved flags — always 0 today; a future additive change sets bits here instead of bumping the version
 	bw.puti(h.dim)
 	bw.puti(h.count())
 	bw.puti(h.m)
@@ -139,6 +153,7 @@ func (h *HNSW) encode(bw *hblobWriter) {
 	bw.u64(h.seed)
 	bw.boolByte(h.heuristic)
 	bw.boolByte(h.int8) // v3: storage mode
+	bw.raw(hnswPad[:])  // v4: 2 zero bytes so the vector block below starts 8-byte aligned
 
 	// Vectors: int8 codes + per-vector scales (int8 mode) or row-major f32.
 	if h.int8 {
@@ -437,8 +452,19 @@ func scanGraph(b []byte, pos, ndocs int) (nIDs, nLayers int, ok bool) {
 // entry point. The returned *HNSW is query-ready and, like a freshly built one,
 // read-only-safe for concurrent Query. The bytes are not retained (vectors are
 // copied). Returns an error for a bad magic, an unsupported version, or any
-// truncated/inconsistent blob — never a panic.
+// truncated/inconsistent blob — never a panic. Use LoadHNSWMmap (hnsw_mmap.go) to
+// avoid the vector copy for a large embedded index.
 func Load(data []byte) (*HNSW, error) {
+	return loadHNSW(data, false)
+}
+
+// loadHNSW is Load's body, shared with LoadHNSWMmap: alias=false copies the
+// vector block into the heap (Load's contract); alias=true aliases it directly
+// from data instead (LoadHNSWMmap's contract — data is then the caller's mmap,
+// kept alive by the returned *HNSW). Everything else — header validation, graph
+// parsing, integrity checks — is identical either way, which is the point: two
+// entry points, one parser, so they cannot silently diverge.
+func loadHNSW(data []byte, alias bool) (*HNSW, error) {
 	c := newHcur(data)
 	if c.U32() != hnswMagic {
 		return nil, errFormatf("ann: not an HNSW blob (bad magic)")
@@ -446,6 +472,7 @@ func Load(data []byte) (*HNSW, error) {
 	if v := c.U32(); v != hnswVersion {
 		return nil, errFormatf("ann: unsupported HNSW format version %d (want %d)", v, hnswVersion)
 	}
+	_ = c.U32() // reserved flags (v4) — read to advance the cursor, ignored: no flag bit is defined yet
 	dim := c.readLen()
 	ndocs := c.readLen()
 	// match NewHNSW's clamp; a well-formed blob already has m ≥ 2
@@ -458,7 +485,8 @@ func Load(data []byte) (*HNSW, error) {
 	_ = c.U64() // consume the serialized mL to advance the cursor; recomputed below
 	seed := c.U64()
 	heuristic := c.U8() != 0
-	int8mode := c.U8() != 0 // v3
+	int8mode := c.U8() != 0   // v3
+	_ = c.Bytes(len(hnswPad)) // v4: alignment pad, discarded
 	if c.Err != nil {
 		return nil, c.Err
 	}
@@ -480,7 +508,15 @@ func Load(data []byte) (*HNSW, error) {
 		if int64(ndocs)*int64(dim)+int64(ndocs)*4 > int64(len(c.B)-c.Pos) {
 			return nil, errFormatf("ann: HNSW int8 vector block (ndocs=%d dim=%d) exceeds remaining bytes", ndocs, dim)
 		}
-		bq = c.int8s(ndocs * dim)
+		if alias {
+			// int8 has no alignment requirement, so aliasing straight from data is
+			// safe regardless of offset — same reasoning as flat_i8_mmap.go.
+			if raw := c.Bytes(ndocs * dim); len(raw) > 0 {
+				bq = unsafe.Slice((*int8)(unsafe.Pointer(&raw[0])), len(raw))
+			}
+		} else {
+			bq = c.int8s(ndocs * dim)
+		}
 		scales = make([]float32, ndocs)
 		for i := range scales {
 			scales[i] = c.F32()
@@ -493,22 +529,40 @@ func Load(data []byte) (*HNSW, error) {
 		if int64(ndocs)*int64(dim)*4 > int64(len(c.B)-c.Pos) {
 			return nil, errFormatf("ann: HNSW f32 vector block (ndocs=%d dim=%d) exceeds remaining bytes", ndocs, dim)
 		}
-		// One arena, sub-sliced per row, instead of ndocs separate allocations —
-		// 1M rows was 1M allocations for a block that is contiguous in the blob
-		// anyway. The guard above already proved ndocs*dim*4 fits the remaining
-		// bytes, so this allocation is bounded by the input either way.
 		vecs = make([][]float32, ndocs)
-		arena := make([]float32, ndocs*dim)
-		for d := range vecs {
-			row := arena[d*dim : (d+1)*dim : (d+1)*dim]
-			for j := range row {
-				row[j] = c.F32()
+		if alias {
+			// Alias the whole block as one []float32 arena, then sub-slice per row —
+			// same row layout the copying path builds below, just backed by data
+			// (the caller's mmap) instead of a fresh heap allocation. Safe ONLY
+			// because the v4 header pads to an 8-byte boundary before this block
+			// (see the format note above) — a float32 alias at an unaligned offset
+			// is undefined behavior, unlike the int8 branch above.
+			if raw := c.Bytes(ndocs * dim * 4); len(raw) > 0 {
+				arena := unsafe.Slice((*float32)(unsafe.Pointer(&raw[0])), ndocs*dim)
+				for d := range vecs {
+					vecs[d] = arena[d*dim : (d+1)*dim : (d+1)*dim]
+				}
 			}
-			vecs[d] = row
-			if c.Err != nil { // stop reading once the input is exhausted
-				return nil, c.Err
+		} else {
+			// One arena, sub-sliced per row, instead of ndocs separate allocations —
+			// 1M rows was 1M allocations for a block that is contiguous in the blob
+			// anyway. The guard above already proved ndocs*dim*4 fits the remaining
+			// bytes, so this allocation is bounded by the input either way.
+			arena := make([]float32, ndocs*dim)
+			for d := range vecs {
+				row := arena[d*dim : (d+1)*dim : (d+1)*dim]
+				for j := range row {
+					row[j] = c.F32()
+				}
+				vecs[d] = row
+				if c.Err != nil { // stop reading once the input is exhausted
+					return nil, c.Err
+				}
 			}
 		}
+	}
+	if c.Err != nil {
+		return nil, c.Err
 	}
 	// The graph was 2 allocations per node — one [][]int32 of layer headers and one
 	// []int32 per layer — so a 1M-doc index cost >2.1M allocations to load a

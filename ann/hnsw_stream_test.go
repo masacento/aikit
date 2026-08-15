@@ -78,8 +78,8 @@ func TestHNSW_formatGolden(t *testing.T) {
 		size int
 		sha  string
 	}{
-		{"f32", false, 379234, "da3e6b8a66131324efd89238237137298ff5128d7a8198ad0af2cefbdcd974f9"},
-		{"int8", true, 205234, "149151cffbbe728b8f049fd731ef898e7c104819a2e79f1599a6573ea1d20e6b"},
+		{"f32", false, 379240, "2f295d9ac4c985e17d5b7a167bff770fdca2c9c915f8a32754070b8a88666388"},
+		{"int8", true, 205240, "33bbc99f6dd210899a733ca3a4b44b61ec88b7ffbb054bd3f47acdd365673754"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rng := rand.New(rand.NewPCG(4242, 99))

@@ -401,8 +401,16 @@ visibly and you regenerate. The format version is bumped freely within `0.x` whe
 layout improves. If you `//go:embed` blobs in your own releases, pin the aikit minor
 or rebuild in your pipeline (a `go generate` step, as
 [`examples/embedded-corpus`](examples/embedded-corpus) does). At 1.0 this tightens to
-a stronger guarantee (read N−1, or reserved-field forward-compatibility) — the next
-format bump reserves header flag bytes as the mechanism for the latter.
+a stronger guarantee (read N−1, or reserved-field forward-compatibility) — HNSW's v4
+bump already reserves a header flags word as the mechanism for the latter
+(`ann/hnsw_persist.go`'s format note); FlatI8's own format-bump checklist still has
+this one pending.
+
+That same v4 bump also padded HNSW's header to an 8-byte boundary, which is what lets
+[`ann.LoadHNSWMmap`](ann/hnsw_mmap.go) alias the float32 vector block directly from a
+read-only mapping instead of copying it — the zero-copy loader `ann.LoadFlatI8Mmap`
+already had, now mirrored on the higher-recall index (`ann.FlatI8`'s int8 codes never
+needed the alignment fix; HNSW's f32 vectors did).
 
 ## License
 
