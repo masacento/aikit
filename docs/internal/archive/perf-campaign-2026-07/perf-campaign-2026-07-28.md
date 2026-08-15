@@ -7,6 +7,13 @@ A prioritized menu, not a commitment. Every item cites `file:line`, states the
 **Constraints honoured throughout:** core stays pure-Go, no cgo. New hand-written
 `.s` kernels are in bounds and several items depend on them.
 
+> Looking for a code comment that cites `perf-campaign AN` (a letter, not a
+> bare number)? That's [`task-perf-handoff-linux.md`](task-perf-handoff-linux.md)
+> in this same directory, not this file — the letter picks the doc. Plain
+> `item N` citations (`item 27`, `item 33`, …) are this file: items ≤26 have
+> their own `### N ·` heading below; higher ones live as a table row plus
+> later numbered discussion — search for "item N" rather than a heading.
+
 ---
 
 ## 0. How this was produced, and what to distrust

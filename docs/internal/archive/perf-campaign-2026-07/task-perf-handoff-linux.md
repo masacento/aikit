@@ -14,6 +14,11 @@
 > 3. `docs/internal/perf-campaign-2026-07-28.md` — reference for anything marked
 >    **[campaign #N]**. Do not work top-down from its ordering; §6 of the lens doc
 >    supersedes it.
+>
+> **Looking for a code comment that cites `perf-campaign AN` (a letter, e.g.
+> `perf-campaign A5`)?** You're in the right file — search for `### AN ·`
+> below. A bare `item N` citation (no letter) is the OTHER doc,
+> [`perf-campaign-2026-07-28.md`](perf-campaign-2026-07-28.md).
 
 ---
 

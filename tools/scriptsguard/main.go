@@ -16,8 +16,11 @@
 //	build-time binding for, shared verbatim with goinfer — is separate build infrastructure, out
 //	of scope by the scripts/ boundary.)
 //
-// Both rules are derived by path, so nothing is hand-enumerated (B7): adding a pin_ script to
-// oracle/ needs no edit here. The DENOMINATOR is printed so a pass and a scan-of-nothing differ.
+// Both rules are derived by path, so nothing is hand-enumerated: adding a pin_ script to
+// oracle/ needs no edit here. (This cites the same "derived by path, not hand-enumerated"
+// argument as B7 once did — that tag no longer resolves to anything in the archived perf-
+// campaign docs, so it's dropped rather than left pointing nowhere; see docs/architecture.md
+// § Numbered-citation index.) The DENOMINATOR is printed so a pass and a scan-of-nothing differ.
 // Usage: go run -C tools ./scriptsguard
 package main
 

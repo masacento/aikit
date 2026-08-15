@@ -225,3 +225,32 @@ cited from aikit code, with the decision each is invoked for:
 If ken's ADR directory is ever published or relocated, update this table to
 deep-link; until then this index is the in-repo resolution for those
 references.
+
+## Numbered-citation index
+
+Code comments also cite several OTHER numbering schemes — `audit #18`, `item
+27`, `perf-campaign A5`, `lens doc §4.3`, `plan §6.2`, an `M8c` milestone
+tag — each resolvable a different way. This table is the same treatment the
+ADR index above gives ADR-NNN: what a style means and where (if anywhere) to
+go look, so a citation doesn't require guessing. Every row below was verified
+against the actual archive docs (grepped every citation site in the tree and
+checked it resolves), not assumed from the style alone — see the two that
+turned out NOT to be one doc each.
+
+| Style | Example | Resolves to |
+|---|---|---|
+| `audit #N` | `audit #18` | `docs/internal/archive/AUDIT-2026-07-25.md`, finding `### N.` — in-repo, exact. Every cited number (3, 5–24) has a matching heading; verified 2026-08-15, no gaps. |
+| `perf-campaign item N` (plain, unlettered) | `perf-campaign item 27` | `docs/internal/archive/perf-campaign-2026-07/perf-campaign-2026-07-28.md` — in-repo, exact, always this one doc. Items ≤26 have their own `### N ·` heading; higher ones (up to 44+) live as a numbered table row plus later numbered prose discussion ("Item 27 is DONE — …") rather than a heading — Ctrl+F "item N" finds both. Verified every cited number (0–44) resolves; none are missing. |
+| `perf-campaign AN` (lettered) | `perf-campaign A5` | **A DIFFERENT DOC**: `docs/internal/archive/perf-campaign-2026-07/task-perf-handoff-linux.md`, `### AN ·` (A1–A6 exist; all six are cited from real code — ann/flat.go, ann/flat_i8.go, embed/tokenize.go, fuse/rsf.go, fuse/fuse.go, bm25/query.go, sparse/sparse.go). This is the doc a reader following the plain `item N` row above will NOT find these in — the letter, not just the number, picks the file. |
+| A bare `(B7)` with no `perf-campaign` prefix | `tools/scriptsguard/main.go` | **Does not resolve.** Grepped every archive doc in `perf-campaign-2026-07/`: no `B7` heading, table row, or mention anywhere. `task-perf-handoff-linux.md` mentions "A1–A6 and B landed" as a single unenumerated follow-on, and `task-perf-lens-scans.md` has an unrelated prose-numbered "Phase B" list (items 6–10, not "B6"–"B10") — neither is addressable as `B7`. Likely a stale reference to an earlier, since-renumbered version of these docs. Flagged rather than guessed at; the comment's own claim (rules derived by path, not hand-enumerated) doesn't depend on the citation resolving. |
+| Other letter+number tags (`H2`, `H7`, `C5`, `F2`, `P1`, …) | `H2` (`embed/typed_accessors_test.go`, `vision/qwen_encoder.go`) | **Not indexed here — a different citation family from perf-campaign's, scope not yet mapped.** These cluster in `embed`/`vision`/`gpu`/`linalg`, not the packages perf-campaign touched, so they're very likely a separate review's findings-lettering, not a perf-campaign phase. Needs its own grep-and-verify pass before a row can be added truthfully. |
+| `lens doc §N.M` | `lens doc §4.3` | `docs/internal/archive/perf-campaign-2026-07/task-perf-lens-scans.md`'s own §-numbered sections — in-repo. |
+| `plan §N.M`, milestone tags (`M0`…`M24`, `M8c`) | `plan §6.2` (`encoder/attention.go`) | A pre-1.0 CodeRankEmbed build plan from before aikit's split out of ken. **Not present in this repo, goinfer, or ken's tree as far as this index can confirm** — historical color surviving in the comment, not a document to go find. Don't spend time looking for a `plan.md`. Note: this style overlaps in SHAPE with `M8`/`M24` etc. seen elsewhere (`gpu/metal.go`, `encoder/forward_q8.go`) — those are the SAME milestone family (encoder/CodeRankEmbed build milestones), not a coincidence, but still unresolvable the same way. |
+| `migration-plan §N` | `migration-plan §7/§9` (`tools/preflight/main.go`) | The aikit⇄goinfer module-split plan. Its stub, `docs/internal/archive/aikit-module-split-plan.md`, used to point at `goinfer/docs/migration-plan.md` — that file is gone now that the split it described is done (confirmed absent from goinfer's current tree, 2026-08-14). Historical only, same as the milestone tags above. |
+
+Update this table when a new citation STYLE appears (a new archive doc, a new
+tag family) — it tracks styles, not individual numbers, so it shouldn't need
+touching every time a comment cites one more `item N`. If you add a row,
+verify it the way the rows above were: grep every site, don't infer the
+target doc from the style alone — the `AN` row above looks like it should
+live next to the plain `item N` row and it does not.

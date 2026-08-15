@@ -117,14 +117,21 @@ Experimental in `experimentalSyms`/`experimentalMembers`
   2026-07 performance campaign, both archived under
   [`docs/internal/archive/`](docs/internal/archive/) once their live work
   finished. `AUDIT-2026-07-25.md`'s findings are numbered `### N.`;
-  `perf-campaign-2026-07/`'s items are numbered or lettered per-document
-  (`### N ·`, or a letter+number like `A5`/`B7` for an earlier phase).
-  When you cite one, cite it the same way: a short tag in the comment,
-  the full story in the archived doc — not restated inline. If your own
+  `perf-campaign-2026-07/`'s plain-numbered items (`item 27`) are all in
+  `perf-campaign-2026-07-28.md`, but its LETTERED items (`A5`) are a
+  **different file**, `task-perf-handoff-linux.md` — the letter picks the
+  doc, not just the item within one. When you cite one, cite it the same
+  way: a short tag in the comment, the full story in the archived doc —
+  not restated inline. If your own
   work produces a finding worth citing later, it deserves the same
   treatment: a durable record under `docs/internal/` (archived once
   closed), not just a comment that stops making sense once the context
-  that produced it is gone.
+  that produced it is gone. You'll also see `plan §N.M` and milestone
+  tags (`M0`…`M24`, `M8c`) in older comments — those predate aikit's split
+  out of ken and don't resolve to anything in this repo; see
+  [`docs/architecture.md` § Numbered-citation
+  index](docs/architecture.md#numbered-citation-index) for the full table
+  of which style resolves where (or doesn't).
 - **ADRs** (`ADR-NNN` in comments) live in the `ken` repo, not here —
   aikit's packages originated there. See [`docs/architecture.md` § ADR
   index](docs/architecture.md#adr-index) for the table of which ADR
