@@ -66,6 +66,13 @@ int8 index, and the corpus, and answers Go/aikit questions over hybrid (dense +
 lexical) search with **no external files** and ~50 ms startup — the
 `//go:embed`-a-corpus lane no Python or ONNX stack reaches.
 
+For the third retrieval signal, [`examples/splade/`](examples/splade) runs
+learned-sparse (SPLADE) retrieval on its own (chunk → SPLADE expand → sparse
+index → query → top-K) — the in-process, no-Python pipeline behind the
+"learned-sparse" column in the capability matrix below. It composes into a
+fused hybrid search the same way `examples/rag`'s dense and lexical signals
+do, via `fuse.Keys(sparseHits, func(h sparse.Hit) int { return h.Index })`.
+
 ---
 
 ## Platforms
