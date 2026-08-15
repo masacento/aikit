@@ -112,11 +112,6 @@ func (c *Config) ValidateAssumptions() error {
 		return fmt.Errorf("encoder: rotary_emb_interleaved=true unsupported (rotate_half only)")
 	case c.RoPEFraction != 1.0:
 		return fmt.Errorf("encoder: rotary_emb_fraction=%v unsupported (1.0 only)", c.RoPEFraction)
-	case c.HiddenDim == 0 || c.NumHeads == 0 || c.NumLayers == 0 || c.IntermediateDim == 0:
-		return fmt.Errorf("encoder: missing required dim in config (HiddenDim=%d NumHeads=%d NumLayers=%d IntermediateDim=%d)",
-			c.HiddenDim, c.NumHeads, c.NumLayers, c.IntermediateDim)
-	case c.HiddenDim%c.NumHeads != 0:
-		return fmt.Errorf("encoder: HiddenDim %d not divisible by NumHeads %d", c.HiddenDim, c.NumHeads)
 	case c.TypeVocabSize < 1:
 		return fmt.Errorf("encoder: type_vocab_size must be ≥1, got %d", c.TypeVocabSize)
 	case c.LayerNormEpsilon <= 0:
@@ -128,13 +123,11 @@ func (c *Config) ValidateAssumptions() error {
 		// scale_attn_weights=true; a checkpoint with it false would silently get
 		// scaled anyway (wrong activations). Reject it rather than mislead.
 		return fmt.Errorf("encoder: scale_attn_weights=false unsupported (attention is always 1/√headDim scaled)")
-	case (c.HiddenDim/c.NumHeads)%2 != 0:
-		// RoPE rotates head-dim pairs, so an odd head dim panics in rope.go at
-		// the first Encode. Catch it at load. (NumHeads != 0 and HiddenDim %
-		// NumHeads == 0 are guaranteed by the earlier cases.)
-		return fmt.Errorf("encoder: head dim %d (HiddenDim/NumHeads) must be even for RoPE", c.HiddenDim/c.NumHeads)
 	}
-	return nil
+	// CodeRankEmbed/NomicBert is RoPE (rotary_emb_base etc. above), so an odd
+	// head dim panics in rope.go at the first Encode — catch it at load, same
+	// as GTE.
+	return validateDims("CodeRankEmbed", c.HiddenDim, c.NumHeads, c.NumLayers, c.IntermediateDim, true)
 }
 
 // LayerWeights bundles one transformer block's tensors. Matrices are

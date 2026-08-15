@@ -101,10 +101,10 @@ func LoadBERT(dir string) (*BERT, error) {
 		return nil, fmt.Errorf("encoder: BERT hidden_act=%q unsupported (gelu only)", c.Act)
 	case c.PosType != "" && c.PosType != "absolute":
 		return nil, fmt.Errorf("encoder: BERT position_embedding_type=%q unsupported (absolute only)", c.PosType)
-	case c.Hidden == 0 || c.Heads == 0 || c.Layers == 0 || c.Intermediate == 0:
-		return nil, fmt.Errorf("encoder: BERT config missing a required dim")
-	case c.Hidden%c.Heads != 0:
-		return nil, fmt.Errorf("encoder: BERT hidden %d not divisible by heads %d", c.Hidden, c.Heads)
+	}
+	// BERT uses learned absolute positions, not RoPE, so an odd head dim is fine.
+	if err := validateDims("BERT", c.Hidden, c.Heads, c.Layers, c.Intermediate, false); err != nil {
+		return nil, err
 	}
 	if c.LNEps == 0 {
 		c.LNEps = 1e-12

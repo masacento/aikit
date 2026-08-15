@@ -91,12 +91,9 @@ func LoadGTE(dir string) (*GTE, error) {
 		return nil, fmt.Errorf("encoder: GTE position_embedding_type=%q unsupported (rope only)", c.PosType)
 	case c.LNType != "" && c.LNType != "layer_norm":
 		return nil, fmt.Errorf("encoder: GTE layer_norm_type=%q unsupported (layer_norm only)", c.LNType)
-	case c.Hidden == 0 || c.Heads == 0 || c.Layers == 0 || c.Intermediate == 0:
-		return nil, fmt.Errorf("encoder: GTE config missing a required dim")
-	case c.Hidden%c.Heads != 0:
-		return nil, fmt.Errorf("encoder: GTE hidden %d not divisible by heads %d", c.Hidden, c.Heads)
-	case (c.Hidden/c.Heads)%2 != 0:
-		return nil, fmt.Errorf("encoder: GTE head dim %d must be even for RoPE", c.Hidden/c.Heads)
+	}
+	if err := validateDims("GTE", c.Hidden, c.Heads, c.Layers, c.Intermediate, true); err != nil {
+		return nil, err
 	}
 	if c.LNEps == 0 {
 		c.LNEps = 1e-12

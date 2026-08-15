@@ -142,6 +142,9 @@ func TestValidateAssumptions_rejects(t *testing.T) {
 	mutate("rope_interleaved", func(c *Config) { c.RoPEInterleaved = true })
 	mutate("rope_partial", func(c *Config) { c.RoPEFraction = 0.5 })
 	mutate("hidden_not_divisible_by_heads", func(c *Config) { c.HiddenDim = 769 })
+	// 768/256 = 3, odd — RoPE rotates head-dim pairs, so rope.go panics on this
+	// at the first Encode; ValidateAssumptions must catch it at load instead.
+	mutate("head_dim_odd", func(c *Config) { c.NumHeads = 256 })
 	mutate("zero_dims", func(c *Config) { c.HiddenDim = 0 })
 	mutate("type_vocab_zero", func(c *Config) { c.TypeVocabSize = 0 })
 	mutate("eps_zero", func(c *Config) { c.LayerNormEpsilon = 0 })
