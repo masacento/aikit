@@ -420,3 +420,19 @@ func gelu(x []float32) {
 func geluScalar(v float32) float32 {
 	return linalg.GELUF32(v)
 }
+
+// geluTanh applies the tanh-approximation GELU in place — HF's "gelu_new" /
+// "gelu_fast" / "gelu_pytorch_tanh", a different function from the exact erf
+// form gelu applies (see Config.geluTanh and linalg.GELUTanhF32). Same chunking
+// as gelu, for the same reason: elementwise and in place, so splitting is
+// numerically inert.
+func geluTanh(x []float32) {
+	const chunk = 4096
+	chunks := (len(x) + chunk - 1) / chunk
+	parallelRows(chunks, len(x), func(start, end int) {
+		lo, hi := start*chunk, min(end*chunk, len(x))
+		for i, v := range x[lo:hi] {
+			x[lo+i] = linalg.GELUTanhF32(v)
+		}
+	})
+}

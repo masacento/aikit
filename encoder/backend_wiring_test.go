@@ -188,7 +188,7 @@ func TestBackend_mlpIsRouted(t *testing.T) {
 	spy := &spyBackend{}
 	s.be = spy
 	s.ensureLayer(L, D, inter, 2, D/2, L)
-	geluMLP(append([]float32(nil), h...), fc1, fc1b, fc2, fc2b, D, inter, L, s)
+	geluMLP(append([]float32(nil), h...), fc1, fc1b, fc2, fc2b, D, inter, L, false, s)
 
 	if spy.calls == 0 {
 		t.Fatal("backend saw no MLP matmuls — the MLP is not routed through the seam")

@@ -91,7 +91,7 @@ func TestMoEMLP_groupedMatchesPerToken(t *testing.T) {
 		got := append([]float32(nil), base...)
 		sGot := getScratch()
 		sGot.ensureLayer(tc.L, tc.D, tc.inter, 1, tc.D, tc.L)
-		moeMLP(got, router, w1, w2t, bias, tc.experts, tc.topK, tc.D, tc.inter, tc.L, sGot)
+		moeMLP(got, router, w1, w2t, bias, tc.experts, tc.topK, tc.D, tc.inter, tc.L, false, sGot)
 		putScratch(sGot)
 
 		for i := range want {

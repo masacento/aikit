@@ -68,14 +68,20 @@ func addRowBias(dst, bias []float32, M, N int) {
 //
 //	y = GELU(h · Fc1ᵀ + b1) · Fc2ᵀ + b2
 //
-// (vs. the gated SwiGLU form the v1.5/CodeRankEmbed checkpoints use). GELU is the
-// exact erf variant — the reference builds nn.GELU(approximate="none") for
-// activation_function == "gelu".
-func geluMLP(h, fc1, fc1b, fc2, fc2b []float32, D, intermediate, L int, s *scratch) {
+// (vs. the gated SwiGLU form the v1.5/CodeRankEmbed checkpoints use). tanh
+// selects which GELU: false is the exact erf variant (activation_function ==
+// "gelu", the reference builds nn.GELU(approximate="none")); true is the tanh
+// approximation ("gelu_new"/"gelu_fast"/"gelu_pytorch_tanh", see Config.geluTanh)
+// — collapsing the two is a silent model change, not a safe approximation.
+func geluMLP(h, fc1, fc1b, fc2, fc2b []float32, D, intermediate, L int, tanh bool, s *scratch) {
 	inner := s.val[:L*intermediate] // reuse the SwiGLU value buffer
 	s.mm(h, fc1, inner, L, D, intermediate)
 	addRowBias(inner, fc1b, L, intermediate)
-	gelu(inner)
+	if tanh {
+		geluTanh(inner)
+	} else {
+		gelu(inner)
+	}
 
 	out := s.mid[:L*D] // reuse the SwiGLU fc2-output buffer
 	s.mm(inner, fc2, out, L, intermediate, D)
@@ -109,7 +115,7 @@ func geluMLP(h, fc1, fc1b, fc2, fc2b []float32, D, intermediate, L int, s *scrat
 // All working buffers come from the scratch arena: moeScores/moeOut are dedicated,
 // x1 and contrib reuse val/mid (as gelu/swigluMLP do), so the MoE layers allocate
 // nothing after warmup.
-func moeMLP(h, router, w1, w2t, bias []float32, numExperts, topK, D, intermediate, L int, s *scratch) {
+func moeMLP(h, router, w1, w2t, bias []float32, numExperts, topK, D, intermediate, L int, tanh bool, s *scratch) {
 	s.moeAllScores = ensureF32(s.moeAllScores, L*numExperts)
 	s.moeWeight = ensureF32(s.moeWeight, L*topK)
 	s.moeGathered = ensureF32(s.moeGathered, L*D)
@@ -183,7 +189,11 @@ func moeMLP(h, router, w1, w2t, bias []float32, numExperts, topK, D, intermediat
 			expW2t := w2t[off*D : (off+intermediate)*D]
 
 			matmulBTBlockedInto(in, expW1, x1, m, D, intermediate)
-			gelu(x1)
+			if tanh {
+				geluTanh(x1)
+			} else {
+				gelu(x1)
+			}
 			matmulBTBlockedInto(x1, expW2t, contrib, m, intermediate, D)
 
 			for i := range m {
@@ -215,11 +225,11 @@ func applyMLP(w *Weights, l *LayerWeights, h []float32, D, intermediate, L int, 
 	switch {
 	case l.IsMoE:
 		moeMLP(h, l.Router, l.ExpW1, l.ExpW2, l.ExpBias,
-			w.Cfg.NumExperts, w.Cfg.MoETopK, D, intermediate, L, s)
+			w.Cfg.NumExperts, w.Cfg.MoETopK, D, intermediate, L, w.Cfg.geluTanh(), s)
 	case l.Fc11 != nil:
 		swigluMLP(h, l.Fc11, l.Fc12, l.Fc2, D, intermediate, L, s)
 	default:
-		geluMLP(h, l.Fc1, l.Fc1B, l.Fc2, l.Fc2B, D, intermediate, L, s)
+		geluMLP(h, l.Fc1, l.Fc1B, l.Fc2, l.Fc2B, D, intermediate, L, w.Cfg.geluTanh(), s)
 	}
 }
 
