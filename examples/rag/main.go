@@ -1,26 +1,29 @@
 // Command rag is the end-to-end aikit retrieval pipeline in one file:
 //
-//	chunk → embed → (ANN + BM25) → RRF fuse → encoder rerank → top-K
+//	chunk → embed → (ANN + BM25) → RRF fuse → cross-encoder rerank → top-K
 //
 // It indexes a tiny in-memory corpus, runs a hybrid (lexical + dense) search,
 // fuses the two rankings with reciprocal-rank fusion, and reranks the fused
-// shortlist with the CodeRankEmbed encoder for the final order.
+// shortlist with a BERT cross-encoder for the final order — a joint
+// (query, document) forward per candidate, not a cosine comparison of two
+// separately-embedded vectors, which is why it typically outranks a
+// bi-encoder rerank.
 //
 // It needs two local models (skipped-clean if absent, so `go build ./...`
 // always compiles and `go run` without flags just prints guidance):
 //
 //	go run ./examples/rag \
 //	    --embed-model  testdata/model \
-//	    --rerank-model testdata/encoder-model \
+//	    --rerank-model testdata/crossencoder-model \
 //	    --q "read a file line by line"
 //
-// See the repo README for how to fetch the models.
+// See the repo README (and scripts/README.md's "Fetching testdata/
+// crossencoder-model" section) for how to fetch the models.
 package main
 
 import (
 	"flag"
 	"fmt"
-	"math"
 	"os"
 
 	"github.com/townsendmerino/aikit/ann"
@@ -46,7 +49,7 @@ var corpus = []struct{ name, src string }{
 
 func main() {
 	embedDir := flag.String("embed-model", "", "dir with a Model2Vec checkpoint for embed.Load")
-	rerankDir := flag.String("rerank-model", "", "dir with a CodeRankEmbed checkpoint for encoder.Load")
+	rerankDir := flag.String("rerank-model", "", "dir with a BERT cross-encoder checkpoint (e.g. ms-marco-MiniLM-L-6-v2) for encoder.LoadCrossEncoder")
 	query := flag.String("q", "read a file line by line", "search query")
 	shortlist := flag.Int("shortlist", 20, "candidates each retriever contributes to the fuse")
 	rerankN := flag.Int("rerank", 8, "fused candidates to rerank with the encoder")
@@ -56,8 +59,8 @@ func main() {
 		fmt.Println(`rag — end-to-end aikit retrieval example.
 
 Needs two local models:
-  --embed-model  <dir>   Model2Vec       (e.g. testdata/model)
-  --rerank-model <dir>   CodeRankEmbed    (e.g. testdata/encoder-model)
+  --embed-model  <dir>   Model2Vec        (e.g. testdata/model)
+  --rerank-model <dir>   BERT cross-encoder (e.g. testdata/crossencoder-model)
 
 Without them this just prints guidance; the pipeline code below is the point.`)
 		return
@@ -65,7 +68,7 @@ Without them this just prints guidance; the pipeline code below is the point.`)
 
 	em, err := embed.LoadFromFS(os.DirFS(*embedDir), ".")
 	check(err, "load embed model")
-	enc, err := encoder.Load(*rerankDir)
+	ce, err := encoder.LoadCrossEncoder(*rerankDir)
 	check(err, "load rerank model")
 
 	// 1) CHUNK — split each file into indexable units. One flat slice; its
@@ -105,23 +108,23 @@ Without them this just prints guidance; the pipeline code below is the point.`)
 		fuse.Keys(denHits, func(h ann.Hit) int { return h.Index }),
 	)
 
-	// 4) RERANK the fused shortlist with the encoder: encode the query and the
-	//    candidates, score by cosine, and keep the top-K via topk.
+	// 4) RERANK the fused shortlist with the cross-encoder: ScoreBatch scores
+	//    each (query, document) pair JOINTLY in one forward — the trunk attends
+	//    across query and document together, not a cosine comparison of two
+	//    independently-embedded vectors — and dispatches the candidates
+	//    document-parallel. Higher logit = more relevant.
 	n := min(*rerankN, len(fused))
 	cand := fused[:n]
 	texts := make([]string, n)
-	isQuery := make([]bool, n) // all docs
 	for i, r := range cand {
 		texts[i] = chunks[r.Key].Text
 	}
-	qEmb, err := enc.Encode(*query, true)
-	check(err, "encode query")
-	dEmbs, err := enc.EncodeBatch(texts, isQuery, 0)
-	check(err, "encode candidates")
+	scores, err := ce.ScoreBatch(*query, texts, 0)
+	check(err, "cross-encoder rerank")
 
 	sel := topk.New[int](n)
 	for i, r := range cand {
-		sel.Push(r.Key, cosine(qEmb, dEmbs[i]))
+		sel.Push(r.Key, float64(scores[i]))
 	}
 
 	// 5) Final ranked output.
@@ -130,20 +133,6 @@ Without them this just prints guidance; the pipeline code below is the point.`)
 		c := chunks[hit.Item]
 		fmt.Printf("%d. %.4f  %s:%d-%d\n     %s\n", rank+1, hit.Score, c.File, c.StartLine, c.EndLine, firstLine(c.Text))
 	}
-}
-
-// cosine similarity in float64 (the encoder returns raw, un-normalized CLS).
-func cosine(a, b []float32) float64 {
-	var dot, na, nb float64
-	for i := range a {
-		dot += float64(a[i]) * float64(b[i])
-		na += float64(a[i]) * float64(a[i])
-		nb += float64(b[i]) * float64(b[i])
-	}
-	if na == 0 || nb == 0 {
-		return 0
-	}
-	return dot / (math.Sqrt(na) * math.Sqrt(nb))
 }
 
 func firstLine(s string) string {
