@@ -149,7 +149,7 @@ func (ix *Index) Query(q SparseVec, k int) []Hit {
 	items := sel.Result()
 	// Stable secondary sort by ascending doc id to honor the tie-break contract
 	// (the heap only orders by score).
-	slices.SortFunc(items, itemCmp)
+	slices.SortFunc(items, topk.ItemCmp[int])
 	out := make([]Hit, len(items))
 	for j, s := range items {
 		out[j] = Hit{Index: s.Item, Score: s.Score}
@@ -157,37 +157,13 @@ func (ix *Index) Query(q SparseVec, k int) []Hit {
 	return out
 }
 
-// hitCmp and itemCmp order by score descending, then by ascending document id —
-// each a strict total order (the ids are unique), so slices.SortFunc reproduces
-// the previous sort.Slice/SliceStable output exactly without their reflect-based
-// Swapper (A5).
-func hitCmp(a, b Hit) int {
-	switch {
-	case a.Score > b.Score:
-		return -1
-	case a.Score < b.Score:
-		return 1
-	case a.Index < b.Index:
-		return -1
-	case a.Index > b.Index:
-		return 1
-	}
-	return 0
-}
-
-func itemCmp(a, b topk.ItemWithScore[int]) int {
-	switch {
-	case a.Score > b.Score:
-		return -1
-	case a.Score < b.Score:
-		return 1
-	case a.Item < b.Item:
-		return -1
-	case a.Item > b.Item:
-		return 1
-	}
-	return 0
-}
+// hitCmp orders by score descending, then by ascending document id — a strict
+// total order (the ids are unique), so slices.SortFunc reproduces the
+// previous sort.Slice/SliceStable output exactly without their reflect-based
+// Swapper (A5). Same algorithm ann and bm25 each wrote out over their own
+// result types; now the one shared topk.Cmp (items sort via the
+// directly-usable topk.ItemCmp instead of a local wrapper).
+func hitCmp(a, b Hit) int { return topk.Cmp(a.Index, b.Index, a.Score, b.Score) }
 
 // termWeight is one distinct query term and its folded weight.
 type termWeight struct {

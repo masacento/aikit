@@ -400,7 +400,7 @@ func finishCandidates(parts [][]topk.ItemWithScore[int32], cand int, sc *binScra
 		merged = append(merged, p...)
 	}
 	sc.merged = merged
-	slices.SortFunc(merged, itemCmp32)
+	slices.SortFunc(merged, topk.ItemCmp[int32])
 	if len(merged) > cand {
 		merged = merged[:cand]
 	}
@@ -440,7 +440,7 @@ func (f *FlatBinary) rerank(sc *binScratch, q []float32, ids []int32, k int) []H
 		}
 	})
 	items := sel.Result()
-	slices.SortFunc(items, itemCmp)
+	slices.SortFunc(items, topk.ItemCmp[int])
 	hits := make([]Hit, len(items))
 	for j, s := range items {
 		hits[j] = Hit{Index: s.Item, Score: s.Score}

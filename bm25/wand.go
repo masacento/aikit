@@ -258,7 +258,7 @@ func (ix *Index) topKWANDState(query []string, k int, w *wandState) ([]Result, b
 	}
 
 	items := sel.Result()
-	slices.SortFunc(items, itemCmp)
+	slices.SortFunc(items, topk.ItemCmp[int])
 	out := make([]Result, len(items))
 	for j, s := range items {
 		out[j] = Result{Doc: s.Item, Score: s.Score}

@@ -136,7 +136,7 @@ func (ix *Index) topKExhaustive(query []string, k int) []Result {
 	items := sel.Result()
 	// Stable secondary sort by ascending Doc id to honor the doc-comment
 	// tie-break contract.
-	slices.SortFunc(items, itemCmp)
+	slices.SortFunc(items, topk.ItemCmp[int])
 	out := make([]Result, len(items))
 	for j, s := range items {
 		out[j] = Result{Doc: s.Item, Score: s.Score}
@@ -144,38 +144,14 @@ func (ix *Index) topKExhaustive(query []string, k int) []Result {
 	return out
 }
 
-// resultCmp and itemCmp order by score descending, then by ascending document
-// id. Both second keys are unique within the slice, so each is a strict total
-// order and slices.SortFunc reproduces the previous sort.Slice/SliceStable
-// output exactly while avoiding their reflect-based Swapper (A5; the same change
-// audit #24 made in ann/hnsw.go).
-func resultCmp(a, b Result) int {
-	switch {
-	case a.Score > b.Score:
-		return -1
-	case a.Score < b.Score:
-		return 1
-	case a.Doc < b.Doc:
-		return -1
-	case a.Doc > b.Doc:
-		return 1
-	}
-	return 0
-}
-
-func itemCmp(a, b topk.ItemWithScore[int]) int {
-	switch {
-	case a.Score > b.Score:
-		return -1
-	case a.Score < b.Score:
-		return 1
-	case a.Item < b.Item:
-		return -1
-	case a.Item > b.Item:
-		return 1
-	}
-	return 0
-}
+// resultCmp orders by score descending, then by ascending document id — a
+// strict total order (Doc is unique within the slice), so slices.SortFunc
+// reproduces the previous sort.Slice/SliceStable output exactly while
+// avoiding their reflect-based Swapper (A5; the same change audit #24 made
+// in ann/hnsw.go). Same algorithm ann and sparse each wrote out over their
+// own result types; now the one shared topk.Cmp (items sort via the
+// directly-usable topk.ItemCmp instead of a local wrapper).
+func resultCmp(a, b Result) int { return topk.Cmp(a.Doc, b.Doc, a.Score, b.Score) }
 
 // scoreQuery accumulates every (deduped) query term's postings and returns the
 // accumulator. The caller must accum.Put it.

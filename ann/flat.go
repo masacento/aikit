@@ -134,7 +134,7 @@ func (f *Flat) query(q []float32, k int, keep func(int) bool) []Hit {
 	}
 	// Stable secondary sort by ascending Index to honor the doc-comment
 	// tie-break contract. K is small (typically 10), so this is cheap.
-	slices.SortFunc(items, itemCmp)
+	slices.SortFunc(items, topk.ItemCmp[int])
 	hits := make([]Hit, len(items))
 	for j, s := range items {
 		hits[j] = Hit{Index: s.Item, Score: s.Score}
@@ -221,7 +221,7 @@ func (f *Flat) queryShards(q []float32, k, workers int, keep func(int) bool) []t
 	for _, p := range parts {
 		merged = append(merged, p...)
 	}
-	slices.SortFunc(merged, itemCmp)
+	slices.SortFunc(merged, topk.ItemCmp[int])
 	if len(merged) > k {
 		merged = merged[:k]
 	}
@@ -270,9 +270,9 @@ func scanFlat(q []float32, vecs [][]float32, emit func(i int, score float64)) {
 	}
 }
 
-// The comparators below are shared by every selection site in this package, and
-// they are `slices.SortFunc` comparators rather than `sort.Slice` closures for
-// two reasons — one mechanical, one about correctness.
+// hitCmp is shared by every Hit-selection site in this package, and it is a
+// `slices.SortFunc` comparator rather than a `sort.Slice` closure for two
+// reasons — one mechanical, one about correctness.
 //
 // Mechanical: sort.Slice and sort.SliceStable go through reflect.Swapper, so
 // every swap is an indirect call through reflection. slices.SortFunc is generic
@@ -280,54 +280,19 @@ func scanFlat(q []float32, vecs [][]float32, emit func(i int, score float64)) {
 // already made the same change in hnsw.go; it simply never reached the other
 // eight sites.
 //
-// Correctness: SortFunc is NOT stable, and these do not need it to be. Each
-// comparator's second key is a document or vector id, which is unique within the
-// slice being sorted, so each is a strict TOTAL order — there are no ties for
-// stability to resolve, and the output is identical to what the stable sorts
-// produced. This is the argument candCmp already makes in hnsw.go.
+// Correctness: SortFunc is NOT stable, and this does not need it to be. The
+// second key is Hit.Index, which is unique within the slice being sorted, so
+// this is a strict TOTAL order — there are no ties for stability to resolve,
+// and the output is identical to what a stable sort would produce. This is the
+// argument candCmp already makes in hnsw.go.
 //
 // Note the contrast with fuse.RRF, changed in the same item, where stability IS
 // load-bearing because its tie-break lives in the element positions. Same
 // package-level change, opposite conclusion, for a reason visible in the
 // comparator.
-func hitCmp(a, b Hit) int {
-	switch {
-	case a.Score > b.Score:
-		return -1
-	case a.Score < b.Score:
-		return 1
-	case a.Index < b.Index:
-		return -1
-	case a.Index > b.Index:
-		return 1
-	}
-	return 0
-}
-
-func itemCmp(a, b topk.ItemWithScore[int]) int {
-	switch {
-	case a.Score > b.Score:
-		return -1
-	case a.Score < b.Score:
-		return 1
-	case a.Item < b.Item:
-		return -1
-	case a.Item > b.Item:
-		return 1
-	}
-	return 0
-}
-
-func itemCmp32(a, b topk.ItemWithScore[int32]) int {
-	switch {
-	case a.Score > b.Score:
-		return -1
-	case a.Score < b.Score:
-		return 1
-	case a.Item < b.Item:
-		return -1
-	case a.Item > b.Item:
-		return 1
-	}
-	return 0
-}
+//
+// The int/int32 ItemWithScore comparators this package used to define
+// alongside it (itemCmp, itemCmp32) were the exact same algorithm bm25 and
+// sparse also wrote out over their own result types — now topk.Cmp /
+// topk.ItemCmp, called directly at each site rather than re-wrapped here.
+func hitCmp(a, b Hit) int { return topk.Cmp(a.Index, b.Index, a.Score, b.Score) }

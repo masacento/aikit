@@ -228,7 +228,7 @@ func (f *FlatI8) topHits(dst []float32, k int, keep func(int) bool) []Hit {
 		}
 	}
 	items := sel.Result()
-	slices.SortFunc(items, itemCmp)
+	slices.SortFunc(items, topk.ItemCmp[int])
 	hits := make([]Hit, len(items))
 	for j, s := range items {
 		hits[j] = Hit{Index: s.Item, Score: s.Score}

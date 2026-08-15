@@ -742,22 +742,10 @@ func (h *HNSW) selectHeuristic(w []cand, m int) []cand {
 // id — deterministic, for the heuristic's nearest-first pass.
 // candCmp orders candidates by similarity descending, then id ascending — a total
 // order (ids are unique), so slices.SortFunc matches the previous sort.Slice output
-// exactly while avoiding its reflect-based Swapper (audit #24).
-func candCmp(a, b cand) int {
-	if a.sim != b.sim {
-		if a.sim > b.sim {
-			return -1
-		}
-		return 1
-	}
-	if a.id < b.id {
-		return -1
-	}
-	if a.id > b.id {
-		return 1
-	}
-	return 0
-}
+// exactly while avoiding its reflect-based Swapper (audit #24). Same algorithm
+// flat.go's hitCmp and bm25/sparse's own comparators reimplemented independently;
+// now the one shared topk.Cmp.
+func candCmp(a, b cand) int { return topk.Cmp(a.id, b.id, a.sim, b.sim) }
 
 func sortCandsDesc(w []cand) []cand {
 	out := make([]cand, len(w))
