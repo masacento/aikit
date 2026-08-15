@@ -62,12 +62,15 @@ these — and the fix is "unambiguous," which is often still short:
    can't resolve it from the line, rename it (`blockElems`, `bScale`) — but a
    two-letter name that's unambiguous in its scope is fine.
 2. **Overloaded within one file/function.** `h` meaning grid-*height* in one
-   function and hidden-*state* in another (see `vision/qwen_encoder.go`) forces a
-   double-take every time. Give the two distinct concepts distinct names
-   (`gridH` vs `h`).
+   function and hidden-*state* in another forces a double-take every time —
+   this genuinely happened once in `vision/qwen_encoder.go`, since fixed (grid
+   height there is never bound to a bare `h`, only `g[1]`/`g[2]` off the grid
+   tuple; `h` now means hidden-state activations only). Give the two distinct
+   concepts distinct names (`gridH` vs `h`) if it recurs.
 3. **Inverted against our own convention.** `hd` is head-*dimension* everywhere
-   in the kit — using it as a head-*index* in one file (`bert.go`) reads
-   backwards. Match the established name (`headIdx`).
+   in the kit — using it as a head-*index* would read backwards. This happened
+   once in `bert.go`, since renamed to the established `headIdx`; match that
+   name rather than reaching for `hd` on an index.
 
 Notice the fixes — `fn`, `blk`, `gridH`, `headIdx` — are still short. The bar is
 clarity and consistency, not verbosity.
