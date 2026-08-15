@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -549,16 +548,7 @@ func parseUnigramTokenizer(data []byte) (*unigramBackend, error) {
 	for _, at := range raw.AddedTokens {
 		added[at.Content] = at.ID
 	}
-	addedKeys := make([]string, 0, len(added))
-	for k := range added {
-		addedKeys = append(addedKeys, k)
-	}
-	sort.Slice(addedKeys, func(i, j int) bool {
-		if len(addedKeys[i]) != len(addedKeys[j]) {
-			return len(addedKeys[i]) > len(addedKeys[j])
-		}
-		return addedKeys[i] < addedKeys[j]
-	})
+	addedKeys := sortedAddedKeys(added)
 
 	prefixIDs, suffixIDs := templateSpecials(raw.PostProcessor.Single, raw.PostProcessor.SpecialTokens)
 

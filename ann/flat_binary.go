@@ -200,8 +200,8 @@ func (f *FlatBinary) query(q []float32, k int, keep func(int) bool) []Hit {
 
 	sc := binScratchPool.Get().(*binScratch)
 	defer binScratchPool.Put(sc)
-	sc.qc = ensureU64(sc.qc, f.words)
-	sc.qf = ensureF32b(sc.qf, f.dim)
+	sc.qc = ensure(sc.qc, f.words)
+	sc.qf = ensure(sc.qf, f.dim)
 	linalg.PackSignBitsRow(sc.qc, f.centered(sc.qf, q))
 
 	ids := f.prefilter(sc.qc, sc, cand, keep)
@@ -246,8 +246,8 @@ func (f *FlatBinary) prefilter(qc []uint64, sc *binScratch, cand int, keep func(
 func (f *FlatBinary) prefilterHist(qc []uint64, sc *binScratch, cand int) []int32 {
 	nb := f.dim + 1
 	workers := binQueryWorkers(f.n, f.words)
-	sc.dists = ensureU16(sc.dists, f.n)
-	sc.hist = ensureI32(sc.hist, workers*nb)
+	sc.dists = ensure(sc.dists, f.n)
+	sc.hist = ensure(sc.hist, workers*nb)
 	clear(sc.hist)
 
 	if workers <= 1 {
@@ -376,7 +376,7 @@ func (f *FlatBinary) scanShard(qc []uint64, sc *binScratch, lo, hi, cand int, ke
 	// smallest. Distances are small integers exactly representable in float64,
 	// so this is a relabeling, not an approximation.
 	th := sel.Threshold()
-	sc.dists = ensureU16(sc.dists, binBlockRows)
+	sc.dists = ensure(sc.dists, binBlockRows)
 	for base := lo; base < hi; base += binBlockRows {
 		end := min(base+binBlockRows, hi)
 		rows := end - base
@@ -486,30 +486,13 @@ type binScratch struct {
 
 var binScratchPool = sync.Pool{New: func() any { return new(binScratch) }}
 
-func ensureU64(b []uint64, n int) []uint64 {
+// ensure returns b resized to length n, reusing its existing backing array
+// when it has enough capacity and allocating fresh otherwise — the scratch-
+// buffer growth pattern used by every scoring-cache field in this file
+// (qc/qf/dists/hist), previously reimplemented once per element type.
+func ensure[T any](b []T, n int) []T {
 	if cap(b) >= n {
 		return b[:n]
 	}
-	return make([]uint64, n)
-}
-
-func ensureI32(b []int32, n int) []int32 {
-	if cap(b) >= n {
-		return b[:n]
-	}
-	return make([]int32, n)
-}
-
-func ensureU16(b []uint16, n int) []uint16 {
-	if cap(b) >= n {
-		return b[:n]
-	}
-	return make([]uint16, n)
-}
-
-func ensureF32b(b []float32, n int) []float32 {
-	if cap(b) >= n {
-		return b[:n]
-	}
-	return make([]float32, n)
+	return make([]T, n)
 }

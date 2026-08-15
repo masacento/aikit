@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 	"unicode/utf8"
 	"unsafe"
@@ -306,16 +305,7 @@ func parseBPETokenizer(data []byte) (*bpeBackend, error) {
 	for _, at := range raw.AddedTokens {
 		added[at.Content] = at.ID
 	}
-	addedKeys := make([]string, 0, len(added))
-	for k := range added {
-		addedKeys = append(addedKeys, k)
-	}
-	sort.Slice(addedKeys, func(i, j int) bool {
-		if len(addedKeys[i]) != len(addedKeys[j]) {
-			return len(addedKeys[i]) > len(addedKeys[j])
-		}
-		return addedKeys[i] < addedKeys[j]
-	})
+	addedKeys := sortedAddedKeys(added)
 
 	// RobertaProcessing wraps <s> (cls) ++ body ++ </s> (sep).
 	prefixIDs, err := postProcID(raw.PostProcessor.Cls)

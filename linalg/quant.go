@@ -18,7 +18,9 @@ import (
 
 // QuantizeRowsInt8 quantizes a [rows, cols] f32 matrix (row-major) to int8
 // weights + per-row f32 scales. Reconstruct: W[i,j] ≈ float32(q[i*cols+j]) *
-// scales[i]. An all-zero row gets scale 1 (its codes are all zero anyway).
+// scales[i]. An all-zero row gets scale 1 (its codes are all zero anyway) —
+// see QuantizeRowInt8's doc for why that convention differs from the private
+// quantizeRowInt8's, used for activations instead of weights.
 func QuantizeRowsInt8(w []float32, rows, cols int) (q []int8, scales []float32) {
 	if rows < 0 || cols < 0 {
 		panic(fmt.Sprintf("linalg: QuantizeRowsInt8 negative dim (rows=%d cols=%d)", rows, cols))
@@ -32,11 +34,13 @@ func QuantizeRowsInt8(w []float32, rows, cols int) (q []int8, scales []float32) 
 	return q, scales
 }
 
-// QuantizeRowInt8 quantizes one f32 row into q (len cols) and returns its scale —
-// the single-row core of QuantizeRowsInt8 (bit-identical), exposed so a loader can
-// quantize each row as it is dequantized, without buffering the whole f32 matrix.
-// An all-zero row gets scale 1.
-func QuantizeRowInt8(row []float32, q []int8) (scale float32) {
+// quantizeRowInt8Core is the shared max-abs-scale + round-and-clamp
+// implementation behind both QuantizeRowInt8 (public, weight/loader-facing)
+// and quantizeRowInt8 (private, activation-facing) — the two exist because
+// their all-zero-row scale conventions are NOT interchangeable (see each
+// wrapper's doc), not because the quantization itself differs. zeroScale is
+// what an all-zero row reports; the row's codes are all zero either way.
+func quantizeRowInt8Core(row []float32, q []int8, zeroScale float32) (scale float32) {
 	var maxAbs float32
 	for _, v := range row {
 		if v < 0 {
@@ -50,7 +54,7 @@ func QuantizeRowInt8(row []float32, q []int8) (scale float32) {
 		for j := range q {
 			q[j] = 0
 		}
-		return 1
+		return zeroScale
 	}
 	s := maxAbs / 127.0
 	inv := 1.0 / s
@@ -64,6 +68,20 @@ func QuantizeRowInt8(row []float32, q []int8) (scale float32) {
 		q[j] = int8(x)
 	}
 	return s
+}
+
+// QuantizeRowInt8 quantizes one f32 row into q (len cols) and returns its scale —
+// the single-row core of QuantizeRowsInt8 (bit-identical), exposed so a loader can
+// quantize each row as it is dequantized, without buffering the whole f32 matrix.
+//
+// An all-zero row gets scale 1, NOT 0 — the opposite of quantizeRowInt8's
+// convention below, deliberately: this is the public, loader-facing entry point
+// (weight rows via QuantizeRowsInt8; query/index vectors via ann's int8 HNSW and
+// FlatI8), where no caller treats a returned scale as a sentinel, so 1 keeps it
+// reading as an ordinary nonzero scale rather than risking surprising a future
+// caller that checks for exactly 0.
+func QuantizeRowInt8(row []float32, q []int8) (scale float32) {
+	return quantizeRowInt8Core(row, q, 1)
 }
 
 // DequantizeRowInt8 reconstructs one row into dst: dst[j] = float32(q[j])*scale.
@@ -137,35 +155,19 @@ func dotI8Scalar(a, b []int8) int32 {
 
 // quantizeRowInt8 dynamically quantizes one f32 activation row to int8 with a
 // single symmetric scale (maxabs/127). Returns the codes (into dst) and the
-// scale; an all-zero row gets scale 0 and zero codes.
+// scale.
+//
+// An all-zero row gets scale 0, NOT 1 — the opposite of the public
+// QuantizeRowInt8's convention above, deliberately: 0 here is a load-bearing
+// SENTINEL, not just "the natural zero". Every caller of this function feeds
+// its result straight into an aScales slice that MatmulBTW8A8Pre/Batch/W4A8's
+// w8a8Span checks with `if aScales[i] == 0` to skip an all-zero activation
+// row's entire inner loop, rather than compute a redundant all-zero dot. Do
+// not reuse QuantizeRowInt8 here — its scale of 1 would silently defeat that
+// fast path (the output would still be correct, just slower, since the codes
+// are zero either way — but the two are not interchangeable).
 func quantizeRowInt8(a []float32, dst []int8) (scale float32) {
-	var maxAbs float32
-	for _, v := range a {
-		if v < 0 {
-			v = -v
-		}
-		if v > maxAbs {
-			maxAbs = v
-		}
-	}
-	if maxAbs == 0 {
-		for k := range dst {
-			dst[k] = 0
-		}
-		return 0
-	}
-	scale = maxAbs / 127
-	inv := 1.0 / scale
-	for k, v := range a {
-		x := math.Round(float64(v * inv))
-		if x > 127 {
-			x = 127
-		} else if x < -127 {
-			x = -127
-		}
-		dst[k] = int8(x)
-	}
-	return scale
+	return quantizeRowInt8Core(a, dst, 0)
 }
 
 // MatmulBTW8A8 computes dst[M,N] = a[M,K] · bᵀ as full int8×int8→int32 (W8A8):

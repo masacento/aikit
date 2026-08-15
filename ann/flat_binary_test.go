@@ -305,8 +305,8 @@ func TestFlatBinary_shardedMatchesSerial(t *testing.T) {
 
 		// Serial reference: one shard over the whole corpus.
 		sc2 := &binScratch{}
-		sc2.qc = ensureU64(sc2.qc, fb.words)
-		sc2.qf = ensureF32b(sc2.qf, fb.dim)
+		sc2.qc = ensure(sc2.qc, fb.words)
+		sc2.qf = ensure(sc2.qf, fb.dim)
 		packQueryForTest(fb, sc2, q)
 		sc2.parts = append(sc2.parts[:0], nil)
 		fb.scanShard(sc2.qc, sc2, 0, fb.n, k*fb.over, nil, &sc2.parts[0])

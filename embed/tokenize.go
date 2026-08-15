@@ -103,6 +103,28 @@ func LoadTokenizerFromFS(fsys fs.FS, name string) (*Tokenizer, error) {
 	return parseTokenizer(data)
 }
 
+// sortedAddedKeys returns added's keys sorted longest-first, then
+// lexicographically — the carve-out scan order an Encode's added-token match
+// needs so overlapping literals resolve to the canonical greedy (longest)
+// match, with a stable lex tiebreak for deterministic output. Shared by the
+// WordPiece (parseTokenizer, below), byte-level BPE (tokenize_bpe.go), and
+// Unigram (tokenize_unigram.go) loaders, which each build their own added
+// map from the tokenizer.json AddedTokens list but need the identical scan
+// order.
+func sortedAddedKeys(added map[string]int32) []string {
+	keys := make([]string, 0, len(added))
+	for k := range added {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
+}
+
 // parseTokenizer is the shared tokenizer.json parser used by LoadTokenizer
 // and LoadTokenizerFromFS.
 func parseTokenizer(data []byte) (*Tokenizer, error) {
@@ -163,16 +185,7 @@ func parseTokenizer(data []byte) (*Tokenizer, error) {
 	// Pre-sort the added-token literals longest-first so the Encode carve-out
 	// (see Encode below) picks the canonical greedy match when literals
 	// overlap as prefixes. Stable lex tiebreak keeps output deterministic.
-	addedKeys := make([]string, 0, len(added))
-	for k := range added {
-		addedKeys = append(addedKeys, k)
-	}
-	sort.Slice(addedKeys, func(i, j int) bool {
-		if len(addedKeys[i]) != len(addedKeys[j]) {
-			return len(addedKeys[i]) > len(addedKeys[j])
-		}
-		return addedKeys[i] < addedKeys[j]
-	})
+	addedKeys := sortedAddedKeys(added)
 
 	unkID, ok := raw.Model.Vocab[raw.Model.UnkToken]
 	if !ok {
