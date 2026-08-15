@@ -1,6 +1,14 @@
 # Build artifacts
 /dist/
 /bin/
+# `go build ./examples/...` (or ./...) from repo root drops the examples/rag
+# binary here with no -o — untracked but one `git add -A` away from landing
+# in a commit, the same way _to_delete/ below actually did once (b4d8597).
+/rag
+
+# Scratch staging space (review-tool bundles, etc.) — never meant to be
+# committed; add per-session throwaway files here rather than at repo root.
+_to_delete/
 
 # Model artifacts — large, downloaded per-machine, never committed.
 # Tests skip cleanly when these aren't present. Populate via symlink
