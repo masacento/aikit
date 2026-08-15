@@ -34,7 +34,9 @@ var published = map[string]bool{
 var internal = map[string]bool{
 	rootPath + "/benchmarks":               true,
 	rootPath + "/examples/embedded-corpus": true,
+	rootPath + "/examples/gpu-ann":         true,
 	rootPath + "/tools":                    true,
+	rootPath + "/tools/canary/vulnfixture": true,
 }
 
 // modulePath reads the `module <path>` line of a go.mod.
