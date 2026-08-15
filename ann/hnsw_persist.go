@@ -6,6 +6,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"unsafe"
+
+	"github.com/townsendmerino/aikit/internal/cursor"
 )
 
 // HNSW serialization. The format is versioned from day one so the on-disk /
@@ -304,83 +306,45 @@ func (b *hblobWriter) finish() (int64, error) {
 	return b.total, b.err
 }
 
-// hcur is a bounds-checked little-endian reader over the serialized blob. Every
-// read goes through need(), so a truncated or hostile input sets err and yields
-// zeros instead of panicking; counts are additionally clamped to what the
-// remaining bytes could hold before they drive an allocation.
+// hcur is a bounds-checked little-endian reader over the serialized blob —
+// the shared primitive (internal/cursor.Cursor) plus HNSW-specific
+// allocation-guarding readers. Counts are clamped to what the remaining
+// bytes could hold before they drive an allocation.
 type hcur struct {
-	b   []byte
-	pos int
-	err error
+	cursor.Cursor
 }
 
-func (c *hcur) need(n int) bool {
-	if c.err != nil {
-		return false
-	}
-	if n < 0 || n > len(c.b)-c.pos {
-		c.err = errFormatf("ann: HNSW blob truncated (need %d at %d of %d)", n, c.pos, len(c.b))
-		return false
-	}
-	return true
+func newHcur(data []byte) *hcur {
+	return &hcur{cursor.Cursor{B: data, Context: "ann: HNSW blob", Errorf: errFormatf}}
 }
-
-func (c *hcur) u32() uint32 {
-	if !c.need(4) {
-		return 0
-	}
-	v := binary.LittleEndian.Uint32(c.b[c.pos:])
-	c.pos += 4
-	return v
-}
-
-func (c *hcur) u64() uint64 {
-	if !c.need(8) {
-		return 0
-	}
-	v := binary.LittleEndian.Uint64(c.b[c.pos:])
-	c.pos += 8
-	return v
-}
-
-func (c *hcur) f32() float32 { return math.Float32frombits(c.u32()) }
 
 // int8s reads n raw int8 code bytes (the int8 vector block).
 func (c *hcur) int8s(n int) []int8 {
-	if !c.need(n) {
+	raw := c.Bytes(n)
+	if raw == nil {
 		return nil
 	}
 	out := make([]int8, n)
-	for i := range n {
-		out[i] = int8(c.b[c.pos+i])
+	for i, b := range raw {
+		out[i] = int8(b)
 	}
-	c.pos += n
 	return out
 }
 
-func (c *hcur) u8() uint8 {
-	if !c.need(1) {
-		return 0
-	}
-	v := c.b[c.pos]
-	c.pos++
-	return v
-}
-
 // asInt reads a signed int32 (used for entry, which is -1 for an empty index).
-func (c *hcur) asInt() int { return int(int32(c.u32())) }
+func (c *hcur) asInt() int { return int(int32(c.U32())) }
 
 // readLen reads an allocation-driving LENGTH (ndocs, dim, neighbor count) and
 // rejects it if it can't fit the bytes that remain (every subsequent element is
 // ≥4 bytes), so a hostile count can't drive a giant make() before the reads hit
 // EOF.
 func (c *hcur) readLen() int {
-	v := int32(c.u32())
-	if c.err != nil {
+	v := int32(c.U32())
+	if c.Err != nil {
 		return 0
 	}
-	if v < 0 || int(v) > (len(c.b)-c.pos)/4 {
-		c.err = errFormatf("ann: HNSW blob count %d exceeds remaining bytes", v)
+	if v < 0 || int(v) > c.Remaining()/4 {
+		c.Err = errFormatf("ann: HNSW blob count %d exceeds remaining bytes", v)
 		return 0
 	}
 	return int(v)
@@ -393,12 +357,12 @@ const cfgMax = 1 << 20
 
 // cfg reads a non-negative config scalar, rejecting negatives and absurd values.
 func (c *hcur) cfg(name string) int {
-	v := int32(c.u32())
-	if c.err != nil {
+	v := int32(c.U32())
+	if c.Err != nil {
 		return 0
 	}
 	if v < 0 || int(v) > cfgMax {
-		c.err = errFormatf("ann: HNSW %s %d out of [0,%d]", name, v, cfgMax)
+		c.Err = errFormatf("ann: HNSW %s %d out of [0,%d]", name, v, cfgMax)
 		return 0
 	}
 	return int(v)
@@ -475,11 +439,11 @@ func scanGraph(b []byte, pos, ndocs int) (nIDs, nLayers int, ok bool) {
 // copied). Returns an error for a bad magic, an unsupported version, or any
 // truncated/inconsistent blob — never a panic.
 func Load(data []byte) (*HNSW, error) {
-	c := &hcur{b: data}
-	if c.u32() != hnswMagic {
+	c := newHcur(data)
+	if c.U32() != hnswMagic {
 		return nil, errFormatf("ann: not an HNSW blob (bad magic)")
 	}
-	if v := c.u32(); v != hnswVersion {
+	if v := c.U32(); v != hnswVersion {
 		return nil, errFormatf("ann: unsupported HNSW format version %d (want %d)", v, hnswVersion)
 	}
 	dim := c.readLen()
@@ -491,12 +455,12 @@ func Load(data []byte) (*HNSW, error) {
 	efs := c.cfg("efSearch")
 	entry := c.asInt()
 	maxLayer := c.cfg("maxLayer")
-	_ = c.u64() // consume the serialized mL to advance the cursor; recomputed below
-	seed := c.u64()
-	heuristic := c.u8() != 0
-	int8mode := c.u8() != 0 // v3
-	if c.err != nil {
-		return nil, c.err
+	_ = c.U64() // consume the serialized mL to advance the cursor; recomputed below
+	seed := c.U64()
+	heuristic := c.U8() != 0
+	int8mode := c.U8() != 0 // v3
+	if c.Err != nil {
+		return nil, c.Err
 	}
 	// Recompute mL from m rather than trust the serialized value: a crafted blob
 	// could carry mL = +Inf/NaN/≤0, which randomLevel turns into an overflowing
@@ -513,20 +477,20 @@ func Load(data []byte) (*HNSW, error) {
 		// Overflow-safe: the int8 codes + scales must fit the bytes before the
 		// graph (computed in int64 so a hostile ndocs/dim can't wrap to a small
 		// allocation).
-		if int64(ndocs)*int64(dim)+int64(ndocs)*4 > int64(len(c.b)-c.pos) {
+		if int64(ndocs)*int64(dim)+int64(ndocs)*4 > int64(len(c.B)-c.Pos) {
 			return nil, errFormatf("ann: HNSW int8 vector block (ndocs=%d dim=%d) exceeds remaining bytes", ndocs, dim)
 		}
 		bq = c.int8s(ndocs * dim)
 		scales = make([]float32, ndocs)
 		for i := range scales {
-			scales[i] = c.f32()
+			scales[i] = c.F32()
 		}
 	} else {
 		// Overflow-safe product guard, mirroring the int8 branch above:
 		// count() clamps ndocs and dim individually but not their product, so
 		// without this a crafted ~1 MB header (dim≈ndocs≈250k) drives ~250 GB
 		// of row allocations. 4 bytes per f32.
-		if int64(ndocs)*int64(dim)*4 > int64(len(c.b)-c.pos) {
+		if int64(ndocs)*int64(dim)*4 > int64(len(c.B)-c.Pos) {
 			return nil, errFormatf("ann: HNSW f32 vector block (ndocs=%d dim=%d) exceeds remaining bytes", ndocs, dim)
 		}
 		// One arena, sub-sliced per row, instead of ndocs separate allocations —
@@ -538,11 +502,11 @@ func Load(data []byte) (*HNSW, error) {
 		for d := range vecs {
 			row := arena[d*dim : (d+1)*dim : (d+1)*dim]
 			for j := range row {
-				row[j] = c.f32()
+				row[j] = c.F32()
 			}
 			vecs[d] = row
-			if c.err != nil { // stop reading once the input is exhausted
-				return nil, c.err
+			if c.Err != nil { // stop reading once the input is exhausted
+				return nil, c.Err
 			}
 		}
 	}
@@ -552,7 +516,7 @@ func Load(data []byte) (*HNSW, error) {
 	// sized by a non-allocating pre-pass, make it 2. scanGraph returns ok=false on
 	// a truncated blob, which leaves both arenas empty; take() then falls back to
 	// make() and the read below produces exactly the error it always did.
-	nIDs, nLayers, _ := scanGraph(c.b, c.pos, ndocs)
+	nIDs, nLayers, _ := scanGraph(c.B, c.Pos, ndocs)
 	idArena := i32Arena{buf: make([]int32, 0, nIDs)}
 	layerArena := make([][]int32, 0, nLayers)
 	nodes := make([]hnswNode, ndocs)
@@ -563,17 +527,17 @@ func Load(data []byte) (*HNSW, error) {
 			cnt := c.readLen()
 			ids := idArena.take(cnt)
 			for i := range ids {
-				ids[i] = int32(c.u32())
+				ids[i] = int32(c.U32())
 			}
 			nbrs[l] = ids
 		}
 		nodes[d] = hnswNode{layer: layer, nbrs: nbrs}
 	}
-	if c.err != nil {
-		return nil, c.err
+	if c.Err != nil {
+		return nil, c.Err
 	}
-	if c.pos != len(c.b) {
-		return nil, errFormatf("ann: HNSW blob has %d trailing bytes", len(c.b)-c.pos)
+	if c.Pos != len(c.B) {
+		return nil, errFormatf("ann: HNSW blob has %d trailing bytes", len(c.B)-c.Pos)
 	}
 
 	// Validate graph integrity: Query indexes vecs[id] and nodes[id].nbrs[layer]

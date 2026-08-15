@@ -14,10 +14,12 @@ Four rules generate most of the structure:
    + a dependency-graph grep). Anything that would break this is pushed
    behind a seam (§ Backend) or into a separate module (§ Quarantines).
 2. **Packages are small leaves; the DAG stays shallow.** Most packages depend
-   on nothing but the stdlib. `encoder` is the one public composite; `bm25`
-   and `sparse` additionally share `internal/accum` (Go-internal, invisible
-   to importers) — a pooled scoring accumulator extracted after it drifted
-   as two near-identical copies with nothing pinning them to stay in sync.
+   on nothing but the stdlib. `encoder` is the one public composite; two
+   Go-internal packages (invisible to importers) cut duplication between
+   otherwise-independent leaves that had drifted apart: `bm25` and `sparse`
+   share `internal/accum` (a pooled scoring accumulator), and `ann` and
+   `embed` share `internal/cursor` (the bounds-checked little-endian reader
+   behind HNSW/FlatI8's blob formats and GGUF's container format).
 3. **Numerics are parity-pinned.** Every model-touching path (`embed`,
    `encoder`, the `linalg` quant kernels) is tested against golden fixtures
    produced by Python references in [`scripts/`](../scripts/) — see

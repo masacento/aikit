@@ -7,6 +7,7 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/townsendmerino/aikit/internal/cursor"
 	"github.com/townsendmerino/aikit/mmap"
 )
 
@@ -83,31 +84,16 @@ type GGUFFile struct {
 	mmap     []byte // full mmap region iff opened via OpenGGUFMmap; nil for OpenGGUF
 }
 
-// gcur is a little-endian cursor over a byte slice with bounds checks.
+// gcur is a little-endian cursor over a byte slice with bounds checks — the
+// shared primitive (internal/cursor.Cursor) plus GGUF-specific readers.
 type gcur struct {
-	b     []byte
-	pos   int
-	err   error
+	cursor.Cursor
 	depth int // nested-array recursion depth (see ggufMaxArrayDepth)
 }
 
-func (c *gcur) need(n int) bool {
-	if c.err != nil {
-		return false
-	}
-	// n<0 guards a length field that overflowed int when converted from uint64
-	// (a hostile string/array length ≥ 2^63); compare against the remaining
-	// span without adding, so c.pos+n can't itself overflow.
-	if n < 0 || n > len(c.b)-c.pos {
-		c.err = errFormatf("gguf: unexpected EOF (need %d at %d of %d)", n, c.pos, len(c.b))
-		return false
-	}
-	return true
+func newGcur(raw []byte) *gcur {
+	return &gcur{Cursor: cursor.Cursor{B: raw, Context: "gguf", Errorf: errFormatf}}
 }
-
-// remaining is the number of unread bytes — the ceiling on any element count
-// or length, since every element/byte consumes at least one byte of input.
-func (c *gcur) remaining() int { return len(c.b) - c.pos }
 
 // ggufHintCap bounds a map-preallocation hint. No real GGUF has this many KV or
 // tensor entries (a large model has hundreds of KV, thousands of tensors), and
@@ -126,56 +112,20 @@ func (c *gcur) hintLen(n uint64, minEntryBytes int) int {
 	if n > ggufHintCap {
 		n = ggufHintCap
 	}
-	if fit := uint64(c.remaining() / minEntryBytes); n > fit {
+	if fit := uint64(c.Remaining() / minEntryBytes); n > fit {
 		n = fit
 	}
 	return int(n)
 }
 
-func (c *gcur) u8() uint8 {
-	if !c.need(1) {
-		return 0
-	}
-	v := c.b[c.pos]
-	c.pos++
-	return v
-}
-func (c *gcur) u16() uint16 {
-	if !c.need(2) {
-		return 0
-	}
-	v := binary.LittleEndian.Uint16(c.b[c.pos:])
-	c.pos += 2
-	return v
-}
-func (c *gcur) u32() uint32 {
-	if !c.need(4) {
-		return 0
-	}
-	v := binary.LittleEndian.Uint32(c.b[c.pos:])
-	c.pos += 4
-	return v
-}
-func (c *gcur) u64() uint64 {
-	if !c.need(8) {
-		return 0
-	}
-	v := binary.LittleEndian.Uint64(c.b[c.pos:])
-	c.pos += 8
-	return v
-}
-func (c *gcur) f32() float32 { return math.Float32frombits(c.u32()) }
-func (c *gcur) f64() float64 { return math.Float64frombits(c.u64()) }
-
 // str reads a gguf string: uint64 length + raw bytes.
 func (c *gcur) str() string {
-	n := int(c.u64())
-	if !c.need(n) {
+	n := int(c.U64())
+	raw := c.Bytes(n)
+	if raw == nil {
 		return ""
 	}
-	s := string(c.b[c.pos : c.pos+n])
-	c.pos += n
-	return s
+	return string(raw)
 }
 
 // ggufArrayPrealloc caps the eager capacity of a metadata array's []any. Small so
@@ -197,45 +147,45 @@ const ggufMaxArrayDepth = 128
 func (c *gcur) value(vtype uint32) any {
 	switch vtype {
 	case ggufUint8:
-		return c.u8()
+		return c.U8()
 	case ggufInt8:
-		return int8(c.u8())
+		return int8(c.U8())
 	case ggufUint16:
-		return c.u16()
+		return c.U16()
 	case ggufInt16:
-		return int16(c.u16())
+		return int16(c.U16())
 	case ggufUint32:
-		return c.u32()
+		return c.U32()
 	case ggufInt32:
-		return int32(c.u32())
+		return int32(c.U32())
 	case ggufFloat32:
-		return c.f32()
+		return c.F32()
 	case ggufBool:
-		return c.u8() != 0
+		return c.U8() != 0
 	case ggufString:
 		return c.str()
 	case ggufUint64:
-		return c.u64()
+		return c.U64()
 	case ggufInt64:
-		return int64(c.u64())
+		return int64(c.U64())
 	case ggufFloat64:
-		return c.f64()
+		return c.F64()
 	case ggufArray:
 		// Bound recursion depth before descending: an array-of-arrays chain
 		// nests one value() frame per level and would otherwise blow the
 		// goroutine stack (see ggufMaxArrayDepth).
 		if c.depth >= ggufMaxArrayDepth {
-			c.err = errFormatf("gguf: metadata array nesting exceeds %d levels", ggufMaxArrayDepth)
+			c.Err = errFormatf("gguf: metadata array nesting exceeds %d levels", ggufMaxArrayDepth)
 			return nil
 		}
 		c.depth++
 		defer func() { c.depth-- }()
-		et := c.u32()
-		n := c.u64()
+		et := c.U32()
+		n := c.U64()
 		// Each array element is ≥1 byte, so a count beyond the remaining input is
 		// impossible — reject it rather than pre-allocate (or wrap int and panic).
-		if n > uint64(c.remaining()) {
-			c.err = errFormatf("gguf: array length %d exceeds %d remaining bytes", n, c.remaining())
+		if n > uint64(c.Remaining()) {
+			c.Err = errFormatf("gguf: array length %d exceeds %d remaining bytes", n, c.Remaining())
 			return nil
 		}
 		// Cap the EAGER preallocation: n is bounded by the remaining bytes, but for
@@ -246,12 +196,12 @@ func (c *gcur) value(vtype uint32) any {
 		// path). append grows to the true element count, so a small fixed prealloc
 		// keeps total allocation linear in the bytes actually consumed.
 		arr := make([]any, 0, min(n, ggufArrayPrealloc))
-		for i := uint64(0); i < n && c.err == nil; i++ {
+		for i := uint64(0); i < n && c.Err == nil; i++ {
 			arr = append(arr, c.value(et))
 		}
 		return arr
 	default:
-		c.err = errFormatf("gguf: unknown metadata value type %d", vtype)
+		c.Err = errFormatf("gguf: unknown metadata value type %d", vtype)
 		return nil
 	}
 }
@@ -324,49 +274,49 @@ func finalizeGGUFMmap(g *GGUFFile) { _ = g.Close() }
 // already-loaded (heap or mmap) byte slice. The data section is referenced in
 // place via GGUFFile.data, so raw must outlive the GGUFFile's tensor reads.
 func parseGGUF(raw []byte) (*GGUFFile, error) {
-	c := &gcur{b: raw}
-	if c.u32() != ggufMagic {
+	c := newGcur(raw)
+	if c.U32() != ggufMagic {
 		return nil, errFormatf("gguf: bad magic (not a GGUF file)")
 	}
-	version := c.u32()
+	version := c.U32()
 	if version != 2 && version != 3 {
 		return nil, errFormatf("gguf: unsupported version %d (want 2 or 3)", version)
 	}
-	tensorCount := c.u64()
-	kvCount := c.u64()
+	tensorCount := c.U64()
+	kvCount := c.U64()
 
 	// kvCount/tensorCount are untrusted: a hostile header can claim billions of
 	// entries. Clamp the make() hints to what the input could hold; the loops
 	// below still run to the true count and stop at EOF.
 	g := &GGUFFile{Metadata: make(map[string]any, c.hintLen(kvCount, 13)), tensors: make(map[string]ggufTensorInfo, c.hintLen(tensorCount, 24))}
-	for i := uint64(0); i < kvCount && c.err == nil; i++ {
+	for i := uint64(0); i < kvCount && c.Err == nil; i++ {
 		key := c.str()
-		vtype := c.u32()
+		vtype := c.U32()
 		g.Metadata[key] = c.value(vtype)
 	}
-	if c.err != nil {
-		return nil, c.err
+	if c.Err != nil {
+		return nil, c.Err
 	}
 
-	for i := uint64(0); i < tensorCount && c.err == nil; i++ {
+	for i := uint64(0); i < tensorCount && c.Err == nil; i++ {
 		name := c.str()
-		nd := int(c.u32())
+		nd := int(c.U32())
 		// Each dim is a u64; a count beyond remaining/8 can't be satisfied, so
 		// reject it rather than make([]uint64, huge) and OOM.
-		if nd < 0 || nd > c.remaining()/8 {
-			c.err = errFormatf("gguf: tensor %q dim count %d exceeds remaining input", name, nd)
+		if nd < 0 || nd > c.Remaining()/8 {
+			c.Err = errFormatf("gguf: tensor %q dim count %d exceeds remaining input", name, nd)
 			break
 		}
 		dims := make([]uint64, nd)
 		for d := range nd {
-			dims[d] = c.u64()
+			dims[d] = c.U64()
 		}
-		typ := c.u32()
-		off := c.u64()
+		typ := c.U32()
+		off := c.U64()
 		g.tensors[name] = ggufTensorInfo{dims: dims, typ: typ, offset: off}
 	}
-	if c.err != nil {
-		return nil, c.err
+	if c.Err != nil {
+		return nil, c.Err
 	}
 
 	// The tensor data section begins at the next `alignment` boundary after the
@@ -375,7 +325,7 @@ func parseGGUF(raw []byte) (*GGUFFile, error) {
 	if a, ok := g.Uint("general.alignment"); ok && a > 0 {
 		align = a
 	}
-	start := uint64(c.pos)
+	start := uint64(c.Pos)
 	if start%align != 0 {
 		start += align - start%align
 	}

@@ -7,6 +7,8 @@ import (
 	"math"
 	"runtime"
 	"unsafe"
+
+	"github.com/townsendmerino/aikit/internal/cursor"
 )
 
 // FlatI8 serialization — the //go:embed-an-index entry point for the int8 index,
@@ -132,43 +134,26 @@ func (f *FlatI8) WriteTo(w io.Writer) (int64, error) {
 	return total, nil
 }
 
-// fcur is a bounds-checked little-endian reader over a FlatI8 header (the
-// per-format cursor convention, alongside HNSW's hcur and gguf's gcur). Every read
-// goes through need(), so a truncated input sets err instead of panicking.
+// fcur is a bounds-checked little-endian reader over a FlatI8 header — the
+// shared primitive (internal/cursor.Cursor, the per-format cursor
+// convention, alongside HNSW's hcur and gguf's gcur) plus one FlatI8-specific
+// shape-scalar reader.
 type fcur struct {
-	b   []byte
-	pos int
-	err error
+	cursor.Cursor
 }
 
-func (c *fcur) need(n int) bool {
-	if c.err != nil {
-		return false
-	}
-	if n < 0 || n > len(c.b)-c.pos {
-		c.err = errFormatf("ann: FlatI8 blob truncated (need %d at %d of %d)", n, c.pos, len(c.b))
-		return false
-	}
-	return true
-}
-
-func (c *fcur) u32() uint32 {
-	if !c.need(4) {
-		return 0
-	}
-	v := binary.LittleEndian.Uint32(c.b[c.pos:])
-	c.pos += 4
-	return v
+func newFcur(data []byte) *fcur {
+	return &fcur{cursor.Cursor{B: data, Context: "ann: FlatI8 blob", Errorf: errFormatf}}
 }
 
 // nonNeg reads an int32 shape scalar (dim, n) and rejects a negative value.
 func (c *fcur) nonNeg(name string) int {
-	v := int32(c.u32())
-	if c.err != nil {
+	v := int32(c.U32())
+	if c.Err != nil {
 		return 0
 	}
 	if v < 0 {
-		c.err = errFormatf("ann: FlatI8 %s %d is negative", name, v)
+		c.Err = errFormatf("ann: FlatI8 %s %d is negative", name, v)
 		return 0
 	}
 	return int(v)
@@ -178,17 +163,17 @@ func (c *fcur) nonNeg(name string) int {
 // size, returning the dims and the byte offset where the int8 codes begin. Shared
 // by LoadFlatI8 (copies the codes) and LoadFlatI8Mmap (aliases them).
 func flatI8Layout(data []byte) (dim, n, codesAt int, err error) {
-	c := &fcur{b: data}
-	if c.u32() != flatI8Magic {
+	c := newFcur(data)
+	if c.U32() != flatI8Magic {
 		return 0, 0, 0, errFormatf("ann: not a FlatI8 blob (bad magic)")
 	}
-	if v := c.u32(); v != flatI8Version {
+	if v := c.U32(); v != flatI8Version {
 		return 0, 0, 0, errFormatf("ann: unsupported FlatI8 format version %d (want %d)", v, flatI8Version)
 	}
 	dim = c.nonNeg("dim")
 	n = c.nonNeg("n")
-	if c.err != nil {
-		return 0, 0, 0, c.err
+	if c.Err != nil {
+		return 0, 0, 0, c.Err
 	}
 	// An index is either empty (n=0, dim=0, like NewFlatI8(nil)) or non-empty
 	// (both > 0). Reject the mixed cases — in particular n=0 with a huge dim, which
@@ -197,7 +182,7 @@ func flatI8Layout(data []byte) (dim, n, codesAt int, err error) {
 	if (n == 0) != (dim == 0) {
 		return 0, 0, 0, errFormatf("ann: FlatI8 inconsistent shape (n=%d, dim=%d): both must be zero or both nonzero", n, dim)
 	}
-	codesAt = c.pos
+	codesAt = c.Pos
 	// Payload must be exactly n×dim code bytes + n×4 scale bytes. Computed in int64
 	// so a hostile (n, dim) can't overflow into a small allocation; the exact-match
 	// check also rejects truncation and trailing bytes in one shot.
