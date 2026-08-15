@@ -65,7 +65,7 @@ func (c QwenEncoderConfig) validate() error {
 	case (c.HiddenSize/c.NumHeads)%4 != 0:
 		// The rotary path derives rdim = head_dim/2 and len(inv_freq) =
 		// head_dim/4; a head_dim not divisible by 4 makes rdim/inv_freq degenerate
-		// and forwardViT divides by zero at first Forward. (num_heads > 0 and
+		// and computeViTHidden divides by zero at first Forward. (num_heads > 0 and
 		// hidden%num_heads == 0 are guaranteed above.)
 		return fmt.Errorf("head_dim %d (hidden_size/num_heads) must be divisible by 4 for rotary", c.HiddenSize/c.NumHeads)
 	case c.InChans <= 0:
@@ -244,12 +244,18 @@ func (e *QwenVisionEncoder) Forward(pixelValues []float32, gridTHW [][3]int) ([]
 	return e.merge(hid, gridTHW), nil
 }
 
-// ForwardViT runs only the transformer blocks (no merger), returning the pre-merge
-// hidden state [n_patches, hidden] in ORIGINAL patch order — the stage the parity
-// gate checks against HF's last_hidden_state. (HF returns last_hidden_state in
-// WINDOW order; for a self-contained gate we de-window here so the caller sees
-// original order. The encoder_test compares against an order-matched golden.)
-func (e *QwenVisionEncoder) forwardViT(pixelValues []float32, gridTHW [][3]int) ([]float32, error) {
+// computeViTHidden runs only the transformer blocks (no merger), returning the
+// pre-merge hidden state [n_patches, hidden] in ORIGINAL patch order — the stage
+// the parity gate checks against HF's last_hidden_state. (HF returns
+// last_hidden_state in WINDOW order; for a self-contained gate we de-window here
+// so the caller sees original order. The encoder_test compares against an
+// order-matched golden.)
+//
+// Named distinctly from the exported ForwardViT below (rather than the
+// lowercase/uppercase pair this used to be) so a case-insensitive search or
+// skim can't conflate the CPU implementation with the public dispatcher that
+// picks between it and the device-resident path.
+func (e *QwenVisionEncoder) computeViTHidden(pixelValues []float32, gridTHW [][3]int) ([]float32, error) {
 	c := e.Cfg
 	merge := c.SpatialMergeSize
 	mergeUnit := merge * merge
@@ -377,7 +383,7 @@ func (e *QwenVisionEncoder) ForwardViT(pixelValues []float32, gridTHW [][3]int) 
 	if e.resident != nil {
 		return e.resident.ForwardViT(pixelValues, gridTHW)
 	}
-	return e.forwardViT(pixelValues, gridTHW)
+	return e.computeViTHidden(pixelValues, gridTHW)
 }
 
 // merge runs the patch merger on the ViT hidden (original patch order):

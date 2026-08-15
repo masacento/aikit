@@ -111,7 +111,7 @@ func TestQwenScratch_poisonedArenaIsInert(t *testing.T) {
 	c := e.Cfg
 	hidden, hd := c.HiddenSize, c.HiddenSize/c.NumHeads
 
-	// Drive one real block the way forwardViT does.
+	// Drive one real block the way computeViTHidden does.
 	_, cuWin := e.windowIndex(grid)
 	seq := cuWin[len(cuWin)-1]
 	maxSeg := maxSegment(cuWin)
@@ -137,7 +137,7 @@ func TestQwenScratch_poisonedArenaIsInert(t *testing.T) {
 				}
 			}
 		}
-		// Destinations come from the ARENA, exactly as forwardViT passes them —
+		// Destinations come from the ARENA, exactly as computeViTHidden passes them —
 		// s.att and s.mlpOut are themselves reused across layers, so a
 		// partially-written output is part of what this must catch.
 		att := s.att[:seq*hidden]
