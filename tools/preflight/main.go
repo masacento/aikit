@@ -50,7 +50,7 @@ func run(args []string) int {
 	fast := len(args) > 0 && args[0] == "--fast"
 	root, err := gpumod.RepoRoot()
 	if err != nil {
-		fmt.Println("PREFLIGHT: INCONCLUSIVE — cannot locate repo root: " + err.Error())
+		fmt.Println(gate.Verdict(gate.Inconclusive, "cannot locate repo root: "+err.Error()))
 		return 2
 	}
 	p := gpumod.Provenance(root)
@@ -87,13 +87,14 @@ func run(args []string) int {
 	fmt.Println()
 	switch rep.Outcome {
 	case gate.Fail:
-		fmt.Printf("PREFLIGHT: %d check(s) failed — fix before pushing.\n", rep.Fail)
+		fmt.Println(gate.Verdict(gate.Fail, fmt.Sprintf("%d check(s) failed — fix before pushing", rep.Fail)))
 		return 1
 	case gate.Inconclusive:
-		fmt.Printf("PREFLIGHT: INCONCLUSIVE — %d check(s) could not be run (external tool unavailable).\n", rep.Incon)
+		fmt.Println(gate.Verdict(gate.Inconclusive, fmt.Sprintf("%d check(s) could not be run (external tool unavailable)", rep.Incon)))
 		return 2
 	}
-	fmt.Println("PREFLIGHT: clean. CI still runs -race, the cgo-deps guard, aikit_checks, fuzz, the gpu jobs and vulncheck.")
+	fmt.Println(gate.Verdict(gate.OK, fmt.Sprintf("%d/%d clean", rep.Pass, rep.Total)))
+	fmt.Println("         CI still runs -race, the cgo-deps guard, aikit_checks, fuzz, the gpu jobs and vulncheck.")
 	return 0
 }
 

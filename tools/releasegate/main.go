@@ -64,7 +64,7 @@ func run(args []string) int {
 	ver := args[0]
 	root, err := gpumod.RepoRoot()
 	if err != nil {
-		fmt.Println("release-gate: INCONCLUSIVE — cannot locate repo root: " + err.Error())
+		fmt.Println(gate.Verdict(gate.Inconclusive, "cannot locate repo root: "+err.Error()))
 		return 2
 	}
 
@@ -79,13 +79,13 @@ func run(args []string) int {
 
 	switch rep.Outcome {
 	case gate.Fail:
-		fmt.Printf("release-gate: v%s FAILED ✗\n", ver)
+		fmt.Println(gate.Verdict(gate.Fail, fmt.Sprintf("v%s — %d/%d check(s) failed", ver, rep.Fail, rep.Total)))
 		return 1
 	case gate.Inconclusive:
-		fmt.Printf("release-gate: v%s INCONCLUSIVE ✗ — a required external tool was unavailable\n", ver)
+		fmt.Println(gate.Verdict(gate.Inconclusive, fmt.Sprintf("v%s — a required external tool was unavailable", ver)))
 		return 2
 	}
-	fmt.Printf("release-gate: v%s OK ✓\n", ver)
+	fmt.Println(gate.Verdict(gate.OK, fmt.Sprintf("v%s — %d/%d checks passed", ver, rep.Pass, rep.Total)))
 	return 0
 }
 
