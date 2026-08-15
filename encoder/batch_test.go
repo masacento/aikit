@@ -165,7 +165,7 @@ func TestEncodeBatch_speedup(t *testing.T) {
 		seq := time.Since(t0)
 
 		t1 := time.Now()
-		_, err = m.EncodeBatch(texts, isQ, 0) // 0 = NumCPU
+		_, err = m.EncodeBatch(texts, isQ, width) // match the gate above; EncodeBatch's own <=0 default is NumCPU, not GOMAXPROCS
 		if err != nil {
 			t.Fatal(err)
 		}
