@@ -304,28 +304,30 @@ func quantizeRowInt8(a []float32, dst []int8) (scale float32) {
 // platforms cross over in different places. See docs/BENCH-gpu-results.md.
 const topkMinN = 50_000
 
-// topkMinBatch WAS 8, and the reason it existed is gone.
+// topkMinBatch does not exist any more. It WAS 8, gating TopKBatch to decline
+// batches smaller than that — about occupancy: topk_rows ran ONE BLOCK PER
+// QUERY, so a batch of 1 occupied a single SM of 40 while the rest idled.
+// Measured then: at N=100k, batch=1 went 0.79x -> 0.43x with device top-k
+// unconditionally on, while batch=8 went 0.88x -> 3.93x. So the kernel
+// needed a real batch behind it.
 //
-// It was about occupancy: topk_rows ran ONE BLOCK PER QUERY, so a batch of 1 occupied a
-// single SM of 40 while the rest idled. Measured then: at N=100k, batch=1 went 0.79x ->
-// 0.43x with device top-k unconditionally on, while batch=8 went 0.88x -> 3.93x. So the
-// kernel needed a real batch behind it.
-//
-// It does not any more. topkSplitParts splits one query's row across as many blocks as
-// the device has room for, which is precisely the case this constant was excluding.
-// Re-measured at N=200k k=10, device top-k against ScoreBatch + host selection (the
-// fallback this gate hands work to):
+// It does not any more. topkSplitParts splits one query's row across as many
+// blocks as the device has room for, which is precisely the case this
+// constant used to exclude. Re-measured at N=200k k=10, device top-k against
+// ScoreBatch + host selection (the fallback TopKBatch hands work to):
 //
 //	M=1   1.02 ms vs 1.20   1.18x      M=16   2.05 vs  5.55   2.71x
 //	M=2   1.18 vs 1.54      1.31x      M=64   6.47 vs 29.94   4.63x
 //	M=8   1.44 vs 3.15      2.18x      M=256 24.56 vs 79.20   3.22x
 //
-// Device selection now wins at every width, so the gate is 1: decline nothing on batch
-// size. A constant that encodes a kernel's limitation has to be re-derived when the
-// limitation is removed — this file has now produced three of those (gemmTileMinM,
-// topkMinBatch, and gemv's warp width), which is an argument for deriving such things
-// from a measurement rather than storing them.
-const topkMinBatch = 1
+// Device selection wins at every width, so the batch-size gate in TopKBatch is
+// deleted rather than set to 1 — TopKBatch already returns early on M==0, so a
+// "M < 1" check would have been permanently dead code, not a decision anyone
+// could still tune. A constant that encodes a kernel's limitation has to be
+// re-derived when the limitation is removed — this file has now produced
+// three of those (gemmTileMinM, this one, and gemv's warp width), an
+// argument for deriving such things from a measurement rather than storing
+// them.
 
 // batchSmallMaxM is where the wider query tile starts to pay, and both halves of the
 // choice were swept rather than reasoned (the table is in gemv_w8a8.cu). The narrow
@@ -572,7 +574,7 @@ func (x *cudaI8Index) TopKBatch(queries [][]float32, k int) (hits [][]ann.Hit, e
 	// k <= 0 or k >= N is topHits's full-sort path, which this kernel does not
 	// implement; below topkMinN the extra launch costs more than the readback it
 	// saves. Both decline rather than approximate.
-	if k <= 0 || k >= N || N < topkMinN || M < topkMinBatch {
+	if k <= 0 || k >= N || N < topkMinN {
 		return nil, fmt.Errorf("gpu: TopKBatch declined (k=%d n=%d batch=%d)", k, N, M)
 	}
 	qi8 := make([]int8, M*K)
