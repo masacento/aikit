@@ -10,7 +10,7 @@ import (
 
 // WAND (Weak AND) dynamic pruning — perf-campaign item 39.
 //
-// The scoring loop in accum.go is term-at-a-time: every posting of every query
+// scoreQuery's (query.go) scoring loop is term-at-a-time: every posting of every query
 // term is accumulated, and only then is the top-k selected. That is O(postings)
 // no matter how few documents can actually reach the top k. WAND is
 // document-at-a-time and skips documents whose score CANNOT beat the current

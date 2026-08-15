@@ -5,6 +5,8 @@ import (
 	"math/rand"
 	"sort"
 	"testing"
+
+	"github.com/townsendmerino/aikit/internal/accum"
 )
 
 // wandCorpus builds a synthetic corpus with a realistic term distribution: a
@@ -266,8 +268,8 @@ func (ix *Index) wandEvaluated(query []string, k int) int {
 // the quantity pruning is trying to reduce.
 func (ix *Index) exhaustiveScored(query []string) int {
 	a := ix.scoreQuery(query)
-	defer putAccum(a)
-	return len(a.touched)
+	defer accum.Put(a)
+	return len(a.Touched)
 }
 
 // TestWAND_declinesLongQueries pins the length guard. Past maxWandTerms the

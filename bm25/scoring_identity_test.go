@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/townsendmerino/aikit/internal/accum"
 )
 
 // scoreReference is the pre-item-10/29 scoring expression, character for
@@ -231,8 +233,8 @@ func TestOrderTouched_matchesSort(t *testing.T) {
 					}
 				}
 				a := ix.scoreQuery(q)
-				got := append([]int32(nil), a.touched...)
-				putAccum(a)
+				got := append([]int32(nil), a.Touched...)
+				accum.Put(a)
 
 				want := append([]int32(nil), got...)
 				slices.Sort(want)

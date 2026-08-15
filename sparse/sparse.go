@@ -32,6 +32,7 @@ package sparse
 import (
 	"slices"
 
+	"github.com/townsendmerino/aikit/internal/accum"
 	"github.com/townsendmerino/aikit/topk"
 )
 
@@ -99,10 +100,10 @@ func (ix *Index) Scores(q SparseVec) []float64 {
 	// Public API: dense slice indexed by doc id, materialized from the touched set.
 	// Query does NOT go through here — it selects over the touched ids directly.
 	a := ix.scoreQuery(q)
-	defer putAccum(a)
+	defer accum.Put(a)
 	out := make([]float64, ix.ndocs)
-	for _, d := range a.touched {
-		out[d] = a.scores[d]
+	for _, d := range a.Touched {
+		out[d] = a.Scores[d]
 	}
 	return out
 }
@@ -121,12 +122,12 @@ func (ix *Index) Query(q SparseVec, k int) []Hit {
 	// not a shape anyone sends to a sparse index. MaxScore is the algorithm for
 	// the long-query case and remains open.
 	a := ix.scoreQuery(q)
-	defer putAccum(a)
+	defer accum.Put(a)
 
 	if k < 0 {
-		out := make([]Hit, 0, len(a.touched))
-		for _, d := range a.touched {
-			if s := a.scores[d]; s > 0 {
+		out := make([]Hit, 0, len(a.Touched))
+		for _, d := range a.Touched {
+			if s := a.Scores[d]; s > 0 {
 				out = append(out, Hit{Index: int(d), Score: s})
 			}
 		}
@@ -139,8 +140,8 @@ func (ix *Index) Query(q SparseVec, k int) []Hit {
 	// same items.
 	sel := topk.New[int](k)
 	th := sel.Threshold()
-	for _, d := range a.touched {
-		if s := a.scores[d]; s > 0 && s > th {
+	for _, d := range a.Touched {
+		if s := a.Scores[d]; s > 0 && s > th {
 			sel.Push(int(d), s)
 			th = sel.Threshold()
 		}
@@ -186,4 +187,69 @@ func itemCmp(a, b topk.ItemWithScore[int]) int {
 		return 1
 	}
 	return 0
+}
+
+// termWeight is one distinct query term and its folded weight.
+type termWeight struct {
+	term uint32
+	w    float64
+}
+
+// foldQuery collapses duplicate query terms into dst, summing their weights and
+// preserving FIRST-APPEARANCE order.
+//
+// That order is not cosmetic and this is the single implementation of it, used
+// by both the exhaustive scan and the pruning path (item 39). This package
+// promises deterministic scores; ranging a map here once made the float64
+// accumulation order random per call, so identical queries produced 0.6 vs
+// 0.6000000000000001 and ties flipped (audit #16). Two implementations of the
+// fold would reintroduce exactly that divergence between the two paths, which
+// is why the pruning path calls this rather than repeating it.
+//
+// The dedupe is a linear scan rather than a map: a SPLADE query is tens of
+// terms, where the map's allocation and hashing cost more than the scan (item
+// 11, second-order), and a scan preserves first-appearance order by
+// construction.
+func foldQuery(q SparseVec, dst []termWeight) []termWeight {
+	n := min(len(q.Terms), len(q.Weights))
+	for i := range n {
+		t := q.Terms[i]
+		found := false
+		for j := range dst {
+			if dst[j].term == t {
+				dst[j].w += float64(q.Weights[i])
+				found = true
+				break
+			}
+		}
+		if !found {
+			dst = append(dst, termWeight{t, float64(q.Weights[i])})
+		}
+	}
+	return dst
+}
+
+// scoreQuery accumulates the query's postings. The caller must accum.Put the result.
+//
+// Duplicate query terms are folded in FIRST-APPEARANCE order, preserved exactly: this
+// package promises deterministic scores, and ranging a map here once made the float64
+// accumulation order random per call, so identical queries produced 0.6 vs
+// 0.6000000000000001 and ties flipped (audit #16). The dedupe is a linear scan over
+// the accumulated terms rather than a map — a SPLADE query is tens of terms, where the
+// map's allocation and hashing cost more than the scan (item 11, second-order) — and a
+// scan preserves first-appearance order by construction.
+func (ix *Index) scoreQuery(q SparseVec) *accum.Accum {
+	order := foldQuery(q, nil)
+	a := accum.Get(ix.ndocs)
+	for _, tw := range order {
+		if tw.w == 0 {
+			continue
+		}
+		a.BeginRun()
+		for _, p := range ix.postings[tw.term] {
+			a.Add(p.doc, tw.w*float64(p.w))
+		}
+	}
+	a.OrderTouched()
+	return a
 }

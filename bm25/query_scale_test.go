@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+
+	"github.com/townsendmerino/aikit/internal/accum"
 )
 
 // buildScaleIndex makes a corpus at the scale where finding A is visible. The existing
@@ -156,6 +158,6 @@ func headTerms(ix *Index, n int) []string {
 
 func touchedCount(ix *Index, q []string) int {
 	a := ix.scoreQuery(q)
-	defer putAccum(a)
-	return len(a.touched)
+	defer accum.Put(a)
+	return len(a.Touched)
 }

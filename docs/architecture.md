@@ -14,7 +14,10 @@ Four rules generate most of the structure:
    + a dependency-graph grep). Anything that would break this is pushed
    behind a seam (§ Backend) or into a separate module (§ Quarantines).
 2. **Packages are small leaves; the DAG stays shallow.** Most packages depend
-   on nothing but the stdlib. Only `encoder` composes other aikit packages.
+   on nothing but the stdlib. `encoder` is the one public composite; `bm25`
+   and `sparse` additionally share `internal/accum` (Go-internal, invisible
+   to importers) — a pooled scoring accumulator extracted after it drifted
+   as two near-identical copies with nothing pinning them to stay in sync.
 3. **Numerics are parity-pinned.** Every model-touching path (`embed`,
    `encoder`, the `linalg` quant kernels) is tested against golden fixtures
    produced by Python references in [`scripts/`](../scripts/) — see

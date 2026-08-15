@@ -4,6 +4,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/townsendmerino/aikit/internal/accum"
 	"github.com/townsendmerino/aikit/topk"
 )
 
@@ -60,10 +61,10 @@ func (ix *Index) Scores(query []string) []float64 {
 	// one from the touched set. TopK does NOT go through here — it selects over the
 	// touched ids directly, which is the whole point of item 11.
 	a := ix.scoreQuery(query)
-	defer putAccum(a)
+	defer accum.Put(a)
 	out := make([]float64, ix.N())
-	for _, d := range a.touched {
-		out[d] = a.scores[d]
+	for _, d := range a.Touched {
+		out[d] = a.Scores[d]
 	}
 	return out
 }
@@ -104,13 +105,13 @@ func (ix *Index) TopK(query []string, k int) []Result {
 // against, the answer for k<0, and the fallback whenever the bound is unusable.
 func (ix *Index) topKExhaustive(query []string, k int) []Result {
 	a := ix.scoreQuery(query)
-	defer putAccum(a)
+	defer accum.Put(a)
 
 	// Full-sort path: k<0 means "no truncation, return everything".
 	if k < 0 {
-		res := make([]Result, 0, len(a.touched))
-		for _, d := range a.touched {
-			if s := a.scores[d]; s > 0 {
+		res := make([]Result, 0, len(a.Touched))
+		for _, d := range a.Touched {
+			if s := a.Scores[d]; s > 0 {
 				res = append(res, Result{Doc: int(d), Score: s})
 			}
 		}
@@ -126,8 +127,8 @@ func (ix *Index) topKExhaustive(query []string, k int) []Result {
 	// exactly the same items.
 	sel := topk.New[int](k)
 	th := sel.Threshold()
-	for _, d := range a.touched {
-		if s := a.scores[d]; s > 0 && s > th {
+	for _, d := range a.Touched {
+		if s := a.Scores[d]; s > 0 && s > th {
 			sel.Push(int(d), s)
 			th = sel.Threshold()
 		}
@@ -174,4 +175,49 @@ func itemCmp(a, b topk.ItemWithScore[int]) int {
 		return 1
 	}
 	return 0
+}
+
+// scoreQuery accumulates every (deduped) query term's postings and returns the
+// accumulator. The caller must accum.Put it.
+func (ix *Index) scoreQuery(query []string) *accum.Accum {
+	a := accum.Get(ix.N())
+	for i, term := range query {
+		if dupTerm(query, i) {
+			continue // term contributes once; tf is per-document, not per-query
+		}
+		e := ix.entry(term)
+		if e == nil {
+			continue
+		}
+		idf := ix.idfOf(e)
+		if idf == 0 {
+			continue
+		}
+		a.BeginRun()
+		// K1/B are exported and may be tuned by the caller before querying, so
+		// they cannot be folded into the postings at Build (item 10's
+		// "precompute the impact" would bake them in). Hoisting them out of the
+		// posting loop is free and keeps them live.
+		k1, bb := ix.K1, ix.B
+		k1p1 := k1 + 1
+		for _, p := range e.postings {
+			tf := float64(p.tf)
+			denom := tf + k1*(1-bb+bb*ix.norm[p.doc])
+			a.Add(p.doc, idf*(tf*k1p1)/denom)
+		}
+	}
+	a.OrderTouched()
+	return a
+}
+
+// dupTerm reports whether query[i] appeared earlier in query. A linear scan over the
+// preceding terms replaces the per-query `seen` map: queries are tens of terms, where
+// the map's allocation and hashing cost more than the scan (item 11, second-order).
+func dupTerm(query []string, i int) bool {
+	for j := range i {
+		if query[j] == query[i] {
+			return true
+		}
+	}
+	return false
 }
