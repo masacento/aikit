@@ -38,8 +38,9 @@ var extLang = map[string]string{
 	// Known data/markup formats (no chunker handles these yet — line fallback).
 	".md": "markdown", ".rst": "rst", ".txt": "text",
 	".json": "json", ".yaml": "yaml", ".yml": "yaml", ".toml": "toml",
-	".xml": "xml", ".html": "html", ".css": "css", ".scss": "css",
+	".xml": "xml", ".html": "html", ".css": "css", ".scss": "scss",
 	".sql": "sql", ".proto": "proto", ".graphql": "graphql",
+	".r": "r", // .R lowercases to .r before this lookup
 }
 
 // Language returns the canonical language for a path, or "" if unknown.

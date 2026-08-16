@@ -59,12 +59,13 @@
 //     single whole-file chunk (whole-file fallback regressed bash NDCG
 //     by 0.119 in measurement; the current behavior matches what the
 //     regex chunker does for unsupported languages).
-//   - **Deliberate language omissions** (languages.go). The C# grammar
-//     OOMs on real-world C# (1.7+ GB RSS → SIGKILL); bash grammar is
-//     too slow even with the timeout. Both are absent from
-//     languageGrammars and auto-fall-back to the line chunker, matching
-//     the regex chunker's behavior for those languages. Revisit when
-//     gotreesitter ships bounded-memory C# or a faster bash grammar.
+//   - **Deliberate language omissions** (languages.go). The bash grammar
+//     is too slow even with the timeout (−0.119 NDCG), so it's absent from
+//     languageGrammars and auto-falls back to the line chunker, matching
+//     the regex chunker's behavior. (C# was in this bucket for the same
+//     OOM reason but was re-enabled 2026-06-06 once gotreesitter v0.20.2
+//     bounded its namespace-recovery sub-parses.) Revisit bash if
+//     gotreesitter ships a faster grammar.
 package treesitter
 
 import (
@@ -343,7 +344,7 @@ func newlineOffsets(source []byte) []uint32 {
 
 // fallback delegates to the registered "line" chunker. This is the
 // graceful-degrade path when (a) the language isn't in languageGrammars
-// (e.g. csharp, deliberately omitted), (b) the grammar isn't
+// (e.g. shell/bash, deliberately omitted), (b) the grammar isn't
 // registered, (c) the parse timed out, or (d) the parse returned a nil
 // tree. Whole-file fallback was the original v0.2.0 behavior; it
 // regressed bash NDCG by 0.118 because BM25 collapses a giant single
