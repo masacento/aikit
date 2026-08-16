@@ -173,6 +173,28 @@ func (*Chunker) SupportedLanguages() []string {
 	return out
 }
 
+// Grammars returns the gotreesitter grammar names this chunker dispatches — the
+// VALUES of the internal language→grammar map (so "c_sharp", not "csharp"),
+// sorted and de-duplicated. Distinct from SupportedLanguages (which returns
+// ken's language names, the keys): the grammar names are what
+// gotreesitter's grammar_subset_<grammar> build tags key on, so ken's
+// slim-build drift guard (internal/buildchecks) compares this against
+// .goreleaser.yml. Returned as a fresh slice so callers can't mutate internal
+// state (the reason languageGrammars itself is unexported — 2026-07-25 audit).
+func (*Chunker) Grammars() []string {
+	seen := make(map[string]struct{}, len(languageGrammars))
+	out := make([]string, 0, len(languageGrammars))
+	for _, g := range languageGrammars {
+		if _, dup := seen[g]; dup {
+			continue
+		}
+		seen[g] = struct{}{}
+		out = append(out, g)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // poolFor returns a cached ParserPool for the given ken language, or
 // creates one (and caches it) on first use. Returns nil if the
 // language isn't supported by the treesitter chunker or its grammar
