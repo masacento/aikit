@@ -3,7 +3,7 @@ module github.com/townsendmerino/aikit/gpu/encmetal
 go 1.26.6
 
 require (
-	github.com/townsendmerino/aikit v1.19.0
+	github.com/townsendmerino/aikit v1.20.0
 	github.com/townsendmerino/aikit/gpu v0.28.0
 )
 
