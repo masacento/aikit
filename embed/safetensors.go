@@ -592,6 +592,33 @@ func (t Tensor) Float32s() ([]float32, error) {
 	return reinterpretLE[float32](t.Name, t.raw)
 }
 
+// Uint8s returns the tensor's raw bytes, for the byte-wide dtypes ("U8", "I8",
+// "BOOL"). The result ALIASES the file's mapped bytes — do not mutate, and do not
+// retain it past the owning SafetensorsFile's Close.
+//
+// WHY THIS EXISTS. Block-quantized formats increasingly ship their payload as U8
+// tensors that only the consumer knows how to interpret: MXFP4 in safetensors, for
+// instance, stores packed 4-bit codes in a `*_blocks` U8 tensor and their E8M0
+// exponents in a separate `*_scales` U8 tensor. There is no meaningful "decode" aikit
+// could apply — the layout is the caller's — so the honest accessor is the bytes
+// themselves rather than a typed one that would have to guess.
+//
+// It is restricted to byte-wide dtypes deliberately. Returning raw bytes for, say, an
+// F32 tensor would silently hand out a little-endian-dependent view and invite callers
+// to reimplement reinterpretLE badly; those dtypes already have typed accessors.
+func (t Tensor) Uint8s() ([]byte, error) {
+	defer runtime.KeepAlive(t.owner) // §2.5: guard the read against a mid-decode munmap
+	switch t.DType {
+	case "U8", "I8", "BOOL":
+	default:
+		return nil, fmt.Errorf("tensor %q: Uint8s requires a byte-wide dtype (U8/I8/BOOL), got %s", t.Name, t.DType)
+	}
+	if n := t.Elements(); n < 0 || n != len(t.raw) {
+		return nil, fmt.Errorf("tensor %q: shape %v implies %d bytes, payload has %d", t.Name, t.Shape, n, len(t.raw))
+	}
+	return t.raw, nil
+}
+
 // Float64s returns the tensor data as []float64. Requires DType "F64". Aliases
 // when aligned, else a copy (see reinterpretLE).
 func (t Tensor) Float64s() ([]float64, error) {
@@ -766,6 +793,14 @@ func halfBitsToF32(h uint16) float32 {
 // (I8/U8/BOOL/F8_*, …) is reported unknown, so parseSafetensors skips the
 // shape×dtype byte-range check for it — the typed accessors reject it at read
 // time exactly as before.
+//
+// U8/I8/BOOL stay UNSIZED even though Uint8s can now read them. Sizing them here
+// would extend the parser's byte-range check to files that currently load fine
+// without it, turning a previously-ignored header inconsistency in an UNREAD
+// tensor into a hard load failure for existing callers. Uint8s performs the same
+// shape-vs-payload check itself, at read time, on the one tensor being read — the
+// blast radius of a validation belongs where the data is consumed, not where an
+// unrelated file is opened.
 func dtypeSize(dtype string) (int, bool) {
 	switch dtype {
 	case "F64", "I64":

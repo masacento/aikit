@@ -1,6 +1,7 @@
 package embed
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -304,4 +305,71 @@ func eqF32(a, b []float32) bool {
 		}
 	}
 	return true
+}
+
+// TestUint8s covers the byte-wide accessor added for block-quantized payloads
+// (MXFP4 safetensors ships packed 4-bit codes in a U8 `*_blocks` tensor and their
+// E8M0 exponents in a separate U8 `*_scales` tensor).
+func TestUint8s(t *testing.T) {
+	blob := buildSafetensors(map[string]stEntry{
+		"blocks": {dtype: "U8", shape: []int{2, 3}, raw: []byte{1, 2, 3, 250, 251, 252}},
+		"flags":  {dtype: "BOOL", shape: []int{2}, raw: []byte{0, 1}},
+		"signed": {dtype: "I8", shape: []int{2}, raw: []byte{0x80, 0x7f}},
+		"floats": {dtype: "F32", shape: []int{2}, raw: f32raw(1, 2)},
+	})
+	f, err := parseSafetensors(blob)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		want []byte
+	}{
+		{"blocks", []byte{1, 2, 3, 250, 251, 252}},
+		{"flags", []byte{0, 1}},
+		{"signed", []byte{0x80, 0x7f}},
+	} {
+		tn, err := f.Tensor(tc.name)
+		if err != nil {
+			t.Fatalf("Tensor(%s): %v", tc.name, err)
+		}
+		got, err := tn.Uint8s()
+		if err != nil {
+			t.Fatalf("Uint8s(%s): %v", tc.name, err)
+		}
+		if !bytes.Equal(got, tc.want) {
+			t.Errorf("%s = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// Non-byte dtypes are refused rather than reinterpreted: handing back raw bytes for
+	// an F32 would be a little-endian-dependent view, and those dtypes already have
+	// typed accessors that decode properly.
+	tn, err := f.Tensor("floats")
+	if err != nil {
+		t.Fatalf("Tensor(floats): %v", err)
+	}
+	if _, err := tn.Uint8s(); err == nil {
+		t.Error("Uint8s on an F32 tensor succeeded; want an error")
+	}
+
+	// A header whose shape disagrees with its payload must be refused AT READ TIME.
+	// Byte-wide dtypes are deliberately left unsized in dtypeSize (so opening an
+	// unrelated file with an inconsistent, unread U8 tensor keeps working), which makes
+	// this accessor the only place that check can happen.
+	bad := buildSafetensors(map[string]stEntry{
+		"blocks": {dtype: "U8", shape: []int{4, 4}, raw: []byte{1, 2, 3}}, // says 16, has 3
+	})
+	bf, err := parseSafetensors(bad)
+	if err != nil {
+		t.Fatalf("parse (mismatched U8 should still OPEN): %v", err)
+	}
+	bt, err := bf.Tensor("blocks")
+	if err != nil {
+		t.Fatalf("Tensor: %v", err)
+	}
+	if _, err := bt.Uint8s(); err == nil {
+		t.Error("Uint8s accepted a shape/payload mismatch; want an error")
+	}
 }

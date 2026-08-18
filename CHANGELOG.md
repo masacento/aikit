@@ -10,6 +10,30 @@ it.
 
 ## [Unreleased]
 
+## [1.21.0] — 2026-08-18
+
+### Added
+
+- **`Tensor.Uint8s()` — raw byte access for the byte-wide safetensors dtypes** (`U8`, `I8`,
+  `BOOL`). Block-quantized formats increasingly ship their payload as U8 tensors only the
+  consumer can interpret: MXFP4 in safetensors stores packed 4-bit codes in a `*_blocks` U8
+  tensor and their E8M0 exponents in a separate `*_scales` U8 tensor. aikit has no meaningful
+  decode to apply — the layout belongs to the caller — so the honest accessor is the bytes,
+  not a typed one that would have to guess. Until now these tensors were simply unreadable:
+  every typed accessor rejects them and `raw` is unexported, which blocked goinfer's gpt-oss
+  safetensors loader outright.
+
+  Restricted to byte-wide dtypes on purpose. Returning raw bytes for an `F32` would hand out a
+  little-endian-dependent view and invite callers to reimplement `reinterpretLE` badly; those
+  dtypes already have typed accessors.
+
+  **`dtypeSize` deliberately still reports `U8`/`I8`/`BOOL` as unknown.** Sizing them would
+  extend the parser's shape×dtype byte-range check to files that load fine today, turning a
+  previously-ignored header inconsistency in an *unread* tensor into a hard load failure for
+  existing callers. `Uint8s` performs that same check itself, at read time, on the one tensor
+  actually being read — a validation's blast radius belongs where the data is consumed, not
+  where an unrelated file is opened.
+
 ## [1.19.0] — 2026-08-15
 
 ### Added
