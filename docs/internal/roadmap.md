@@ -303,6 +303,21 @@ none of these has a trigger; do not start one without finding or declaring
 one first, same as §2. Each entry says what it is, why it fits aikit
 specifically, how hard it is, and what it composes with.
 
+**Torch-oracle endgame — PARKED, 2026-08-18 (Francis), low priority, no
+trigger.** aikit's own ~23-file `scripts/oracle/*.py` cluster (the
+BERT/SPLADE/cross-encoder/SigLIP/Qwen2.5-VL-vision parity golden generators)
+is the same class of problem as goinfer's much larger decoder-side one — a
+pure-Go independent reference (`oracle/`-shaped: own module, own weight
+reader, deliberately naive f64 math, periodically re-anchored against real
+HF/PyTorch output) could eventually replace routine per-model golden
+generation, dropping Python to occasional per-architecture anchor runs
+rather than eliminating it. Full design, phases, and open decisions live in
+goinfer's `docs/task-oracle-refforward.md` (status line records the parked
+decision); if this is ever revisited, do it as **one joint Phase-0
+clustering pass across both repos' scripts together**, not as two separate
+plans — the independence argument and phase structure apply unchanged to
+both.
+
 Context: aikit is the pure-Go **retrieval** toolkit (`topk`, `ann` flat+HNSW,
 `bm25`, `fuse` RRF, `embed`, `encoder`, `chunk`, `linalg`); the **generation**
 half (decoder / tokenizer / sampler / constrained decoding) lives in goinfer,
