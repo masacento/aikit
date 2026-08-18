@@ -63,7 +63,7 @@ graph TD
         linalg["linalg<br/><i>SIMD f32/int8/int4 kernels</i>"]
         embed["embed<br/><i>Model2Vec + safetensors/GGUF loaders</i>"]
         encoder["encoder<br/><i>BERT-family embedders (9 architectures) +<br/>SPLADE expansion + cross-encoder reranker</i>"]
-        vision["vision<br/><i>SigLIP/ViT image encoder (Experimental)</i>"]
+        vision["vision<br/><i>SigLIP/ViT image encoder</i>"]
         bench["bench<br/><i>recall + latency harness</i>"]
         encoder --> embed
         encoder --> linalg
@@ -208,7 +208,7 @@ is the index:
 | Quant kernels trust block-size-aligned K (caller contract) | `linalg/quant.go` |
 | Parallel matmuls are bit-identical at any width (column partition) | `linalg/linalg.go`, CHANGELOG 0.5.1 |
 | Kernel dispatch / CPU feature detection map | [`internal/cpu-acceleration.md`](./internal/cpu-acceleration.md) |
-| Serialized blob formats: rebuild-per-minor pre-1.0; `Load*` rejects other versions with `ann.ErrFormat` (loud, never silent) | [README versioning](../README.md#serialized-blob-formats), `ann/hnsw_persist.go` + `ann/flat_i8_persist.go` format-bump checklist |
+| Serialized blob formats: still rebuild-per-minor despite aikit being past 1.0 now (the "tighten at 1.0" plan never actually landed); `Load*` rejects other versions with `ann.ErrFormat` (loud, never silent) | [README versioning](../README.md#serialized-blob-formats), `ann/hnsw_persist.go` + `ann/flat_i8_persist.go` format-bump checklist |
 
 ## ADR index
 

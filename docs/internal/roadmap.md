@@ -163,6 +163,23 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
    projections via `lw.MatmulBTInto(&s.ws, …)` (`vision/encoder.go`, the
    audit-#12 Workspace threading). So the "unconsumed" caveat is resolved;
    the method has real coverage for the graduation audit.
+   *Partial ✅, 2026-08-18:* first real audit pass against the trigger, checked
+   against goinfer's actual source (not just its `go.mod`) rather than assumed.
+   Four surfaces had organically-found production evidence and graduated:
+   `linalg` root (`Dot`/`MatmulBT`/int8-int4 quant kernels — 36 non-test files
+   in goinfer), `encoder.Backend`/`RegisterBackend`/`NewBackend` (goinfer's
+   `gpu/backend.go` + `internal/serveapp/{embeddings,openai,main}.go`),
+   `vision` whole package (goinfer's serving path, GPU registration, demo
+   agent), `mmap` whole package (4 non-test goinfer files). Checked ken too —
+   it contributed no additional evidence (imports only already-Hard-tier
+   aikit surface). Everything else in the Experimental list (HNSW, FlatI8,
+   BERT, SPLADE, CrossEncoder, `sparse`, `TokenizePlain`, `Truncate`, …) had
+   **zero** organic external-production hits in either repo and stays
+   Experimental regardless of age — age alone was never the bar. README's
+   Stability tiers + Versioning sections rewritten to match (also fixed: the
+   Versioning section's own "at 1.0 this tightens" blob-format language had
+   gone stale — the milestone passed without the tightening landing; now
+   says so honestly instead of implying it's still pending arrival).
 8. **`linalg.WeightMat` — unify the quantized-weight abstraction** —
    ✅ **DONE (type + 3 of 3 consumers).** The precision-hiding
    weight-matrix wrapper was implemented **three times** — aikit

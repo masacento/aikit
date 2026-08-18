@@ -2,11 +2,10 @@
 
 All notable changes to `aikit` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
-adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) with the
-pre-1.0 caveat documented in [README.md](README.md#versioning): the "Hard,
-1.0-committed" surfaces are expected to be stable through the path to 1.0, but
-breaking changes may still occur between `0.x` minors if the design requires
-it.
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html): see
+[README.md](README.md#stability-tiers) for the two-tier split — the Hard tier
+follows semver (no breaking change before a v2.0), the Experimental tier is
+excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 

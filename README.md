@@ -25,15 +25,15 @@ large embedded-grammar payload) — is quarantined in the separate
 | `ann` | cosine ANN over a dense matrix — exact flat scan + approximate HNSW graph | `linalg`, `topk` |
 | `bm25` | identifier-aware BM25 lexical index (Lucene-variant); `Tokenize` (code) + `TokenizePlain` (general text) | `topk` |
 | `fuse` | rank fusion (RRF) + relative-score fusion (RSF) — blend lexical + dense rankings for hybrid search | — |
-| `hybrid` | thin, opt-in wrapper around "retrieve dense + lexical, then `fuse.RRF`" — composes already-built indices, doesn't build/embed/tokenize/rerank | `ann`, `bm25`, `fuse` |
+| `hybrid` *(Experimental)* | thin, opt-in wrapper around "retrieve dense + lexical, then `fuse.RRF`" — composes already-built indices, doesn't build/embed/tokenize/rerank | `ann`, `bm25`, `fuse` |
 | `sparse` | learned-sparse (SPLADE) retrieval — inverted index + sparse-dot scoring over vectors from `encoder.SPLADE` (in-process) or precomputed | `topk` |
-| `late` | ColBERT-style late-interaction (MaxSim) reranking over pre-computed per-token vectors (`encoder.Model.EncodeTokens`) — a shortlist reranker, not a corpus-scale index | `linalg`, `topk` |
+| `late` *(Experimental)* | ColBERT-style late-interaction (MaxSim) reranking over pre-computed per-token vectors (`encoder.Model.EncodeTokens`) — a shortlist reranker, not a corpus-scale index | `linalg`, `topk` |
 | `bench` | reproducible recall + latency harness for the dense indexes (Flat / HNSW / FlatI8) — Experimental tooling | `ann` |
 | `linalg` | SIMD `f32` dot/matmul (NEON on arm64, AVX2/FMA on amd64) + int8/int4 quant kernels | — |
-| `mmap` *(Experimental)* | read-only file mapping + `madvise` residency hints + a demand-signal-agnostic `SpanCache` (LRU spans under a byte budget) — the substrate `ann`/`embed` mmap loaders sit on; cgo-free, `!unix` heap fallback | `golang.org/x/sys` *(darwin only)* |
+| `mmap` | read-only file mapping + `madvise` residency hints + a demand-signal-agnostic `SpanCache` (LRU spans under a byte budget) — the substrate `ann`/`embed` mmap loaders sit on; cgo-free, `!unix` heap fallback | `golang.org/x/sys` *(darwin only)* |
 | `embed` | Model2Vec inference: WordPiece tokenizer + safetensors loader + L2-norm | `golang.org/x/text` |
 | `encoder` | BERT/RoBERTa/XLM-R/GTE/nomic-bert(+MoE) embedder family (12 certified models, `docs/embedder-coverage.md`, incl. CodeRankEmbed) + SPLADE expansion + cross-encoder reranker — transformer inference scored by cosine / sparse dot / relevance logit; pluggable matmul `Backend` | `embed`, `linalg`, `sparse` |
-| `vision` *(Experimental)* | SigLIP / ViT image encoder — decode → preprocess → pure-Go transformer forward → image embeddings (f32 or int8 W8A8), parity-pinned to HF `SiglipVisionModel`; stdlib image codecs, no cgo | `embed`, `linalg` |
+| `vision` | SigLIP / ViT image encoder — decode → preprocess → pure-Go transformer forward → image embeddings (f32 or int8 W8A8), parity-pinned to HF `SiglipVisionModel`; stdlib image codecs, no cgo | `embed`, `linalg` |
 | `chunk` | language-aware chunker registry + `regex`, `markdown`, `line` chunkers | — |
 | `gpu` *(Experimental, darwin+linux; separate modules)* | cgo-free native-GPU device substrate — `Device`/`Buffer`/`Queue`/`Pipeline`/`Encoder` over Metal (darwin, runtime MSL compiler) or CUDA (linux, embedded PTX); the GPU analogue of `linalg`'s CPU role. 8 one-backend-per-module leaves plug into 3 seams: `anncuda`/`annmetal` → `FlatI8.EnableGPU`; `enccuda`/`encmetal` → `encoder.RegisterBackend("cuda"/"metal", …)`; `qwencuda`/`qwenmetal` + `visioncuda`/`visionmetal` → `vision.RegisterResident`. Device tests are hand-run (no GPU CI); the default aikit build never imports any of them and stays pure-Go. See [`examples/gpu-ann`](examples/gpu-ann) for the `FlatI8.EnableGPU` seam end to end. | `github.com/ebitengine/purego` *(darwin)*, `github.com/eitamring/gocudrv` *(linux)* |
 | `chunk/treesitter` *(submodule)* | tree-sitter-backed syntactic chunker | `gotreesitter`, `…/aikit` |
@@ -227,14 +227,16 @@ the difference is what you deploy.
 
 ## Stability tiers
 
-These two tiers define what 1.0 promises. The split is **frozen for v1.0**, and
-the Hard tier is verified backward-compatible across the 0.4.x and 0.5.x minors
-(`apidiff`, zero incompatible changes).
+Two tiers define aikit's compatibility promise: the Hard tier follows semver
+(no breaking change before a v2.0), verified by `apidiff` on every tagged
+release (`tools/releasegate`, enforced since v1.0 — see `RELEASING.md`); the
+Experimental tier is explicitly excluded from that promise and may change in
+any release until it graduates. aikit is at v1.21.0; the Hard tier has held
+backward-compatible across every release since 1.0.
 
-### Hard — the 1.0 compatibility guarantee
+### Hard — the semver-covered surface
 
-From v1.0 these follow semver: no breaking change before a v2.0. This is the API
-to build on.
+No breaking change before a v2.0. This is the API to build on.
 
 - `topk.Selector[T]`, `topk.New`, `topk.Selector.Threshold`
 - `ann.New`, `ann.Flat.Query`, `ann.Hit`
@@ -246,20 +248,35 @@ to build on.
 - `encoder.Load`, `encoder.LoadFromFS`, `encoder.Model`, `encoder.Encoder` interface
 - `chunk.Chunker` interface; `chunk.{Chunk, Register, Get, Names, ChunkFile, Language}`
 - Concrete chunker names registered under `regex`, `markdown`, `treesitter`
+- `linalg.Dot`, `linalg.MatmulBT`, and the int8/int4 quant kernels — public
+  since v0.4.0, and the busiest Experimental surface by a wide margin: 36
+  non-test files in goinfer route through it. **Graduated 2026-08-18** (this
+  tier re-curation) on that organically-found production evidence, per
+  `docs/internal/roadmap.md` §2.7's trigger.
+- `encoder.Backend`, `encoder.RegisterBackend`, `encoder.NewBackend` — the
+  matmul-provider seam, public since v0.4.0. goinfer's WebGPU backend
+  (`gpu/backend.go`) and serving path (`internal/serveapp/{embeddings,
+  openai,main}.go`) register and dispatch through it in production.
+  **Graduated 2026-08-18.**
+- `vision` — the whole package (SigLIP/ViT image encoder). In aikit since
+  v1.7.0 (14 minors survived); goinfer's serving path (`vision_serve.go`),
+  GPU backend registration (`gpu/vision_*.go`), and demo agent all depend on
+  it directly. **Graduated 2026-08-18.**
+- `mmap` — the whole package. In aikit since v1.9.0 (12 minors survived);
+  goinfer imports it in 4 non-test files. **Graduated 2026-08-18.**
 
-### Experimental — outside the 1.0 guarantee
+### Experimental — outside the semver promise
 
-Young, tuning-driven surfaces that ship in 1.0 but are **explicitly excluded
-from the compatibility promise**: they may change in any release (minor or
-patch). Supported and useful — but pin a version, or prefer the Hard-tier
-equivalent, if you need stability. Each graduates to the Hard tier once it
-settles.
+Young, tuning-driven surfaces that are **explicitly excluded from the
+compatibility promise**: they may change in any release (minor or patch).
+Supported and useful — but pin a version, or prefer the Hard-tier equivalent,
+if you need stability. Each graduates to the Hard tier once an external
+consumer uses it in production, organically found (not chased), for two-plus
+consecutive quiet minors — `docs/internal/roadmap.md` §2.7's trigger, not a
+fixed schedule. Age alone doesn't graduate a surface: several entries below
+have shipped since v0.4.0/v1.x with no reported break, but stay here because
+no such consumer has surfaced yet.
 
-- `linalg` — promoted to public in v0.4.0 (was `internal/linalg`). `Dot`,
-  `MatmulBT` and the int8/int4 quant kernels are stable in shape but the surface
-  is young and tuning-driven.
-- `encoder.Backend` / `encoder.RegisterBackend` / `encoder.NewBackend` — the
-  matmul-provider seam; new in v0.4.0.
 - `ann.HNSW` / `ann.NewHNSW` / `ann.BuildHNSW` / `ann.Config` — the `Hit`/`Query`
   surface is stable, but graph internals and `Config` defaults may tune. Neighbor
   selection defaults to the diversity heuristic (Algorithm 4) for high recall on
@@ -267,6 +284,9 @@ settles.
 - `ann.HNSW.MarshalBinary` / `ann.Load` — index persistence (the
   `//go:embed`-an-index pattern). The serialized format is versioned from day one
   but stays Experimental until the graph internals settle.
+- `ann.LoadHNSWMmap` — zero-copy mmap loader for HNSW (aliases the float32
+  vector block directly from a read-only mapping), added alongside the v4
+  format bump. Covered by `ann.Load`'s existing Experimental status above.
 - `ann.FlatI8` / `ann.NewFlatI8` — int8-quantized dense index (¼ the memory,
   scored via the W8A8 kernel). Same `Hit`/`Query` shape as `Flat`; new surface, so
   Experimental.
@@ -281,16 +301,12 @@ settles.
   (aliases the int8 codes from a read-only mapping for instant startup + page-cache
   sharing); `FlatI8.Close` releases it. Versioned format, settling alongside
   `FlatI8`.
-- `mmap` — new leaf package: `MapReadOnly`/`Unmap` (the read-only mapping `ann` and
-  `embed` previously each kept a private copy of), `Advise` (`madvise` residency
-  hints — firm cap on Linux, best-effort elsewhere), and `SpanCache` (a
-  demand-signal-agnostic LRU of page-aligned spans under a byte budget) for paging a
-  mapping larger than RAM. stdlib-only (plus `golang.org/x/sys` on darwin), cgo-free,
-  with a `!unix` heap fallback. New surface, settling.
 - `Flat`/`HNSW`/`FlatI8` `.QueryFilter(q, k, keep)` — query-time logical-delete /
   live-set filter (the index stays immutable). New surface, settling.
 - `bm25.TokenizePlain` — new general-text (Unicode word) analyzer alongside the
   code-tuned `Tokenize` (which stays the default); pick whichever fits the corpus.
+- `bm25.Index.TopKBatch` — batch query API mirroring `ann.FlatI8.QueryBatch`'s
+  work-stealing dispatch, for bulk workloads. New surface.
 - `fuse.RSF` / `fuse.RSFWeighted` / `fuse.Scored` / `fuse.Scores` — new
   relative-score fusion alongside the rank-based `RRF`; new surface, settling.
 - `embed.Truncate` — new Matryoshka (MRL) embedding truncate + L2-renormalize
@@ -299,6 +315,8 @@ settles.
   `SparseVec` / `Index` / `Query` shape is settled; `encoder.SPLADE` (below) now
   provides the in-process masked-LM expansion head, closing the index+scorer
   package end-to-end. Stays Experimental — new surface, settling.
+  `sparse.Index.QueryBatch` (batch query API, mirroring `bm25.Index.TopKBatch`
+  above) is covered by the same status.
 - `encoder.LoadQ8` / `encoder.ModelQ8` (int8 quant) — alternate precision path.
 - `encoder.LoadBERT` / `encoder.BERT` / `BERT.Encode` — MiniLM-class BERT encoder
   (learned positions + GELU FFN + mean pooling), cgo-free, parity-pinned to
@@ -353,8 +371,12 @@ settles.
   `HasFusedQ8Kernel`, `FusedQ8Applies`), W8A8 activation quantization
   (`QuantizeActivations{,Into}`, `MatmulBTW8A8Pre`, `DequantizeRowsInt8Into`) and
   the Hamming/SimHash primitives (`PackSignBits{,Row}`, `PackedWords`,
-  `HammingRows`). The whole package is Experimental, so these need no separate
-  carve-out — noted because it is a large batch of new surface.
+  `HammingRows`) — new surface, distinct from `Dot`/`MatmulBT`/the int8/int4
+  quant kernels (Hard tier, above): `linalg` is now a mixed-tier package, not
+  wholly Experimental.
+- `late` — the whole package (ColBERT-style MaxSim reranking). New package.
+- `hybrid` — the whole package (thin dense+lexical+`fuse.RRF` wrapper). New
+  package.
 - The concrete chunker structs (`regex.Chunker`, `markdown.Chunker`,
   `treesitter.Chunker`) and their `New()` — prefer `chunk.Get("regex")`.
 - `chunk/treesitter` — its own opt-in module, **tagged in lockstep with the core
@@ -425,32 +447,37 @@ Regenerate the committed golden fixtures:
 
 ## Versioning
 
-`v0.x` is pre-1.0; breaking changes can still land between `0.x` minors when the
-design requires it (the CHANGELOG records each). **v0.4.0** split the LLM runtime
-out to `goinfer`, promoted `linalg` to public, and added the `encoder.Backend`
-seam — the last hard-tier-affecting break.
-
-The **Hard tier has held backward-compatible across 0.4.x and 0.5.x** (verified
-with `apidiff` — zero incompatible changes), meeting the two-consecutive-minors
-bar, so it is **frozen for v1.0**. From v1.0 the Hard tier follows semver
-(breaking changes only at a v2.0); the Experimental tier is excluded from that
+aikit is past 1.0 — current release: **v1.21.0** (see the
+[CHANGELOG](CHANGELOG.md)). **v0.4.0** split the LLM runtime out to `goinfer`,
+promoted `linalg` to public, and added the `encoder.Backend` seam — the last
+Hard-tier-affecting break before 1.0. The Hard tier has held
+backward-compatible ever since, verified by `apidiff` on every tagged release
+(`tools/releasegate`; see `RELEASING.md`) — not just the 0.4.x/0.5.x window
+that originally justified freezing it — and follows semver: no breaking
+change before a v2.0. The Experimental tier (above) is excluded from that
 promise and may change in any release until it graduates.
 
 ### Serialized blob formats
 
 The persisted index blobs (`ann.HNSW` / `ann.FlatI8` `MarshalBinary`) are
-magic-tagged and versioned. **Pre-1.0 policy: rebuild per minor** — a blob is not a
-stable cross-version interchange format; re-serialize your index after an aikit minor
-upgrade. The safety net is loud, not silent: `Load*` rejects any version it doesn't
-recognize with `ann.ErrFormat` (never a crash or a misread), so a stale blob fails
-visibly and you regenerate. The format version is bumped freely within `0.x` when the
-layout improves. If you `//go:embed` blobs in your own releases, pin the aikit minor
-or rebuild in your pipeline (a `go generate` step, as
-[`examples/embedded-corpus`](examples/embedded-corpus) does). At 1.0 this tightens to
-a stronger guarantee (read N−1, or reserved-field forward-compatibility) — HNSW's v4
-bump already reserves a header flags word as the mechanism for the latter
-(`ann/hnsw_persist.go`'s format note); FlatI8's own format-bump checklist still has
-this one pending.
+magic-tagged and versioned. **Policy: rebuild per minor** — a blob is not a
+stable cross-version interchange format; re-serialize your index after an
+aikit minor upgrade. The safety net is loud, not silent: `Load*` rejects any
+version it doesn't recognize with `ann.ErrFormat` (never a crash or a
+misread), so a stale blob fails visibly and you regenerate. The format
+version is bumped freely when the layout improves. If you `//go:embed` blobs
+in your own releases, pin the aikit minor or rebuild in your pipeline (a
+`go generate` step, as [`examples/embedded-corpus`](examples/embedded-corpus)
+does).
+
+**This was originally planned to tighten "at 1.0"** (read N−1, or
+reserved-field forward-compatibility). That milestone has passed — aikit is
+well past 1.0 now — without the tightening actually happening: rebuild-per-
+minor is still the real policy. HNSW's v4 bump reserves a header flags word
+as the mechanism for it (`ann/hnsw_persist.go`'s format note), and FlatI8's
+own format-bump checklist has the equivalent item pending — the plumbing
+exists, the guarantee doesn't yet. Read "at 1.0" here as retired language
+describing an unmet trigger, not a promise that was honored on schedule.
 
 That same v4 bump also padded HNSW's header to an 8-byte boundary, which is what lets
 [`ann.LoadHNSWMmap`](ann/hnsw_mmap.go) alias the float32 vector block directly from a
