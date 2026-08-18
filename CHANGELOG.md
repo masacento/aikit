@@ -9,6 +9,37 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.22.0] — 2026-08-18
+
+### Added
+
+- **`bm25.MarshalTokens` / `bm25.UnmarshalTokens`** — a cache for the tokenized corpus
+  (`Build`'s own input), not a serialized `Index`. Re-measured the cold-start cost behind
+  the deferred N4 persistence question before building anything: it's almost exactly 50/50
+  between tokenization (8.83ms) and `Build` itself (8.78ms), not tokenization-dominant as
+  first assumed. This ships the smaller, reversible half — caching tokenization costs
+  nothing on `Index`'s own compatibility surface, since `Build` still runs on load at its
+  own already-cheap cost. Versioned, magic-tagged, bounds-checked reader; `Index` itself
+  gains no format from this.
+
+### Changed
+
+- **Tier re-curation: `linalg` root (`Dot`/`MatmulBT`/int8-int4 quant kernels),
+  `encoder.Backend`/`RegisterBackend`/`NewBackend`, `vision` (whole package), and `mmap`
+  (whole package) graduate from Experimental to the Hard tier.** First real audit against
+  `docs/internal/roadmap.md` §2.7's graduation trigger — checked goinfer's actual source,
+  not just its `go.mod` — found organic, real production usage for all four (36 non-test
+  files for `linalg`; goinfer's WebGPU backend + serving path for `encoder.Backend`;
+  goinfer's serving path + GPU registration + demo agent for `vision`; 4 non-test files for
+  `mmap`), each surviving well past the two-quiet-minors bar. Everything else in the
+  Experimental list stays there — age alone was never the bar, and no other surface had
+  organic external-production evidence in either goinfer or ken.
+- **README's Versioning section rewritten out of pre-1.0 future tense.** aikit has been past
+  1.0 for many minors; the section still spoke as if 1.0 were a future milestone. Also
+  corrected rather than hid a related gap: the blob-format "tightens at 1.0" language
+  implied that tightening was still pending arrival — 1.0 already passed without it landing,
+  and the section now says so.
+
 ## [1.21.0] — 2026-08-18
 
 ### Added
@@ -2076,7 +2107,8 @@ broad slice of the open-weights ecosystem.
   golden cosine 1.000000 vs PyTorch+MPS CodeRankEmbed. See
   [README.md](README.md) for stability tiers.
 
-[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.21.0...HEAD
+[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.22.0...HEAD
+[1.22.0]: https://github.com/townsendmerino/aikit/compare/v1.21.0...v1.22.0
 [1.21.0]: https://github.com/townsendmerino/aikit/compare/v1.20.0...v1.21.0
 [1.19.0]: https://github.com/townsendmerino/aikit/compare/v1.18.0...v1.19.0
 [1.18.0]: https://github.com/townsendmerino/aikit/compare/v1.17.1...v1.18.0
