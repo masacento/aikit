@@ -3,7 +3,7 @@ module github.com/townsendmerino/aikit/gpu/visionmetal
 go 1.26.6
 
 require (
-	github.com/townsendmerino/aikit v1.20.0
+	github.com/townsendmerino/aikit v1.21.0
 	github.com/townsendmerino/aikit/gpu v0.28.0
 )
 
