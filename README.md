@@ -307,6 +307,14 @@ no such consumer has surfaced yet.
   code-tuned `Tokenize` (which stays the default); pick whichever fits the corpus.
 - `bm25.Index.TopKBatch` — batch query API mirroring `ann.FlatI8.QueryBatch`'s
   work-stealing dispatch, for bulk workloads. New surface.
+- `bm25.MarshalTokens` / `bm25.UnmarshalTokens` — a cache for the *tokenized
+  corpus* (`Build`'s input), not a serialized `Index`; `bm25.Index` itself
+  gains no format or compatibility promise from this. Deliberately the
+  smaller half of the deferred N4 persistence question
+  (`docs/internal/roadmap.md` §2.14) — caches roughly half of BM25's measured
+  cold-start cost (tokenization), while `Build` itself still runs on load at
+  its own already-cheap cost. New surface, may be reworked or dropped without
+  touching `Index`.
 - `fuse.RSF` / `fuse.RSFWeighted` / `fuse.Scored` / `fuse.Scores` — new
   relative-score fusion alongside the rank-based `RRF`; new surface, settling.
 - `embed.Truncate` — new Matryoshka (MRL) embedding truncate + L2-renormalize

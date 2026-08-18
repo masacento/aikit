@@ -287,6 +287,18 @@ duplication. One deduplication earns immediate work; the rest is gated (§2).
    presence should look like. N1 was additive with a contract obvious from the serial
    loop it replaced; N4 is a format. Trigger: an adopter who needs warm-restart or
    incremental indexing badly enough to own the format's compatibility surface.
+   *Partial ✅, 2026-08-18:* re-measured the split before deciding anything — the
+   17.6 ms combined cost is almost exactly 50/50 between `TokenizePlain`
+   (8.83 ms) and `Build` itself (8.78 ms), not tokenization-dominant as first
+   assumed. Shipped the smaller, reversible half:
+   `bm25.MarshalTokens`/`bm25.UnmarshalTokens` cache the tokenized corpus
+   (`Build`'s input) so a `//go:embed` deployment skips re-tokenizing raw text,
+   while `Build` still runs on load at its own cost. `bm25.Index` itself gains
+   **no** format, no version, no compatibility promise — the new surface can be
+   rendered obsolete or dropped without touching `Index` at all. This resolves
+   roughly half the measured cost (~8.8 ms) as a low-commitment opt-in; full N4
+   (serializing `Index` itself, eliminating the other half) and N6
+   (`Builder.Add`) remain gated exactly as before, same trigger.
 
 ---
 
