@@ -223,6 +223,27 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
    sidesteps it: `MatmulBTQ8Fused` row-splits large M so each worker's `packedFillQ8`
    runs at small M where the gap does not open. Revisit only with a profile showing the
    a-re-read is the dominant term, or as part of the §2.12-roadmap 3-level Goto GEMM.
+6. **`dequantRowInt8` (K=768) — marginal-FMA issue-width probe run for real —
+   ✅ DONE, NOT issue-limited on either box.** `docs/internal/priors-microgpt-c.md`
+   §1 proposed injecting independent dead FMAs into a hot loop and comparing the
+   marginal ns/FMA cost against the same loop's cost measured alone; a match means
+   the kernel already occupied those issue slots (issue-limited, the `dotNEON2x8`
+   story above), a gap means idle slots exist. Built as
+   `linalg/fma_issue_probe_test.go`'s `TestFMAIssueProbe`, run on both boxes (best
+   of 3, least-squares slope over N∈{0,8,16,32,64}, reproduced twice each):
+   `apple-m1pro` stacked/alone ratio **0.94–0.97**, `nvidia-rtx2070s`'s Ryzen host
+   (AVX2) **0.79–0.82** — both comfortably below 1.0, so **not issue-limited on
+   either architecture**, even though the exact ratio differs between them (the
+   AVX2 box shows more slack, not less — the opposite of what a naive read of
+   priors-microgpt-c.md §2's "amd64 has fewer registers, less headroom" caution
+   might suggest; the *qualitative verdict* transferred fine even though the
+   *quantitative ratio* didn't, which is the distinction §2 is actually about).
+   Implication: `dequantRowInt8` has idle issue slots on both boxes — it is
+   waiting on something else (memory is the obvious suspect, given the kernel is a
+   load/sign-extend/convert/multiply/store chain), not issue-width bound, so a
+   scheduling/unrolling change here would have nothing to win against. No load
+   profile currently justifies chasing the memory side further at this kernel's
+   real call frequency; revisit only if a profile flags it as a real hot path.
 
 GPU follow-ups (resident buffers, tiled kernel, batch-tiling) are **goinfer's** —
 see `goinfer/gpu` and goinfer's perf docs.
