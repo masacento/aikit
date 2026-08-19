@@ -55,7 +55,7 @@ func BenchmarkAttnStridedVsPacked(b *testing.B) {
 
 		b.Run(s.name+"/K_gather+matmul", func(b *testing.B) {
 			for b.Loop() {
-				for j := 0; j < nKeys; j++ {
+				for j := range nKeys {
 					copy(kh[j*hd:j*hd+hd], cache[j*kvDim+off:j*kvDim+off+hd])
 				}
 				MatmulBTAcc64(qh, kh, outK, 1, hd, nKeys)
@@ -68,8 +68,8 @@ func BenchmarkAttnStridedVsPacked(b *testing.B) {
 		})
 		b.Run(s.name+"/V_transpose+matmul", func(b *testing.B) {
 			for b.Loop() {
-				for j := 0; j < nKeys; j++ {
-					for d := 0; d < hd; d++ {
+				for j := range nKeys {
+					for d := range hd {
 						vt[d*nKeys+j] = cache[j*kvDim+off+d]
 					}
 				}

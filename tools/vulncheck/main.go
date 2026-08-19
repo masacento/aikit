@@ -81,7 +81,6 @@ func run() int {
 	mods := allModuleDirs(root)
 	checks := make([]gate.Check, 0, len(mods))
 	for _, m := range mods {
-		m := m
 		checks = append(checks, gate.Check{Name: m, Run: func() gate.Cell { return scanModule(root, gvc, m) }})
 	}
 	cells := gate.RunAll(checks)
@@ -157,7 +156,7 @@ func scanModule(root, gvc, m string) gate.Cell {
 			{Key: "status", State: "VULNERABLE"},
 			{Key: "count", State: fmt.Sprintf("%d", n)},
 		}}
-		for _, ln := range strings.Split(out, "\n") {
+		for ln := range strings.SplitSeq(out, "\n") {
 			t := strings.TrimSpace(ln)
 			if reVuln.MatchString(ln) || strings.HasPrefix(t, "Found in:") || strings.HasPrefix(t, "Fixed in:") {
 				c.Fields = append(c.Fields, gate.Field{Key: "line", State: t})
@@ -225,7 +224,7 @@ func scannerVersion(gvc string) string {
 }
 
 func firstNonEmpty(s string) string {
-	for _, ln := range strings.Split(s, "\n") {
+	for ln := range strings.SplitSeq(s, "\n") {
 		if strings.TrimSpace(ln) != "" {
 			t := strings.TrimSpace(ln)
 			if len(t) > 70 {

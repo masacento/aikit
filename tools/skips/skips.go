@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -167,8 +168,8 @@ func reasonFrom(lines []string) string {
 	if reason != "" {
 		return reason
 	}
-	for i := len(lines) - 1; i >= 0; i-- {
-		t := strings.TrimSpace(lines[i])
+	for _, line := range slices.Backward(lines) {
+		t := strings.TrimSpace(line)
 		if t != "" && !strings.HasPrefix(t, "=== ") && !strings.HasPrefix(t, "--- ") {
 			return t
 		}

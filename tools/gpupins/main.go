@@ -104,7 +104,6 @@ func run(args []string) int {
 
 	checks := make([]gate.Check, 0, len(backends))
 	for _, m := range backends {
-		m := m
 		checks = append(checks, gate.Check{Name: m, Run: func() gate.Cell { return checkModule(root, m, wantRoot, wantGpu) }})
 	}
 	cells := gate.RunAll(checks)
@@ -166,7 +165,7 @@ func pinField(key, got, want string) gate.Field {
 // "replace" (not the bare module path), so they are ignored; the aikit/gpu path is checked
 // before the aikit path because the former is a prefix-extension of the latter.
 func requires(gomod string) (root, gpu string) {
-	for _, ln := range strings.Split(gomod, "\n") {
+	for ln := range strings.SplitSeq(gomod, "\n") {
 		t := strings.TrimSpace(ln)
 		switch {
 		case strings.HasPrefix(t, gpuMod+" "):
@@ -268,7 +267,7 @@ func setVersion(indent, modPath, trimmed, ver string) string {
 // re is the real filter that keeps only the module-root series.
 func latestTag(root, glob string, re *regexp.Regexp) string {
 	out, _ := gpumod.Exec(root, "", nil, "git", "tag", "--list", glob, "--sort=-v:refname")
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		t := strings.TrimSpace(ln)
 		if re.MatchString(t) {
 			return t

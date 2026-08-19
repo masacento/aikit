@@ -1,6 +1,6 @@
 module github.com/townsendmerino/aikit/chunk/treesitter
 
-go 1.26.6
+go 1.27.0
 
 require (
 	github.com/odvcencio/gotreesitter v0.40.0

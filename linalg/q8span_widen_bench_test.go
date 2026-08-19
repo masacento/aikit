@@ -77,9 +77,9 @@ func BenchmarkQ8Span_widenShare(b *testing.B) {
 		// widen_scalar: exactly what q8Span does today, over all N rows.
 		b.Run(s.name+"/widen_scalar", func(b *testing.B) {
 			for b.Loop() {
-				for j := 0; j < N; j++ {
+				for j := range N {
 					bq := bQ[j*K : j*K+K]
-					for k := 0; k < K; k++ {
+					for k := range K {
 						deq[k] = float32(bq[k])
 					}
 				}
@@ -88,7 +88,7 @@ func BenchmarkQ8Span_widenShare(b *testing.B) {
 		// widen_simd: the proposed substitution (SIMD widen, scale 1.0), over all N rows.
 		b.Run(s.name+"/widen_simd", func(b *testing.B) {
 			for b.Loop() {
-				for j := 0; j < N; j++ {
+				for j := range N {
 					dequantRowInt8(deq, bQ[j*K:j*K+K], 1.0)
 				}
 			}
@@ -100,7 +100,7 @@ func BenchmarkQ8Span_widenShare(b *testing.B) {
 		}
 		b.Run(s.name+"/dot_simd", func(b *testing.B) {
 			for b.Loop() {
-				for j := 0; j < N; j++ {
+				for j := range N {
 					dst[j] = dotF32(a, deq) * bScales[j]
 				}
 			}

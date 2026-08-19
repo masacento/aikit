@@ -57,7 +57,6 @@ func run() int {
 	// never aborts the rest and the count is never lost.
 	checks := make([]gate.Check, 0, len(mods))
 	for _, m := range mods {
-		m := m
 		checks = append(checks, gate.Check{Name: m, Run: func() gate.Cell { return checkModule(root, m) }})
 	}
 	cells := gate.RunAll(checks)
@@ -167,7 +166,7 @@ func devCell(name string, o gate.Outcome, status, inline string) gate.Cell {
 // follow captures the first n non-empty lines of a loader error as indented follow-up.
 func follow(out string, n int) []gate.Field {
 	var fs []gate.Field
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		if strings.TrimSpace(ln) == "" {
 			continue
 		}
@@ -182,7 +181,7 @@ func follow(out string, n int) []gate.Field {
 // failLines captures the first five ^--- FAIL / FAIL / panic lines of a test failure.
 func failLines(out string) []gate.Field {
 	var fs []gate.Field
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		if strings.HasPrefix(ln, "--- FAIL") || strings.HasPrefix(ln, "FAIL") || strings.HasPrefix(ln, "panic") {
 			fs = append(fs, gate.Field{Key: "line", State: strings.TrimRight(ln, "\r")})
 			if len(fs) >= 5 {
@@ -196,7 +195,7 @@ func failLines(out string) []gate.Field {
 // countTopLevel counts top-level (unindented) --- PASS / --- SKIP lines, matching the shell's
 // `grep -c '^--- PASS'`: a module whose every top-level test skipped has ran == 0.
 func countTopLevel(out string) (ran, skip int) {
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		switch {
 		case strings.HasPrefix(ln, "--- PASS"):
 			ran++

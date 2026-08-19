@@ -41,7 +41,7 @@ func main() {
 	const reps = 400
 	start := time.Now()
 	n := 0
-	for i := 0; i < reps; i++ {
+	for range reps {
 		for _, s := range sentences {
 			m.Encode(s)
 			n++
@@ -59,7 +59,7 @@ func main() {
 	m.Encode(long)                                                 // warm
 	const longReps = 120
 	start = time.Now()
-	for i := 0; i < longReps; i++ {
+	for range longReps {
 		m.Encode(long)
 	}
 	el = time.Since(start)
