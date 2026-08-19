@@ -92,12 +92,7 @@ type gcur struct {
 }
 
 func newGcur(raw []byte) *gcur {
-	// NOT flattened to &gcur{B: raw, ...} — go fix's Go 1.27 modernizer offers that
-	// promoted-field literal syntax, but staticcheck's IR builder (honnef.co/go/tools
-	// v0.7.0, bundled in golangci-lint v2.12.2) panics on the *ast.KeyValueExpr shape
-	// it produces ("unexpected expr"). Keep the explicit embedded-field form until
-	// that catches up.
-	return &gcur{Cursor: cursor.Cursor{B: raw, Context: "gguf", Errorf: errFormatf}}
+	return &gcur{B: raw, Context: "gguf", Errorf: errFormatf}
 }
 
 // ggufHintCap bounds a map-preallocation hint. No real GGUF has this many KV or
