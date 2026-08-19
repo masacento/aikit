@@ -1,6 +1,6 @@
 module github.com/townsendmerino/aikit/examples/embedded-corpus
 
-go 1.27.0
+go 1.26.6
 
 require github.com/townsendmerino/aikit v1.3.0
 

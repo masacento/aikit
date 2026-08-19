@@ -46,7 +46,7 @@ func envInts(key string, def []int) []int {
 		return def
 	}
 	var out []int
-	for s := range strings.SplitSeq(v, ",") {
+	for _, s := range strings.Split(v, ",") {
 		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
 			out = append(out, n)
 		}

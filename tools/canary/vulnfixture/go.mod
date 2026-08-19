@@ -4,6 +4,6 @@
 // never enters the shipped scan.
 module github.com/townsendmerino/aikit/tools/canary/vulnfixture
 
-go 1.27.0
+go 1.26.6
 
 require golang.org/x/text v0.3.5

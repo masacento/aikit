@@ -100,7 +100,7 @@ func CheckApidiff(out string) Result {
 }
 
 func firstLine(s string) string {
-	for ln := range strings.SplitSeq(s, "\n") {
+	for _, ln := range strings.Split(s, "\n") {
 		if strings.TrimSpace(ln) != "" {
 			return strings.TrimSpace(ln)
 		}

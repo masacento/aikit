@@ -119,16 +119,16 @@ func LoadWeightsQ8(dir string) (*WeightsQ8, error) {
 			Norm1B: cloneFloat32(l.Norm1B),
 			Norm2W: cloneFloat32(l.Norm2W),
 			Norm2B: cloneFloat32(l.Norm2B),
-
-			// Quantize big projections (rows = output dim, cols = input dim) to
-			// weight-only Q8. linalg.QuantizeInt8 is bit-identical to the encoder's
-			// quantizeRowsInt8 (same per-row symmetric max/127 round+clamp), so the
-			// stored codes/scales — and the forward — are unchanged.
-			Wqkv:    linalg.QuantizeInt8(l.Wqkv, 3*cfg.HiddenDim, cfg.HiddenDim, false),
-			OutProj: linalg.QuantizeInt8(l.OutProj, cfg.HiddenDim, cfg.HiddenDim, false),
-			Fc11:    linalg.QuantizeInt8(l.Fc11, cfg.IntermediateDim, cfg.HiddenDim, false),
-			Fc12:    linalg.QuantizeInt8(l.Fc12, cfg.IntermediateDim, cfg.HiddenDim, false),
-			Fc2:     linalg.QuantizeInt8(l.Fc2, cfg.HiddenDim, cfg.IntermediateDim, false)}
+		}
+		// Quantize big projections (rows = output dim, cols = input dim) to
+		// weight-only Q8. linalg.QuantizeInt8 is bit-identical to the encoder's
+		// quantizeRowsInt8 (same per-row symmetric max/127 round+clamp), so the
+		// stored codes/scales — and the forward — are unchanged.
+		lq.Wqkv = linalg.QuantizeInt8(l.Wqkv, 3*cfg.HiddenDim, cfg.HiddenDim, false)
+		lq.OutProj = linalg.QuantizeInt8(l.OutProj, cfg.HiddenDim, cfg.HiddenDim, false)
+		lq.Fc11 = linalg.QuantizeInt8(l.Fc11, cfg.IntermediateDim, cfg.HiddenDim, false)
+		lq.Fc12 = linalg.QuantizeInt8(l.Fc12, cfg.IntermediateDim, cfg.HiddenDim, false)
+		lq.Fc2 = linalg.QuantizeInt8(l.Fc2, cfg.HiddenDim, cfg.IntermediateDim, false)
 		q.Layers[i] = lq
 		// Those five f32 tensors are now int8 + scales on the heap, and nothing
 		// reads their mapped pages again. Drop them before touching layer i+1 so

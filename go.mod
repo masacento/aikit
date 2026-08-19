@@ -1,6 +1,6 @@
 module github.com/townsendmerino/aikit
 
-go 1.27.0
+go 1.26.6
 
 require (
 	golang.org/x/sys v0.47.0

@@ -118,7 +118,10 @@ func TestMetalGEMV_offBoundaryShapes(t *testing.T) {
 			if err := gpu.EnableGPU(); err != nil {
 				t.Fatalf("N=%d K=%d EnableGPU: %v", N, K, err)
 			}
-			k := min(10, N)
+			k := 10
+			if k > N {
+				k = N
+			}
 			worst := 0.0
 			for _, q := range randUnit(rng, 20, K) {
 				want := cpu.Query(q, k)

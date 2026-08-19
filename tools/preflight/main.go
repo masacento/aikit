@@ -142,7 +142,7 @@ func checkNoCgoDeps(root string) gate.Cell {
 		return c
 	}
 	var leaked []string
-	for ln := range strings.SplitSeq(out, "\n") {
+	for _, ln := range strings.Split(out, "\n") {
 		low := strings.ToLower(ln)
 		if strings.Contains(low, "webgpu") || strings.Contains(low, "gotreesitter") {
 			leaked = append(leaked, ln)
@@ -163,7 +163,7 @@ func checkNoCgoDeps(root string) gate.Cell {
 func checkGofmt(root string) gate.Cell {
 	out, _ := gpumod.Exec(root, "", nil, "gofmt", "-l", ".")
 	var bad []string
-	for ln := range strings.SplitSeq(out, "\n") {
+	for _, ln := range strings.Split(out, "\n") {
 		ln = strings.TrimSpace(ln)
 		if ln != "" && !strings.HasPrefix(ln, ".venv/") {
 			bad = append(bad, ln)
@@ -208,7 +208,7 @@ func goTest(root string) gate.Cell {
 	}
 	c := cell("go test", outcome, "GOWORK=off")
 	if outcome == gate.Fail {
-		for ln := range strings.SplitSeq(buf.String(), "\n") {
+		for _, ln := range strings.Split(buf.String(), "\n") {
 			if strings.HasPrefix(ln, "---") || strings.HasPrefix(ln, "FAIL") || strings.HasPrefix(ln, "panic") {
 				c.Fields = append(c.Fields, gate.Field{Key: "line", State: strings.TrimRight(ln, "\r")})
 				if countLines(c) >= 8 {
@@ -217,7 +217,7 @@ func goTest(root string) gate.Cell {
 			}
 		}
 	}
-	for ln := range strings.SplitSeq("skip census — "+res.Summary(), "\n") {
+	for _, ln := range strings.Split("skip census — "+res.Summary(), "\n") {
 		c.Fields = append(c.Fields, gate.Field{Key: "line", State: ln})
 	}
 	return c
@@ -265,7 +265,7 @@ func statusWord(o gate.Outcome) string {
 
 func headLines(out string, n int) []gate.Field {
 	var fs []gate.Field
-	for ln := range strings.SplitSeq(out, "\n") {
+	for _, ln := range strings.Split(out, "\n") {
 		if strings.TrimSpace(ln) == "" {
 			continue
 		}

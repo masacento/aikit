@@ -44,13 +44,13 @@ func TestMatmulBTAcc64Strided_bitIdenticalToPacked(t *testing.T) {
 			scores[i] = float32(rng.NormFloat64())
 		}
 
-		for kvh := range nKV {
+		for kvh := 0; kvh < nKV; kvh++ {
 			off := kvh * hd
 
 			// --- K re-copy: QKᵀ, dst[Mq,nKeys] = qh[Mq,hd]·K_head[nKeys,hd]ᵀ ---
 			// reference: pack K_head then MatmulBTAcc64.
 			kPacked := make([]float32, nKeys*hd)
-			for j := range nKeys {
+			for j := 0; j < nKeys; j++ {
 				copy(kPacked[j*hd:j*hd+hd], cache[j*kvDim+off:j*kvDim+off+hd])
 			}
 			refK := make([]float32, Mq*nKeys)
@@ -63,8 +63,8 @@ func TestMatmulBTAcc64Strided_bitIdenticalToPacked(t *testing.T) {
 			// --- V re-transpose: scores·V, dst[Mq,hd] = scores[Mq,nKeys]·V_head[nKeys,hd] ---
 			// reference: transpose V_head to vt[hd,nKeys] then MatmulBTAcc64.
 			vt := make([]float32, hd*nKeys)
-			for j := range nKeys {
-				for d := range hd {
+			for j := 0; j < nKeys; j++ {
+				for d := 0; d < hd; d++ {
 					vt[d*nKeys+j] = cache[j*kvDim+off+d]
 				}
 			}

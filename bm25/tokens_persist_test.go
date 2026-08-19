@@ -115,7 +115,7 @@ func TestTokens_truncated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for cut := range blob {
+	for cut := 0; cut < len(blob); cut++ {
 		if _, err := UnmarshalTokens(blob[:cut]); err == nil {
 			t.Fatalf("truncated to %d/%d bytes: expected an error, got none", cut, len(blob))
 		} else if !errors.Is(err, ErrFormat) {

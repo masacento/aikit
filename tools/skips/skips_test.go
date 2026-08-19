@@ -57,7 +57,7 @@ func TestParse_tallyAndReemit(t *testing.T) {
 	res := Result{ByReason: map[string]int{}, Examples: map[string]string{}}
 	var out bytes.Buffer
 	buf := map[string][]string{}
-	for line := range strings.SplitSeq(strings.TrimRight(jsonStream, "\n"), "\n") {
+	for _, line := range strings.Split(strings.TrimRight(jsonStream, "\n"), "\n") {
 		var ev testEvent
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
 			t.Fatalf("unmarshal %q: %v", line, err)

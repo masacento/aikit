@@ -100,7 +100,7 @@ func TestSafetensorsFile_SubF32(t *testing.T) {
 		// Each "expert" row [3 elements]; the concatenation of the per-row SubF32 reads
 		// must equal the whole tensor.
 		var got []float32
-		for e := range 2 {
+		for e := 0; e < 2; e++ {
 			row, err := tn.SubF32(e*3, 3)
 			if err != nil {
 				t.Fatalf("%s SubF32(%d,3): %v", name, e*3, err)

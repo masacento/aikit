@@ -166,7 +166,7 @@ func TestPTXReproducible(t *testing.T) {
 
 // fmaHistogram counts the float instructions whose mix the bit-identity contract fixes.
 func fmaHistogram(ptx []byte) (fma, mul int) {
-	for line := range strings.SplitSeq(string(ptx), "\n") {
+	for _, line := range strings.Split(string(ptx), "\n") {
 		switch {
 		case strings.Contains(line, "fma.rn.f32"):
 			fma++

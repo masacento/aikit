@@ -42,13 +42,13 @@ func TestQ8Span_bitIdenticalToScalarWiden(t *testing.T) {
 		// reference: the pre-P2 math — scalar widen, same dotF32, same post-scale, same order.
 		ref := make([]float32, M*N)
 		deq := make([]float32, K)
-		for j := range N {
+		for j := 0; j < N; j++ {
 			bq := bQ[j*K : j*K+K]
-			for k := range K {
+			for k := 0; k < K; k++ {
 				deq[k] = float32(bq[k])
 			}
 			sc := bScales[j]
-			for i := range M {
+			for i := 0; i < M; i++ {
 				ref[i*N+j] = dotF32(a[i*K:i*K+K], deq) * sc
 			}
 		}

@@ -68,7 +68,7 @@ func tkMeasureBW(t *testing.T, dev *gpu.Device, q gpu.Queue, bytes int) float64 
 	for _, gsz := range []int{1 << 18, 1 << 20, 1 << 22} {
 		gszBuf := dev.NewBufferU32(uint32(gsz))
 		secs := math.Inf(1)
-		for range 5 {
+		for rep := 0; rep < 5; rep++ {
 			runtime.LockOSThread()
 			e := q.Begin()
 			e.Dispatch(p, gsz, 256, src, n4buf, gszBuf, sink)
@@ -131,7 +131,7 @@ func TestMetalTopKBandwidth(t *testing.T) {
 			scoreOut := dev.NewBufferLen(M * k)
 
 			secs := math.Inf(1)
-			for range 8 {
+			for rep := 0; rep < 8; rep++ {
 				runtime.LockOSThread()
 				e := q.Begin()
 				e.Dispatch(topk, M*topkTG, topkTG, scoreBuf, nBuf, kBuf, idxOut, scoreOut)

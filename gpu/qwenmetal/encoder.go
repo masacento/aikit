@@ -156,7 +156,10 @@ func (e *encoder) ensure(n int) {
 	e.qkv = f32(n * 3 * H)
 	e.att, e.projOut = f32(n*H), f32(n*H)
 	e.gate, e.up = f32(n*I), f32(n*I)
-	wide := max(I, H)
+	wide := H
+	if I > wide {
+		wide = I
+	}
 	e.qi8 = e.dev.NewBufferInt8(make([]int8, n*wide))
 	e.qs = f32(n)
 	e.cosB, e.sinB = f32(n*hd), f32(n*hd)

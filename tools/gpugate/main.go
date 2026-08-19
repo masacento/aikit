@@ -256,7 +256,7 @@ func word(o gate.Outcome) string {
 }
 
 func countTests(out string) (nrun, npass, nskip int) {
-	for ln := range strings.SplitSeq(out, "\n") {
+	for _, ln := range strings.Split(out, "\n") {
 		t := strings.TrimSpace(ln)
 		switch {
 		case strings.HasPrefix(ln, "=== RUN"):
@@ -271,7 +271,7 @@ func countTests(out string) (nrun, npass, nskip int) {
 }
 
 func testErrLine(out string) string {
-	for ln := range strings.SplitSeq(out, "\n") {
+	for _, ln := range strings.Split(out, "\n") {
 		if reTestLine.MatchString(ln) {
 			s := strings.TrimSpace(ln)
 			if len(s) > 90 {
@@ -284,7 +284,7 @@ func testErrLine(out string) string {
 }
 
 func firstLine(s string) string {
-	for ln := range strings.SplitSeq(s, "\n") {
+	for _, ln := range strings.Split(s, "\n") {
 		if strings.TrimSpace(ln) != "" {
 			s := strings.TrimSpace(ln)
 			if len(s) > 90 {

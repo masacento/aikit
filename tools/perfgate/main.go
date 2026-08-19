@@ -161,6 +161,7 @@ func run(args []string) int {
 
 	checks := make([]gate.Check, 0, len(shapes))
 	for _, sh := range shapes {
+		sh := sh
 		checks = append(checks, gate.Check{Name: sh, Run: func() gate.Cell { return judge(sh, curV, prevV, floors[sh], cfg) }})
 	}
 	cells := gate.RunAll(checks)
@@ -289,20 +290,20 @@ var reKN = regexp.MustCompile(`K(\d+)_N(\d+)`)
 // tree's `K768_N8192_resident`) still matches on the shape it measures.
 func parseBench(s string) map[string]float64 {
 	m := map[string]float64{}
-	for ln := range strings.SplitSeq(s, "\n") {
+	for _, ln := range strings.Split(s, "\n") {
 		g := reBench.FindStringSubmatch(strings.TrimSpace(ln))
 		if g == nil {
 			continue
 		}
 		name, nsStr := g[1], g[2]
 		family := name
-		if before, _, ok := strings.Cut(name, "/"); ok {
-			family = before
+		if i := strings.Index(name, "/"); i >= 0 {
+			family = name[:i]
 		}
 		key := family
 		if kn := reKN.FindStringSubmatch(name); kn != nil {
 			key = family + "/K" + kn[1] + "_N" + kn[2]
-		} else if found := strings.Contains(name, "/"); found {
+		} else if i := strings.Index(name, "/"); i >= 0 {
 			key = name // no K/N — key on the full sub-benchmark name
 		}
 		ns, err := strconv.ParseFloat(nsStr, 64)
@@ -372,7 +373,7 @@ func defaultTag(root string, pos []string) string {
 	}
 	out, _ := gitIn(root, "tag", "--list", "v*", "--sort=-v:refname")
 	re := regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
-	for ln := range strings.SplitSeq(out, "\n") {
+	for _, ln := range strings.Split(out, "\n") {
 		t := strings.TrimSpace(ln)
 		if re.MatchString(t) {
 			return t
@@ -471,7 +472,7 @@ func maxF(a, b float64) float64 {
 }
 
 func firstLine(s string) string {
-	for ln := range strings.SplitSeq(s, "\n") {
+	for _, ln := range strings.Split(s, "\n") {
 		if strings.TrimSpace(ln) != "" {
 			return strings.TrimSpace(ln)
 		}

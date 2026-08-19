@@ -140,7 +140,7 @@ func goRunEnv(cfg config, dir string, extra []string, name string, args ...strin
 }
 
 func firstLine(s string) string {
-	for ln := range strings.SplitSeq(s, "\n") {
+	for _, ln := range strings.Split(s, "\n") {
 		if strings.TrimSpace(ln) != "" {
 			return trim(ln)
 		}
@@ -149,7 +149,7 @@ func firstLine(s string) string {
 }
 
 func matchLine(s string, re *regexp.Regexp) string {
-	for ln := range strings.SplitSeq(s, "\n") {
+	for _, ln := range strings.Split(s, "\n") {
 		if re.MatchString(ln) {
 			return trim(ln)
 		}
@@ -160,7 +160,7 @@ func matchLine(s string, re *regexp.Regexp) string {
 // buildError returns the first line that is neither a `go: downloading/added` progress
 // note nor a bare `# pkg` header — the actual compile error.
 func buildError(s string) string {
-	for ln := range strings.SplitSeq(s, "\n") {
+	for _, ln := range strings.Split(s, "\n") {
 		t := strings.TrimSpace(ln)
 		if t == "" || strings.HasPrefix(t, "#") ||
 			strings.HasPrefix(t, "go: downloading") || strings.HasPrefix(t, "go: added") ||

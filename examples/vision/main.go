@@ -205,7 +205,7 @@ func embedImage(enc *vision.Encoder, cfg vision.Config, pngBytes []byte) ([]floa
 	D := enc.Cfg.HiddenSize
 	np := len(hidden) / D
 	mean := make([]float32, D)
-	for p := range np {
+	for p := 0; p < np; p++ {
 		row := hidden[p*D : (p+1)*D]
 		for j, v := range row {
 			mean[j] += v
@@ -221,8 +221,8 @@ func embedImage(enc *vision.Encoder, cfg vision.Config, pngBytes []byte) ([]floa
 
 func solid(n int, c color.Color) image.Image {
 	img := image.NewNRGBA(image.Rect(0, 0, n, n))
-	for y := range n {
-		for x := range n {
+	for y := 0; y < n; y++ {
+		for x := 0; x < n; x++ {
 			img.Set(x, y, c)
 		}
 	}
@@ -231,8 +231,8 @@ func solid(n int, c color.Color) image.Image {
 
 func vsplit(n int, left, right color.Color) image.Image {
 	img := image.NewNRGBA(image.Rect(0, 0, n, n))
-	for y := range n {
-		for x := range n {
+	for y := 0; y < n; y++ {
+		for x := 0; x < n; x++ {
 			if x < n/2 {
 				img.Set(x, y, left)
 			} else {
@@ -246,8 +246,8 @@ func vsplit(n int, left, right color.Color) image.Image {
 func checker(n int, c1, c2 color.Color) image.Image {
 	img := image.NewNRGBA(image.Rect(0, 0, n, n))
 	const cell = 16
-	for y := range n {
-		for x := range n {
+	for y := 0; y < n; y++ {
+		for x := 0; x < n; x++ {
 			if (x/cell+y/cell)%2 == 0 {
 				img.Set(x, y, c1)
 			} else {
@@ -261,8 +261,8 @@ func checker(n int, c1, c2 color.Color) image.Image {
 func circle(n int, bg, fg color.Color) image.Image {
 	img := image.NewNRGBA(image.Rect(0, 0, n, n))
 	cx, cy, r := float64(n)/2, float64(n)/2, float64(n)/3
-	for y := range n {
-		for x := range n {
+	for y := 0; y < n; y++ {
+		for x := 0; x < n; x++ {
 			dx, dy := float64(x)-cx, float64(y)-cy
 			if math.Hypot(dx, dy) <= r {
 				img.Set(x, y, fg)

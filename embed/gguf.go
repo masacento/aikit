@@ -92,7 +92,7 @@ type gcur struct {
 }
 
 func newGcur(raw []byte) *gcur {
-	return &gcur{B: raw, Context: "gguf", Errorf: errFormatf}
+	return &gcur{Cursor: cursor.Cursor{B: raw, Context: "gguf", Errorf: errFormatf}}
 }
 
 // ggufHintCap bounds a map-preallocation hint. No real GGUF has this many KV or

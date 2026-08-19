@@ -14,7 +14,7 @@ import (
 func largeGoSource() []byte {
 	var b strings.Builder
 	b.WriteString("package x\n\n")
-	for i := range 400 {
+	for i := 0; i < 400; i++ {
 		fmt.Fprintf(&b, "func F%d(a, b int) int {\n\tc := a + b\n\tif c > %d {\n\t\treturn c * 2\n\t}\n\treturn c\n}\n\n", i, i)
 	}
 	return []byte(b.String())

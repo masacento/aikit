@@ -70,7 +70,7 @@ func measureBandwidth(t *testing.T, dev *gpu.Device, q gpu.Queue, bytes int) flo
 	for _, gsz := range []int{1 << 16, 1 << 18, 1 << 20, 1 << 22} {
 		gszBuf := dev.NewBufferU32(uint32(gsz))
 		secs := math.Inf(1)
-		for range 5 {
+		for rep := 0; rep < 5; rep++ {
 			runtime.LockOSThread()
 			e := q.Begin()
 			e.Dispatch(p, gsz, 256, src, n4buf, gszBuf, sink)
