@@ -109,6 +109,15 @@ type Chunker struct {
 	parseErr        atomic.Int64
 	nilRoot         atomic.Int64
 	invalidSpans    atomic.Int64
+
+	// Per-parse wall-clock timeout policy (see WithParseTimeoutMicros).
+	// Zero value = the parseTimeoutMicros const default, so a zero-value
+	// Chunker (&Chunker{}) and New() are unchanged. parseTimeoutOverride
+	// (when > 0) replaces the default; parseTimeoutDisabled removes the
+	// wall-clock timeout entirely. Set once at construction and only read
+	// afterwards, so no synchronization is needed against concurrent Chunk.
+	parseTimeoutOverride uint64
+	parseTimeoutDisabled bool
 }
 
 // Stats is a point-in-time snapshot of the treesitter chunker's
@@ -152,9 +161,67 @@ func (c *Chunker) Stats() Stats {
 	}
 }
 
+// Option configures a Chunker constructed with New.
+type Option func(*Chunker)
+
+// WithParseTimeoutMicros sets the per-parse wall-clock timeout in
+// microseconds. A value of 0 DISABLES the wall-clock timeout entirely,
+// making a parse's outcome a pure function of its input bytes —
+// deterministic and load-independent. A positive value overrides the
+// default (parseTimeoutMicros, 1s). The default (no option / zero-value
+// Chunker) keeps the 1s const, so existing callers are unaffected.
+//
+// The motivating case is reproducible index builds (ken issue #35): with a
+// wall-clock timeout, a borderline file whose parse straddles the budget
+// completes on an idle machine but times out and falls back to the line
+// chunker on a loaded one, producing different chunk counts across
+// rebuilds of the same corpus. Disabling the timeout removes that load
+// dependence; a latency-sensitive consumer (a live server) instead keeps a
+// bounded positive value.
+//
+// Caveat: disabling the wall-clock timeout removes the only guard
+// gotreesitter offers against a runaway parse — it exposes no deterministic
+// node/step budget. Disable it only where inputs are size-bounded and the
+// grammars are known-good (ken caps files at 2 MiB on the walk and omits
+// the pathological bash grammar).
+func WithParseTimeoutMicros(micros uint64) Option {
+	return func(c *Chunker) {
+		if micros == 0 {
+			c.parseTimeoutDisabled = true
+			c.parseTimeoutOverride = 0
+			return
+		}
+		c.parseTimeoutDisabled = false
+		c.parseTimeoutOverride = micros
+	}
+}
+
+// ParseTimeout reports the chunker's effective per-parse wall-clock timeout:
+// disabled==true means no timeout (deterministic parse, see
+// WithParseTimeoutMicros); otherwise micros is the budget in microseconds
+// (the parseTimeoutMicros default when never overridden). Exposed for
+// observability and so a consumer can assert which tier it configured.
+func (c *Chunker) ParseTimeout() (micros uint64, disabled bool) {
+	if c.parseTimeoutDisabled {
+		return 0, true
+	}
+	if c.parseTimeoutOverride != 0 {
+		return c.parseTimeoutOverride, false
+	}
+	return parseTimeoutMicros, false
+}
+
 // New returns a tree-sitter chunker. The internal caches are empty;
-// they fill lazily as files in each language are encountered.
-func New() *Chunker { return &Chunker{} }
+// they fill lazily as files in each language are encountered. With no
+// options the per-parse wall-clock timeout is the parseTimeoutMicros
+// default (1s); see WithParseTimeoutMicros to override or disable it.
+func New(opts ...Option) *Chunker {
+	c := &Chunker{}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
 
 func init() { chunk.Register("treesitter", New()) }
 
@@ -234,9 +301,20 @@ func (c *Chunker) poolFor(kenLang string) *gotreesitter.ParserPool {
 	// large real files, and any parse exceeding it returns a truncated tree that
 	// Chunk detects via tree.ParseStoppedEarly() and routes to the line-chunker
 	// fallback (gotreesitter >=0.40 no longer surfaces the timeout as an error).
-	pool := gotreesitter.NewParserPool(lang,
-		gotreesitter.WithParserPoolTimeoutMicros(parseTimeoutMicros),
-	)
+	// Per-parse timeout policy: disabled (deterministic), an explicit
+	// override, or the parseTimeoutMicros default. See WithParseTimeoutMicros.
+	var pool *gotreesitter.ParserPool
+	if c.parseTimeoutDisabled {
+		pool = gotreesitter.NewParserPool(lang)
+	} else {
+		to := c.parseTimeoutOverride
+		if to == 0 {
+			to = parseTimeoutMicros
+		}
+		pool = gotreesitter.NewParserPool(lang,
+			gotreesitter.WithParserPoolTimeoutMicros(to),
+		)
+	}
 	// LoadOrStore handles the race where two goroutines both miss
 	// the cache for the same first-seen language: the second one
 	// returns the first one's pool (its own is discarded).
