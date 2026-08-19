@@ -95,11 +95,13 @@ func DequantizeRowInt8(q []int8, scale float32, dst []float32) {
 
 // MatmulBTQ8 computes dst[M,N] = a[M,K] · bᵀ where b is the [N,K] matrix stored
 // as int8 rows bQ + per-row f32 scales bScales (b[j,k] ≈ float32(bQ[j,k]) *
-// bScales[j]). Each output row is widened int8→f32 into a reused scratch buffer,
-// then the SIMD dotF32 kernel (AVX2/NEON — the primitive MatmulBT uses) runs over
-// the whole row and the per-row scale is applied at write-back. Only the cheap
-// int8→f32 widen stays scalar; the multiply-accumulate is vectorized. The scratch
-// is one row wide and allocated once per worker. Parallelized over the N columns.
+// bScales[j]). Each output row is widened int8→f32 into a reused scratch buffer
+// via the SIMD dequantRowInt8 (AVX2/NEON — see q8Span, P2/2f0c65f), then the SIMD
+// dotF32 kernel (AVX2/NEON — the primitive MatmulBT uses) runs over the whole row
+// and the per-row scale is applied at write-back. Both the widen and the
+// multiply-accumulate are vectorized; only the O(1)-per-row scale-and-store stays
+// scalar. The scratch is one row wide and allocated once per worker. Parallelized
+// over the N columns.
 func MatmulBTQ8(a []float32, bQ []int8, bScales []float32, dst []float32, M, K, N int) {
 	var ws Workspace
 	MatmulBTQ8Into(&ws, a, bQ, bScales, dst, M, K, N)
