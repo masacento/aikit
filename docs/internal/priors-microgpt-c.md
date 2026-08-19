@@ -57,6 +57,21 @@ in `cpu-acceleration.md`'s Open follow-ups item 6, not restated here: not issue-
 either `apple-m1pro` or the `nvidia-rtx2070s` host's Ryzen/AVX2. This item is now a
 practice, not a prior.
 
+**Extension, 2026-08-19 — the norm/RoPE candidate this doc said "doesn't exist in `linalg`"
+turned out to exist in goinfer** (`decoder/rmsnorm.go`, `decoder/rope.go`) — flagged after a
+scoping correction, since this doc's own charter line only scoped the search to where the
+CPU-kernel *residue* lands (`linalg`), not to where every candidate the source project named
+actually lives. Same probe, same file shape, run in goinfer as
+`decoder/fma_issue_probe_test.go`. First pass at the original N∈{0..64} sweep did not
+reproduce — both kernels flipped verdict run to run, because these kernels (~1.1-2.7us) are
+an order of magnitude bigger than `dequantRowInt8` (~35-50ns), so N≤64 added too small a
+fraction of runtime to clear jitter. Widening to N∈{0..512} fixed it: both `rmsNorm` and
+`applyRoPE` reproducibly land at ratio ~1.0 — NOT issue-limited on `apple-m1pro`, unlike
+`applyRoPE`'s brief false-positive at the narrow sweep. The Ryzen/AVX2 run (`nobara`, once
+its goinfer 1.0 prep sweep cleared) agrees: both kernels ~1.0, not issue-limited, on both
+boxes. Full numbers live in goinfer's `docs/measurements/aikit-fma-issue-width-probe.md`, not
+restated here.
+
 ## 2 · Porting caution: accumulator-chain counts do not survive arm64 → amd64
 
 Their finding, stated as mechanism: an accumulator set is 16 floats — 4 registers and 4
