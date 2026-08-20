@@ -2,7 +2,6 @@ package encoder
 
 import (
 	"fmt"
-	"math"
 
 	"github.com/townsendmerino/aikit/sparse"
 )
@@ -127,11 +126,7 @@ func (s *SPLADE) expandIDs(ids []int32) sparse.SparseVec {
 			}
 		}
 	}
-	for v, x := range pooled {
-		if x > 0 {
-			pooled[v] = float32(math.Log1p(float64(x)))
-		}
-	}
+	log1pPoolInto(pooled)
 	var out sparse.SparseVec
 	for v, w := range pooled {
 		if w > 0 {

@@ -355,21 +355,55 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
    need either a different technique entirely or waiting for a future Go
    release.
 
-   **A fourth candidate from the same sweep, NOT attempted — genuinely
-   different scope, not a quick vectorization:** SPLADE's pooling
-   (`encoder/splade.go`) applies `float32(math.Log1p(float64(x)))` once
-   per vocab entry post-max (perf-campaign item 2, already reducing this
-   from millions of calls to V=30522). Unlike items 7/8, aikit has no
-   existing `Log1pF32` to vectorize — Go 1.27's `simd` package ships zero
-   transcendentals (confirmed against `src/simd`'s exported surface), so
-   this would mean designing and validating a NEW float32 minimax log1p
-   kernel from scratch, including deriving its own accuracy contract
-   (there is no existing tolerance test to inherit, unlike `ErfF32`'s
-   carefully-derived downstream-error-propagation bound). Read Go's own
-   `src/math/log1p.go` (Sun/FreeBSD's algorithm, ported) as the reference:
-   it is a multi-branch, bit-manipulation-heavy float64 algorithm, not a
-   drop-in vectorization target. Real candidate, correctly scoped as its
-   own task rather than rushed alongside 7/8.
+9. **SPLADE's `log1p` pooling — ✅ DONE, a new kernel, Experimental
+   tier.** The fourth candidate from item 8's sweep, and genuinely
+   different scope from items 7/8: `encoder/splade.go`'s pooling applies
+   `float32(math.Log1p(float64(x)))` once per vocab entry post-max
+   (perf-campaign item 2, already V=30522 calls, down from millions).
+   Unlike items 7/8, aikit had no existing `Log1pF32` to vectorize, and
+   Go 1.27's `simd` package ships zero transcendentals — this meant
+   designing a new float32 kernel, not vectorizing an existing one.
+
+   **Sourced from Cephes' verified single-precision `logf`** (Moshier,
+   `single/logf.c`), not invented: small x (< 2^-12) uses
+   `log1p(x) ≈ x - 0.5x²` directly (the dropped x³/3 term is empirically
+   below float32 precision there); larger x computes `u = 1+x` (safe —
+   x is never tiny in this branch, so no `1+x` cancellation), decomposes
+   u's IEEE-754 bits into a frexp-equivalent mantissa/exponent, reduces
+   into Cephes' exact domain (threshold `sqrt(2)/2`), and evaluates its
+   verified 9-coefficient polynomial. Cross-checked before writing any
+   code: the reduction bounds independently match Go's own
+   `src/math/log1p.go` (`Sqrt2M1`/`Sqrt2HalfM1` = Cephes' `SQRTHF`
+   exactly) — two independent sources agreeing on the same constants.
+   Validated with a throwaway sweep script *before* touching the repo:
+   max absolute error **2.97e-7** vs `math.Log1p` over x ∈ [0, 1e10]
+   (`TestLog1pF32Core_matchesMathLog1p`, bound set at 1e-6 with headroom
+   — comparable to `GELUF32`'s existing 1e-6 absolute bound). The vector
+   kernel (`TestLog1pF32CoreVec_matchesScalar`) came back **bit-identical
+   (0 diff)** to the scalar form of the same algorithm on `apple-m1pro`
+   — unlike items 7/8's polynomial, this one's `p = p*m + c` reassignment
+   shape apparently doesn't trigger arm64's scalar auto-fusion.
+
+   `pooled[v]` is seeded at 0 and only ever raised by `max`, so it is
+   never negative, and `log1pF32Core(0) == 0` exactly — the SIMD kernel
+   applies unconditionally to every lane (`TestLog1pPoolInto_zeroIsIdentity`),
+   no per-element mask needed for the scalar build's `x > 0` skip, which
+   was always a call-count optimization, not a correctness requirement.
+   `TestSPLADE_parity` (real cosine-vs-Python comparison) stays at
+   **1.000000 unchanged** under `GOEXPERIMENT=simd` — the ~3e-7 error
+   doesn't move it at all.
+
+   Measured (`BenchmarkLog1pPoolInto`, V=30522, ~15% positive density):
+   `apple-m1pro` 2.193 → 1.595 ns/elem (**~1.37x**), `nvidia-rtx2070s`
+   3.354 → 2.323 ns/elem (**~1.44x**) — smaller than items 7/8 on both
+   boxes because the vector kernel computes BOTH branches
+   unconditionally for every lane and mask-selects, paying the full
+   large-branch cost (bit manipulation + 9-term polynomial) even for the
+   ~85% of lanes that are 0 and would have cost nothing in the scalar
+   build's `x > 0` skip. Real on both boxes, but the most modest win of
+   the three landed kernels — reported honestly rather than rounded up.
+   Also bit-identical vector-vs-scalar on `nvidia-rtx2070s`, matching
+   `apple-m1pro` (not the arch-dependent split items 7/8 measured).
 
 GPU follow-ups (resident buffers, tiled kernel, batch-tiling) are **goinfer's** —
 see `goinfer/gpu` and goinfer's perf docs.
