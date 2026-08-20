@@ -623,14 +623,14 @@ func topkKernelsAgreeAt(t *testing.T, dev *gpu.Device, lib gpu.Library, q gpu.Qu
 	maxK := map[string]int{"topk_rows_r8": 8, "topk_rows_r16": 16, "topk_rows_r32": 32,
 		"topk_rows_r64": 64, "topk_rows": 1 << 30}
 
-	sb := dev.NewBufferFloats(scores)
-	mB := dev.NewBufferU32(uint32(M))
-	nB := dev.NewBufferU32(uint32(N))
+	sb := gpu.NewBufferOf(dev, scores)
+	mB := gpu.NewBufferOf(dev, []uint32{uint32(M)})
+	nB := gpu.NewBufferOf(dev, []uint32{uint32(N)})
 	for _, k := range []int{1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 100} {
 		want := cpuTopK(scores, M, N, k)
 		idxB := gpu.NewBufferLenOf[int32](dev, M*k)
 		valB := dev.NewBufferLen(M * k)
-		kB := dev.NewBufferU32(uint32(k))
+		kB := gpu.NewBufferOf(dev, []uint32{uint32(k)})
 		for _, name := range kernels {
 			if k > maxK[name] {
 				continue
@@ -640,7 +640,7 @@ func topkKernelsAgreeAt(t *testing.T, dev *gpu.Device, lib gpu.Library, q gpu.Qu
 				t.Fatalf("%s: %v", name, err)
 			}
 			// topk_rows consumes winners in place, so every kernel gets a fresh row.
-			if err := sb.WriteFloats(scores); err != nil {
+			if err := gpu.Upload(sb, scores); err != nil {
 				t.Fatalf("upload: %v", err)
 			}
 			if err := q.Launch(p, gpu.LaunchConfig{
@@ -737,13 +737,13 @@ func TestCUDATopK_splitMatchesOneBlock(t *testing.T) {
 				// per chunk and once across chunks.
 				scores[i] = float32(rng.Intn(64))
 			}
-			sb := dev.NewBufferFloats(scores)
-			mB := dev.NewBufferU32(uint32(M))
-			nB := dev.NewBufferU32(uint32(N))
+			sb := gpu.NewBufferOf(dev, scores)
+			mB := gpu.NewBufferOf(dev, []uint32{uint32(M)})
+			nB := gpu.NewBufferOf(dev, []uint32{uint32(N)})
 			for wi, w := range topkWidths {
 				for _, k := range []int{1, w} {
 					want := cpuTopK(scores, M, N, k)
-					kB := dev.NewBufferU32(uint32(k))
+					kB := gpu.NewBufferOf(dev, []uint32{uint32(k)})
 					ib := gpu.NewBufferLenOf[int32](dev, M*k)
 					vb := dev.NewBufferLen(M * k)
 					for _, parts := range []int{1, 2, 3, 7, 48, 1000} {
@@ -757,7 +757,7 @@ func TestCUDATopK_splitMatchesOneBlock(t *testing.T) {
 						}
 						pi := gpu.NewBufferLenOf[int32](dev, M*parts*k)
 						pv := dev.NewBufferLen(M * parts * k)
-						pB := dev.NewBufferU32(uint32(parts * k))
+						pB := gpu.NewBufferOf(dev, []uint32{uint32(parts * k)})
 						if err := q.Launch(split, gpu.LaunchConfig{
 							GridX: uint32(parts), GridY: uint32(M), GridZ: 1,
 							BlockX: topkBlockThreads, BlockY: 1, BlockZ: 1,

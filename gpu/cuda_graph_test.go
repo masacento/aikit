@@ -30,9 +30,9 @@ func TestCUDA_graphDependentChain(t *testing.T) {
 	q := d.NewCommandQueue()
 	const n = 5
 	const N = 64 // dependent increments per replay
-	x := d.NewBufferFloats(make([]float32, n))
-	one := d.NewBufferFloats([]float32{1, 1, 1, 1, 1})
-	nb := d.NewBufferU32(n)
+	x := NewBufferOf(d, make([]float32, n))
+	one := NewBufferOf(d, []float32{1, 1, 1, 1, 1})
+	nb := NewBufferOf(d, []uint32{n})
 
 	chain := func() error {
 		for i := 0; i < N; i++ {
@@ -61,8 +61,8 @@ func TestCUDA_graphDependentChain(t *testing.T) {
 			t.Fatalf("Sync: %v", e)
 		}
 		got := make([]float32, n)
-		if e := x.ReadFloats(got); e != nil {
-			t.Fatalf("ReadFloats: %v", e)
+		if e := Download(x, got); e != nil {
+			t.Fatalf("Download: %v", e)
 		}
 		for i := range got {
 			if got[i] != float32(N) {
@@ -101,10 +101,10 @@ func TestCUDA_graphReplay(t *testing.T) {
 		t.Fatalf("pipeline: %v", err)
 	}
 	q := d.NewCommandQueue()
-	a := d.NewBufferFloats([]float32{1, 2, 3, 4, 5})
-	b := d.NewBufferFloats([]float32{10, 20, 30, 40, 50})
+	a := NewBufferOf(d, []float32{1, 2, 3, 4, 5})
+	b := NewBufferOf(d, []float32{10, 20, 30, 40, 50})
 	out := d.NewBufferLen(5)
-	nb := d.NewBufferU32(5)
+	nb := NewBufferOf(d, []uint32{5})
 
 	// Capture vadd(a,b,out,n) — a pure async launch, no sync inside the closure.
 	g, err := q.Capture(func() error { return q.launch(p, 5, 5, []Buffer{a, b, out, nb}) })
@@ -118,8 +118,8 @@ func TestCUDA_graphReplay(t *testing.T) {
 			t.Fatalf("Sync: %v", err)
 		}
 		got := make([]float32, 5)
-		if err := out.ReadFloats(got); err != nil {
-			t.Fatalf("ReadFloats: %v", err)
+		if err := Download(out, got); err != nil {
+			t.Fatalf("Download: %v", err)
 		}
 		return got
 	}

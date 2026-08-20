@@ -73,8 +73,8 @@ func TestCUDA_scalarArgs(t *testing.T) {
 		y[i] = float32(10 * (i + 1)) // 10..80
 		want[i] = a*x[i] + y[i]
 	}
-	dx := d.NewBufferFloats(x)
-	dy := d.NewBufferFloats(y)
+	dx := NewBufferOf(d, x)
+	dy := NewBufferOf(d, y)
 
 	if err := q.Launch(p, Grid1D(n, 256), Arg(dy), Arg(dx), ArgValue(a), ArgValue(int32(n))); err != nil {
 		t.Fatalf("Launch: %v", err)
@@ -83,8 +83,8 @@ func TestCUDA_scalarArgs(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 	got := make([]float32, n)
-	if err := dy.ReadFloats(got); err != nil {
-		t.Fatalf("ReadFloats: %v", err)
+	if err := Download(dy, got); err != nil {
+		t.Fatalf("Download: %v", err)
 	}
 	for i := range want {
 		if got[i] != want[i] {
@@ -103,8 +103,8 @@ func TestCUDA_scalarArgs(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 	after := make([]float32, n)
-	if err := dy.ReadFloats(after); err != nil {
-		t.Fatalf("ReadFloats: %v", err)
+	if err := Download(dy, after); err != nil {
+		t.Fatalf("Download: %v", err)
 	}
 	same := true
 	for i := range after {
@@ -132,7 +132,7 @@ func TestCUDA_explicitGeometrySharedMem(t *testing.T) {
 		x[i] = float32(i + 1)
 		want += float64(x[i])
 	}
-	dx := d.NewBufferFloats(x)
+	dx := NewBufferOf(d, x)
 	out := d.NewBufferLen(1)
 
 	cfg := GridOne(block, block*4) // 1 block, `block` threads, block*4 bytes shared
@@ -146,8 +146,8 @@ func TestCUDA_explicitGeometrySharedMem(t *testing.T) {
 		t.Fatalf("Sync: %v", err)
 	}
 	got := make([]float32, 1)
-	if err := out.ReadFloats(got); err != nil {
-		t.Fatalf("ReadFloats: %v", err)
+	if err := Download(out, got); err != nil {
+		t.Fatalf("Download: %v", err)
 	}
 	if math.Abs(float64(got[0])-want) > 1e-3 {
 		t.Errorf("blocksum = %v, want %v", got[0], want)
@@ -177,8 +177,8 @@ func TestCUDA_hostBufferRoundTrip(t *testing.T) {
 	for i := range x {
 		x[i] = float32(i)
 	}
-	dx := d.NewBufferFloats(x)
-	dy := d.NewBufferFloats(make([]float32, n)) // zeros ⇒ y = a*x
+	dx := NewBufferOf(d, x)
+	dy := NewBufferOf(d, make([]float32, n)) // zeros ⇒ y = a*x
 
 	hb, err := NewHostBuffer[float32](d, n)
 	if err != nil {
@@ -238,7 +238,7 @@ func TestCUDA_asyncLaunchThenSync(t *testing.T) {
 	for i := range x {
 		x[i] = 1
 	}
-	dx := d.NewBufferFloats(x)
+	dx := NewBufferOf(d, x)
 
 	// reps launches, no sync between them.
 	for range reps {
@@ -253,8 +253,8 @@ func TestCUDA_asyncLaunchThenSync(t *testing.T) {
 
 	want := float32(math.Pow(float64(s), reps)) // 2^12 = 4096
 	got := make([]float32, n)
-	if err := dx.ReadFloats(got); err != nil {
-		t.Fatalf("ReadFloats: %v", err)
+	if err := Download(dx, got); err != nil {
+		t.Fatalf("Download: %v", err)
 	}
 	for i := range got {
 		if got[i] != want {
@@ -268,7 +268,7 @@ func TestCUDA_asyncLaunchThenSync(t *testing.T) {
 // malformed launch is an error rather than an undefined-behavior dispatch.
 func TestCUDA_launchRejectsBadInput(t *testing.T) {
 	d, q, p := setup(t, "saxpy")
-	dx := d.NewBufferFloats([]float32{1, 2, 3, 4})
+	dx := NewBufferOf(d, []float32{1, 2, 3, 4})
 
 	for _, tc := range []struct {
 		name string

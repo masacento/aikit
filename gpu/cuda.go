@@ -18,9 +18,8 @@
 //     contents be a zero-copy Go slice, so metal.go's Floats/Int8s/SetU32 both
 //     read AND write device memory in place. A discrete NVIDIA GPU has no such
 //     mapping, so faking those views would silently drop writes. Transfers are
-//     therefore EXPLICIT here: WriteFloats/WriteInt8s/SetU32 upload,
-//     ReadFloats/ReadInt8s/ReadU32 download. Same buffer constructors, explicit
-//     traffic.
+//     therefore EXPLICIT here: Upload/SetU32 upload, Download reads back into
+//     caller-owned storage. Same buffer constructors, explicit traffic.
 //
 //  2. **Dispatch launches whole blocks.** Metal's dispatchThreads launches
 //     EXACTLY n threads, so its kernels need no bounds check. CUDA launches
@@ -378,16 +377,6 @@ func (b Buffer) download(dst []byte) error {
 	return b.b.CopyToAt(bg, dst, int(b.off))
 }
 
-// NewBufferFloats allocates a device buffer and uploads data into it.
-func (d *Device) NewBufferFloats(data []float32) Buffer {
-	b := d.MustBuf(len(data)*4, len(data), "floats")
-	if err := b.upload(asBytes(data)); err != nil {
-		panic(fmt.Sprintf("cuda: NewBufferFloats upload: %v", err))
-	}
-	runtime.KeepAlive(data)
-	return b
-}
-
 // NewBufferLen allocates an uninitialized device buffer of nFloats float32s.
 func (d *Device) NewBufferLen(nFloats int) Buffer { return d.MustBuf(nFloats*4, nFloats, "len") }
 
@@ -396,114 +385,19 @@ func (d *Device) NewBufferLen(nFloats int) Buffer { return d.MustBuf(nFloats*4, 
 // size in raw bytes rather than float32s.
 func (d *Device) NewBufferBytes(n int) Buffer { return d.MustBuf(n, n, "bytes") }
 
-// NewBufferInt8 uploads int8 data (n counts bytes for this buffer).
-func (d *Device) NewBufferInt8(data []int8) Buffer {
-	b := d.MustBuf(len(data), len(data), "int8")
-	if err := b.upload(asBytes(data)); err != nil {
-		panic(fmt.Sprintf("cuda: NewBufferInt8 upload: %v", err))
-	}
-	runtime.KeepAlive(data)
-	return b
-}
-
-// NewBufferU32 uploads a single uint32 (a kernel scalar passed by reference, the
-// shape metal.go uses for `constant uint&` args).
-func (d *Device) NewBufferU32(v uint32) Buffer {
-	b := d.MustBuf(4, 1, "u32")
-	if err := b.upload(asBytes([]uint32{v})); err != nil {
-		panic(fmt.Sprintf("cuda: NewBufferU32 upload: %v", err))
-	}
-	return b
-}
-
-// NewBufferUint32s uploads packed u32 data (n counts u32 words).
-func (d *Device) NewBufferUint32s(data []uint32) Buffer {
-	b := d.MustBuf(len(data)*4, len(data), "uint32s")
-	if err := b.upload(asBytes(data)); err != nil {
-		panic(fmt.Sprintf("cuda: NewBufferUint32s upload: %v", err))
-	}
-	runtime.KeepAlive(data)
-	return b
-}
-
-// NewBufferU16s uploads u16 data (e.g. f16 group scales; n counts u16s). An empty
-// input still yields a live 1-element buffer, so a kernel arg is never a null
-// pointer — metal.go does the same.
-func (d *Device) NewBufferU16s(data []uint16) Buffer {
-	if len(data) == 0 {
-		return d.MustBuf(2, 1, "u16s")
-	}
-	b := d.MustBuf(len(data)*2, len(data), "u16s")
-	if err := b.upload(asBytes(data)); err != nil {
-		panic(fmt.Sprintf("cuda: NewBufferU16s upload: %v", err))
-	}
-	runtime.KeepAlive(data)
-	return b
-}
-
-// WriteFloats / WriteInt8s / WriteUint32s / SetU32 upload into an existing buffer.
-// On Metal these are slice writes through the UMA mapping; here they are explicit
-// H2D copies (divergence 1 in the file header).
-func (b Buffer) WriteFloats(src []float32) error {
-	err := b.upload(asBytes(src))
-	runtime.KeepAlive(src)
-	return err
-}
-
-func (b Buffer) WriteInt8s(src []int8) error {
-	err := b.upload(asBytes(src))
-	runtime.KeepAlive(src)
-	return err
-}
-
-func (b Buffer) WriteUint32s(src []uint32) error {
-	err := b.upload(asBytes(src))
-	runtime.KeepAlive(src)
-	return err
-}
-
 // SetU32 overwrites a 1-word uniform buffer (per-call: rope pos, nKeys, a row count).
 func (b Buffer) SetU32(v uint32) error { return b.upload(asBytes([]uint32{v})) }
 
-// ReadFloats / ReadInt8s / ReadUint32s download into caller-owned storage; the
-// slice's length is the transfer size. ReadU32 reads a 1-word buffer.
-func (b Buffer) ReadFloats(dst []float32) error {
-	err := b.download(asBytes(dst))
-	runtime.KeepAlive(dst)
-	return err
-}
-
-func (b Buffer) ReadInt8s(dst []int8) error {
-	err := b.download(asBytes(dst))
-	runtime.KeepAlive(dst)
-	return err
-}
-
-func (b Buffer) ReadUint32s(dst []uint32) error {
-	err := b.download(asBytes(dst))
-	runtime.KeepAlive(dst)
-	return err
-}
-
-func (b Buffer) ReadU32() (uint32, error) {
-	var v [1]uint32
-	if err := b.download(asBytes(v[:])); err != nil {
-		return 0, err
-	}
-	return v[0], nil
-}
-
 // ---- generic buffer verbs (any scalar element type) ----
 //
-// The NewBuffer*/Write*/Read* methods above name the element types aikit's own
-// consumers use, mirroring metal.go's constructors one for one. A consumer with a
-// wider mix of element types — a decode path allocating float32 activations, int32
-// indices, uint16 f16 scales and uint32 packed weights — wants the same four verbs
-// parameterized instead of a method per type. These are those, and they are free
-// functions for the same reason NewHostBuffer is: Go has no generic methods.
-//
-// Both spellings produce identical buffers; NewBufferFloats(x) is exactly
-// NewBufferOf(d, x).
+// A consumer with a wider mix of element types — a decode path allocating
+// float32 activations, int32 indices, uint16 f16 scales and uint32 packed
+// weights — wants the same four verbs parameterized instead of a method per
+// type. These are those, and they are free functions for the same reason
+// NewHostBuffer is: Go has no generic methods. This used to be two parallel
+// APIs (a type-suffixed one mirroring metal.go's constructors one for one,
+// plus these) with every real consumer already on the generic one; the
+// type-suffixed twin was deleted once nothing called it anymore.
 
 // NewBufferOf allocates a device buffer sized to data and uploads it. n for the
 // returned Buffer is len(data), in elements of T. Panics on allocation failure

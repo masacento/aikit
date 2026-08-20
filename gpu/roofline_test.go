@@ -79,8 +79,8 @@ func TestDeviceCeilings(t *testing.T) {
 		threads := 40 * 32 * 256 // enough waves that no SM runs dry
 		src := dev.MustBuf(streamBytes, streamBytes/4, "roofline-src")
 		out := NewBufferLenOf[int32](dev, threads)
-		n4 := dev.NewBufferU32(uint32(streamBytes / 16))
-		tot := dev.NewBufferU32(uint32(threads))
+		n4 := NewBufferOf(dev, []uint32{uint32(streamBytes / 16)})
+		tot := NewBufferOf(dev, []uint32{uint32(threads)})
 		d, err := bestOf(5, func() error { return q.Run1D(p, threads, 256, src, out, n4, tot) })
 		if err != nil {
 			t.Fatalf("stream_read run: %v", err)
@@ -98,8 +98,8 @@ func TestDeviceCeilings(t *testing.T) {
 		const threads, iters, unroll = 40 * 1024, 20000, 16
 		seed := NewBufferLenOf[int32](dev, 256)
 		out := NewBufferLenOf[int32](dev, threads)
-		it := dev.NewBufferU32(iters)
-		tot := dev.NewBufferU32(threads)
+		it := NewBufferOf(dev, []uint32{iters})
+		tot := NewBufferOf(dev, []uint32{threads})
 		d, err := bestOf(5, func() error { return q.Run1D(p, threads, 256, seed, out, it, tot) })
 		if err != nil {
 			t.Fatalf("%s run: %v", name, err)

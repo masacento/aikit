@@ -141,12 +141,12 @@ func (b *cudaBackend) NewI8Index(bq []int8, scales []float32, n, dim int) (idx a
 		b:      b,
 		n:      n,
 		dim:    dim,
-		codes:  b.dev.NewBufferInt8(bq),
-		scales: b.dev.NewBufferFloats(scales),
-		qi8:    b.dev.NewBufferInt8(make([]int8, dim)),
-		qscale: b.dev.NewBufferFloats([]float32{0}),
-		kbuf:   b.dev.NewBufferU32(uint32(dim)),
-		nbuf:   b.dev.NewBufferU32(uint32(n)),
+		codes:  gpu.NewBufferOf(b.dev, bq),
+		scales: gpu.NewBufferOf(b.dev, scales),
+		qi8:    gpu.NewBufferOf(b.dev, make([]int8, dim)),
+		qscale: gpu.NewBufferOf(b.dev, []float32{0}),
+		kbuf:   gpu.NewBufferOf(b.dev, []uint32{uint32(dim)}),
+		nbuf:   gpu.NewBufferOf(b.dev, []uint32{uint32(n)}),
 		out:    b.dev.NewBufferLen(n),
 		hq:     make([]int8, dim),
 	}
@@ -188,10 +188,10 @@ func (x *cudaI8Index) Score(q []float32, dst []float32) error {
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	qscale := quantizeRowInt8(q, x.hq)
-	if err := x.qi8.WriteInt8s(x.hq); err != nil {
+	if err := gpu.Upload(x.qi8, x.hq); err != nil {
 		return err
 	}
-	if err := x.qscale.WriteFloats([]float32{qscale}); err != nil {
+	if err := gpu.Upload(x.qscale, []float32{qscale}); err != nil {
 		return err
 	}
 	// gemv_w8a8 puts a LANE GROUP on each row, not a thread: gemvLanes threads
@@ -201,7 +201,7 @@ func (x *cudaI8Index) Score(q []float32, dst []float32) error {
 	if err := x.b.q.Run1D(x.b.gemv, x.n*gemvLanes, batchBlock, x.codes, x.qi8, x.scales, x.kbuf, x.qscale, x.out, x.nbuf); err != nil {
 		return err
 	}
-	return x.out.ReadFloats(dst)
+	return gpu.Download(x.out, dst)
 }
 
 // ScoreBatch scores M = len(queries) queries against all N rows in a single
@@ -234,8 +234,8 @@ func (x *cudaI8Index) ScoreBatch(queries [][]float32, dst []float32) (err error)
 			err = fmt.Errorf("gpu: batch scratch allocation failed: %v", r)
 		}
 	}()
-	qi8Buf := x.b.dev.NewBufferInt8(qi8)
-	qscaleBuf := x.b.dev.NewBufferFloats(qscale)
+	qi8Buf := gpu.NewBufferOf(x.b.dev, qi8)
+	qscaleBuf := gpu.NewBufferOf(x.b.dev, qscale)
 	outBuf := x.b.dev.NewBufferLen(M * N)
 	defer func() {
 		for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, outBuf} {
@@ -248,7 +248,7 @@ func (x *cudaI8Index) ScoreBatch(queries [][]float32, dst []float32) (err error)
 	if err := x.b.q.Sync(); err != nil {
 		return err
 	}
-	return outBuf.ReadFloats(dst)
+	return gpu.Download(outBuf, dst)
 }
 
 // Close releases this index's device buffers (the shared device stays alive for
@@ -483,7 +483,7 @@ func (x *cudaI8Index) launchTopK(scoreBuf, idxBuf, valBuf, mBuf, kBuf gpu.Buffer
 	// than cached, like the rest of TopKBatch's scratch.
 	partIdx := gpu.NewBufferLenOf[int32](x.b.dev, M*parts*k)
 	partVal := x.b.dev.NewBufferLen(M * parts * k)
-	pBuf := x.b.dev.NewBufferU32(uint32(parts * k))
+	pBuf := gpu.NewBufferOf(x.b.dev, []uint32{uint32(parts * k)})
 	defer func() {
 		for _, b := range []gpu.Buffer{partIdx, partVal, pBuf} {
 			x.b.dev.ReleaseBuf(b)
@@ -598,13 +598,13 @@ func (x *cudaI8Index) TopKBatch(queries [][]float32, k int) (hits [][]ann.Hit, e
 	var qi8Buf, qscaleBuf, scoreBuf, idxBuf, valBuf, mBuf, kBuf gpu.Buffer
 	if M <= topkScratchMaxM {
 		t := &x.tk
-		t.qi8 = x.growBuf(t.qi8, M*K, func(n int) gpu.Buffer { return x.b.dev.NewBufferInt8(make([]int8, n)) })
+		t.qi8 = x.growBuf(t.qi8, M*K, func(n int) gpu.Buffer { return gpu.NewBufferOf(x.b.dev, make([]int8, n)) })
 		t.qscale = x.growBuf(t.qscale, M, x.b.dev.NewBufferLen)
 		t.score = x.growBuf(t.score, M*N, x.b.dev.NewBufferLen)
 		t.idx = x.growBuf(t.idx, M*k, func(n int) gpu.Buffer { return gpu.NewBufferLenOf[int32](x.b.dev, n) })
 		t.val = x.growBuf(t.val, M*k, x.b.dev.NewBufferLen)
-		t.mBuf = x.growBuf(t.mBuf, 1, func(int) gpu.Buffer { return x.b.dev.NewBufferU32(uint32(M)) })
-		t.kBuf = x.growBuf(t.kBuf, 1, func(int) gpu.Buffer { return x.b.dev.NewBufferU32(uint32(k)) })
+		t.mBuf = x.growBuf(t.mBuf, 1, func(int) gpu.Buffer { return gpu.NewBufferOf(x.b.dev, []uint32{uint32(M)}) })
+		t.kBuf = x.growBuf(t.kBuf, 1, func(int) gpu.Buffer { return gpu.NewBufferOf(x.b.dev, []uint32{uint32(k)}) })
 		// The scalars are one element each, so growBuf never resizes them — they have
 		// to be rewritten every call instead.
 		if err := t.mBuf.SetU32(uint32(M)); err != nil {
@@ -613,22 +613,22 @@ func (x *cudaI8Index) TopKBatch(queries [][]float32, k int) (hits [][]ann.Hit, e
 		if err := t.kBuf.SetU32(uint32(k)); err != nil {
 			return nil, err
 		}
-		if err := t.qi8.WriteInt8s(qi8); err != nil {
+		if err := gpu.Upload(t.qi8, qi8); err != nil {
 			return nil, err
 		}
-		if err := t.qscale.WriteFloats(qscale); err != nil {
+		if err := gpu.Upload(t.qscale, qscale); err != nil {
 			return nil, err
 		}
 		qi8Buf, qscaleBuf, scoreBuf = t.qi8, t.qscale, t.score
 		idxBuf, valBuf, mBuf, kBuf = t.idx, t.val, t.mBuf, t.kBuf
 	} else {
-		qi8Buf = x.b.dev.NewBufferInt8(qi8)
-		qscaleBuf = x.b.dev.NewBufferFloats(qscale)
+		qi8Buf = gpu.NewBufferOf(x.b.dev, qi8)
+		qscaleBuf = gpu.NewBufferOf(x.b.dev, qscale)
 		scoreBuf = x.b.dev.NewBufferLen(M * N)
 		idxBuf = gpu.NewBufferLenOf[int32](x.b.dev, M*k)
 		valBuf = x.b.dev.NewBufferLen(M * k)
-		mBuf = x.b.dev.NewBufferU32(uint32(M))
-		kBuf = x.b.dev.NewBufferU32(uint32(k))
+		mBuf = gpu.NewBufferOf(x.b.dev, []uint32{uint32(M)})
+		kBuf = gpu.NewBufferOf(x.b.dev, []uint32{uint32(k)})
 		defer func() {
 			for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, scoreBuf, idxBuf, valBuf, mBuf, kBuf} {
 				x.b.dev.ReleaseBuf(b)
@@ -698,7 +698,7 @@ func (x *cudaI8Index) launchBatch(qi8Buf, qscaleBuf, outBuf gpu.Buffer, M, N, K 
 	// shapes this backend sees (K ≤ 1024) that is at most 16 KiB, inside the 48 KiB
 	// a block gets by default.
 	cfg.SharedMemBytes = uint32(qtile * K)
-	mBuf := x.b.dev.NewBufferU32(uint32(M))
+	mBuf := gpu.NewBufferOf(x.b.dev, []uint32{uint32(M)})
 	defer x.b.dev.ReleaseBuf(mBuf)
 	return x.b.q.Launch(p, cfg,
 		gpu.Arg(x.codes), gpu.Arg(qi8Buf), gpu.Arg(x.scales), gpu.Arg(x.kbuf),

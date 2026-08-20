@@ -32,17 +32,17 @@ func TestCUDA_smokeAdd(t *testing.T) {
 		t.Fatalf("pipeline: %v", err)
 	}
 	q := d.NewCommandQueue()
-	a := d.NewBufferFloats([]float32{1, 2, 3, 4, 5})
-	b := d.NewBufferFloats([]float32{10, 20, 30, 40, 50})
+	a := NewBufferOf(d, []float32{1, 2, 3, 4, 5})
+	b := NewBufferOf(d, []float32{10, 20, 30, 40, 50})
 	out := d.NewBufferLen(5)
-	n := d.NewBufferU32(5)
+	n := NewBufferOf(d, []uint32{5})
 	if err := q.Run1D(p, 5, 5, a, b, out, n); err != nil {
 		t.Fatalf("Run1D: %v", err)
 	}
 
 	got := make([]float32, 5)
-	if err := out.ReadFloats(got); err != nil {
-		t.Fatalf("ReadFloats: %v", err)
+	if err := Download(out, got); err != nil {
+		t.Fatalf("Download: %v", err)
 	}
 	want := []float32{11, 22, 33, 44, 55}
 	for i := range want {
@@ -79,17 +79,17 @@ func TestCUDA_tailBlockGuard(t *testing.T) {
 	// out is allocated with 3 elements of slack, pre-filled with a sentinel. If the
 	// tail block wrote past n, the sentinel would be clobbered.
 	const n, slack = 5, 3
-	a := d.NewBufferFloats([]float32{1, 2, 3, 4, 5})
-	b := d.NewBufferFloats([]float32{10, 20, 30, 40, 50})
-	out := d.NewBufferFloats([]float32{-1, -1, -1, -1, -1, -7, -7, -7})
-	nbuf := d.NewBufferU32(n)
+	a := NewBufferOf(d, []float32{1, 2, 3, 4, 5})
+	b := NewBufferOf(d, []float32{10, 20, 30, 40, 50})
+	out := NewBufferOf(d, []float32{-1, -1, -1, -1, -1, -7, -7, -7})
+	nbuf := NewBufferOf(d, []uint32{n})
 	if err := q.Run1D(p, n, 4, a, b, out, nbuf); err != nil { // 4 ∤ 5 ⇒ a partial tail block
 		t.Fatalf("Run1D: %v", err)
 	}
 
 	got := make([]float32, n+slack)
-	if err := out.ReadFloats(got); err != nil {
-		t.Fatalf("ReadFloats: %v", err)
+	if err := Download(out, got); err != nil {
+		t.Fatalf("Download: %v", err)
 	}
 	want := []float32{11, 22, 33, 44, 55, -7, -7, -7}
 	for i := range want {
@@ -120,7 +120,7 @@ func TestCUDA_ledgerDrains(t *testing.T) {
 	}
 	_ = d.NewCommandQueue()
 	scratch := d.NewBufferLen(16)
-	d.NewBufferInt8(make([]int8, 32))
+	NewBufferOf(d, make([]int8, 32))
 
 	allocs, objs := d.LedgerLen()
 	if allocs != 2 || objs != 2 { // 2 buffers; module + stream
