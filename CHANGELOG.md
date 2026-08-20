@@ -9,6 +9,50 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.23.0] — 2026-08-20
+
+### Added
+
+- **Go 1.27's `simd` package landed for three CPU kernels — Experimental tier,
+  gated behind `GOEXPERIMENT=simd`.** `linalg.SoftmaxRowInto` (~2.5-3.2x on both
+  boxes, up to ~8.5x on the exp kernel alone with AVX2's 256-bit width), RoPE
+  rotation (`encoder`/`vision`, ~1.4-1.9x), and SPLADE's `log1p` pooling
+  (`encoder`, a new kernel ported from Cephes' verified single-precision
+  `logf`, ~1.37-1.44x — no existing aikit kernel to vectorize, since Go 1.27's
+  `simd` package ships zero transcendentals). **Every number here compares
+  scalar Go arithmetic against vector CPU instructions (NEON on arm64, AVX2 on
+  amd64) — nothing to do with this repo's GPU (CUDA/Metal) backends**, a
+  separate code path measured in `gpu`'s own docs; stated explicitly since it
+  was a point of confusion internally before this shipped. Off by default: the
+  non-experimental build is byte-for-byte what shipped before this landed
+  (verified — full `linalg`/`encoder`/`vision` suites, golden and
+  cosine-parity tests, and SPLADE's real Python-parity comparison all pass
+  unchanged under the experiment). A new CI job on both arm64 and amd64
+  GitHub-hosted runners is the only place the experimental path is exercised.
+- **`chunk/treesitter`: `WithParseTimeoutMicros`** — a functional option to
+  override or disable the `Chunker`'s 1s default wall-clock parse timeout, for
+  a deterministic, reproducible build (a borderline file's parse straddling
+  the timeout made chunk output load-dependent across machines — ken issue
+  #35). `New()` and the zero-value `Chunker` keep the previous default
+  unchanged.
+
+### Changed
+
+- **Go toolchain bumped to 1.27.0** (all 16 `go.mod` files). Blocked once
+  already: `golangci-lint`'s bundled `staticcheck` panicked on Go 1.27's own
+  standard-library composite-literal syntax (`internal/poll`, Linux), not on
+  anything in aikit's own code — resolved once `golangci-lint` v2.13.0 shipped
+  a `staticcheck` bump; the pin (`tools/gpumod.GolangciLint`, the CI Action)
+  moved from v2.11.4.
+
+### Fixed
+
+- **`MatmulBTQ8`'s doc comment** described the pre-P2 scalar int8→f32 widen;
+  the widen has been SIMD (`dotI8AVX2`-based) since `2f0c65f`, months before
+  this fix. A cross-repo audit re-filed the already-fixed widen as an open
+  finding because the wrapper's comment didn't match `q8Span`'s own (correct)
+  comment three lines below it.
+
 ## [1.22.0] — 2026-08-18
 
 ### Added
@@ -2108,6 +2152,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.22.0...HEAD
+[1.23.0]: https://github.com/townsendmerino/aikit/compare/v1.22.0...v1.23.0
 [1.22.0]: https://github.com/townsendmerino/aikit/compare/v1.21.0...v1.22.0
 [1.21.0]: https://github.com/townsendmerino/aikit/compare/v1.20.0...v1.21.0
 [1.19.0]: https://github.com/townsendmerino/aikit/compare/v1.18.0...v1.19.0
