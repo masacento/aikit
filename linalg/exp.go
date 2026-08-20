@@ -136,6 +136,15 @@ func ExpF32Into(dst, src []float32) {
 //
 // A row whose exponentials all underflow to zero yields a uniform distribution,
 // matching the encoder's scalar softmaxRow rather than emitting NaN.
+//
+// The per-element work (max-scan, exp, scale) is vectorized when built with
+// GOEXPERIMENT=simd (see exp_simd.go); the f64 sum is always scalar, same
+// reduction order either way. The two builds are NOT bit-identical to each
+// other — the SIMD exp differs from the scalar one by up to 1 ULP (FMA
+// contraction; TestExpF32CoreVec_matchesScalarULP gates the bound — see that
+// file for why this doesn't reach the encoder's cosine goldens) — but each
+// build is internally deterministic and the default (non-experimental) build
+// is byte-for-byte what shipped before this existed.
 func SoftmaxRowInto(dst, src []float32) {
 	if len(dst) != len(src) {
 		panic("linalg: SoftmaxRowInto length mismatch")
@@ -143,31 +152,7 @@ func SoftmaxRowInto(dst, src []float32) {
 	if len(src) == 0 {
 		return
 	}
-	maxV := src[0]
-	for _, v := range src[1:] {
-		if v > maxV {
-			maxV = v
-		}
-	}
-	var sum float64
-	for i, v := range src {
-		// v-maxV <= 0 by construction, so only the underflow end is reachable
-		// and expF32Core's guards suffice.
-		e := expF32Core(v - maxV)
-		dst[i] = e
-		sum += float64(e)
-	}
-	if sum == 0 {
-		u := 1.0 / float32(len(dst))
-		for i := range dst {
-			dst[i] = u
-		}
-		return
-	}
-	inv := float32(1.0 / sum)
-	for i := range dst {
-		dst[i] *= inv
-	}
+	softmaxRowIntoRaw(dst, src)
 }
 
 // ErfF32 returns erf(x) in float32.

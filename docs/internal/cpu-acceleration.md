@@ -244,6 +244,60 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
    scheduling/unrolling change here would have nothing to win against. No load
    profile currently justifies chasing the memory side further at this kernel's
    real call frequency; revisit only if a profile flags it as a real hot path.
+7. **`SoftmaxRowInto` vectorized via Go 1.27's `simd` package — ✅ DONE
+   (item 13, "SIMD expF32"), Experimental tier, `linalg/exp_simd.go`.**
+   **Read this framing before quoting a number from this item — it has been a
+   point of confusion once already:** every ratio below compares two ways of
+   running the SAME math on the SAME CPU core — today's scalar Go arithmetic
+   vs. Go 1.27's `simd` package compiling to vector CPU instructions (NEON on
+   arm64, AVX2 on amd64). **It has nothing to do with this repo's GPU
+   (CUDA/Metal) kernels** — those are `gpu/*`, a completely separate code
+   path measured in `gpu`'s own docs. If this item's numbers ever make it
+   into a release note, state that explicitly, the way this entry does.
+
+   Landed after validating an uncompiled prototype
+   (`~/tmcode/go127-simd-audit`, 2026-08-20 — read the go1.27.0 `src/simd`
+   source directly since the authoring container had no 1.27 toolchain) by
+   actually compiling and benchmarking it on both boxes before touching
+   `linalg`. Measured (production `BenchmarkSoftmaxRow_vs_scalar`, same
+   function both builds, only the build tag differs):
+
+   | box | width | scalar (today) | SIMD | speedup |
+   |---|---|--:|--:|--:|
+   | `apple-m1pro` (NEON) | 128-bit (native) | ~5.2-5.3 ns/elem | ~2.08-2.10 ns/elem | **~2.5x** |
+   | `nvidia-rtx2070s` (AVX2) | 128-bit (default) | ~6.5-6.8 ns/elem | ~2.06-2.2 ns/elem | **~3.0-3.2x** |
+   | `nvidia-rtx2070s` (AVX2) | 256-bit (opt-in, `GODEBUG=simd='+256'`) | ~4.7-4.9 ns/elem | ~0.56-0.68 ns/elem (exp only, isolated) | **~6.9-8.5x** |
+
+   Go 1.27's `simd` package defaults conservatively to 128-bit even on AVX2
+   hardware; the wider width needs an explicit runtime opt-in past a safety
+   check (`GODEBUG=simd='+256'`) — correctness held there too, but a library
+   can't force this on its consumers unilaterally, so it stays a documented
+   knob rather than a default. Scope: only `SoftmaxRowInto` (real callers:
+   `encoder`, `vision`) — `ExpF32Into` has zero production callers as of this
+   writing and was deliberately NOT vectorized, since doing so correctly
+   would mean replicating `ExpF32`'s NaN/overflow/underflow guards via SIMD
+   masks for a function nobody calls; the validated prototype and this
+   landing both use `expF32Core`'s narrower "already-bounded" contract,
+   which is exactly `SoftmaxRowInto`'s real shape.
+
+   NOT bit-identical to the non-experimental build (the vector exp differs
+   by up to 1 ULP — FMA contraction; `TestExpF32CoreVec_matchesScalarULP`
+   gates the bound) — gated behind `GOEXPERIMENT=simd`, off by default, so
+   the default build is byte-for-byte what shipped before this landed
+   (verified: full `linalg`/`encoder`/`vision` suites pass unchanged).
+   Correctness verified on both boxes, both real hardware and forced
+   emulation (`GODEBUG=simd=0`, runs on any box regardless of ISA) —
+   `encoder`'s and `vision`'s golden/cosine tests also pass under
+   `GOEXPERIMENT=simd`, confirming the ≤1 ULP shift doesn't reach them. CI
+   coverage: a dedicated `simd` job (`.github/workflows/ci.yml`), both
+   arm64 and amd64 runners, since this is the ONLY place the experimental
+   path gets exercised — nothing else needed updating (`tools/gate`,
+   `consumergate`, the release gates all operate on the module graph or the
+   default build, neither of which this touches).
+
+   Next, not started: `A3`-`A6` siblings (`SiLUF32`, `GELUF32`, `TanhF32`,
+   `GELUTanhF32` — same technique, same validation shape) and goinfer's
+   parity ladder (`queue-performance.md` items this unblocks for adoption).
 
 GPU follow-ups (resident buffers, tiled kernel, batch-tiling) are **goinfer's** —
 see `goinfer/gpu` and goinfer's perf docs.

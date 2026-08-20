@@ -147,6 +147,37 @@ jobs:
       - name: test (aikit_checks)
         run: go test -tags aikit_checks ./linalg/
 
+  simd:
+    name: GOEXPERIMENT=simd (${{ matrix.os }})
+    # Experimental-tier coverage for the Go 1.27 simd package (item 13: SoftmaxRowInto's
+    # exp/max-scan/scale passes, exp_simd.go). The default (non-experimental) build is
+    # byte-for-byte unaffected by this code existing — SoftmaxRowInto's non-SIMD behavior
+    # is unchanged, gated by every other job in this file — so this is the ONLY place the
+    # GOEXPERIMENT=simd path gets exercised at all. Two runners because NEON (arm64) and
+    # AVX2 (amd64) are genuinely different code paths under the portable simd API. Real
+    # hardware AND forced emulation (GODEBUG=simd=0, runs on any box regardless of ISA) —
+    # both are correctness legs; this job asserts nothing about timing (perfgate's job).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: GOEXPERIMENT=simd go build ./linalg/...
+      - name: vet
+        run: GOEXPERIMENT=simd go vet ./linalg/...
+      - name: test (hardware)
+        run: GOEXPERIMENT=simd go test ./linalg/... ./encoder/... ./vision/...
+      - name: test (forced emulation)
+        run: GOEXPERIMENT=simd GODEBUG=simd=0 go test ./linalg/...
+      - name: execute softmax benchmark (no timing assertion)
+        run: GOEXPERIMENT=simd go test ./linalg/ -run '^$' -bench '^BenchmarkSoftmaxRow_vs_scalar$' -benchtime=1x
+
   treesitter:
     name: chunk/treesitter submodule
     runs-on: ubuntu-latest
