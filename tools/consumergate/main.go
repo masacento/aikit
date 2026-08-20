@@ -100,7 +100,6 @@ func run(args []string) int {
 	// cell never aborts the rest and the count is never lost.
 	checks := make([]gate.Check, 0, len(pairs))
 	for _, p := range pairs {
-		p := p
 		checks = append(checks, gate.Check{Name: p.String(), Run: func() gate.Cell { return checkPair(cfg, p) }})
 	}
 	cells := gate.RunAll(checks)
@@ -123,7 +122,7 @@ func run(args []string) int {
 		}
 		fmt.Printf("  %-52s %-30s %-30s %s\n", c.Name, rfield, cfield, verdict)
 		if c.Outcome == gate.OK {
-			mod := strings.SplitN(c.Name, "@", 2)[0]
+			mod, _, _ := strings.Cut(c.Name, "@")
 			for _, f := range c.Fields {
 				if f.Key == "compile" && f.State == "ok" {
 					compiled = append(compiled, shortLabel(mod))

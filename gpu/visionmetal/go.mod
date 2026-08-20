@@ -1,6 +1,6 @@
 module github.com/townsendmerino/aikit/gpu/visionmetal
 
-go 1.26.6
+go 1.27.0
 
 require (
 	github.com/townsendmerino/aikit v1.22.0

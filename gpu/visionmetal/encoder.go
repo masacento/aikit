@@ -130,10 +130,7 @@ func newEncoder(w vision.GPUWeights) (enc *encoder, err error) {
 	e.qa, e.ka, e.va = f32(np*hidden), f32(np*hidden), f32(np*hidden)
 	e.att, e.o, e.mlp, e.out = f32(np*hidden), f32(np*hidden), f32(np*hidden), f32(np*hidden)
 	e.mid = f32(np * inter)
-	wide := hidden
-	if inter > wide {
-		wide = inter
-	}
+	wide := max(inter, hidden)
 	e.qi8 = dev.NewBufferInt8(make([]int8, np*wide))
 	e.qs = f32(np)
 	e.s0, e.s1, e.s2 = dev.NewBufferU32(0), dev.NewBufferU32(0), dev.NewBufferU32(0)

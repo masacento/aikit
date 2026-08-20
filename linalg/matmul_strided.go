@@ -53,7 +53,7 @@ func matmulBTAcc64StridedSpan(a, bMat, dst []float32, M, K, N, bOff, bRowStride,
 		for j := j0; j < j1; j++ {
 			bBase := bOff + j*bRowStride
 			var s float64
-			for k := 0; k < K; k++ {
+			for k := range K {
 				s += float64(arow[k]) * float64(bMat[bBase+k*bElemStride])
 			}
 			drow[j] = float32(s)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -274,11 +275,11 @@ func (u *unigram) viterbiIDs(sentence string) []int32 {
 		endsAt = n.startAt
 	}
 	ids := make([]int32, 0, len(rev))
-	for i := len(rev) - 1; i >= 0; i-- {
-		if u.fuseUnk && rev[i] == u.unkID && len(ids) > 0 && ids[len(ids)-1] == u.unkID {
+	for _, r := range slices.Backward(rev) {
+		if u.fuseUnk && r == u.unkID && len(ids) > 0 && ids[len(ids)-1] == u.unkID {
 			continue // fuse consecutive <unk>
 		}
-		ids = append(ids, rev[i])
+		ids = append(ids, r)
 	}
 	return ids
 }

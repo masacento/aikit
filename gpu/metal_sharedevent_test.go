@@ -88,17 +88,17 @@ func TestSharedEventHandshake(t *testing.T) {
 
 	baseline := func() { // (1) one CB, N dispatches, one commit+wait
 		e := queue.Begin()
-		for i := 0; i < N; i++ {
-			for dd := 0; dd < dPerSeg; dd++ {
+		for range N {
+			for range dPerSeg {
 				e.Dispatch(work, grid, 256, buf, uIters)
 			}
 		}
 		e.End()
 	}
 	perLayer := func() { // (2) N CBs, N commit+wait
-		for i := 0; i < N; i++ {
+		for range N {
 			e := queue.Begin()
-			for dd := 0; dd < dPerSeg; dd++ {
+			for range dPerSeg {
 				e.Dispatch(work, grid, 256, buf, uIters)
 			}
 			e.End()
@@ -107,8 +107,8 @@ func TestSharedEventHandshake(t *testing.T) {
 	var base uint64            // monotonic event base (MTLSharedEvent must not go backwards, so never reset)
 	sharedEvt := func() bool { // (3) one CB, per-boundary GPU signal/wait + CPU ack
 		e := queue.Begin()
-		for i := 0; i < N; i++ {
-			for dd := 0; dd < dPerSeg; dd++ {
+		for i := range N {
+			for range dPerSeg {
 				e.Dispatch(work, grid, 256, buf, uIters)
 			}
 			if i < N-1 {
@@ -118,7 +118,7 @@ func TestSharedEventHandshake(t *testing.T) {
 		e.FinishEncoding()
 		e.Commit()
 		ok := true
-		for i := 0; i < N-1; i++ { // CPU handshake, concurrent with GPU execution
+		for i := range N - 1 { // CPU handshake, concurrent with GPU execution
 			if !spinUntil(base + uint64(2*i+1)) { // GPU finished segment i?
 				ok = false
 				break
@@ -134,7 +134,7 @@ func TestSharedEventHandshake(t *testing.T) {
 
 	bestMs := func(run func()) float64 {
 		best := 1e18
-		for r := 0; r < 4; r++ {
+		for r := range 4 {
 			start := time.Now()
 			run()
 			ms := float64(time.Since(start).Microseconds()) / 1000.0
@@ -154,7 +154,7 @@ func TestSharedEventHandshake(t *testing.T) {
 	var evMs float64
 	{
 		best := 1e18
-		for r := 0; r < 4; r++ {
+		for r := range 4 {
 			start := time.Now()
 			if !sharedEvt() {
 				t.Fatal("shared-event handshake deadlocked mid-measurement")

@@ -6,7 +6,7 @@
 // FOUR CHECKS:
 //  1. CHANGELOG.md has a `## [X.Y.Z]` section AND a `[X.Y.Z]:` compare link — a release
 //     deliverable; its failure messages name exactly what is missing.
-//  2. golangci-lint clean against .golangci.yml, build-pinned via `go run @v2.11.4` (the
+//  2. golangci-lint clean against .golangci.yml, build-pinned via `go run @v2.13.0` (the
 //     same the gpu gate, preflight, and CI resolve to) so a local gate reports identically.
 //  3. apidiff shows NO incompatible change in any Hard-tier package vs the previous tag —
 //     the 1.0 compatibility bar — with documented-Experimental symbols/members exempted.
@@ -198,7 +198,7 @@ func checkCoreDeps(root string) gate.Cell {
 	}
 	var ext []string
 	allowed := regexp.MustCompile(`^golang\.org/x/(text|sys)(/|$)`)
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		ln = strings.TrimSpace(ln)
 		if ln == "" || strings.HasPrefix(ln, rootMod) || allowed.MatchString(ln) {
 			continue
@@ -229,7 +229,7 @@ func apidiffCanaryOut(root string) string {
 // old tag (v1.8.0) is never selected for a current-era release.
 func prevTag(root, ver string) string {
 	out, _ := gpumod.Exec(root, "", nil, "git", "tag", "--list", "v*", "--sort=-v:refname")
-	for _, ln := range strings.Split(out, "\n") {
+	for ln := range strings.SplitSeq(out, "\n") {
 		t := strings.TrimSpace(ln)
 		if t != "" && t != "v"+ver {
 			return t
@@ -285,7 +285,7 @@ func inconMsg(name, msg string) gate.Cell {
 }
 
 func firstLine(s string) string {
-	for _, ln := range strings.Split(s, "\n") {
+	for ln := range strings.SplitSeq(s, "\n") {
 		if strings.TrimSpace(ln) != "" {
 			return strings.TrimSpace(ln)
 		}
