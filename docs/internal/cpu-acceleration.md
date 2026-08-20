@@ -298,6 +298,78 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
    Next, not started: `A3`-`A6` siblings (`SiLUF32`, `GELUF32`, `TanhF32`,
    `GELUTanhF32` — same technique, same validation shape) and goinfer's
    parity ladder (`queue-performance.md` items this unblocks for adoption).
+8. **RoPE rotation vectorized via Go 1.27's `simd` package — ✅ DONE, both
+   sites, Experimental tier.** A follow-up sweep of the rest of the
+   codebase (beyond item 7's `linalg/exp.go` scope) for elementwise math
+   the original audit missed found aikit's own RoPE (two independent
+   implementations, both NeoX rotate_half, neither transcendental — pure
+   `x*cos - y*sin` / `y*cos + x*sin`, so unlike item 7 there is no new
+   minimax polynomial involved, just vectorizing arithmetic that already
+   existed): `vision/qwen_encoder.go`'s `applyRotaryVision` (Qwen2-VL
+   vision tower, own comment cites "~8k patches × 16 heads × 32 blocks"
+   per image) and `encoder/rope.go`'s `rotateHalfInto` (text encoders,
+   called per attention layer). Landed as
+   `vision/rope_simd.go`/`rope_scalar.go` and
+   `encoder/rope_simd.go`/`rope_scalar.go`, same build-tag dispatch shape
+   as item 7.
+
+   Measured (`BenchmarkApplyRotaryVision`/`BenchmarkRotateHalfInto`, same
+   function both builds):
+
+   | box | kernel | scalar | SIMD | speedup |
+   |---|---|--:|--:|--:|
+   | `apple-m1pro` | applyRotaryVision (headDim=128) | 0.534 ns/elem | 0.284 ns/elem | ~1.9x |
+   | `apple-m1pro` | rotateHalfInto (half=32) | 0.401 ns/elem | 0.267 ns/elem | ~1.5x |
+   | `nvidia-rtx2070s` | applyRotaryVision | 0.603 ns/elem | 0.336 ns/elem | ~1.8x |
+   | `nvidia-rtx2070s` | rotateHalfInto | 0.532 ns/elem | 0.334 ns/elem | ~1.6x |
+
+   Smaller than item 7's ~2.5-3.2x — these are tiny, cheap-per-element
+   calls (no polynomial, just a handful of multiply/add/subtract), so
+   fixed per-call overhead eats a bigger share of the win. Still real on
+   both boxes.
+
+   **Accuracy note, worth stating precisely because it differs from item
+   7**: this is pure `Mul`/`Sub`/`Add` — no `MulAdd`, so no FMA
+   contraction is *requested*. Measured anyway rather than assumed
+   bit-identical (`TestApplyRotaryVision_matchesScalar`,
+   `TestRotateHalfInto_matchesScalar`): **bit-identical (0 diff) on
+   `nvidia-rtx2070s`**, but **~2.4e-7 max abs diff (~2 ULP-class) on
+   `apple-m1pro`** — Go's arm64 scalar compiler auto-fuses `a*b - c*d`
+   shapes into a real hardware FMA where amd64's does not (same asymmetry
+   item 7's doc noted for `p*r+c`), so the scalar REFERENCE itself already
+   differs by architecture; the SIMD build's divergence from IT differs
+   correspondingly. `encoder`/`vision` golden and cosine-parity tests pass
+   unchanged under `GOEXPERIMENT=simd` on both boxes.
+
+   **Two related candidates from the same sweep, ruled out — not a
+   priority call, a hard API gap:** `embed/model.go`'s `encodeIDs`
+   (Model2Vec weighted-mean pooling, "77.8% of an index run") and
+   `embed/pool.go`'s `L2Normalize` both carry an explicit, tested
+   precision contract — sum-of-squares/weighted-sum accumulates in
+   float64, each float32 element widened before the multiply-accumulate,
+   narrowed to float32 only at the very end ("accumulating in float32
+   silently drifts cosine below the 1−1e-5 parity bar... do not
+   'optimize' it away," `embed/model.go`). **Go 1.27's `simd` package has
+   no float32↔float64 conversion at all** — not even a widen — so this
+   contract cannot be expressed with it, full stop. Not attempted; would
+   need either a different technique entirely or waiting for a future Go
+   release.
+
+   **A fourth candidate from the same sweep, NOT attempted — genuinely
+   different scope, not a quick vectorization:** SPLADE's pooling
+   (`encoder/splade.go`) applies `float32(math.Log1p(float64(x)))` once
+   per vocab entry post-max (perf-campaign item 2, already reducing this
+   from millions of calls to V=30522). Unlike items 7/8, aikit has no
+   existing `Log1pF32` to vectorize — Go 1.27's `simd` package ships zero
+   transcendentals (confirmed against `src/simd`'s exported surface), so
+   this would mean designing and validating a NEW float32 minimax log1p
+   kernel from scratch, including deriving its own accuracy contract
+   (there is no existing tolerance test to inherit, unlike `ErfF32`'s
+   carefully-derived downstream-error-propagation bound). Read Go's own
+   `src/math/log1p.go` (Sun/FreeBSD's algorithm, ported) as the reference:
+   it is a multi-branch, bit-manipulation-heavy float64 algorithm, not a
+   drop-in vectorization target. Real candidate, correctly scoped as its
+   own task rather than rushed alongside 7/8.
 
 GPU follow-ups (resident buffers, tiled kernel, batch-tiling) are **goinfer's** —
 see `goinfer/gpu` and goinfer's perf docs.

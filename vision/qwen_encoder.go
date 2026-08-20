@@ -669,20 +669,10 @@ func rmsNormInto(out, x, w []float32, rows, dim int) {
 	}
 }
 
-// applyRotaryVision applies NeoX rotate_half rotary to one head_dim vector in place,
-// given precomputed cos/sin of length head_dim.
-func applyRotaryVision(vec, cos, sin []float32) {
-	// In-place pairwise: each (vec[d], vec[d+half]) rotates into itself, so no
-	// per-call scratch is needed — this was ~8M tiny allocs on a realistic image
-	// (~8k patches × 16 heads × 32 blocks). Reads x,y before overwriting either,
-	// and is bit-identical to the tmp version (a+(-b)·s == a-b·s in IEEE).
-	half := len(vec) / 2
-	for d := range half {
-		x, y := vec[d], vec[d+half]
-		vec[d] = x*cos[d] - y*sin[d]
-		vec[d+half] = y*cos[d+half] + x*sin[d+half]
-	}
-}
+// applyRotaryVision applies NeoX rotate_half rotary to one head_dim vector in
+// place, given precomputed cos/sin of length head_dim. Body lives in
+// rope_scalar.go / rope_simd.go (build-tag dispatched on GOEXPERIMENT=simd);
+// this doc comment is the canonical one for both.
 
 func silu(x []float32) {
 	linalg.SiLUInto(x, x)

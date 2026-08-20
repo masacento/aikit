@@ -136,14 +136,15 @@ func (t *ropeTable) applyRows(x []float32, heads, rows int) {
 		base := m * stride
 		for h := range heads {
 			off := base + h*hd
-			for d := range half {
-				x1 := x[off+d]
-				x2 := x[off+half+d]
-				c := cosRow[d]
-				s := sinRow[d]
-				x[off+d] = x1*c - x2*s
-				x[off+half+d] = x2*c + x1*s
-			}
+			rotateHalfInto(x[off:off+half], x[off+half:off+hd], cosRow, sinRow)
 		}
 	}
 }
+
+// rotateHalfInto is applyRows' per-(position,head) NeoX rotate_half body:
+//
+//	x1[d] = x1[d]*c[d] - x2[d]*s[d]
+//	x2[d] = x2[d]*c[d] + x1[d]*s[d]  (using x1's ORIGINAL value)
+//
+// Body lives in rope_scalar.go / rope_simd.go (GOEXPERIMENT=simd dispatch);
+// this doc comment is the canonical one for both.
