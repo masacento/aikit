@@ -1,5 +1,7 @@
 package encoder
 
+import "github.com/townsendmerino/aikit/linalg"
+
 // swigluMLP runs one block's SwiGLU MLP and adds the output to the
 // residual `h` (in place). Caller applies the post-MLP LayerNorm.
 //
@@ -31,9 +33,15 @@ func swigluMLP(h []float32, Fc11, Fc12, Fc2 []float32, D, intermediate, L int, s
 	gate := s.gate[:L*intermediate]
 	s.mm(h, Fc11, val, L, D, intermediate)
 	s.mm(h, Fc12, gate, L, D, intermediate)
-	// mid = val ⊙ SiLU(gate), reuse val's storage
+	// mid = val ⊙ SiLU(gate), reuse val's storage. SiLU(gate) is computed
+	// batched (linalg.SiLUInto, vectorized under GOEXPERIMENT=simd — T1,
+	// autoresearch round 1) in place on gate, then the elementwise multiply
+	// into val is its own trivial pass — this used to call scalar SiLUF32
+	// per element here, the encoder's own biggest caller of SiLU that
+	// SiLUInto's vectorization never actually reached until now.
+	linalg.SiLUInto(gate, gate)
 	for i, v := range val {
-		val[i] = v * silu(gate[i])
+		val[i] = v * gate[i]
 	}
 	mid := s.mid[:L*D]
 	s.mm(val, Fc2, mid, L, intermediate, D)

@@ -697,6 +697,60 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
     doc's own stop condition triggers here if the elementwise layer's share
     has fallen under ~2-3% of the forward.
 
+14. **Wiring fix: `encoder`'s real hot paths never called the batched
+    kernels items 10-12 vectorized — ✅ FOUND AND FIXED, correctness-only,
+    no new kernel.** Found while re-profiling for T2's stop-condition
+    check (autoresearch loop, immediately after T2): `linalg.SiLUInto`/
+    `GELUInto`/`GELUTanhInto` DO have real production callers — but they
+    were `vision/qwen_encoder.go` and `vision/encoder.go` (the SigLIP/
+    Qwen2-VL towers), NOT `encoder`'s main text-forward path. `encoder`'s
+    own biggest activation call sites — `mlp.go`'s `swigluMLP` and
+    `swigluMLPQ8` (`val[i] = v * silu(gate[i])`), `bert.go`'s `gelu`/
+    `geluTanh` (chunked per-element loops), and `gte.go`'s GeGLU (the
+    `~27% of GTE.Encode at L=690` hotspot item 8's own doc cites) — all
+    called the SCALAR single-element `SiLUF32`/`GELUF32`/`GELUTanhF32`
+    directly, never the batched `Into` functions. **Items 10-12's landed
+    SIMD kernels were real, tested, and measured — but genuinely
+    unreachable from `encoder`'s own main forward pass until this fix.**
+
+    A `cpu-acceleration.md` profile (`go tool pprof -top`,
+    `BenchmarkEncode_singleLong`, `apple-m1pro`) before this fix confirms
+    it directly: zero samples in any `*Vec`/`*IntoRaw` SIMD symbol
+    anywhere in the trace — only scalar `expF32Core`/`ExpF32`/`SiLUF32`.
+
+    Fixed by rewiring each site to call the batched function on its
+    existing chunk/row slice (in place — `GELUInto(x[lo:hi], x[lo:hi])`
+    etc.) instead of a per-element scalar loop, keeping every existing
+    core-level `parallelRows` split exactly as it was (SIMD now layers
+    UNDER the existing multi-core parallelism, not instead of it):
+    `bert.go`'s `gelu`/`geluTanh`, `mlp.go`'s `swigluMLP`, `forward_q8.go`'s
+    `swigluMLPQ8`, `gte.go`'s GeGLU loop. `geluScalar` (bert.go) had zero
+    callers left anywhere (production or test) after the fix and was
+    deleted; `silu`/`softmaxRows`(unscaled) were left in place — both have
+    real, independent test coverage of their own even though `silu` has no
+    remaining production caller either.
+
+    Re-profiling after the fix (same `BenchmarkEncode_singleLong` on
+    `apple-m1pro`, plus `BenchmarkGTEEncode/L512` for the GeGLU
+    architecture) now shows the SIMD symbols present and load-bearing
+    (`siluIntoRaw@simd128`, `softmaxRowScaledIntoRaw@simd128`,
+    `geluIntoRaw@simd128`, `erfVec@simd128`), with the matmul kernels
+    (`dotNEON2x8`/`blockedFill`) still dominant at 54-69% — the
+    elementwise layer's combined share (SiLU/GELU + the T2 softmax-scale
+    fusion) landed at **~1.2-1.9% of the forward on both the SwiGLU-model
+    and GeGLU (GTE) architectures** — under the autoresearch doc's own
+    2-3% stop threshold. Full gate green on both boxes: the default build
+    verified bit-identical (existing golden/cosine suites, unchanged), the
+    `GOEXPERIMENT=simd` build's `encoder`+`vision` goldens pass, the
+    `GODEBUG=simd=0` emulation leg, and `-race`.
+
+    **This closes the autoresearch loop's T1+T2 stop condition.** Not
+    because the technique stopped working — because it worked well enough,
+    once actually wired up, that there is no longer enough elementwise
+    share left to chase with T3-T5. See
+    `docs/prompts/simd-elementwise-autoresearch.md`'s STATUS block for the
+    stop record.
+
 GPU follow-ups (resident buffers, tiled kernel, batch-tiling) are **goinfer's** —
 see `goinfer/gpu` and goinfer's perf docs.
 

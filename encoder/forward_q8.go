@@ -269,8 +269,10 @@ func swigluMLPQ8(h []float32, fc11, fc12, fc2 *linalg.WeightMat,
 	Fc12Q, Fc12Scales, _, _ := fc12.Int8()
 	s.mmq8(val, h, Fc11Q, Fc11Scales, L, D, intermediate)
 	s.mmq8(gate, h, Fc12Q, Fc12Scales, L, D, intermediate)
+	// Same batched-SiLU fix as swigluMLP (T1, autoresearch round 1).
+	linalg.SiLUInto(gate, gate)
 	for i, v := range val {
-		val[i] = v * silu(gate[i])
+		val[i] = v * gate[i]
 	}
 	mid := s.mid[:L*D]
 	Fc2Q, Fc2Scales, _, _ := fc2.Int8()

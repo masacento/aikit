@@ -396,43 +396,34 @@ func l2norm(v []float32) []float32 { return embed.L2Normalize(v) }
 // transformers' "gelu" activation is the erf form, not the tanh approximation.
 func gelu(x []float32) {
 	// Chunked so a long activation block (BERT's [L,intermediate]) splits across
-	// cores; geluScalar is math.Erf per element, which is expensive enough that
+	// cores; each chunk is expensive enough (math.Erf-class transcendental) that
 	// this is one of the largest serial stages once the matmuls are parallel.
-	// Elementwise and in place, so the split is numerically inert.
+	// Elementwise and in place, so the split is numerically inert. Each chunk
+	// routes through linalg.GELUInto (vectorized under GOEXPERIMENT=simd — T1,
+	// autoresearch round 2) instead of a per-element scalar loop, so this now
+	// layers SIMD-within-a-chunk under the existing core-level parallelism —
+	// this was the encoder's own gap the autoresearch loop found: GELUInto had
+	// real callers (vision/qwen_encoder.go) but not this one, its biggest.
 	const chunk = 4096
 	chunks := (len(x) + chunk - 1) / chunk
 	parallelRows(chunks, len(x), func(start, end int) {
 		lo, hi := start*chunk, min(end*chunk, len(x))
-		for i, v := range x[lo:hi] {
-			x[lo+i] = geluScalar(v)
-		}
+		linalg.GELUInto(x[lo:hi], x[lo:hi])
 	})
-}
-
-// geluScalar is the exact erf GELU for one element — the same computation gelu
-// applies, exposed for GeGLU where the activation is on a strided gate (gte.go).
-//
-// Routed through linalg's float32 kernel rather than math.Erf (perf-campaign
-// item 13). math.Erf is a multi-segment float64 rational and was the single
-// most expensive transcendental in the forward at 29.4 ns/element. Not
-// bit-identical; the contract is absolute error ≤1e-06, which is under 15% of
-// the HF goldens' existing maxΔ budget. See linalg.GELUF32.
-func geluScalar(v float32) float32 {
-	return linalg.GELUF32(v)
 }
 
 // geluTanh applies the tanh-approximation GELU in place — HF's "gelu_new" /
 // "gelu_fast" / "gelu_pytorch_tanh", a different function from the exact erf
 // form gelu applies (see Config.geluTanh and linalg.GELUTanhF32). Same chunking
 // as gelu, for the same reason: elementwise and in place, so splitting is
-// numerically inert.
+// numerically inert. Same SIMD-under-parallelism fix as gelu (T1, autoresearch
+// round 3): each chunk routes through linalg.GELUTanhInto instead of a
+// per-element scalar loop.
 func geluTanh(x []float32) {
 	const chunk = 4096
 	chunks := (len(x) + chunk - 1) / chunk
 	parallelRows(chunks, len(x), func(start, end int) {
 		lo, hi := start*chunk, min(end*chunk, len(x))
-		for i, v := range x[lo:hi] {
-			x[lo+i] = linalg.GELUTanhF32(v)
-		}
+		linalg.GELUTanhInto(x[lo:hi], x[lo:hi])
 	})
 }
