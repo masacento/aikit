@@ -190,6 +190,10 @@ func (f *FlatI8) Close() error {
 		_ = f.gpu.Close() //nolint:errcheck // teardown: dropping the device index before the mmap, nothing to flush
 		f.gpu = nil
 	}
+	if f.gpuShard != nil {
+		_ = f.gpuShard.Close() //nolint:errcheck // teardown: dropping the shard device index before the mmap, nothing to flush
+		f.gpuShard = nil
+	}
 	if f.mmap == nil || f.closed {
 		return nil // in-memory (nothing to release) or already closed
 	}

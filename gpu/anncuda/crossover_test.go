@@ -42,6 +42,16 @@ const (
 	iters     = 10
 )
 
+// shardShares are the CPU∥GPU shard-split candidates the crossover sweep also
+// measures (backend "cpu+cuda"): at N=100_000 they put the device shard at
+// ~35k rows (below both gpu/anncuda's and gpu/annmetal's topkMinN — forces
+// ScoreBatch on both) and ~60k rows (above CUDA's 50_000 threshold — CUDA
+// gets on-device top-k fusion for its shard here — but still below Metal's
+// 100_000, so Metal's mirror of this sweep stays in the ScoreBatch-fallback
+// regime at both shares). See gpu/annmetal/crossover_test.go's identical
+// comment for the full reasoning; kept in sync across both files by hand.
+var shardShares = []float64{0.35, 0.6}
+
 func envInts(key string, def []int) []int {
 	v := os.Getenv(key)
 	if v == "" {
@@ -213,6 +223,50 @@ func TestCUDAANNCrossover(t *testing.T) {
 			t.Logf("N=%-7d batch=%-4d  cpu %8.0f q/s  cuda %8.0f q/s  %5.2f×  recall cpu %.4f cuda %.4f  parity %v",
 				N, b, cpuThr[b], gpuThr, sp, cr, gr, parityOK)
 		}
+
+		// --- CPU∥GPU shard-split QueryBatch: see shardShares' doc comment for the
+		// topkMinN regime this sweep does and doesn't reach at these N values. ---
+		for _, share := range shardShares {
+			if err := fi8.EnableGPUShardSplit(share); err != nil {
+				t.Logf("N=%d share=%.2f: EnableGPUShardSplit: %v (skipping)", N, share, err)
+				continue
+			}
+			for _, b := range batches {
+				qs := qpool[:b]
+				for range warmup {
+					fi8.QueryBatch(qs, kTop)
+				}
+				var hits [][]ann.Hit
+				best := bench.MinDuration(iters, func() { hits = fi8.QueryBatch(qs, kTop) })
+				wallMs := float64(best.Nanoseconds()) / 1e6
+				thr := float64(b) / best.Seconds()
+				recall := meanRecall(hits, truth)
+				parityOK, maxDelta := parity(hits, cpuHitsByBatch[b], cpuRecall[b], recall)
+				if !parityOK {
+					t.Errorf("PARITY(shard share=%.2f): N=%d batch=%d — cpu+cuda ranking diverged from CPU int8 (recall %.4f vs %.4f).",
+						share, N, b, recall, cpuRecall[b])
+				}
+				sp := thr / cpuThr[b]
+				shape := bench.Shape{N: N, Dim: dim, Batch: b, K: kTop}
+				rec := bench.Record{
+					Workload: "ann.FlatI8.QueryBatch", Backend: "cpu+cuda", Precision: "int8",
+					Device: gpuDev, Shape: shape,
+					// Same discrete-GPU framing as the whole-corpus cuda row above: H2D+D2H
+					// folded into Wall, Compute set equal to it.
+					Timing:     bench.Timing{Compute: wallMs, Wall: wallMs},
+					Throughput: thr, ThroughputUnit: "queries/s",
+					Quality:      bench.Quality{RecallAtK: &recall, ParityOK: parityOK, MaxDeltaVsCPU: maxDelta},
+					SpeedupVsCPU: &sp,
+					Meta:         meta,
+				}
+				if err := bench.AppendRecords(recordsPath, rec); err != nil {
+					t.Fatalf("append shard records: %v", err)
+				}
+				t.Logf("N=%-7d batch=%-4d share=%.2f (gpu shard≈%d rows)  cpu+cuda %8.0f q/s  %5.2f×  recall %.4f  parity %v",
+					N, b, share, int(share*float64(N)), thr, sp, recall, parityOK)
+			}
+		}
+
 		fi8.Close()
 	}
 	t.Logf("records → %s ; generate the doc with:\n  go run ./bench/cmd/benchreport docs/bench-records/*.jsonl > docs/BENCH-gpu-results.md", recordsPath)

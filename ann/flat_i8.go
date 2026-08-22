@@ -52,6 +52,12 @@ type FlatI8 struct {
 	// (see backend.go). When set, query scores on the device instead of the CPU
 	// W8A8 kernel, falling back to CPU if a device Score errors.
 	gpu I8Index
+	// gpuShard is non-nil after EnableGPUShardSplit: a device-resident copy of
+	// ONLY rows [0, gpuShardRows) — the complement [gpuShardRows, n) scores on
+	// the CPU concurrently with it. Independent of gpu/EnableGPU (see backend.go);
+	// QueryBatch-only, does not affect Query/QueryFilter.
+	gpuShard     I8Index
+	gpuShardRows int
 	// ws is a persistent W8A8 scratch for scorePaged, reused across the per-block
 	// matmuls instead of MatmulBTW8A8 allocating a fresh Workspace per block
 	// (~9766 blocks per query on a 10M-vector index — audit #13). Guarded by
@@ -199,11 +205,14 @@ func (f *FlatI8) query(q []float32, k int, keep func(int) bool) []Hit {
 	return f.topHits(dst, k, keep)
 }
 
-// topHits selects the k highest scores from dst (one score per indexed vector),
-// descending, ties broken by ascending index, honoring an optional keep filter.
-// k <= 0 or k >= Len returns all, sorted. Shared by Query and QueryBatch.
+// topHits selects the k highest scores from dst (one score per indexed vector,
+// or per shard row when dst is a shard-sized sub-score, not always f.n — the
+// caller offsets returned indices when dst represents a sub-range), descending,
+// ties broken by ascending index, honoring an optional keep filter. k <= 0 or
+// k >= len(dst) returns all, sorted. Shared by Query, QueryBatch, and the
+// CPU∥GPU shard-split path.
 func (f *FlatI8) topHits(dst []float32, k int, keep func(int) bool) []Hit {
-	if k <= 0 || k >= f.n {
+	if k <= 0 || k >= len(dst) {
 		hits := make([]Hit, 0, f.n)
 		for i, s := range dst {
 			if keep == nil || keep(i) {

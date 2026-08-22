@@ -118,6 +118,54 @@ tolerance. Tests assert exact equality.
   that work:** on `apple-m1pro` `dotNEON2x8` is at ~95% of FMLA peak, so the f32 kernel
   is compute-bound and no load-reduction lever helps here even where the amd64 analysis
   said it would (perf-dead-ends §2).
+- **`ann.FlatI8.EnableGPUShardSplit` (CPU∥GPU shard-split QueryBatch) — shipped
+  2026-08-20, real win bounded and share/box/scale-dependent, NOT the ~1.5-1.7×
+  the whole-corpus throughput ratio implied.** Follow-on from the July 2026 GPU
+  crossover finding (M×N readback fixed by fusing top-k on-device; see
+  `archive/perf-campaign-2026-07/perf-campaign-2026-07-28.md`): split the corpus
+  into a device-resident shard and a CPU-scored shard, score both CONCURRENTLY
+  per `QueryBatch` call, merge. The premise (measured on `apple-m1pro` at
+  N=100k/batch=64: CPU 2.3k q/s, Metal 3.4k q/s, "neither saturates DRAM, so
+  splitting should be roughly additive") assumed CPU and GPU are close in
+  speed. Measuring the actual shard-split path — not just the whole-corpus
+  numbers it was extrapolated from — on both boxes shows that assumption only
+  holds sometimes:
+  - **`apple-m1pro` (Metal): real, modest wins, mostly positive.** At
+    N=100,000/batch=64, `metal`-only is 3548 q/s; `cpu+metal` at share=0.60
+    (60k-row GPU shard) is 4485 q/s (**1.26×** over GPU-only). At
+    N=10,000/batch=256, `metal`-only 23,776 q/s → `cpu+metal` share=0.35
+    34,803 q/s (**1.46×**, the best case measured). But batch=1 is always
+    worse than CPU-simd alone (GPU dispatch overhead isn't amortized at one
+    query), and a badly-chosen share can lose to GPU-only outright (N=10,000/
+    batch=64, share=0.60: 15,804 q/s vs `metal`-only's 19,726 — **0.80×**).
+  - **`nvidia-rtx2070s` (CUDA): wins only at small N, actively HURTS at
+    N=100,000.** At N=100,000/batch=64, `cuda`-only is 33,386 q/s
+    (**30×** over CPU's 1108 q/s — this box's CPU/GPU gap is an order of
+    magnitude larger than the M1's ~1.5×). Every tested share LOSES to
+    GPU-only there: share=0.60 gives 6,906 q/s (**0.21×** of GPU-only),
+    share=0.35 gives 4,228 q/s (**0.13×**) — the CPU shard, even at 35-40% of
+    the corpus, takes far longer than CUDA's much larger complementary share,
+    so the `sync.WaitGroup` merge waits on the slow side and the combined
+    result is WORSE than just using CUDA alone. At N=10,000 (CPU/GPU gap only
+    ~6×), the same technique genuinely helps: `cuda`-only 38,083 q/s →
+    `cpu+cuda` share=0.60 44,513 q/s (**1.17×** over GPU-only, and the best
+    absolute number in the whole sweep).
+  - **The one-line rule:** shard-split is worth it only when CPU and GPU
+    throughput are within roughly the same order of magnitude for that N —
+    check the box's own `Query`/`QueryBatch` crossover numbers first. When the
+    GPU is 10×+ faster than CPU at the N in question (CUDA at N≥100k on this
+    box), giving the CPU ANY meaningful share of the corpus makes it the
+    bottleneck and shard-split should not be used. `gpuShare` is not
+    auto-tuned (see `EnableGPUShardSplit`'s doc comment) — pick it from a
+    measurement like this one, per box, per N, not from the whole-corpus
+    throughput ratio.
+  - Correctness held everywhere measured (`parity=true`, exact-CPU-matching
+    recall, on both boxes, all shares, all batches) — this is a throughput
+    finding, not a correctness one. Full sweep:
+    `docs/bench-records/crossover-{metal,cuda}.jsonl` (`Backend:
+    "cpu+metal"`/`"cpu+cuda"` rows), reproducible via
+    `AIKIT_GPU_BENCH=1 go test ./gpu/annmetal/... -run Crossover` (and the
+    CUDA mirror in `gpu/anncuda`).
 
 ### AVX2 kernel numbers (Ryzen 7 3700X, `-bench 'Dot'`, MB/s)
 

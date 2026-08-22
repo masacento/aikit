@@ -1,6 +1,11 @@
 package ann
 
-import "sync"
+import (
+	"slices"
+	"sync"
+
+	"github.com/townsendmerino/aikit/linalg"
+)
 
 // Backend is a device accelerator for FlatI8 scoring. It is registered by an
 // aikit/gpu build (native Metal today, CUDA later) via RegisterBackend in an
@@ -64,6 +69,16 @@ func (f *FlatI8) QueryBatch(queries [][]float32, k int) [][]Hit {
 		if len(q) != f.dim {
 			allDim = false
 			break
+		}
+	}
+	// CPU∥GPU shard-split path (preferred over all three below, when configured):
+	// a device-resident shard and a CPU-scored shard score the whole batch
+	// concurrently, then their per-query top-k results merge. See
+	// EnableGPUShardSplit. Falls through to the tiers below on any error, exactly
+	// like the tiers below fall through to each other.
+	if f.gpuShard != nil && allDim && k > 0 {
+		if hits, ok := f.queryBatchSharded(queries, k); ok {
+			return hits
 		}
 	}
 	// Device top-k path (preferred): the backend selects each query's top-k on the
@@ -161,14 +176,193 @@ func (f *FlatI8) EnableGPU() error {
 	return nil
 }
 
-// GPUEnabled reports whether Query scores on the device backend.
+// GPUEnabled reports whether Query scores on the device backend. Only reflects
+// EnableGPU (the whole-corpus path): an index with EnableGPUShardSplit but not
+// EnableGPU reports false here even though QueryBatch is GPU-accelerated,
+// since Query/QueryFilter are unaffected by the shard-split path.
 func (f *FlatI8) GPUEnabled() bool { return f.gpu != nil }
+
+// EnableGPUShardSplit makes the FIRST rows = int(gpuShare*n) rows resident on
+// the registered device backend, and marks the remaining rows to score on the
+// CPU — concurrently with the device shard, on every subsequent QueryBatch
+// call (see the shard-split tier at the top of QueryBatch). Independent of
+// EnableGPU: Query and QueryFilter are unaffected, only QueryBatch is.
+//
+// gpuShare is an absolute row-count knob, not an auto-tuned one: how many
+// rows are worth putting on the device is backend- and scale-dependent (a
+// device backend's own on-device top-k selection declines below its own
+// threshold — e.g. gpu/annmetal's topkMinN=100_000, gpu/anncuda's =50_000,
+// neither visible to this package — falling back to a score-then-host-select
+// path that is slower per row than the fused one). Pick gpuShare by measuring
+// QueryBatch throughput at a few candidate shares on the box that matters,
+// the same way this repo's crossover benchmarks record a per-box,
+// per-backend number rather than compute one.
+//
+// gpuShare must be in (0, 1) and n >= 2, so neither shard is empty; returns
+// errShardRange otherwise. Also returns an error if no backend is registered,
+// if the index is paged (CPU-only until Phase 2, same as EnableGPU), or if
+// the device upload fails — on any error QueryBatch keeps using its other
+// tiers. A second call replaces the prior shard device index (the old one is
+// closed).
+func (f *FlatI8) EnableGPUShardSplit(gpuShare float64) error {
+	if backend == nil {
+		return errNoBackend
+	}
+	if f.pager != nil {
+		return errPagedGPU
+	}
+	if f.closed {
+		panic("ann: EnableGPUShardSplit on a closed FlatI8")
+	}
+	if f.n < 2 || !(gpuShare > 0 && gpuShare < 1) {
+		return errShardRange
+	}
+	rows := int(gpuShare * float64(f.n))
+	if rows < 1 {
+		rows = 1
+	}
+	if rows > f.n-1 {
+		rows = f.n - 1
+	}
+	idx, err := backend.NewI8Index(f.bq[:rows*f.dim], f.scales[:rows], rows, f.dim)
+	if err != nil {
+		return err
+	}
+	if f.gpuShard != nil {
+		_ = f.gpuShard.Close() //nolint:errcheck // releasing the superseded shard index; the replacement already built
+	}
+	f.gpuShard = idx
+	f.gpuShardRows = rows
+	return nil
+}
+
+// queryBatchSharded runs the CPU∥GPU shard-split path: the device-resident
+// shard and the CPU-scored shard score the whole batch CONCURRENTLY, then
+// each query's two shard-local top-k results merge into one global top-k. ok
+// is false if either shard's scoring failed, in which case the caller falls
+// through to QueryBatch's other tiers — the same "try, else fall through"
+// contract every tier in QueryBatch uses.
+func (f *FlatI8) queryBatchSharded(queries [][]float32, k int) ([][]Hit, bool) {
+	var gpuHits [][]Hit
+	var gpuOK bool
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		gpuHits, gpuOK = f.scoreShardGPU(queries, k)
+	}()
+
+	cpuHits, cpuOK := f.scoreShardCPU(queries, k)
+	wg.Wait()
+
+	if !gpuOK || !cpuOK {
+		return nil, false
+	}
+
+	out := make([][]Hit, len(queries))
+	for m := range queries {
+		// gpuHits[m]'s indices are already corpus-global (the shard is rows
+		// [0, gpuShardRows)); cpuHits[m]'s were offset in scoreShardCPU. Gather +
+		// full sort + truncate is Flat.queryShards' own merge shape (flat.go),
+		// just 2-way instead of N-way — correct for the same reason: each
+		// shard's local top-k is a superset of its contribution to the global
+		// top-k under this package's total order (hitCmp).
+		merged := append(append([]Hit(nil), gpuHits[m]...), cpuHits[m]...)
+		slices.SortFunc(merged, hitCmp)
+		if len(merged) > k {
+			merged = merged[:k]
+		}
+		out[m] = merged
+	}
+	return out, true
+}
+
+// scoreShardGPU scores queries against the device-resident shard [0,
+// gpuShardRows), preferring on-device top-k selection and falling back to
+// score-then-host-select — the same two-tier fallback QueryBatch's own
+// whole-corpus dispatch uses above, just scoped to the shard.
+func (f *FlatI8) scoreShardGPU(queries [][]float32, k int) ([][]Hit, bool) {
+	if ti, ok := f.gpuShard.(I8TopKIndex); ok && k < f.gpuShardRows {
+		if hits, err := ti.TopKBatch(queries, k); err == nil && len(hits) == len(queries) {
+			return hits, true
+		}
+	}
+	bi, ok := f.gpuShard.(I8BatchIndex)
+	if !ok {
+		return nil, false
+	}
+	sc := batchScratchPool.Get().(*batchScratch)
+	defer batchScratchPool.Put(sc)
+	need := len(queries) * f.gpuShardRows
+	if cap(sc.dst) < need {
+		sc.dst = make([]float32, need)
+	}
+	dst := sc.dst[:need]
+	if err := bi.ScoreBatch(queries, dst); err != nil {
+		return nil, false
+	}
+	hits := make([][]Hit, len(queries))
+	for m := range queries {
+		hits[m] = f.topHits(dst[m*f.gpuShardRows:(m+1)*f.gpuShardRows], k, nil)
+	}
+	return hits, true
+}
+
+// scoreShardCPU scores queries against the CPU-scored shard [gpuShardRows,
+// n) in one batched W8A8 matmul — the same kernel query() uses at M=1,
+// generalized here to M=len(queries) so the CPU side gets the same
+// weight-streamed-once win the device batched tier gets — then offsets
+// returned indices by gpuShardRows so they are corpus-global.
+func (f *FlatI8) scoreShardCPU(queries [][]float32, k int) ([][]Hit, bool) {
+	shardN := f.n - f.gpuShardRows
+	if shardN <= 0 {
+		return nil, false
+	}
+	M := len(queries)
+	sc := shardCPUScratchPool.Get().(*shardCPUScratch)
+	defer shardCPUScratchPool.Put(sc)
+	if cap(sc.qbuf) < M*f.dim {
+		sc.qbuf = make([]float32, M*f.dim)
+	}
+	qbuf := sc.qbuf[:M*f.dim]
+	for m, q := range queries {
+		copy(qbuf[m*f.dim:(m+1)*f.dim], q)
+	}
+	need := M * shardN
+	if cap(sc.dst) < need {
+		sc.dst = make([]float32, need)
+	}
+	dst := sc.dst[:need]
+	linalg.MatmulBTW8A8Into(&sc.ws, qbuf, f.bq[f.gpuShardRows*f.dim:], f.scales[f.gpuShardRows:], dst, M, f.dim, shardN)
+	hits := make([][]Hit, M)
+	for m := range queries {
+		h := f.topHits(dst[m*shardN:(m+1)*shardN], k, nil)
+		for i := range h {
+			h[i].Index += f.gpuShardRows
+		}
+		hits[m] = h
+	}
+	return hits, true
+}
+
+// shardCPUScratch is the pooled per-batch scratch for scoreShardCPU: the
+// flattened-queries buffer, the W8A8 kernel's Workspace, and the shard-sized
+// score matrix. Separate from flatI8Scratch/batchScratch — a different shape
+// (M·dim + M·shardN) from either of those.
+type shardCPUScratch struct {
+	ws   linalg.Workspace
+	qbuf []float32
+	dst  []float32
+}
+
+var shardCPUScratchPool = sync.Pool{New: func() any { return new(shardCPUScratch) }}
 
 type annError string
 
 func (e annError) Error() string { return string(e) }
 
 const (
-	errNoBackend annError = "ann: no device backend registered (build with the aikit/gpu backend)"
-	errPagedGPU  annError = "ann: EnableGPU unsupported on a paged index (CPU-only until Phase 2)"
+	errNoBackend  annError = "ann: no device backend registered (build with the aikit/gpu backend)"
+	errPagedGPU   annError = "ann: EnableGPU unsupported on a paged index (CPU-only until Phase 2)"
+	errShardRange annError = "ann: EnableGPUShardSplit requires 0 < gpuShare < 1 and n >= 2"
 )
