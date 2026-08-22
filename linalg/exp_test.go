@@ -358,6 +358,33 @@ func BenchmarkGELU_vs_mathErf(b *testing.B) {
 	})
 }
 
+// BenchmarkSiLU_vs_scalar compares SiLUInto (vectorized under GOEXPERIMENT=simd,
+// scalar loop over SiLUF32 in the default build) against a math.Exp-based
+// scalar reference — the shape encoder/linalg.go's silu wraps.
+func BenchmarkSiLU_vs_scalar(b *testing.B) {
+	const n = 65536
+	rng := rand.New(rand.NewSource(4))
+	src := make([]float32, n)
+	for i := range src {
+		src[i] = float32(rng.NormFloat64() * 4)
+	}
+	dst := make([]float32, n)
+	b.Run("math.Exp/f64", func(b *testing.B) {
+		for b.Loop() {
+			for i, v := range src {
+				dst[i] = float32(float64(v) / (1 + math.Exp(-float64(v))))
+			}
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+	})
+	b.Run("SiLUInto", func(b *testing.B) {
+		for b.Loop() {
+			SiLUInto(dst, src)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+	})
+}
+
 func TestSiLUF32_accuracy(t *testing.T) {
 	// SiLU is judged RELATIVELY, unlike GELU. x/(1+e^-x) is a division, not a
 	// subtraction, so neither tail cancels and relative accuracy is achievable

@@ -2,7 +2,11 @@
 
 package linalg
 
-import "simd"
+import (
+	"math"
+
+	"simd"
+)
 
 // softmaxRowIntoRaw (SIMD build) — perf-campaign item 13, validated as a
 // prototype (~/tmcode/go127-simd-audit, 2026-08-20) before landing here: on
@@ -100,7 +104,8 @@ func softmaxRowIntoRaw(dst, src []float32) {
 type expSIMDConsts struct {
 	log2e, magic, ln2Hi, ln2Lo             simd.Float32s
 	c0, c1, c2, c3, c4, c5, one, underflow simd.Float32s
-	i127                                   simd.Int32s
+	two, overflow, posInf                  simd.Float32s
+	i127, i1, i255                         simd.Int32s
 }
 
 func newExpSIMDConsts() expSIMDConsts {
@@ -117,19 +122,24 @@ func newExpSIMDConsts() expSIMDConsts {
 		c5:        simd.BroadcastFloat32s(5.0000001201e-1),
 		one:       simd.BroadcastFloat32s(1),
 		underflow: simd.BroadcastFloat32s(expUnderflowF32),
+		two:       simd.BroadcastFloat32s(2),
+		overflow:  simd.BroadcastFloat32s(expOverflowF32),
+		posInf:    simd.BroadcastFloat32s(float32(math.Inf(1))),
 		i127:      simd.BroadcastInt32s(127),
+		i1:        simd.BroadcastInt32s(1),
+		i255:      simd.BroadcastInt32s(255),
 	}
 }
 
 // expF32CoreVec is expF32Core (exp.go), vectorized — same constants, same
-// round-magic trick, same Cephes minimax chain, same op order. Same contract
-// as the scalar expF32Core: caller has bounded x <= 0 (softmax's domain
-// after subtracting the row max), so the e>=255 overflow branch expF32Core
-// itself guards is unreachable here and not replicated — this is NOT a
-// vectorization of the general-purpose ExpF32 (which still has zero
-// production callers as of this writing and is intentionally left
-// unvectorized rather than replicating its NaN/overflow guards for no real
-// caller).
+// round-magic trick, same Cephes minimax chain, same op order, including the
+// e>=255 two-step scale expF32Core uses for x close enough to the overflow
+// bound that k reaches 128 while the true result is still finite (2^128
+// would encode +Inf and poison it — see expF32Core's own comment). Valid for
+// the same domain ExpF32 delegates to the scalar core: x in
+// [expUnderflowF32, expOverflowF32]. x > expOverflowF32 or NaN is NOT this
+// function's job — see expF32Vec, which adds those two guards on top for a
+// caller (SiLU) whose argument is unbounded, unlike softmax's x <= 0.
 func expF32CoreVec(x simd.Float32s, c *expSIMDConsts) simd.Float32s {
 	z := x.Mul(c.log2e)
 	kf := z.Add(c.magic).Sub(c.magic) // round-to-nearest-even via 1.5*2^23
@@ -142,14 +152,63 @@ func expF32CoreVec(x simd.Float32s, c *expSIMDConsts) simd.Float32s {
 	p = p.MulAdd(r, c.c5)
 	res := p.Mul(r).Mul(r).Add(r).Add(c.one) // p*r^2 + r + 1, same op order
 
-	// 2^k by bit construction: (k+127)<<23 reinterpreted as float32.
-	// x <= 0 => k <= 0 => e <= 127: the e>=255 overflow branch is unreachable.
+	// 2^k by bit construction: (k+127)<<23 reinterpreted as float32. For
+	// softmax's x <= 0 domain, e is always < 255 (see the comment this used
+	// to carry) and the branch below is inert; for SiLU's e^-x with x very
+	// negative (e.g. x=-88), e CAN reach 255+, which is why the two-step
+	// path exists at all — both branches are computed and mask-selected,
+	// the two-branch pattern this codebase already uses for Erf/Tanh.
 	e := kf.ConvertToInt32().Add(c.i127)
-	scale := e.ShiftAllLeft(23).ToBits().BitsToFloat32()
-	res = res.Mul(scale)
+	scaleLo := e.ShiftAllLeft(23).ToBits().BitsToFloat32()
+	scaleHi := e.Sub(c.i1).ShiftAllLeft(23).ToBits().BitsToFloat32()
+	resLo := res.Mul(scaleLo)
+	resHi := res.Mul(scaleHi).Mul(c.two)
+	res = resHi.IfElse(e.GreaterEqual(c.i255), resLo)
 
 	// Lanes with x < underflow have e <= 0; e=0 self-flushes via a zero
 	// scale but e<0 shifts sign bits into garbage — mask keeps only
 	// in-domain lanes (Masked zeroes where the mask is false).
 	return res.Masked(x.GreaterEqual(c.underflow))
+}
+
+// expF32Vec is ExpF32 (exp.go), vectorized: expF32CoreVec plus the two guards
+// it doesn't cover — overflow saturates to +Inf, NaN propagates — the full
+// contract a caller with an UNBOUNDED argument needs (unlike softmax, whose
+// domain after subtracting the row max is always x <= 0). This is the guard
+// work ExpF32Into declined to build for its caller-less state; SiLU's real
+// caller is what justifies building it now.
+func expF32Vec(x simd.Float32s, c *expSIMDConsts) simd.Float32s {
+	res := expF32CoreVec(x, c)
+	res = c.posInf.IfElse(x.Greater(c.overflow), res)
+	// NaN != NaN is the one IEEE comparison that's true for NaN and only
+	// NaN, so this reproduces ExpF32's `if x != x { return x }` branch-free.
+	return x.IfElse(x.NotEqual(x), res)
+}
+
+// siluIntoRaw is SiLUInto (exp.go) with the length/empty checks already done
+// — SiLU's autoresearch T1 target (docs/prompts/simd-elementwise-autoresearch.md).
+// x/(1+e^-x) is where item 7's SoftmaxRowInto could stay narrow: exp's
+// argument here is UNBOUNDED, so this is built on expF32Vec (full guards),
+// not the softmax-only expF32CoreVec. The saturating ends need no branch of
+// their own — they fall out of expF32Vec's own guards exactly as the scalar
+// SiLUF32's doc comment says: x far below the exp overflow bound makes
+// e^-x=+Inf and x/(1+Inf) a signed zero; x far above it makes e^-x flush to
+// 0 and the result exactly x (Div's IEEE semantics do the rest).
+func siluIntoRaw(dst, src []float32) {
+	n := len(src)
+	c := newExpSIMDConsts()
+	var probe simd.Float32s
+	L := probe.Len()
+
+	i := 0
+	for ; i+L <= n; i += L {
+		x := simd.LoadFloat32s(src[i : i+L])
+		e := expF32Vec(x.Neg(), &c)
+		x.Div(c.one.Add(e)).Store(dst[i : i+L])
+	}
+	if i < n {
+		x, _ := simd.LoadFloat32sPart(src[i:])
+		e := expF32Vec(x.Neg(), &c)
+		x.Div(c.one.Add(e)).StorePart(dst[i:])
+	}
 }

@@ -343,9 +343,9 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
    `consumergate`, the release gates all operate on the module graph or the
    default build, neither of which this touches).
 
-   Next, not started: `A3`-`A6` siblings (`SiLUF32`, `GELUF32`, `TanhF32`,
-   `GELUTanhF32` — same technique, same validation shape) and goinfer's
-   parity ladder (`queue-performance.md` items this unblocks for adoption).
+   Next: `A3`-`A6` siblings — `SiLUF32` done (item 10); `GELUF32`, `TanhF32`,
+   `GELUTanhF32` not started — and goinfer's parity ladder
+   (`queue-performance.md` items this unblocks for adoption).
 8. **RoPE rotation vectorized via Go 1.27's `simd` package — ✅ DONE, both
    sites, Experimental tier.** A follow-up sweep of the rest of the
    codebase (beyond item 7's `linalg/exp.go` scope) for elementwise math
@@ -452,6 +452,68 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
    the three landed kernels — reported honestly rather than rounded up.
    Also bit-identical vector-vs-scalar on `nvidia-rtx2070s`, matching
    `apple-m1pro` (not the arch-dependent split items 7/8 measured).
+
+10. **`SiLUInto` vectorized via Go 1.27's `simd` package — ✅ DONE, Experimental
+    tier, `linalg/exp_simd.go`.** First of the `A3`-`A6` siblings item 7 left
+    "next, not started" (`docs/prompts/simd-elementwise-autoresearch.md`'s T1,
+    round 1) — chosen first because, unlike GELU/Erf/Tanh's two-branch
+    cancellation shape, SiLU's only extra work is the guards, and it already
+    has a real caller (`encoder/linalg.go`'s `silu`) that justifies building
+    them.
+
+    **The guards ARE the work.** `x/(1+e^-x)` feeds exp an UNBOUNDED
+    argument — unlike item 7's `SoftmaxRowInto`, whose domain after
+    subtracting the row max is always `x <= 0`, so `expF32CoreVec` could
+    stay narrow and skip `ExpF32`'s overflow/NaN guards (that item's own
+    entry says so explicitly: "`ExpF32Into` has zero production callers...
+    deliberately NOT vectorized"). SiLU is the caller that changes that
+    calculus. Two things had to be built, both new:
+    - `expF32Vec` — the full vector `ExpF32`, wrapping `expF32CoreVec` with
+      overflow (→ `+Inf`, via `IfElse`) and NaN (→ NaN, via the `x != x`
+      IEEE identity, also `IfElse`) — the two-branch compute-both-and-select
+      pattern this file already uses for Erf/Tanh, just for guards instead
+      of algorithm branches.
+    - `expF32CoreVec` itself needed a real fix, not just a wrapper: its
+      e>=255 two-step scale (the boundary correction scalar `expF32Core` has
+      for when `k` reaches 128 while the true result is still finite — `2^k`
+      built in one step would encode `+Inf` and poison a finite answer) was
+      never replicated, because softmax's `x <= 0` domain can never reach
+      it. SiLU's `e^-x` does reach it (`x` near `-88`). Extended in place
+      (same function, same existing `TestExpF32CoreVec_matchesScalarULP`
+      gate, which never exercised the new branch since it's still
+      unreachable for `x <= 0` — fresh coverage added specifically for the
+      newly-reachable boundary: `TestExpF32Vec_matchesScalarULP`).
+
+    SiLU's own saturating ends (per `SiLUF32`'s doc comment) fall out of
+    `expF32Vec`'s guards with no additional branch: very negative `x` makes
+    `e^-x = +Inf`, and IEEE division gives `x/(1+Inf)` a signed zero; very
+    positive `x` flushes `e^-x` to 0 (already handled) and the result is
+    exactly `x`.
+
+    Measured (`BenchmarkSiLU_vs_scalar`, same `SiLUInto`, only the build tag
+    differs — compared against the CURRENT shipped scalar path, not the
+    `math.Exp` strawman the benchmark also carries for scale):
+
+    | box | scalar (today) | SIMD | speedup |
+    |---|--:|--:|--:|
+    | `apple-m1pro` (NEON) | 3.86 ns/elem | 1.34 ns/elem | **~2.9x** |
+    | `nvidia-rtx2070s` (AVX2, 128-bit default) | 7.48 ns/elem | 2.61 ns/elem | **~2.86x** |
+
+    Both boxes land within 2% of each other — unusually tight agreement for
+    this doc's SIMD entries, likely because the two new guard branches
+    (`IfElse`-based, not a polynomial) cost about the same fraction of the
+    kernel on both ISAs. Up to 2 ULP vector-vs-scalar drift
+    (`TestSiLUIntoRaw_matchesScalar`, within `SiLUF32`'s own 4 ULP contract)
+    — NOT bit-identical to the non-experimental build, same class of
+    difference as items 7-9. Full gate green on both boxes: accuracy/ULP
+    tests, `encoder`+`vision` golden/cosine suites under
+    `GOEXPERIMENT=simd`, the `GODEBUG=simd=0` emulation leg, `-race`, and
+    the default (non-experimental) build verified byte-for-byte unchanged
+    (full `linalg` suite passes with zero diff).
+
+    Next: `GELUF32`/`ErfF32` and `TanhF32`/`GELUTanhF32` (T1's remaining two
+    targets — both two-branch cancellation kernels, a different shape from
+    SiLU's guards-only case) — autoresearch loop round 2.
 
 GPU follow-ups (resident buffers, tiled kernel, batch-tiling) are **goinfer's** —
 see `goinfer/gpu` and goinfer's perf docs.

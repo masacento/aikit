@@ -33,3 +33,13 @@ func softmaxRowIntoRaw(dst, src []float32) {
 		dst[i] *= inv
 	}
 }
+
+// siluIntoRaw is SiLUInto (exp.go) with the length/empty checks already done.
+// This is the default build — byte-for-byte the loop SiLUInto had before
+// exp_simd.go's siluIntoRaw existed; see that file for the GOEXPERIMENT=simd
+// alternative.
+func siluIntoRaw(dst, src []float32) {
+	for i, v := range src {
+		dst[i] = SiLUF32(v)
+	}
+}

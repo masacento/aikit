@@ -1,0 +1,2 @@
+round	target	technique	verdict	ns_elem_before_m1pro	ns_elem_after_m1pro	ns_elem_before_rtx2070s	ns_elem_after_rtx2070s	note
+1	T1-SiLU	vectorize SiLUInto via expF32Vec (full-range exp: expF32CoreVec + overflow/NaN guards, extends e>=255 two-step scale into the core)	kept	3.86	1.34	7.48	2.61	~2.9x both boxes; full gate (accuracy/ULP, encoder+vision goldens, emulation leg, -race, default-build-unchanged) green on both; landed to main

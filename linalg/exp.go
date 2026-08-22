@@ -260,14 +260,19 @@ func SiLUF32(x float32) float32 {
 	return x / (1 + ExpF32(-x))
 }
 
-// SiLUInto writes SiLUF32(src[i]) into dst[i]. Same length required; may alias.
+// SiLUInto writes SiLUF32(src[i]) into dst[i]. Same length required; may
+// alias. Vectorized when built with GOEXPERIMENT=simd (see exp_simd.go); NOT
+// bit-identical to the default build (up to 1 ULP per exponential, same
+// class of difference SoftmaxRowInto documents) — the default (non-
+// experimental) build is byte-for-byte what shipped before this existed.
 func SiLUInto(dst, src []float32) {
 	if len(dst) != len(src) {
 		panic("linalg: SiLUInto length mismatch")
 	}
-	for i, v := range src {
-		dst[i] = SiLUF32(v)
+	if len(src) == 0 {
+		return
 	}
+	siluIntoRaw(dst, src)
 }
 
 // TanhF32 returns tanh(x) in float32.
