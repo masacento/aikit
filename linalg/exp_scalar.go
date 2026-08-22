@@ -53,3 +53,23 @@ func geluIntoRaw(dst, src []float32) {
 		dst[i] = GELUF32(v)
 	}
 }
+
+// tanhIntoRaw is TanhInto (exp.go) with the length/empty checks already
+// done. This is the default build — byte-for-byte the loop TanhInto had
+// before exp_simd.go's tanhIntoRaw existed; see that file for the
+// GOEXPERIMENT=simd alternative.
+func tanhIntoRaw(dst, src []float32) {
+	for i, v := range src {
+		dst[i] = TanhF32(v)
+	}
+}
+
+// geluTanhIntoRaw is GELUTanhInto (exp.go) with the length/empty checks
+// already done. This is the default build — byte-for-byte the loop
+// GELUTanhInto had before exp_simd.go's geluTanhIntoRaw existed; see that
+// file for the GOEXPERIMENT=simd alternative.
+func geluTanhIntoRaw(dst, src []float32) {
+	for i, v := range src {
+		dst[i] = GELUTanhF32(v)
+	}
+}

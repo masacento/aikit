@@ -327,22 +327,30 @@ func GELUTanhF32(x float32) float32 {
 	return 0.5 * x * (1 + TanhF32(c*(x+0.044715*x*x*x)))
 }
 
-// GELUTanhInto writes GELUTanhF32(src[i]) into dst[i]. Same length; may alias.
+// GELUTanhInto writes GELUTanhF32(src[i]) into dst[i]. Same length; may
+// alias. Vectorized when built with GOEXPERIMENT=simd (see exp_simd.go),
+// same NOT-bit-identical caveat as SiLUInto/GELUInto — the default build is
+// unchanged.
 func GELUTanhInto(dst, src []float32) {
 	if len(dst) != len(src) {
 		panic("linalg: GELUTanhInto length mismatch")
 	}
-	for i, v := range src {
-		dst[i] = GELUTanhF32(v)
+	if len(src) == 0 {
+		return
 	}
+	geluTanhIntoRaw(dst, src)
 }
 
 // TanhInto writes TanhF32(src[i]) into dst[i]. Same length; may alias.
+// Vectorized when built with GOEXPERIMENT=simd (see exp_simd.go), same
+// NOT-bit-identical caveat as SiLUInto/GELUInto — the default build is
+// unchanged.
 func TanhInto(dst, src []float32) {
 	if len(dst) != len(src) {
 		panic("linalg: TanhInto length mismatch")
 	}
-	for i, v := range src {
-		dst[i] = TanhF32(v)
+	if len(src) == 0 {
+		return
 	}
+	tanhIntoRaw(dst, src)
 }

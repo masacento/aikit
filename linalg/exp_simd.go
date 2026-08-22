@@ -320,3 +320,105 @@ func geluIntoRaw(dst, src []float32) {
 		ec.half.Mul(x).Mul(ec.one.Add(erf)).StorePart(dst[i:])
 	}
 }
+
+// tanhSIMDConsts holds TanhF32's broadcast constants — its own struct for
+// the same reason erfSIMDConsts is separate from expSIMDConsts: these
+// coefficients have no reason to ride softmax/SiLU/GELU's hot path.
+type tanhSIMDConsts struct {
+	zero, one, negOne, two, c625, nine simd.Float32s
+	pc0, pc1, pc2, pc3, pc4            simd.Float32s // Cephes series, |x|<0.625
+}
+
+func newTanhSIMDConsts() tanhSIMDConsts {
+	return tanhSIMDConsts{
+		zero: simd.BroadcastFloat32s(0), one: simd.BroadcastFloat32s(1),
+		negOne: simd.BroadcastFloat32s(-1), two: simd.BroadcastFloat32s(2),
+		c625: simd.BroadcastFloat32s(0.625), nine: simd.BroadcastFloat32s(9),
+		pc0: simd.BroadcastFloat32s(-5.70498872745e-3),
+		pc1: simd.BroadcastFloat32s(2.06390887954e-2),
+		pc2: simd.BroadcastFloat32s(-5.37397155531e-2),
+		pc3: simd.BroadcastFloat32s(1.33314422036e-1),
+		pc4: simd.BroadcastFloat32s(-3.33332819422e-1),
+	}
+}
+
+// tanhVec is TanhF32 (exp.go), vectorized: the same two-branch shape as
+// erfVec — Cephes' minimax polynomial for |x|<0.625 (no cancellation there),
+// the exponential form 1-2/(e^2x+1) for |x|>=0.625 (stable: subtracts at
+// most 0.445 from 1). exp(2*|x|) reuses the NARROW expF32CoreVec, not
+// expF32Vec: |x| is bounded to [0.625,9] in this branch (|x|>9 saturates
+// separately, before reaching it), so 2*|x| in [1.25,18] never approaches
+// expF32CoreVec's overflow/underflow boundaries — same reasoning erfVec's
+// tail branch already established. NaN is not specially guarded, same
+// scoping call as erfVec (no production caller of TanhF32/GELUTanhF32 has
+// ever produced NaN, and the scalar has no stated NaN contract either).
+func tanhVec(x simd.Float32s, c *tanhSIMDConsts, xc *expSIMDConsts) simd.Float32s {
+	sign := c.negOne.IfElse(x.Less(c.zero), c.one)
+	absX := x.Abs()
+
+	z := absX.Mul(absX)
+	p := c.pc0.MulAdd(z, c.pc1)
+	p = p.MulAdd(z, c.pc2)
+	p = p.MulAdd(z, c.pc3)
+	p = p.MulAdd(z, c.pc4)
+	seriesMag := p.Mul(z).Mul(absX).Add(absX) // p*z*x + x
+
+	e := expF32CoreVec(c.two.Mul(absX), xc)
+	expMag := c.one.Sub(c.two.Div(e.Add(c.one))) // 1 - 2/(e^2x+1)
+
+	mag := seriesMag.IfElse(absX.Less(c.c625), expMag)
+	mag = c.one.IfElse(absX.Greater(c.nine), mag) // tanh(9) saturates below f32 resolution
+	return mag.Mul(sign)
+}
+
+// tanhIntoRaw is TanhInto (exp.go) with the length/empty checks already
+// done — T1's third and last target.
+func tanhIntoRaw(dst, src []float32) {
+	n := len(src)
+	tc := newTanhSIMDConsts()
+	xc := newExpSIMDConsts()
+	var probe simd.Float32s
+	L := probe.Len()
+
+	i := 0
+	for ; i+L <= n; i += L {
+		x := simd.LoadFloat32s(src[i : i+L])
+		tanhVec(x, &tc, &xc).Store(dst[i : i+L])
+	}
+	if i < n {
+		x, _ := simd.LoadFloat32sPart(src[i:])
+		tanhVec(x, &tc, &xc).StorePart(dst[i:])
+	}
+}
+
+// geluTanhIntoRaw is GELUTanhInto (exp.go) with the length/empty checks
+// already done. Built directly on tanhVec, same op order as scalar
+// GELUTanhF32: 0.5*x*(1+tanh(c*(x+0.044715*x^3))).
+func geluTanhIntoRaw(dst, src []float32) {
+	n := len(src)
+	const cConst = 0.7978845608028654 // sqrt(2/pi)
+	tc := newTanhSIMDConsts()
+	xc := newExpSIMDConsts()
+	c := simd.BroadcastFloat32s(cConst)
+	a := simd.BroadcastFloat32s(0.044715)
+	half := simd.BroadcastFloat32s(0.5)
+	one := simd.BroadcastFloat32s(1)
+	var probe simd.Float32s
+	L := probe.Len()
+
+	i := 0
+	for ; i+L <= n; i += L {
+		x := simd.LoadFloat32s(src[i : i+L])
+		x3 := x.Mul(x).Mul(x)
+		arg := c.Mul(x.Add(x3.Mul(a)))
+		th := tanhVec(arg, &tc, &xc)
+		half.Mul(x).Mul(one.Add(th)).Store(dst[i : i+L])
+	}
+	if i < n {
+		x, _ := simd.LoadFloat32sPart(src[i:])
+		x3 := x.Mul(x).Mul(x)
+		arg := c.Mul(x.Add(x3.Mul(a)))
+		th := tanhVec(arg, &tc, &xc)
+		half.Mul(x).Mul(one.Add(th)).StorePart(dst[i:])
+	}
+}

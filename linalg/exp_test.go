@@ -428,6 +428,62 @@ func TestSiLUF32_accuracy(t *testing.T) {
 	}
 }
 
+// BenchmarkTanh_vs_scalar compares TanhInto (vectorized under
+// GOEXPERIMENT=simd, scalar loop over TanhF32 in the default build) against
+// a math.Tanh-based scalar reference — the shape encoder/crossencoder.go's
+// pooling wraps.
+func BenchmarkTanh_vs_scalar(b *testing.B) {
+	const n = 65536
+	rng := rand.New(rand.NewSource(6))
+	src := make([]float32, n)
+	for i := range src {
+		src[i] = float32(rng.NormFloat64() * 3)
+	}
+	dst := make([]float32, n)
+	b.Run("math.Tanh/f64", func(b *testing.B) {
+		for b.Loop() {
+			for i, v := range src {
+				dst[i] = float32(math.Tanh(float64(v)))
+			}
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+	})
+	b.Run("TanhInto", func(b *testing.B) {
+		for b.Loop() {
+			TanhInto(dst, src)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+	})
+}
+
+// BenchmarkGELUTanh_vs_scalar is BenchmarkGELU_vs_mathErf's twin for the
+// tanh-approximation GELU (SigLIP/Gemma 3's vision tower activation).
+func BenchmarkGELUTanh_vs_scalar(b *testing.B) {
+	const n = 65536
+	rng := rand.New(rand.NewSource(7))
+	src := make([]float32, n)
+	for i := range src {
+		src[i] = float32(rng.NormFloat64() * 2)
+	}
+	dst := make([]float32, n)
+	const c = 0.7978845608028654
+	b.Run("math.Tanh/f64", func(b *testing.B) {
+		for b.Loop() {
+			for i, v := range src {
+				vf := float64(v)
+				dst[i] = float32(0.5 * vf * (1 + math.Tanh(c*(vf+0.044715*vf*vf*vf))))
+			}
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+	})
+	b.Run("GELUTanhInto", func(b *testing.B) {
+		for b.Loop() {
+			GELUTanhInto(dst, src)
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+	})
+}
+
 func TestTanhF32_accuracy(t *testing.T) {
 	// tanh is judged relatively on both branches: neither the polynomial nor
 	// 1 - 2/(e^2x+1) cancels in its own domain, which is the whole point of the

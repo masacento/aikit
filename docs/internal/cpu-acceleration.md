@@ -567,6 +567,56 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
     Next: `TanhF32`/`GELUTanhF32` (T1's last target, same two-branch
     cancellation shape as Erf) — autoresearch loop round 3.
 
+12. **`TanhInto`/`GELUTanhInto` vectorized via Go 1.27's `simd` package — ✅
+    DONE, Experimental tier, `linalg/exp_simd.go`. T1 (the `A3`-`A6`
+    siblings) is now COMPLETE.** Third and last of the round-3 targets, same
+    two-branch shape as item 11's Erf: Cephes' minimax polynomial for
+    `|x|<0.625` (no cancellation there), the exponential form
+    `1-2/(e^2x+1)` for `|x|>=0.625` (stable — subtracts at most 0.445 from
+    1). New `tanhVec`, its own `tanhSIMDConsts`. The exponential branch's
+    `exp(2·|x|)` again reuses the NARROW `expF32CoreVec`: `|x|` is bounded
+    to `[0.625,9]` in that branch (`|x|>9` saturates separately, same
+    saturating-tail shape as Erf's `|x|>4`), so `2·|x| ∈ [1.25,18]` never
+    approaches the overflow/underflow boundaries — the third kernel in a
+    row to use this reuse, after softmax (item 7) and Erf's tail (item 11).
+    `GELUTanhInto` (the actual SigLIP/Gemma-3-vision-tower activation
+    caller) is built directly on `tanhVec` with no guard work of its own,
+    same relationship item 10's SiLU has to `expF32Vec`.
+
+    Both `TanhInto` and `GELUTanhInto` have real callers
+    (`encoder/crossencoder.go`'s pooling for the former,
+    `encoder/bert.go`'s tanh-GELU chunking for the latter) — checked before
+    building, per this doc's own item-7 precedent of only vectorizing
+    functions something actually calls.
+
+    Measured (`BenchmarkTanh_vs_scalar`/`BenchmarkGELUTanh_vs_scalar`, same
+    functions both builds, only the build tag differs):
+
+    | box | kernel | scalar (today) | SIMD | speedup |
+    |---|---|--:|--:|--:|
+    | `apple-m1pro` | TanhInto | 9.97 ns/elem | 1.94 ns/elem | **~5.1x** |
+    | `apple-m1pro` | GELUTanhInto | 15.03 ns/elem | 2.68 ns/elem | **~5.6x** |
+    | `nvidia-rtx2070s` | TanhInto | 12.44 ns/elem | 3.45 ns/elem | **~3.6x** |
+    | `nvidia-rtx2070s` | GELUTanhInto | 17.22 ns/elem | 4.02 ns/elem | **~4.28x** |
+
+    Same two-branch-pays-for-both-lanes premise as item 11, and the numbers
+    confirm it again: large wins on both boxes, `apple-m1pro` consistently
+    ahead of `nvidia-rtx2070s` for this whole two-branch family (items
+    11-12), unlike item 10's SiLU where the two boxes landed within 2% of
+    each other. Up to 4 ULP / 2.38e-07 abs vector-vs-scalar drift
+    (`TestTanhVec_matchesScalar`, `TestGELUTanhIntoRaw_matchesScalar` —
+    both within the scalar kernels' own contracts). Full gate green on both
+    boxes: accuracy/ULP-class tests, `encoder`+`vision` golden/cosine
+    suites under `GOEXPERIMENT=simd`, the `GODEBUG=simd=0` emulation leg,
+    `-race`, and the default (non-experimental) build verified
+    byte-for-byte unchanged.
+
+    **T1 is now fully landed** (items 10-12: SiLU, GELU/Erf, Tanh/GELUTanh
+    — all four `A3`-`A6` siblings item 7 named). Next per
+    `docs/prompts/simd-elementwise-autoresearch.md`'s own ranking: T2, the
+    softmax-scale fusion dead-ends §4.4 reopens now that item 7's SIMD
+    softmax makes the scale pass a bigger share of the kernel.
+
 GPU follow-ups (resident buffers, tiled kernel, batch-tiling) are **goinfer's** —
 see `goinfer/gpu` and goinfer's perf docs.
 

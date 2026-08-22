@@ -282,6 +282,118 @@ func TestGELUIntoRaw_tail(t *testing.T) {
 	}
 }
 
+// TestTanhVec_matchesScalar checks tanhVec against TanhF32 across both
+// branches (series |x|<0.625, exponential |x|>=0.625) and the saturation
+// boundary at |x|=9, plus the sign flip.
+func TestTanhVec_matchesScalar(t *testing.T) {
+	const n = 1 << 20
+	tc := newTanhSIMDConsts()
+	xc := newExpSIMDConsts()
+	rng := rand.New(rand.NewSource(59))
+	src := make([]float32, n)
+	for i := range src {
+		src[i] = float32(-20 + 40*rng.Float64())
+	}
+	copy(src, []float32{0, -0.0, 0.625, -0.625, 0.624999, 0.625001, 9, -9, 8.999999, 9.000001, 15, -15})
+
+	got := make([]float32, n)
+	var probe simd.Float32s
+	L := probe.Len()
+	i := 0
+	for ; i+L <= n; i += L {
+		tanhVec(simd.LoadFloat32s(src[i:i+L]), &tc, &xc).Store(got[i : i+L])
+	}
+	if i < n {
+		v, _ := simd.LoadFloat32sPart(src[i:])
+		tanhVec(v, &tc, &xc).StorePart(got[i:])
+	}
+
+	var maxULP uint32
+	var argMax float32
+	for i, x := range src {
+		want := TanhF32(x)
+		if d := ulpDiff32(got[i], want); d > maxULP {
+			maxULP, argMax = d, x
+		}
+	}
+	t.Logf("max vector-vs-scalar diff: %d ULP at x=%g", maxULP, argMax)
+	if maxULP > 4 {
+		t.Fatalf("max ULP diff %d at x=%g exceeds bound 4", maxULP, argMax)
+	}
+}
+
+// TestGELUTanhIntoRaw_matchesScalar checks the SIMD GELUTanhInto against
+// GELUTanhF32, against the same absolute bound TestGELUTanhF32_accuracy
+// gates the scalar kernel with (1e-6).
+func TestGELUTanhIntoRaw_matchesScalar(t *testing.T) {
+	const n = 1 << 18
+	rng := rand.New(rand.NewSource(61))
+	src := make([]float32, n)
+	for i := range src {
+		src[i] = float32(-9 + 18*rng.Float64())
+	}
+	copy(src, []float32{0, -0.0, 10, -10})
+
+	got := make([]float32, n)
+	geluTanhIntoRaw(got, src)
+
+	var worstAbs float64
+	var argMax float32
+	for i, x := range src {
+		want := GELUTanhF32(x)
+		if d := math.Abs(float64(got[i]) - float64(want)); d > worstAbs {
+			worstAbs, argMax = d, x
+		}
+	}
+	t.Logf("max vector-vs-scalar abs diff: %.3g at x=%g", worstAbs, argMax)
+	if worstAbs > 1e-6 {
+		t.Fatalf("max abs diff %.3g at x=%g exceeds bound 1e-06", worstAbs, argMax)
+	}
+}
+
+// TestTanhIntoRaw_tail and TestGELUTanhIntoRaw_tail walk every remainder
+// length against the scalar reference, mirroring the same tail-length
+// sweep every kernel in this file gets.
+func TestTanhIntoRaw_tail(t *testing.T) {
+	var probe simd.Float32s
+	L := probe.Len()
+	rng := rand.New(rand.NewSource(67))
+	for n := 1; n <= 3*L+1; n++ {
+		src := make([]float32, n)
+		for i := range src {
+			src[i] = float32(rng.NormFloat64()) * 6
+		}
+		got := make([]float32, n)
+		tanhIntoRaw(got, src)
+		for i := range src {
+			want := TanhF32(src[i])
+			if d := ulpDiff32(got[i], want); d > 4 {
+				t.Fatalf("n=%d i=%d: got %g want %g (%d ULP)", n, i, got[i], want, d)
+			}
+		}
+	}
+}
+
+func TestGELUTanhIntoRaw_tail(t *testing.T) {
+	var probe simd.Float32s
+	L := probe.Len()
+	rng := rand.New(rand.NewSource(71))
+	for n := 1; n <= 3*L+1; n++ {
+		src := make([]float32, n)
+		for i := range src {
+			src[i] = float32(rng.NormFloat64()) * 3
+		}
+		got := make([]float32, n)
+		geluTanhIntoRaw(got, src)
+		for i := range src {
+			want := GELUTanhF32(src[i])
+			if d := math.Abs(float64(got[i]) - float64(want)); d > 1e-6 {
+				t.Fatalf("n=%d i=%d: got %g want %g (diff %.3g)", n, i, got[i], want, d)
+			}
+		}
+	}
+}
+
 // TestSoftmaxRowIntoRaw_tail checks every remainder length against the
 // non-SIMD reference (exp_scalar.go's algorithm, reproduced here since that
 // file is excluded from this build) — the SIMD kernel's tail handling
