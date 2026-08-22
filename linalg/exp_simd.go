@@ -212,3 +212,111 @@ func siluIntoRaw(dst, src []float32) {
 		x.Div(c.one.Add(e)).StorePart(dst[i:])
 	}
 }
+
+// erfSIMDConsts holds ErfF32's broadcast constants — separate from
+// expSIMDConsts (which erfVec still uses internally, for the tail branch's
+// exp(-x^2)) so softmax/SiLU's hot path doesn't carry erf's ~20 extra
+// broadcasts it never needs.
+type erfSIMDConsts struct {
+	zero, one, negOne, four, half, invSqrt2, erfScale      simd.Float32s
+	sc0, sc1, sc2, sc3, sc4, sc5, sc6, sc7, sc8, sc9, sc10 simd.Float32s // series (|x|<1), Cephes
+	tc0, tc1, tc2, tc3, tc4                                simd.Float32s // A&S tail (|x|>=1)
+	a1                                                     simd.Float32s
+}
+
+func newErfSIMDConsts() erfSIMDConsts {
+	return erfSIMDConsts{
+		zero: simd.BroadcastFloat32s(0),
+		one:  simd.BroadcastFloat32s(1), negOne: simd.BroadcastFloat32s(-1),
+		four: simd.BroadcastFloat32s(4), half: simd.BroadcastFloat32s(0.5),
+		invSqrt2: simd.BroadcastFloat32s(0.7071067811865476),
+		erfScale: simd.BroadcastFloat32s(1.1283791670955126),
+		sc0:      simd.BroadcastFloat32s(1.3122532963802806e-08),
+		sc1:      simd.BroadcastFloat32s(-1.4503852223150468e-07),
+		sc2:      simd.BroadcastFloat32s(1.4589169000933706e-06),
+		sc3:      simd.BroadcastFloat32s(-1.3227513227513228e-05),
+		sc4:      simd.BroadcastFloat32s(1.0683760683760684e-04),
+		sc5:      simd.BroadcastFloat32s(-7.5757575757575758e-04),
+		sc6:      simd.BroadcastFloat32s(4.6296296296296294e-03),
+		sc7:      simd.BroadcastFloat32s(-2.3809523809523808e-02),
+		sc8:      simd.BroadcastFloat32s(1.0000000000000001e-01),
+		sc9:      simd.BroadcastFloat32s(-3.3333333333333331e-01),
+		sc10:     simd.BroadcastFloat32s(1),
+		tc0:      simd.BroadcastFloat32s(1.061405429),
+		tc1:      simd.BroadcastFloat32s(-1.453152027),
+		tc2:      simd.BroadcastFloat32s(1.421413741),
+		tc3:      simd.BroadcastFloat32s(-0.284496736),
+		tc4:      simd.BroadcastFloat32s(0.254829592),
+		a1:       simd.BroadcastFloat32s(0.3275911),
+	}
+}
+
+// erfVec is ErfF32 (exp.go), vectorized: both branches (series for |x|<1,
+// A&S tail for |x|>=1) are computed unconditionally and mask-selected — the
+// two-branch pattern this file's own comments describe for Erf/Tanh, now
+// built. NOT full ExpF32 domain: the tail branch's exp(-x^2) argument is in
+// [-16, -1] for the |x| in [1,4] it's ever evaluated at (x>4 saturates
+// separately, before reaching it), comfortably inside expF32CoreVec's
+// validated range with no overflow risk — so this reuses the narrow core,
+// not expF32Vec, exactly as softmax does and for the same reason.
+//
+// NaN is NOT specially guarded, unlike expF32Vec's guard for SiLU's real
+// caller: no production caller here has ever produced NaN input (GELU feeds
+// on a forward pass's own activations), and the existing scalar ErfF32 has
+// no stated/tested NaN contract either — this only vectorizes the domain
+// both the scalar function and its real callers actually see.
+func erfVec(x simd.Float32s, ec *erfSIMDConsts, xc *expSIMDConsts) simd.Float32s {
+	absX := x.Abs()
+	sgn := ec.negOne.IfElse(x.Less(ec.zero), ec.one)
+
+	// Series branch, |x| < 1: erf(x) = (2/sqrt(pi))*x*P(x^2), no cancellation.
+	z := absX.Mul(absX)
+	p := ec.sc0.MulAdd(z, ec.sc1)
+	p = p.MulAdd(z, ec.sc2)
+	p = p.MulAdd(z, ec.sc3)
+	p = p.MulAdd(z, ec.sc4)
+	p = p.MulAdd(z, ec.sc5)
+	p = p.MulAdd(z, ec.sc6)
+	p = p.MulAdd(z, ec.sc7)
+	p = p.MulAdd(z, ec.sc8)
+	p = p.MulAdd(z, ec.sc9)
+	p = p.MulAdd(z, ec.sc10)
+	seriesMag := ec.erfScale.Mul(absX).Mul(p)
+
+	// A&S 7.1.26 tail, |x| >= 1: erf ~ 1, so 1-(small) is stable.
+	t := ec.one.Div(ec.one.Add(ec.a1.Mul(absX)))
+	pt := ec.tc0.MulAdd(t, ec.tc1)
+	pt = pt.MulAdd(t, ec.tc2)
+	pt = pt.MulAdd(t, ec.tc3)
+	pt = pt.MulAdd(t, ec.tc4)
+	negX2 := absX.Mul(absX).Neg()
+	tailMag := ec.one.Sub(pt.Mul(t).Mul(expF32CoreVec(negX2, xc)))
+
+	mag := seriesMag.IfElse(absX.Less(ec.one), tailMag)
+	mag = ec.one.IfElse(absX.Greater(ec.four), mag) // saturated: 1-erf(4) below f32 resolution
+	return mag.Mul(sgn)
+}
+
+// geluIntoRaw is GELUInto (exp.go) with the length/empty checks already
+// done — T1's second target, the exact (erf) GELU. Built directly on erfVec;
+// no extra guard work of its own (GELU's own saturating ends, per GELUF32's
+// doc comment, fall out of erf's ±1 saturation with no separate branch).
+func geluIntoRaw(dst, src []float32) {
+	n := len(src)
+	ec := newErfSIMDConsts()
+	xc := newExpSIMDConsts()
+	var probe simd.Float32s
+	L := probe.Len()
+
+	i := 0
+	for ; i+L <= n; i += L {
+		x := simd.LoadFloat32s(src[i : i+L])
+		erf := erfVec(x.Mul(ec.invSqrt2), &ec, &xc)
+		ec.half.Mul(x).Mul(ec.one.Add(erf)).Store(dst[i : i+L])
+	}
+	if i < n {
+		x, _ := simd.LoadFloat32sPart(src[i:])
+		erf := erfVec(x.Mul(ec.invSqrt2), &ec, &xc)
+		ec.half.Mul(x).Mul(ec.one.Add(erf)).StorePart(dst[i:])
+	}
+}

@@ -515,6 +515,58 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
     targets — both two-branch cancellation kernels, a different shape from
     SiLU's guards-only case) — autoresearch loop round 2.
 
+11. **`GELUInto`/`ErfF32` vectorized via Go 1.27's `simd` package — ✅ DONE,
+    Experimental tier, `linalg/exp_simd.go`.** Second of the `A3`-`A6`
+    siblings (autoresearch round 2), and a genuinely different shape from
+    item 10's SiLU: Erf is a TWO-BRANCH kernel (series for `|x|<1`, no
+    cancellation; the A&S 7.1.26 tail for `|x|>=1`, stable because
+    `1-(small)` doesn't cancel there), so the vector form computes BOTH
+    branches unconditionally and mask-selects with `IfElse` — exactly the
+    pattern this file's SiLU entry named as the alternative shape, now
+    built.
+
+    New `erfVec`, its own `erfSIMDConsts` (kept separate from
+    `expSIMDConsts` — Erf's ~20 extra broadcasts have no reason to ride
+    softmax's or SiLU's hot path). The tail branch's `exp(-x²)` reuses the
+    NARROW `expF32CoreVec` (not item 10's full-range `expF32Vec`): for the
+    `|x|` in `[1,4]` the tail branch ever runs at (`|x|>4` saturates to ±1
+    separately, before reaching it), `-x²` is always in `[-16,-1]` —
+    comfortably inside `expF32CoreVec`'s validated domain, no overflow risk,
+    same reasoning softmax's own narrow reuse already established. NaN is
+    NOT specially guarded here (unlike item 10's guard for SiLU's real,
+    NaN-reachable caller): GELU feeds on a forward pass's own activations,
+    no production input has ever been NaN, and the existing scalar `ErfF32`
+    has no stated or tested NaN contract to preserve — this vectorizes the
+    domain the scalar function and its real callers actually see, not a
+    hypothetical wider one.
+
+    Measured (`BenchmarkGELU_vs_mathErf`, same `GELUInto`, only the build
+    tag differs — the CURRENT shipped scalar path, not the `math.Erf`
+    strawman the benchmark also carries for scale):
+
+    | box | scalar (today) | SIMD | speedup |
+    |---|--:|--:|--:|
+    | `apple-m1pro` (NEON) | 12.97 ns/elem | 2.50 ns/elem | **~5.2x** |
+    | `nvidia-rtx2070s` (AVX2, 128-bit default) | 16.64 ns/elem | 3.92 ns/elem | **~4.25x** |
+
+    The biggest speedup of any item in this doc so far — consistent with
+    the two-branch premise: the scalar kernel already pays for one branch's
+    worth of work per call, but the vector kernel pays for BOTH branches on
+    every lane regardless of which one a given element "needs", and the
+    branches here (an 11-term polynomial vs. a division-heavy 5-term one
+    plus an exp call) are each substantial, so lane-parallelism buys more
+    than it did for SiLU's single-branch-plus-guards shape. Up to 2.4e-07
+    max absolute vector-vs-scalar drift (`TestErfVec_matchesScalar`,
+    `TestGELUIntoRaw_matchesScalar` — both within `GELUF32`'s own 1e-6
+    absolute contract) — NOT bit-identical to the non-experimental build,
+    same class of difference as items 7-10. Full gate green on both boxes:
+    accuracy/ULP-class tests, `encoder`+`vision` golden/cosine suites under
+    `GOEXPERIMENT=simd`, the `GODEBUG=simd=0` emulation leg, `-race`, and
+    the default (non-experimental) build verified byte-for-byte unchanged.
+
+    Next: `TanhF32`/`GELUTanhF32` (T1's last target, same two-branch
+    cancellation shape as Erf) — autoresearch loop round 3.
+
 GPU follow-ups (resident buffers, tiled kernel, batch-tiling) are **goinfer's** —
 see `goinfer/gpu` and goinfer's perf docs.
 

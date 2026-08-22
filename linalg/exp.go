@@ -236,14 +236,18 @@ func GELUF32(x float32) float32 {
 	return 0.5 * x * (1 + ErfF32(x*invSqrt2))
 }
 
-// GELUInto writes GELUF32(src[i]) into dst[i]. Same length required; may alias.
+// GELUInto writes GELUF32(src[i]) into dst[i]. Same length required; may
+// alias. Vectorized when built with GOEXPERIMENT=simd (see exp_simd.go),
+// same NOT-bit-identical caveat as SiLUInto (up to a few ULP, within
+// GELUF32's own 1e-6 absolute contract) — the default build is unchanged.
 func GELUInto(dst, src []float32) {
 	if len(dst) != len(src) {
 		panic("linalg: GELUInto length mismatch")
 	}
-	for i, v := range src {
-		dst[i] = GELUF32(v)
+	if len(src) == 0 {
+		return
 	}
+	geluIntoRaw(dst, src)
 }
 
 // SiLUF32 returns x·sigmoid(x) = x/(1+e^−x), the SwiGLU gate activation.

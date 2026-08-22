@@ -43,3 +43,13 @@ func siluIntoRaw(dst, src []float32) {
 		dst[i] = SiLUF32(v)
 	}
 }
+
+// geluIntoRaw is GELUInto (exp.go) with the length/empty checks already
+// done. This is the default build — byte-for-byte the loop GELUInto had
+// before exp_simd.go's geluIntoRaw existed; see that file for the
+// GOEXPERIMENT=simd alternative.
+func geluIntoRaw(dst, src []float32) {
+	for i, v := range src {
+		dst[i] = GELUF32(v)
+	}
+}

@@ -189,6 +189,99 @@ func TestSiLUIntoRaw_tail(t *testing.T) {
 	}
 }
 
+// TestErfVec_matchesScalar checks erfVec against ErfF32 across both its
+// branches (series |x|<1, A&S tail |x|>=1) and the saturation boundary at
+// |x|=4, plus the sign flip — the seams a mask-select kernel can get wrong
+// silently rather than crash on.
+func TestErfVec_matchesScalar(t *testing.T) {
+	const n = 1 << 20
+	ec := newErfSIMDConsts()
+	xc := newExpSIMDConsts()
+	rng := rand.New(rand.NewSource(43))
+	src := make([]float32, n)
+	for i := range src {
+		src[i] = float32(-9 + 18*rng.Float64())
+	}
+	copy(src, []float32{0, -0.0, 1, -1, 0.999999, 1.000001, 4, -4, 3.999999, 4.000001, 8, -8})
+
+	got := make([]float32, n)
+	var probe simd.Float32s
+	L := probe.Len()
+	i := 0
+	for ; i+L <= n; i += L {
+		erfVec(simd.LoadFloat32s(src[i:i+L]), &ec, &xc).Store(got[i : i+L])
+	}
+	if i < n {
+		v, _ := simd.LoadFloat32sPart(src[i:])
+		erfVec(v, &ec, &xc).StorePart(got[i:])
+	}
+
+	var worstAbs float64
+	var argMax float32
+	for i, x := range src {
+		want := ErfF32(x)
+		if d := math.Abs(float64(got[i]) - float64(want)); d > worstAbs {
+			worstAbs, argMax = d, x
+		}
+	}
+	t.Logf("max vector-vs-scalar abs diff: %.3g at x=%g", worstAbs, argMax)
+	if worstAbs > 2.5e-7 {
+		t.Fatalf("max abs diff %.3g at x=%g exceeds bound 2.5e-07", worstAbs, argMax)
+	}
+}
+
+// TestGELUIntoRaw_matchesScalar checks the SIMD GELUInto against GELUF32,
+// against the SAME absolute bound TestErfF32_accuracy gates the scalar
+// kernel with (1e-6) — GELU's contract is absolute, not relative (see
+// GELUF32's doc comment for why).
+func TestGELUIntoRaw_matchesScalar(t *testing.T) {
+	const n = 1 << 18
+	rng := rand.New(rand.NewSource(47))
+	src := make([]float32, n)
+	for i := range src {
+		src[i] = float32(-9 + 18*rng.Float64())
+	}
+	copy(src, []float32{0, -0.0, 10, -10, 4, -4})
+
+	got := make([]float32, n)
+	geluIntoRaw(got, src)
+
+	var worstAbs float64
+	var argMax float32
+	for i, x := range src {
+		want := GELUF32(x)
+		if d := math.Abs(float64(got[i]) - float64(want)); d > worstAbs {
+			worstAbs, argMax = d, x
+		}
+	}
+	t.Logf("max vector-vs-scalar abs diff: %.3g at x=%g", worstAbs, argMax)
+	if worstAbs > 1e-6 {
+		t.Fatalf("max abs diff %.3g at x=%g exceeds bound 1e-06", worstAbs, argMax)
+	}
+}
+
+// TestGELUIntoRaw_tail walks every remainder length against GELUF32,
+// mirroring TestSiLUIntoRaw_tail's tail-length sweep for the same reason.
+func TestGELUIntoRaw_tail(t *testing.T) {
+	var probe simd.Float32s
+	L := probe.Len()
+	rng := rand.New(rand.NewSource(53))
+	for n := 1; n <= 3*L+1; n++ {
+		src := make([]float32, n)
+		for i := range src {
+			src[i] = float32(rng.NormFloat64()) * 3
+		}
+		got := make([]float32, n)
+		geluIntoRaw(got, src)
+		for i := range src {
+			want := GELUF32(src[i])
+			if d := math.Abs(float64(got[i]) - float64(want)); d > 1e-6 {
+				t.Fatalf("n=%d i=%d: got %g want %g (diff %.3g)", n, i, got[i], want, d)
+			}
+		}
+	}
+}
+
 // TestSoftmaxRowIntoRaw_tail checks every remainder length against the
 // non-SIMD reference (exp_scalar.go's algorithm, reproduced here since that
 // file is excluded from this build) — the SIMD kernel's tail handling
