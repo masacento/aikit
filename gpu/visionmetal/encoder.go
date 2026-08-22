@@ -108,9 +108,9 @@ func newEncoder(w vision.GPUWeights) (enc *encoder, err error) {
 	cpp := w.NumChannels * w.PatchSize * w.PatchSize
 
 	e := &encoder{dev: dev, q: dev.NewCommandQueue(), k: kern, w: w, cpp: cpp}
-	up := func(x []float32) gpu.Buffer { return dev.NewBufferFloats(x) }
+	up := func(x []float32) gpu.Buffer { return gpu.NewBufferOf(dev, x) }
 	upMat := func(m vision.GPUMat) mat {
-		return mat{q: dev.NewBufferInt8(m.Q), s: dev.NewBufferFloats(m.Scales), rows: m.Rows, cols: m.Cols}
+		return mat{q: gpu.NewBufferOf(dev, m.Q), s: gpu.NewBufferOf(dev, m.Scales), rows: m.Rows, cols: m.Cols}
 	}
 	e.patchW, e.patchB, e.posEmb = up(w.PatchW), up(w.PatchB), up(w.PosEmb)
 	e.postLNw, e.postLNb = up(w.PostLNw), up(w.PostLNb)
@@ -131,10 +131,10 @@ func newEncoder(w vision.GPUWeights) (enc *encoder, err error) {
 	e.att, e.o, e.mlp, e.out = f32(np*hidden), f32(np*hidden), f32(np*hidden), f32(np*hidden)
 	e.mid = f32(np * inter)
 	wide := max(inter, hidden)
-	e.qi8 = dev.NewBufferInt8(make([]int8, np*wide))
+	e.qi8 = gpu.NewBufferOf(dev, make([]int8, np*wide))
 	e.qs = f32(np)
-	e.s0, e.s1, e.s2 = dev.NewBufferU32(0), dev.NewBufferU32(0), dev.NewBufferU32(0)
-	e.epsBuf, e.scaleBuf = dev.NewBufferFloats([]float32{0}), dev.NewBufferFloats([]float32{0})
+	e.s0, e.s1, e.s2 = gpu.NewBufferOf(dev, []uint32{0}), gpu.NewBufferOf(dev, []uint32{0}), gpu.NewBufferOf(dev, []uint32{0})
+	e.epsBuf, e.scaleBuf = gpu.NewBufferOf(dev, []float32{0}), gpu.NewBufferOf(dev, []float32{0})
 	return e, nil
 }
 

@@ -306,11 +306,11 @@ func (b *metalBackend) NewI8Index(bq []int8, scales []float32, n, dim int) (ann.
 		b:      b,
 		n:      n,
 		dim:    dim,
-		codes:  b.dev.NewBufferInt8(bq),
-		scales: b.dev.NewBufferFloats(scales),
-		qi8:    b.dev.NewBufferInt8(make([]int8, dim)),
-		qscale: b.dev.NewBufferFloats([]float32{0}),
-		kbuf:   b.dev.NewBufferU32(uint32(dim)),
+		codes:  gpu.NewBufferOf(b.dev, bq),
+		scales: gpu.NewBufferOf(b.dev, scales),
+		qi8:    gpu.NewBufferOf(b.dev, make([]int8, dim)),
+		qscale: gpu.NewBufferOf(b.dev, []float32{0}),
+		kbuf:   gpu.NewBufferOf(b.dev, []uint32{uint32(dim)}),
 		out:    b.dev.NewBufferLen(n),
 	}, nil
 }
@@ -374,10 +374,10 @@ func (x *metalI8Index) ScoreBatch(queries [][]float32, dst []float32) error {
 	}
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	qi8Buf := x.b.dev.NewBufferInt8(qi8)
-	qscaleBuf := x.b.dev.NewBufferFloats(qscale)
-	nBuf := x.b.dev.NewBufferU32(uint32(N))
-	mBuf := x.b.dev.NewBufferU32(uint32(M))
+	qi8Buf := gpu.NewBufferOf(x.b.dev, qi8)
+	qscaleBuf := gpu.NewBufferOf(x.b.dev, qscale)
+	nBuf := gpu.NewBufferOf(x.b.dev, []uint32{uint32(N)})
+	mBuf := gpu.NewBufferOf(x.b.dev, []uint32{uint32(M)})
 	outBuf := x.b.dev.NewBufferLen(M * N)
 	defer func() {
 		for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, nBuf, mBuf, outBuf} {
@@ -419,13 +419,13 @@ func (x *metalI8Index) TopKBatch(queries [][]float32, k int) ([][]ann.Hit, error
 	x.mu.Lock()
 	defer x.mu.Unlock()
 	dev := x.b.dev
-	qi8Buf := dev.NewBufferInt8(qi8)
-	qscaleBuf := dev.NewBufferFloats(qscale)
-	nBuf := dev.NewBufferU32(uint32(N))
-	mBuf := dev.NewBufferU32(uint32(M))
-	kBuf := dev.NewBufferU32(uint32(k))
+	qi8Buf := gpu.NewBufferOf(dev, qi8)
+	qscaleBuf := gpu.NewBufferOf(dev, qscale)
+	nBuf := gpu.NewBufferOf(dev, []uint32{uint32(N)})
+	mBuf := gpu.NewBufferOf(dev, []uint32{uint32(M)})
+	kBuf := gpu.NewBufferOf(dev, []uint32{uint32(k)})
 	scoreBuf := dev.NewBufferLen(M * N)                 // device-only; never crosses to the host
-	idxOut := dev.NewBufferUint32s(make([]uint32, M*k)) // device int* (u32 storage, same bytes)
+	idxOut := gpu.NewBufferOf(dev, make([]uint32, M*k)) // device int* (u32 storage, same bytes)
 	scoreOut := dev.NewBufferLen(M * k)                 // only M*k floats come back
 	defer func() {
 		for _, b := range []gpu.Buffer{qi8Buf, qscaleBuf, nBuf, mBuf, kBuf, scoreBuf, idxOut, scoreOut} {

@@ -113,12 +113,12 @@ func newEncoder(src *vision.QwenVisionEncoder) (enc *encoder, err error) {
 		return nil, err
 	}
 	e := &encoder{dev: dev, q: dev.NewCommandQueue(), k: kern, src: src, w: w}
-	upF := func(x []float32) gpu.Buffer { return dev.NewBufferFloats(x) }
+	upF := func(x []float32) gpu.Buffer { return gpu.NewBufferOf(dev, x) }
 	upM := func(m vision.QwenGPUMat) mat {
 		if m.Quantized {
-			return mat{quant: true, a: dev.NewBufferInt8(m.Q), b: dev.NewBufferFloats(m.Scales), rows: m.Rows, cols: m.Cols}
+			return mat{quant: true, a: gpu.NewBufferOf(dev, m.Q), b: gpu.NewBufferOf(dev, m.Scales), rows: m.Rows, cols: m.Cols}
 		}
-		return mat{a: dev.NewBufferFloats(m.F32), rows: m.Rows, cols: m.Cols}
+		return mat{a: gpu.NewBufferOf(dev, m.F32), rows: m.Rows, cols: m.Cols}
 	}
 	e.patchW = upF(w.PatchW)
 	e.blocks = make([]block, len(w.Blocks))
@@ -132,8 +132,8 @@ func newEncoder(src *vision.QwenVisionEncoder) (enc *encoder, err error) {
 			downw: upM(B.Downw), downb: upF(B.Downb),
 		}
 	}
-	e.s0, e.s1, e.s2 = dev.NewBufferU32(0), dev.NewBufferU32(0), dev.NewBufferU32(0)
-	e.epsBuf, e.scaleBuf = dev.NewBufferFloats([]float32{0}), dev.NewBufferFloats([]float32{0})
+	e.s0, e.s1, e.s2 = gpu.NewBufferOf(dev, []uint32{0}), gpu.NewBufferOf(dev, []uint32{0}), gpu.NewBufferOf(dev, []uint32{0})
+	e.epsBuf, e.scaleBuf = gpu.NewBufferOf(dev, []float32{0}), gpu.NewBufferOf(dev, []float32{0})
 	return e, nil
 }
 
@@ -157,11 +157,11 @@ func (e *encoder) ensure(n int) {
 	e.att, e.projOut = f32(n*H), f32(n*H)
 	e.gate, e.up = f32(n*I), f32(n*I)
 	wide := max(I, H)
-	e.qi8 = e.dev.NewBufferInt8(make([]int8, n*wide))
+	e.qi8 = gpu.NewBufferOf(e.dev, make([]int8, n*wide))
 	e.qs = f32(n)
 	e.cosB, e.sinB = f32(n*hd), f32(n*hd)
-	e.segS = e.dev.NewBufferUint32s(make([]uint32, n))
-	e.segE = e.dev.NewBufferUint32s(make([]uint32, n))
+	e.segS = gpu.NewBufferOf(e.dev, make([]uint32, n))
+	e.segE = gpu.NewBufferOf(e.dev, make([]uint32, n))
 	e.cap = n
 }
 

@@ -278,6 +278,7 @@ var (
 	selNewBufferNoCopy = objc.RegisterName("newBufferWithBytesNoCopy:length:options:deallocator:")
 	selNewBufferLen    = objc.RegisterName("newBufferWithLength:options:")
 	selContents        = objc.RegisterName("contents")
+	selLength          = objc.RegisterName("length") // MTLBuffer → NSUInteger, actual allocated bytes
 	selCommandBuffer   = objc.RegisterName("commandBuffer")
 	selComputeEncoder  = objc.RegisterName("computeCommandEncoder")
 	selSetPipeline     = objc.RegisterName("setComputePipelineState:")
@@ -418,12 +419,6 @@ func (d *Device) ReleaseBuf(b Buffer) {
 	b.id.Send(selRelease)
 }
 
-func (d *Device) NewBufferFloats(data []float32) Buffer {
-	id := d.id.Send(selNewBufferBytes, unsafe.Pointer(&data[0]), uintptr(len(data)*4), uintptr(0))
-	runtime.KeepAlive(data)
-	return d.MustBuf(id, len(data), "floats")
-}
-
 // NewBufferLen allocates an uninitialized shared MTLBuffer of nFloats float32s.
 func (d *Device) NewBufferLen(nFloats int) Buffer {
 	return d.MustBuf(d.id.Send(selNewBufferLen, uintptr(nFloats*4), uintptr(0)), nFloats, "len")
@@ -435,14 +430,6 @@ func (d *Device) NewBufferLen(nFloats int) Buffer {
 // for when re-pointed onto this substrate.
 func (d *Device) NewBufferBytes(n int) Buffer {
 	return d.MustBuf(d.id.Send(selNewBufferLen, uintptr(n), uintptr(0)), n, "bytes")
-}
-
-// NewBufferInt8 uploads int8 data (n counts BYTES for this buffer). NewBufferU32
-// uploads a single uint32 (kernel scalar arg). Both are shared/UMA.
-func (d *Device) NewBufferInt8(data []int8) Buffer {
-	id := d.id.Send(selNewBufferBytes, unsafe.Pointer(&data[0]), uintptr(len(data)), uintptr(0))
-	runtime.KeepAlive(data)
-	return d.MustBuf(id, len(data), "int8")
 }
 
 // NewBufferNoCopy wraps caller-owned memory in a shared MTLBuffer WITHOUT copying
@@ -457,27 +444,105 @@ func (d *Device) NewBufferNoCopy(ptr unsafe.Pointer, nBytes int) Buffer {
 	return d.MustBuf(id, nBytes, "nocopy")
 }
 
-func (d *Device) NewBufferU32(v uint32) Buffer {
-	id := d.id.Send(selNewBufferBytes, unsafe.Pointer(&v), uintptr(4), uintptr(0))
-	runtime.KeepAlive(&v)
-	return d.MustBuf(id, 1, "u32")
+// ---- generic buffer verbs (any scalar element type) ----
+//
+// A consumer with a wider mix of element types — a decode path allocating
+// float32 activations, int32 indices, uint16 f16 scales and uint32 packed
+// weights — wants the same four verbs parameterized instead of a method per
+// type. These are those, and they are free functions for the same reason
+// NewBufferNoCopy can't be one: Go has no generic methods. This used to be a
+// type-suffixed method per element type (NewBufferFloats, NewBufferInt8,
+// NewBufferU32, NewBufferUint32s, NewBufferU16s) with every real consumer
+// already on the generic twin once cuda.go's collapse landed; the
+// type-suffixed set was deleted here too, once nothing called it anymore.
+
+// Scalar is the element type a generic buffer verb (NewBufferOf, Upload,
+// Download, ...) can move — fixed-size numeric scalars only. Mirrors cuda.go's
+// Scalar exactly: the two files are build-tag mutually exclusive (darwin vs
+// linux) so this can't be shared code, but a consumer building against both
+// backends needs the same set of allowed element types on each.
+type Scalar interface {
+	~int8 | ~uint8 |
+		~int16 | ~uint16 |
+		~int32 | ~uint32 |
+		~int64 | ~uint64 |
+		~float32 | ~float64
 }
 
-// NewBufferUint32s uploads packed u32 data (n counts u32 words). Shared/UMA.
-func (d *Device) NewBufferUint32s(data []uint32) Buffer {
-	id := d.id.Send(selNewBufferBytes, unsafe.Pointer(&data[0]), uintptr(len(data)*4), uintptr(0))
-	runtime.KeepAlive(data)
-	return d.MustBuf(id, len(data), "uint32s")
-}
-
-// NewBufferU16s uploads u16 data (e.g. f16 group scales; n counts u16s). Shared/UMA.
-func (d *Device) NewBufferU16s(data []uint16) Buffer {
-	if len(data) == 0 {
-		return d.NewBufferLen(1)
+// asBytes reinterprets a slice of fixed-size scalars as the []byte the objc
+// buffer calls below copy through. The caller must runtime.KeepAlive the
+// source across the call. Mirrors cuda.go's asBytes exactly.
+func asBytes[T any](s []T) []byte {
+	if len(s) == 0 {
+		return nil
 	}
-	id := d.id.Send(selNewBufferBytes, unsafe.Pointer(&data[0]), uintptr(len(data)*2), uintptr(0))
+	var z T
+	return unsafe.Slice((*byte)(unsafe.Pointer(&s[0])), len(s)*int(unsafe.Sizeof(z)))
+}
+
+// NewBufferOf allocates a shared MTLBuffer sized to data and copies it in. n
+// for the returned Buffer is len(data), in elements of T. Panics on
+// allocation failure (see MustBuf).
+func NewBufferOf[T Scalar](d *Device, data []T) Buffer {
+	if len(data) == 0 {
+		return d.MustBuf(d.id.Send(selNewBufferLen, uintptr(0), uintptr(0)), 0, "typed-empty")
+	}
+	b := asBytes(data)
+	id := d.id.Send(selNewBufferBytes, unsafe.Pointer(&b[0]), uintptr(len(b)), uintptr(0))
 	runtime.KeepAlive(data)
-	return d.MustBuf(id, len(data), "u16s")
+	return d.MustBuf(id, len(data), "typed")
+}
+
+// NewBufferLenOf allocates an uninitialized shared MTLBuffer of n elements of T.
+func NewBufferLenOf[T Scalar](d *Device, n int) Buffer {
+	var z T
+	nBytes := n * int(unsafe.Sizeof(z))
+	return d.MustBuf(d.id.Send(selNewBufferLen, uintptr(nBytes), uintptr(0)), n, "typed-len")
+}
+
+// capacityBytes queries the MTLBuffer's actual allocated byte length — the
+// bounds-check source Upload/Download need. b.n is recorded in the
+// constructor's unit (floats, int8s, u32s, …), not bytes, so a generic verb
+// crossing that boundary (e.g. Download[float32] from a buffer NewBufferOf[int8]
+// built) cannot trust it the way cuda.go's Buffer.n comment already warns.
+// Mirrors cuda.go's b.b.Bytes().
+func (b Buffer) capacityBytes() uintptr {
+	return objc.Send[uintptr](b.id, selLength)
+}
+
+// Upload copies src into the buffer at its bind offset. On Metal's UMA this is
+// an in-place copy into shared memory, not a real host→device transfer — but
+// the verb matches cuda.go's so a consumer building against both backends
+// reads the same vocabulary either way.
+func Upload[T Scalar](b Buffer, src []T) error {
+	if len(src) == 0 {
+		return nil
+	}
+	data := asBytes(src)
+	if avail, want := b.capacityBytes(), uint64(b.off)+uint64(len(data)); uint64(avail) < want {
+		return fmt.Errorf("metal: upload of %d bytes at offset %d overruns a %d-byte buffer", len(data), b.off, avail)
+	}
+	dst := unsafe.Slice(objc.Send[*byte](b.id, selContents), int(b.capacityBytes()))
+	copy(dst[b.off:], data)
+	runtime.KeepAlive(src)
+	return nil
+}
+
+// Download copies the buffer's contents at its bind offset into dst
+// (zero-copy on UMA; dst's length sizes the transfer).
+func Download[T Scalar](b Buffer, dst []T) error {
+	if len(dst) == 0 {
+		return nil
+	}
+	var z T
+	need := len(dst) * int(unsafe.Sizeof(z))
+	if avail, want := b.capacityBytes(), uint64(b.off)+uint64(need); uint64(avail) < want {
+		return fmt.Errorf("metal: download of %d bytes at offset %d overruns a %d-byte buffer", need, b.off, avail)
+	}
+	src := unsafe.Slice(objc.Send[*byte](b.id, selContents), int(b.capacityBytes()))
+	copy(asBytes(dst), src[b.off:b.off+uintptr(need)])
+	runtime.KeepAlive(dst)
+	return nil
 }
 
 // Floats / Int8s view the buffer's shared contents as a Go slice (zero-copy on UMA).

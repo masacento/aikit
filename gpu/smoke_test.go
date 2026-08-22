@@ -35,8 +35,8 @@ func TestMetal_smokeAdd(t *testing.T) {
 		t.Fatalf("pipeline: %v", err)
 	}
 	q := d.NewCommandQueue()
-	a := d.NewBufferFloats([]float32{1, 2, 3, 4, 5})
-	b := d.NewBufferFloats([]float32{10, 20, 30, 40, 50})
+	a := NewBufferOf(d, []float32{1, 2, 3, 4, 5})
+	b := NewBufferOf(d, []float32{10, 20, 30, 40, 50})
 	out := d.NewBufferLen(5)
 	q.Run1D(p, 5, 5, a, b, out)
 

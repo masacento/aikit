@@ -127,7 +127,7 @@ func New() (*Backend, error) {
 		return nil, err
 	}
 	b := &Backend{dev: dev, q: dev.NewCommandQueue(), k: k, cpu: cpu}
-	b.mS, b.nS, b.kS = dev.NewBufferU32(0), dev.NewBufferU32(0), dev.NewBufferU32(0)
+	b.mS, b.nS, b.kS = gpu.NewBufferOf(dev, []uint32{0}), gpu.NewBufferOf(dev, []uint32{0}), gpu.NewBufferOf(dev, []uint32{0})
 	return b, nil
 }
 
@@ -217,7 +217,7 @@ func (b *Backend) residentQ8(wq []int8, wscales []float32, K, N int) gpu.Buffer 
 	if c, ok := b.q8[k]; ok && c.n == len(wq) {
 		return c.buf
 	}
-	// Dequantize STRAIGHT into the UMA buffer's backing (lens §4.4). NewBufferFloats
+	// Dequantize STRAIGHT into the UMA buffer's backing (lens §4.4). NewBufferOf
 	// would first stage a make([]float32, N*K) on the Go heap only to memcpy it into
 	// this same shared memory — 37.8 MB × 12 layers = 453 MB allocated, written, and
 	// immediately garbage on the first forward. On UMA the CPU can write the device

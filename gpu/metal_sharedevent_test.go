@@ -70,7 +70,7 @@ func TestSharedEventHandshake(t *testing.T) {
 	// per-command-buffer SUBMIT cost scales with the buffer's dispatch count, while the per-boundary
 	// HANDSHAKE cost does not; comparing them at 1 dispatch/segment understates the handshake's edge.
 	buf := d.NewBufferLen(grid)
-	uIters := d.NewBufferU32(iters)
+	uIters := NewBufferOf(d, []uint32{iters})
 	ev := d.NewSharedEvent()
 	queue := d.NewCommandQueue()
 

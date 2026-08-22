@@ -106,7 +106,7 @@ func TestNoCopyWiring(t *testing.T) {
 	nPages := mapBytes / pageSize
 	out := d.NewBufferLen(nPages)
 	q := d.NewCommandQueue()
-	q.Run1D(pipe, nPages, 256, buf, out, d.NewBufferU32(uint32(strideFloats)))
+	q.Run1D(pipe, nPages, 256, buf, out, NewBufferOf(d, []uint32{uint32(strideFloats)}))
 	_ = out.Floats()[0] // completion barrier (Run1D waits) + force the readback
 	wAfterTouch := wiredPages(t)
 	_ = mapping[0] // keep the mapping alive across the GPU read (deallocator is nil)

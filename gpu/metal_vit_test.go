@@ -51,8 +51,8 @@ func maxAbsDiffM(a, b []float32) float64 {
 }
 
 // i32b/f32b bind an int/float scalar as a 1-element buffer — Metal has no by-value arg.
-func i32b(d *Device, v int) Buffer     { return d.NewBufferU32(uint32(int32(v))) }
-func f32b(d *Device, v float32) Buffer { return d.NewBufferFloats([]float32{v}) }
+func i32b(d *Device, v int) Buffer     { return NewBufferOf(d, []uint32{uint32(int32(v))}) }
+func f32b(d *Device, v float32) Buffer { return NewBufferOf(d, []float32{v}) }
 
 func mtg(n int) int {
 	if n < ViTBlock {
@@ -108,7 +108,7 @@ func TestMetal_vitLayerNorm(t *testing.T) {
 				want[r*shape.dim+i] = float32((float64(xr[i])-mean)*inv)*w[i] + b[i]
 			}
 		}
-		dx, dw, db := d.NewBufferFloats(x), d.NewBufferFloats(w), d.NewBufferFloats(b)
+		dx, dw, db := NewBufferOf(d, x), NewBufferOf(d, w), NewBufferOf(d, b)
 		out := d.NewBufferLen(len(x))
 		run1d(q, v.LayerNorm, shape.rows*ViTBlock, ViTBlock,
 			dx, dw, db, out, i32b(d, shape.rows), i32b(d, shape.dim), f32b(d, eps))
@@ -133,7 +133,7 @@ func TestMetal_vitGELU(t *testing.T) {
 		vv := float64(val)
 		want[i] = float32(0.5 * vv * (1.0 + math.Tanh(c*(vv+0.044715*vv*vv*vv))))
 	}
-	dx := d.NewBufferFloats(x)
+	dx := NewBufferOf(d, x)
 	run1d(q, v.GELUTanh, len(x), mtg(len(x)), dx, i32b(d, len(x)))
 	got := append([]float32(nil), dx.Floats()...)
 	dmax := maxAbsDiffM(got, want)
@@ -192,8 +192,8 @@ func TestMetal_vitQuantRows(t *testing.T) {
 			wantQ[r*dim+i] = int8(vv)
 		}
 	}
-	dx := d.NewBufferFloats(x)
-	dq := d.NewBufferInt8(make([]int8, rows*dim))
+	dx := NewBufferOf(d, x)
+	dq := NewBufferOf(d, make([]int8, rows*dim))
 	ds := d.NewBufferLen(rows)
 	run1d(q, v.QuantRows, rows*ViTBlock, ViTBlock, dx, dq, ds, i32b(d, rows), i32b(d, dim))
 	gotQ, gotS := dq.Int8s(), ds.Floats()
@@ -239,7 +239,7 @@ func TestMetal_vitGEMMs(t *testing.T) {
 		}
 		dC := d.NewBufferLen(s.M * s.N)
 		run1d(q, v.GEMMW8A8, s.M*s.N, mtg(s.M*s.N),
-			d.NewBufferInt8(A), d.NewBufferFloats(as), d.NewBufferInt8(B), d.NewBufferFloats(bs), dC,
+			NewBufferOf(d, A), NewBufferOf(d, as), NewBufferOf(d, B), NewBufferOf(d, bs), dC,
 			i32b(d, s.M), i32b(d, s.N), i32b(d, s.K))
 		if dmax := maxAbsDiffM(dC.Floats(), want); dmax > 1e-4 {
 			t.Fatalf("W8A8 %dx%dx%d worst Δ %.3g", s.M, s.N, s.K, dmax)
@@ -258,7 +258,7 @@ func TestMetal_vitGEMMs(t *testing.T) {
 		}
 		dCf := d.NewBufferLen(s.M * s.N)
 		run1d(q, v.GEMMF32, s.M*s.N, mtg(s.M*s.N),
-			d.NewBufferFloats(Af), d.NewBufferFloats(Bf), dCf, i32b(d, s.M), i32b(d, s.N), i32b(d, s.K))
+			NewBufferOf(d, Af), NewBufferOf(d, Bf), dCf, i32b(d, s.M), i32b(d, s.N), i32b(d, s.K))
 		if dmax := maxAbsDiffM(dCf.Floats(), wantF); dmax > 1e-3 {
 			t.Fatalf("f32 %dx%dx%d worst Δ %.3g", s.M, s.N, s.K, dmax)
 		}
@@ -310,7 +310,7 @@ func TestMetal_vitAttention(t *testing.T) {
 		}
 		out := d.NewBufferLen(s.np * hidden)
 		run1dTG(q, v.Attention, s.np*s.nH*ViTBlock, ViTBlock, s.np*4,
-			d.NewBufferFloats(qv), d.NewBufferFloats(kv), d.NewBufferFloats(vv), out,
+			NewBufferOf(d, qv), NewBufferOf(d, kv), NewBufferOf(d, vv), out,
 			i32b(d, s.np), i32b(d, s.nH), i32b(d, s.hd), f32b(d, scale))
 		if dmax := maxAbsDiffM(out.Floats(), want); dmax > worstAll {
 			worstAll = dmax
@@ -339,13 +339,13 @@ func TestMetal_vitAddOps(t *testing.T) {
 	for i := range x {
 		wantVec[i] = x[i] + vec[i]
 	}
-	dx := d.NewBufferFloats(x)
-	run1d(q, v.AddBias, rows*dim, mtg(rows*dim), dx, d.NewBufferFloats(bias), i32b(d, rows), i32b(d, dim))
+	dx := NewBufferOf(d, x)
+	run1d(q, v.AddBias, rows*dim, mtg(rows*dim), dx, NewBufferOf(d, bias), i32b(d, rows), i32b(d, dim))
 	if dmax := maxAbsDiffM(dx.Floats(), wantBias); dmax > 1e-6 {
 		t.Fatalf("add_bias worst Δ %.3g", dmax)
 	}
-	dx2 := d.NewBufferFloats(x)
-	run1d(q, v.AddVec, rows*dim, mtg(rows*dim), dx2, d.NewBufferFloats(vec), i32b(d, rows*dim))
+	dx2 := NewBufferOf(d, x)
+	run1d(q, v.AddVec, rows*dim, mtg(rows*dim), dx2, NewBufferOf(d, vec), i32b(d, rows*dim))
 	if dmax := maxAbsDiffM(dx2.Floats(), wantVec); dmax > 1e-6 {
 		t.Fatalf("add_vec worst Δ %.3g", dmax)
 	}
@@ -361,7 +361,7 @@ func segb(d *Device, s []int32) Buffer {
 	for i, v := range s {
 		u[i] = uint32(v)
 	}
-	return d.NewBufferUint32s(u)
+	return NewBufferOf(d, u)
 }
 
 // TestMetal_vitRMSNorm gates weight-only RMSNorm against vision/qwen_encoder.go's
@@ -389,7 +389,7 @@ func TestMetal_vitRMSNorm(t *testing.T) {
 		}
 		out := d.NewBufferLen(len(x))
 		run1d(q, v.RMSNorm, shape.rows*ViTBlock, ViTBlock,
-			d.NewBufferFloats(x), d.NewBufferFloats(w), out, i32b(d, shape.rows), i32b(d, shape.dim), f32b(d, eps))
+			NewBufferOf(d, x), NewBufferOf(d, w), out, i32b(d, shape.rows), i32b(d, shape.dim), f32b(d, eps))
 		if dmax := maxAbsDiffM(out.Floats(), want); dmax > worstAll {
 			worstAll = dmax
 		}
@@ -414,7 +414,7 @@ func TestMetal_vitGELUErf(t *testing.T) {
 		vv := float64(val)
 		want[i] = float32(0.5 * vv * (1.0 + math.Erf(vv/math.Sqrt2)))
 	}
-	dx := d.NewBufferFloats(x)
+	dx := NewBufferOf(d, x)
 	run1d(q, v.GELUErf, len(x), mtg(len(x)), dx, i32b(d, len(x)))
 	got := append([]float32(nil), dx.Floats()...)
 	dm := maxAbsDiffM(got, want)
@@ -422,7 +422,7 @@ func TestMetal_vitGELUErf(t *testing.T) {
 	if dm > 5e-5 {
 		t.Fatalf("gelu_erf worst Δ %.3g exceeds the stated f32 bound 5e-5", dm)
 	}
-	dx2 := d.NewBufferFloats(x)
+	dx2 := NewBufferOf(d, x)
 	run1d(q, v.GELUTanh, len(x), mtg(len(x)), dx2, i32b(d, len(x)))
 	sep := maxAbsDiffM(dx2.Floats(), got)
 	if sep <= 1e-6 {
@@ -443,8 +443,8 @@ func TestMetal_vitSiLUMul(t *testing.T) {
 		vv := float64(gate[i])
 		want[i] = float32(vv/(1.0+math.Exp(-vv))) * up[i]
 	}
-	dg := d.NewBufferFloats(gate)
-	run1d(q, v.SiLUMul, len(gate), mtg(len(gate)), dg, d.NewBufferFloats(up), i32b(d, len(gate)))
+	dg := NewBufferOf(d, gate)
+	run1d(q, v.SiLUMul, len(gate), mtg(len(gate)), dg, NewBufferOf(d, up), i32b(d, len(gate)))
 	dm := maxAbsDiffM(dg.Floats(), want)
 	t.Logf("silu_mul f32 worst Δ %.3g vs double CPU (CUDA bar was 1e-6)", dm)
 	if dm > 5e-5 {
@@ -479,9 +479,9 @@ func TestMetal_vitRopeQK(t *testing.T) {
 		}
 	}
 
-	dq := d.NewBufferFloats(qkv)
+	dq := NewBufferOf(d, qkv)
 	run1d(q, v.RopeQK, seq*nH*hf, mtg(seq*nH*hf),
-		dq, d.NewBufferFloats(cos), d.NewBufferFloats(sin), i32b(d, seq), i32b(d, nH), i32b(d, hd))
+		dq, NewBufferOf(d, cos), NewBufferOf(d, sin), i32b(d, seq), i32b(d, nH), i32b(d, hd))
 	got := dq.Floats()
 	if dm := maxAbsDiffM(got, want); dm > 1e-5 {
 		t.Fatalf("rope_qk worst Δ %.3g", dm)
@@ -551,7 +551,7 @@ func TestMetal_vitAttentionSeg(t *testing.T) {
 		}
 	}
 
-	dq := d.NewBufferFloats(qkv)
+	dq := NewBufferOf(d, qkv)
 	out := d.NewBufferLen(seq * hidden)
 	run1dTG(q, v.AttentionSeg, seq*nH*ViTBlock, ViTBlock, maxSeg*4,
 		dq, out, segb(d, segStart), segb(d, segEnd), i32b(d, seq), i32b(d, nH), i32b(d, hd), f32b(d, scale))
@@ -608,8 +608,8 @@ func TestMetal_gemmTiledMatchesUntiled(t *testing.T) {
 			B[i] = int8(rng.Intn(255) - 127)
 		}
 		as, bs := randF32M(rng, sh.M, 0.01), randF32M(rng, sh.N, 0.01)
-		dA, dB := d.NewBufferInt8(A), d.NewBufferInt8(B)
-		dAs, dBs := d.NewBufferFloats(as), d.NewBufferFloats(bs)
+		dA, dB := NewBufferOf(d, A), NewBufferOf(d, B)
+		dAs, dBs := NewBufferOf(d, as), NewBufferOf(d, bs)
 		c1 := d.NewBufferLen(sh.M * sh.N) // untiled
 		c2 := d.NewBufferLen(sh.M * sh.N) // tiled
 		run1d(q, v.GEMMW8A8, sh.M*sh.N, mtg(sh.M*sh.N),
@@ -627,7 +627,7 @@ func TestMetal_gemmTiledMatchesUntiled(t *testing.T) {
 
 		Af, Bf := randF32M(rng, sh.M*sh.K, 1), randF32M(rng, sh.N*sh.K, 1)
 		f2 := d.NewBufferLen(sh.M * sh.N)
-		run2d(q, v.GEMMF32Tiled, gx, gy, tgx, tgy, d.NewBufferFloats(Af), d.NewBufferFloats(Bf), f2,
+		run2d(q, v.GEMMF32Tiled, gx, gy, tgx, tgy, NewBufferOf(d, Af), NewBufferOf(d, Bf), f2,
 			i32b(d, sh.M), i32b(d, sh.N), i32b(d, sh.K))
 		h2 := f2.Floats()
 		worst := 0.0
@@ -678,7 +678,7 @@ func TestMetal_gemmF32SG(t *testing.T) {
 		// so gating through it covers BOTH kernels on the shapes each actually serves.
 		p, gx, gy, tgx, tgy := v.GEMMF32Plan(sh.M, sh.N, sh.K)
 		out := d.NewBufferLen(sh.M * sh.N)
-		run2d(q, p, gx, gy, tgx, tgy, d.NewBufferFloats(Af), d.NewBufferFloats(Bf), out,
+		run2d(q, p, gx, gy, tgx, tgy, NewBufferOf(d, Af), NewBufferOf(d, Bf), out,
 			i32b(d, sh.M), i32b(d, sh.N), i32b(d, sh.K))
 		h := out.Floats()
 		worst := 0.0
@@ -726,8 +726,8 @@ func BenchmarkMetalGEMMF32(b *testing.B) {
 		{512, 768, 3072},
 		{1024, 1024, 4096},
 	} {
-		dA := d.NewBufferFloats(randF32M(rng, s.M*s.K, 1))
-		dB := d.NewBufferFloats(randF32M(rng, s.N*s.K, 1))
+		dA := NewBufferOf(d, randF32M(rng, s.M*s.K, 1))
+		dB := NewBufferOf(d, randF32M(rng, s.N*s.K, 1))
 		dC := d.NewBufferLen(s.M * s.N)
 		mf := 2.0 * float64(s.M) * float64(s.K) * float64(s.N) / 1e6
 		name := fmt.Sprintf("M%d_K%d_N%d_%.0fMFLOP", s.M, s.K, s.N, mf)
