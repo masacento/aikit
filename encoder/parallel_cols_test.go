@@ -242,3 +242,56 @@ func TestSoftmaxRows_bitIdentical(t *testing.T) {
 		}
 	}
 }
+
+// TestSoftmaxRowsScaled_bitIdentical is TestSoftmaxRows_bitIdentical's twin
+// for the fused scale+softmax path (T2, dead-ends §4.4) — softmaxRowsScaled
+// is now the real production entry point attention's callers use (softmaxRows
+// itself has no production caller left), so it needs the same row-parallel
+// split correctness gate: the row split must not change results.
+func TestSoftmaxRowsScaled_bitIdentical(t *testing.T) {
+	rng := rand.New(rand.NewSource(83))
+	const scale = 0.0883883476 // 1/sqrt(128), a real headDim
+	for _, sh := range []struct{ rows, cols int }{
+		{1, 4},     // degenerate: below every threshold
+		{2, 3},     // tiny, serial
+		{97, 97},   // below softmaxRowsThreshold
+		{256, 256}, // at the threshold
+		{690, 690}, // the GTE L=690 attention shape
+		{257, 691}, // neither dimension divides the worker count
+	} {
+		src := randF32(rng, sh.rows*sh.cols)
+		for j := range sh.cols {
+			src[j] = 1.0
+			if sh.rows > 1 {
+				src[sh.cols+j] = -1e30
+			}
+		}
+
+		want := make([]float32, len(src))
+		copy(want, src)
+		for i := range sh.rows {
+			softmaxRowScaled(want[i*sh.cols:(i+1)*sh.cols], scale)
+		}
+
+		got := make([]float32, len(src))
+		copy(got, src)
+		softmaxRowsScaled(got, scale, sh.rows, sh.cols)
+
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("rows=%d cols=%d elem %d (row %d): parallel %v, serial %v",
+					sh.rows, sh.cols, i, i/sh.cols, got[i], want[i])
+			}
+		}
+
+		for i := range sh.rows {
+			var sum float64
+			for _, v := range got[i*sh.cols : (i+1)*sh.cols] {
+				sum += float64(v)
+			}
+			if sum < 0.99 || sum > 1.01 {
+				t.Fatalf("rows=%d cols=%d row %d sums to %v, want ~1", sh.rows, sh.cols, i, sum)
+			}
+		}
+	}
+}

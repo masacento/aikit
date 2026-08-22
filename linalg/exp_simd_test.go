@@ -432,3 +432,35 @@ func TestSoftmaxRowIntoRaw_tail(t *testing.T) {
 		}
 	}
 }
+
+// TestSoftmaxRowScaledIntoRaw_tail walks every remainder length, checking
+// the SIMD fused kernel is bit-identical to the two-pass sequence at every
+// tail width — the part-load/store handling both max-scan (pass 1) and the
+// fused scale+exp (pass 2) have is exactly what a fixed-size sweep
+// under-covers.
+func TestSoftmaxRowScaledIntoRaw_tail(t *testing.T) {
+	var probe simd.Float32s
+	L := probe.Len()
+	rng := rand.New(rand.NewSource(79))
+	const scale = 0.0883883476 // 1/sqrt(128)
+	for n := 1; n <= 3*L+1; n++ {
+		src := make([]float32, n)
+		for i := range src {
+			src[i] = float32(rng.NormFloat64()) * 6
+		}
+		got := make([]float32, n)
+		softmaxRowScaledIntoRaw(got, src, scale)
+
+		twoPass := make([]float32, n)
+		for i, v := range src {
+			twoPass[i] = v * scale
+		}
+		softmaxRowIntoRaw(twoPass, twoPass)
+
+		for i := range got {
+			if got[i] != twoPass[i] {
+				t.Fatalf("n=%d i=%d: fused=%v two-pass=%v — NOT bit-identical", n, i, got[i], twoPass[i])
+			}
+		}
+	}
+}

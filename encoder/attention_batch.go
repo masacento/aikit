@@ -86,10 +86,7 @@ func selfAttentionBatched(h []float32, Wqkv, OutProj []float32, heads, headDim, 
 
 			scores = scores[:L*L]
 			s.mm(qH, kH, scores, L, headDim, L)
-			for i := range scores {
-				scores[i] *= scale
-			}
-			softmaxRows(scores, L, L)
+			softmaxRowsScaled(scores, scale, L, L)
 			// ctxHead[L, headDim] = scores[L, L] · V[L, headDim] — was the scalar
 			// triple-loop hotspot; now the SIMD A·Bᵀ matmul.
 			ctxHeadL := ctxHead[:L*headDim]

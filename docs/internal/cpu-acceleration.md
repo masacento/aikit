@@ -617,6 +617,86 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
     softmax-scale fusion dead-ends §4.4 reopens now that item 7's SIMD
     softmax makes the scale pass a bigger share of the kernel.
 
+13. **Softmax-scale fusion — ✅ DONE, Experimental tier,
+    `linalg/exp_simd.go`.** T2, and dead-ends §4.4's own condition for
+    reopening it ("revisit after campaign #13 lands SIMD `expF32` — then it
+    becomes ~20% of the softmax instead of 2%") is exactly what items 7-12
+    did. §4.4 originally measured the fusion worth nothing (16.0 vs
+    16.0 ns/elem at L=80) because scalar `math.Exp` swamped the ~2% the
+    separate `scores[i] *= scale` pass cost — that math hasn't changed for
+    the DEFAULT build, only for the experiment, so this stays scoped there.
+
+    New `linalg.SoftmaxRowScaledInto(dst, src, scale)` — `softmax(scale·src)`
+    in one call. scale MUST be `> 0` (attention's `1/sqrt(headDim)` always
+    is): that's what lets the row max be computed on the UNSCALED row (an
+    identical max-scan to the unfused kernel) and multiplied by `scale`
+    exactly once, rather than needing a max-scan over pre-scaled values —
+    `max(scale·x) == scale·max(x)` for `scale > 0`, and that one multiply is
+    the EXACT SAME float32 operation whether performed as part of a
+    separate full-array pass first or once on the single max value after
+    scanning. Same argument for `scaled[i] == src[i]*scale`: the same
+    single multiply, same operands, same rounding, regardless of when it
+    runs. That's what makes the fusion **provably bit-identical**, not
+    merely close — verified directly
+    (`TestSoftmaxRowScaledInto_bitIdenticalToTwoPass`,
+    `TestSoftmaxRowScaledIntoRaw_tail`,
+    `encoder`'s `TestSoftmaxRowsScaled_bitIdentical`), not just argued.
+
+    Default build: still two passes internally (`softmaxRowScaledIntoRaw`
+    in `exp_scalar.go` scales, then calls the existing
+    `softmaxRowIntoRaw`) — matching §4.4's own finding that fusing them
+    isn't worth it at scalar speeds, so nothing there was worth changing.
+    SIMD build: the `src[i] *= scale` a caller used to run as its own
+    separate O(L²) pass is folded directly into the SAME per-lane pass that
+    already computes the exponential (`src[i]*scale - scaledMax`, vectorized)
+    — three passes instead of four, eliminating the separate multiply pass
+    entirely rather than merely speeding it up.
+
+    Encoder side: all four real call sites that used to do
+    `for i { scores[i] *= scale }` then `softmaxRows(...)` —
+    `encoder/attention.go`, `encoder/attention_batch.go`, and both of
+    `encoder/forward_q8.go`'s (single + batched) — now call a new
+    `softmaxRowsScaled(scores, scale, rows, cols)` (`encoder/parallel.go`,
+    same row-parallel-split shape as `softmaxRows`) instead. The unscaled
+    `softmaxRows`/`softmaxRow` are UNCHANGED and kept (no remaining
+    production caller, but real existing test coverage
+    (`TestSoftmaxRows_bitIdentical`) — left alone rather than deleted, and
+    `softmaxRowsScaled` got the same parallel-split correctness gate
+    (`TestSoftmaxRowsScaled_bitIdentical`) rather than trusting the shared
+    `parallelRows` machinery by inference.
+
+    Measured (`BenchmarkSoftmaxRowScaled_vs_twoPass`, the actual two-pass
+    sequence a caller used to run vs. the fused call, at the two shapes
+    §4.4 named):
+
+    | box | build | L=80 | L=691 |
+    |---|---|--:|--:|
+    | `apple-m1pro` | SIMD | 2.92→2.38 ns/elem (**~18.5%**) | 2.88→2.45 ns/elem (**~15%**) |
+    | `apple-m1pro` | default | 5.24→4.92 ns/elem (noise) | 5.61→5.51 ns/elem (noise) |
+    | `nvidia-rtx2070s` | SIMD | 3.66→3.09 ns/elem (**~15.3%**) | 3.57→2.95 ns/elem (**~17.4%**) |
+    | `nvidia-rtx2070s` | default | 7.20→6.85 ns/elem (noise) | 7.08→6.70 ns/elem (noise) |
+
+    A real, reproducible ~15-19% win under `GOEXPERIMENT=simd` on both
+    boxes — smaller than items 10-12's multi-x kernel wins (this eliminates
+    one O(L²) pass out of softmax's four, not a whole transcendental), but
+    it lands almost exactly where §4.4's own prediction put it ("~20% of
+    the softmax"), and it's a smaller, more surgical class of change: no
+    new transcendental kernel, just removing a pass whose separate
+    existence stopped being justified once the pass it fed got cheap. The
+    default build shows only noise-level movement (<6%, inside
+    measuring-performance's own "treat as unmeasured" band) — expected and
+    correct, since it isn't actually fused there. Full gate green on both
+    boxes: bit-identity tests (not just accuracy bounds — this technique's
+    whole premise is exactness), `encoder`+`vision` golden/cosine suites
+    under `GOEXPERIMENT=simd`, the `GODEBUG=simd=0` emulation leg, `-race`,
+    and the default build's full test suite (`linalg`+`encoder`) verified
+    unchanged.
+
+    Next per `docs/prompts/simd-elementwise-autoresearch.md`: re-profile
+    the L=690 and L=80 forwards now that T1+T2 have both landed — the
+    doc's own stop condition triggers here if the elementwise layer's share
+    has fallen under ~2-3% of the forward.
+
 GPU follow-ups (resident buffers, tiled kernel, batch-tiling) are **goinfer's** —
 see `goinfer/gpu` and goinfer's perf docs.
 

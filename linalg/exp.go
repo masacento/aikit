@@ -155,6 +155,32 @@ func SoftmaxRowInto(dst, src []float32) {
 	softmaxRowIntoRaw(dst, src)
 }
 
+// SoftmaxRowScaledInto is SoftmaxRowInto(dst, scale*src) — fused: the
+// per-element `src[i] *= scale` a caller like attention would otherwise do
+// in a separate O(L²) pass before calling SoftmaxRowInto is folded into the
+// SAME pass that already touches every element (the exponential), instead
+// of a fourth pass over the row. scale MUST be > 0 (attention's own
+// 1/sqrt(headDim) always is) — that's what lets the row max be computed on
+// the UNSCALED row and multiplied by scale exactly once, rather than
+// requiring a max-scan over pre-scaled values: max(scale*x) == scale*max(x)
+// for scale > 0, and scale*max(x) is the exact same float32 multiply either
+// way, so this is provably bit-identical to the two-pass
+// (scale-then-SoftmaxRowInto) sequence it replaces, in BOTH builds — see
+// exp_simd.go's softmaxRowScaledIntoRaw for the SIMD build, where this
+// genuinely eliminates the separate pass (dead-ends §4.4, reopened once
+// item 7's SIMD exp made it worth chasing); the default build still runs it
+// as two passes internally, since dead-ends §4.4's own measurement found no
+// win there (the pass was ~2% of the cost, swamped by scalar math.Exp).
+func SoftmaxRowScaledInto(dst, src []float32, scale float32) {
+	if len(dst) != len(src) {
+		panic("linalg: SoftmaxRowScaledInto length mismatch")
+	}
+	if len(src) == 0 {
+		return
+	}
+	softmaxRowScaledIntoRaw(dst, src, scale)
+}
+
 // ErfF32 returns erf(x) in float32.
 //
 // Accuracy (TestErfF32_accuracy, 4M points over [-8,8]): max ABSOLUTE error

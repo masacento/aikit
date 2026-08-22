@@ -106,10 +106,7 @@ func attentionCore(h []float32, Q, K, V, OutProj, OutProjB []float32, heads, hea
 			}
 		}
 		s.mm(qH, kH, scores, mOut, headDim, L)
-		for i := range scores {
-			scores[i] *= scale
-		}
-		softmaxRows(scores, mOut, L)
+		softmaxRowsScaled(scores, scale, mOut, L)
 		// ctxHead[mOut, headDim] = scores[mOut, L] · V[L, headDim], as scores · (vHT)ᵀ.
 		s.mm(scores, vHT, ctxHead, mOut, L, headDim)
 		// Scatter this head's context into the interleaved ctx[mOut, D].

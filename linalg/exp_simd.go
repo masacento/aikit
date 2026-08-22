@@ -100,6 +100,88 @@ func softmaxRowIntoRaw(dst, src []float32) {
 	}
 }
 
+// softmaxRowScaledIntoRaw is SoftmaxRowScaledInto (exp.go) with the
+// length/empty checks already done — T2 (dead-ends §4.4, reopened after
+// item 7's SIMD exp). The SAME four passes softmaxRowIntoRaw has, minus
+// one: the row max is computed on the UNSCALED src (identical max-scan to
+// softmaxRowIntoRaw's pass 1), scaled by ONE scalar multiply, and the
+// `src[i] *= scale` a caller used to do in its own separate O(L²) pass is
+// folded directly into pass 2's per-lane exp computation instead — see
+// SoftmaxRowScaledInto's doc comment for why this is bit-identical to that
+// two-pass sequence, not just an approximation of it.
+func softmaxRowScaledIntoRaw(dst, src []float32, scale float32) {
+	n := len(src)
+	c := newExpSIMDConsts()
+	var probe simd.Float32s
+	L := probe.Len()
+
+	// Pass 1: max over UNSCALED src — identical to softmaxRowIntoRaw's own
+	// max-scan; nothing about scale enters this pass.
+	maxV := src[0]
+	i := 0
+	if n >= L {
+		m := simd.LoadFloat32s(src[0:L])
+		for i = L; i+L <= n; i += L {
+			m = m.Max(simd.LoadFloat32s(src[i : i+L]))
+		}
+		var buf [16]float32
+		m.Store(buf[:L])
+		maxV = buf[0]
+		for _, v := range buf[1:L] {
+			if v > maxV {
+				maxV = v
+			}
+		}
+	}
+	for ; i < n; i++ {
+		if v := src[i]; v > maxV {
+			maxV = v
+		}
+	}
+	scaledMax := maxV * scale
+
+	// Pass 2: exp(src[i]*scale - scaledMax), vectorized. The `*scale` here
+	// IS the fused-away separate pass — same single multiply a caller's own
+	// loop would have done, just performed inside this one instead of a
+	// pass of its own beforehand.
+	bcScale := simd.BroadcastFloat32s(scale)
+	bcMax := simd.BroadcastFloat32s(scaledMax)
+	i = 0
+	for ; i+L <= n; i += L {
+		v := simd.LoadFloat32s(src[i : i+L]).Mul(bcScale).Sub(bcMax)
+		expF32CoreVec(v, &c).Store(dst[i : i+L])
+	}
+	if i < n {
+		v, _ := simd.LoadFloat32sPart(src[i:])
+		vv := v.Mul(bcScale).Sub(bcMax)
+		expF32CoreVec(vv, &c).StorePart(dst[i:])
+	}
+
+	// Pass 3: f64 sum — unchanged.
+	var sum float64
+	for _, e := range dst {
+		sum += float64(e)
+	}
+	if sum == 0 {
+		u := 1.0 / float32(n)
+		for j := range dst {
+			dst[j] = u
+		}
+		return
+	}
+
+	// Pass 4: scale (normalize) — unchanged.
+	inv := simd.BroadcastFloat32s(float32(1.0 / sum))
+	i = 0
+	for ; i+L <= n; i += L {
+		simd.LoadFloat32s(dst[i : i+L]).Mul(inv).Store(dst[i : i+L])
+	}
+	if i < n {
+		v, _ := simd.LoadFloat32sPart(dst[i:])
+		v.Mul(inv).StorePart(dst[i:])
+	}
+}
+
 // expSIMDConsts holds the broadcast constants so a hot loop hoists them once.
 type expSIMDConsts struct {
 	log2e, magic, ln2Hi, ln2Lo             simd.Float32s

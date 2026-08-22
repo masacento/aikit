@@ -155,6 +155,13 @@ func softmaxRow(row []float32) {
 	linalg.SoftmaxRowInto(row, row)
 }
 
+// softmaxRowScaled is softmaxRow fused with the attention score scale
+// (1/sqrt(headDim)) — see linalg.SoftmaxRowScaledInto for why this replaces
+// a caller's own separate `scores[i] *= scale` pass bit-identically.
+func softmaxRowScaled(row []float32, scale float32) {
+	linalg.SoftmaxRowScaledInto(row, row, scale)
+}
+
 // silu returns x · sigmoid(x), the SwiGLU gate activation.
 //
 // linalg's float32 kernel (perf-campaign item 13), not f64 math.Exp. The

@@ -148,6 +148,44 @@ func TestSoftmaxRowInto_matchesReference(t *testing.T) {
 	}
 }
 
+// TestSoftmaxRowScaledInto_bitIdenticalToTwoPass is the load-bearing gate for
+// T2 (dead-ends §4.4): SoftmaxRowScaledInto(dst, src, scale) must be
+// BIT-IDENTICAL, not just close, to the two-pass sequence it replaces
+// (manually scale src, then SoftmaxRowInto) — the whole fusion's premise is
+// that eliminating the separate pass changes nothing about the arithmetic,
+// in both builds. A mismatch here means the "provably bit-identical" claim
+// in SoftmaxRowScaledInto's doc comment is wrong, not just imprecise.
+func TestSoftmaxRowScaledInto_bitIdenticalToTwoPass(t *testing.T) {
+	rng := rand.New(rand.NewSource(73))
+	for _, n := range []int{1, 2, 7, 8, 15, 16, 17, 64, 80, 691} {
+		for _, scale := range []float32{1, 0.125, 0.0883883476 /* 1/sqrt(128), a real headDim */, 3.7} {
+			for trial := range 50 {
+				src := make([]float32, n)
+				mag := []float64{1, 10, 100}[trial%3]
+				for i := range src {
+					src[i] = float32(rng.NormFloat64() * mag)
+				}
+
+				fused := make([]float32, n)
+				SoftmaxRowScaledInto(fused, src, scale)
+
+				twoPass := make([]float32, n)
+				for i, v := range src {
+					twoPass[i] = v * scale
+				}
+				SoftmaxRowInto(twoPass, twoPass)
+
+				for i := range fused {
+					if fused[i] != twoPass[i] {
+						t.Fatalf("n=%d scale=%v trial=%d i=%d: fused=%v two-pass=%v — NOT bit-identical",
+							n, scale, trial, i, fused[i], twoPass[i])
+					}
+				}
+			}
+		}
+	}
+}
+
 func BenchmarkExpF32_vs_mathExp(b *testing.B) {
 	const n = 65536
 	rng := rand.New(rand.NewSource(1))
@@ -196,6 +234,40 @@ func BenchmarkSoftmaxRow_vs_scalar(b *testing.B) {
 		b.Run("n"+itoaBench(n)+"/f32", func(b *testing.B) {
 			for b.Loop() {
 				SoftmaxRowInto(dst, src)
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+		})
+	}
+}
+
+// BenchmarkSoftmaxRowScaled_vs_twoPass is T2's own measurement (dead-ends
+// §4.4, reopened after item 7's SIMD exp): the two-pass sequence a caller
+// used to run (its own `src[i] *= scale` loop, then SoftmaxRowInto) against
+// the fused SoftmaxRowScaledInto, at the two shapes dead-ends §4.4 named —
+// L=80 (the rerank shape, where the separate pass was ~2% of the cost) and
+// L=690 (the GTE shape, where softmax was half the pre-item-13 forward).
+func BenchmarkSoftmaxRowScaled_vs_twoPass(b *testing.B) {
+	rng := rand.New(rand.NewSource(11))
+	const scale = 0.0883883476 // 1/sqrt(128)
+	for _, n := range []int{80, 691} {
+		src := make([]float32, n)
+		for i := range src {
+			src[i] = float32(rng.NormFloat64() * 4)
+		}
+		dst := make([]float32, n)
+
+		b.Run("n"+itoaBench(n)+"/twoPass", func(b *testing.B) {
+			for b.Loop() {
+				for i, v := range src {
+					dst[i] = v * scale
+				}
+				SoftmaxRowInto(dst, dst)
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+		})
+		b.Run("n"+itoaBench(n)+"/fused", func(b *testing.B) {
+			for b.Loop() {
+				SoftmaxRowScaledInto(dst, src, scale)
 			}
 			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
 		})
