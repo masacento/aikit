@@ -9,6 +9,49 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.24.0] — 2026-08-22
+
+### Added
+
+- **`ann.FlatI8.EnableGPUShardSplit`** — splits the corpus into a
+  device-resident shard and a CPU-scored shard, scoring both concurrently
+  per `QueryBatch` call and merging the per-query top-k results. Measured
+  on real hardware (`apple-m1pro` Metal, `nvidia-rtx2070s` CUDA): a real
+  but bounded, share/box/scale-dependent win — up to 1.46x over GPU-only
+  on Metal, up to 1.17x on CUDA at N=10k, but a net loss on CUDA at N=100k
+  where the GPU is already 15-40x faster than CPU alone and any CPU share
+  becomes the bottleneck. `gpuShare` is an explicit, measured-not-computed
+  tuning knob — see the doc comment and `docs/internal/cpu-acceleration.md`
+  for per-box guidance. `Query`/`QueryFilter` are unaffected; this is
+  `QueryBatch`-only.
+- **The Go 1.27 `simd` elementwise family (v1.23.0's item 7) extended to
+  four more kernels — Experimental tier, `GOEXPERIMENT=simd`.**
+  `SiLUInto` (~2.9x both boxes), `GELUInto`/`ErfF32` (~5.2x `apple-m1pro`,
+  ~4.25x `nvidia-rtx2070s`), `TanhInto`/`GELUTanhInto` (~5.1-5.6x /
+  ~3.6-4.28x), and a fused `SoftmaxRowScaledInto` that eliminates the
+  attention scale pass's separate O(L²) sweep under the experiment
+  (~15-19% real win on both boxes, provably
+  bit-identical to the two-pass sequence it replaces, not merely close).
+  Also fixed: `encoder`'s own hot paths (`swigluMLP`, `bert.go`'s
+  `gelu`/`geluTanh`, `gte.go`'s GeGLU) were calling the scalar per-element
+  activation functions directly rather than these new batched kernels —
+  only `vision`'s towers were exercising the vectorized path before this
+  release. All four kernels and the fix are off by default: the
+  non-experimental build is verified byte-for-byte unchanged (full
+  `linalg`/`encoder`/`vision` suites, golden and cosine-parity tests,
+  `-race`, and the `GODEBUG=simd=0` emulation leg all pass). See
+  `docs/internal/cpu-acceleration.md` items 10-14 for the full numbers and
+  per-kernel accuracy contracts.
+
+### Changed
+
+- **`gpu` package's type-suffixed `Buffer` API collapsed into a generic
+  twin** on the Metal side (`NewBufferOf[T]`/`NewBufferLenOf[T]`/
+  `Upload[T]`/`Download[T]`), mirroring the CUDA-side collapse already
+  shipped in `gpu/v0.29.0`. Ships as `gpu/v0.30.0` alongside this release
+  — see that tag's own notes; nothing in the root module's public API
+  changed.
+
 ## [1.23.0] — 2026-08-20
 
 ### Added
@@ -2152,6 +2195,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.22.0...HEAD
+[1.24.0]: https://github.com/townsendmerino/aikit/compare/v1.23.0...v1.24.0
 [1.23.0]: https://github.com/townsendmerino/aikit/compare/v1.22.0...v1.23.0
 [1.22.0]: https://github.com/townsendmerino/aikit/compare/v1.21.0...v1.22.0
 [1.21.0]: https://github.com/townsendmerino/aikit/compare/v1.20.0...v1.21.0
