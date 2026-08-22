@@ -394,6 +394,21 @@ analysis kept predicting load-reduction wins that do not exist on arm64.
 - **AVX-512 for f32** — deprioritized; the blocker is Intel client parts shipping it
   fused-off, and the int8 VNNI subset (`VPDPBUSD`) is the part worth taking, gated for a
   VNNI-capable machine (none available).
+- **Double-buffering `gpu/annmetal`'s dispatch** (2026-08-21) — the second of two
+  overlap ideas from the July GPU crossover follow-up (the first, CPU∥GPU
+  shard-split `QueryBatch`, shipped — see `cpu-acceleration.md`). `annmetal`'s
+  `Score`/`ScoreBatch`/`TopKBatch` are documented "Serialized: the reused
+  scratch buffers are per-index, and one command queue runs serially" — a
+  double-buffered pipeline (quantize batch i+1 / drain batch i-1 while the GPU
+  scores batch i) would overlap that, and on unified memory it would be cheap
+  to build. Not built: searched every `ann.FlatI8.QueryBatch` call site in
+  aikit (only `examples/gpu-ann/main.go` is a real caller, and it calls
+  `QueryBatch` twice total, not in a loop) and the accessible parts of
+  goinfer's decoder/docs — goinfer does not import `aikit/ann` at all, only
+  `aikit/linalg`/`aikit/embed`. No streaming-batch consumer exists to overlap
+  against. This is category (a) below (genuinely open, not deferred with a
+  measurement) — revisit if a real caller ever issues `QueryBatch` calls
+  back-to-back rather than one-shot.
 
 ---
 
