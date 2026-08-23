@@ -9,6 +9,38 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.25.0] — 2026-08-23
+
+### Added
+
+Two new f64 attention GEMV kernels in `linalg`, built for CPU decode attention at M=1. Both are
+additive; no existing APIs changed.
+
+- **`MatmulQKAcc64`** — computes per-key query·key dot products as 8 concurrent f64 accumulator
+  chains instead of one serialized fold at a time. Each output's own reduction order is
+  unchanged — the interleave runs independent outputs side by side, never splitting or
+  reassociating a single sum — so results are bit-identical to the existing
+  `MatmulBTAcc64Strided` path. The 8-wide shape was chosen over 4-wide by measurement (4.4x vs
+  3.0x). Measured 4.41x at the qwen2.5-1.5b decode attention shape on an M1 Pro, and
+  depth-independent, consistent with what it is: an FMA-latency fix, not a memory fix.
+- **`MatmulAVAcc64`** — computes scores·V with keys-outer/dims-inner accumulation, streaming
+  each V row contiguously instead of reading one strided element per multiply. Per-dim sums
+  still see keys in the same ascending order, so this is also bit-identical by construction.
+  Measured 1.81x at depth 130 growing to 2.39x at depth 8192 on the same shape and box — the
+  depth dependence is the expected signature of a memory-order fix, since the strided reads it
+  replaces get more expensive as the KV history outgrows cache.
+
+Correctness for both is held to exact equality, not tolerance: the new kernels' outputs are
+compared `==` against the existing path across random and stress shapes including every
+key-count residue of the interleave width, and the suite runs clean under `-race`.
+
+Context, for the curious: these came out of a measured finding in goinfer that CPU decode
+attention was running at serial f64 chain speed (~1.0 ns/MAC) while carrying a deliberate
+exactness guarantee (decode bit-identical to batched prefill/verify, which speculative decoding
+depends on). These kernels keep that guarantee and remove the serialization. In goinfer,
+together with caller-side threading across attention heads, decode attention improved 3.86x at
+depth 128 and 10.2x at depth 8192, with zero logit difference across the bit-identity gates.
+
 ## [1.24.0] — 2026-08-22
 
 ### Added
@@ -2195,6 +2227,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.22.0...HEAD
+[1.25.0]: https://github.com/townsendmerino/aikit/compare/v1.24.0...v1.25.0
 [1.24.0]: https://github.com/townsendmerino/aikit/compare/v1.23.0...v1.24.0
 [1.23.0]: https://github.com/townsendmerino/aikit/compare/v1.22.0...v1.23.0
 [1.22.0]: https://github.com/townsendmerino/aikit/compare/v1.21.0...v1.22.0
