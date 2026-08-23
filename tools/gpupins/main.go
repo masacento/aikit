@@ -29,9 +29,21 @@
 // not "a bug shipped" — and the direct-push workflow (no branch protection, see RELEASING.md)
 // makes a transient red on main the right nudge rather than a blocked merge.
 //
-// OUT OF SCOPE, on purpose: chunk/treesitter (frozen at v1.0.0 for the v1.0 line), the
-// examples/ and benchmarks/ modules (in-tree, `replace`-backed, not published), and the
-// `go 1.26.6` toolchain directive — a different axis with its own single source (go.mod).
+// OUT OF SCOPE OF THE VERDICT, on purpose: chunk/treesitter (frozen at v1.0.0 for the v1.0
+// line), the examples/ and benchmarks/ modules (in-tree, `replace`-backed, not published),
+// and the `go 1.26.6` toolchain directive — a different axis with its own single source
+// (go.mod).
+//
+// BUT `--fix` STILL REWRITES ONE OF THEM (see `dependents`). Not being published means an
+// example's require version can't mislead a consumer — it does not mean the version is free
+// to be stale. MVS still reads it: examples/gpu-ann requires anncuda/annmetal, so the moment
+// `--fix` moves those to a new root version, gpu-ann's own root require is BELOW what its
+// own dependencies demand and its go.mod is untidy. `go list` then fails outright with
+// "updates to go.mod needed", which is why v1.25.0 went red in CI on govulncheck (the scan
+// could not load the module at all — UNSCANNED, correctly not a clean result) rather than on
+// anything a consumer would have seen. Judging the eight but fixing nine keeps `--fix` a
+// release step that actually finishes, without claiming the example is part of the pin
+// invariant it is not part of.
 //
 // Usage:
 //
@@ -65,6 +77,16 @@ var backends = []string{
 	"gpu/qwencuda", "gpu/qwenmetal",
 	"gpu/visioncuda", "gpu/visionmetal",
 }
+
+// dependents are in-tree modules that are NOT part of the pin invariant — never checked,
+// never in the verdict — but whose aikit requires `--fix` must carry along anyway, because
+// MVS forces them up the moment the backends move. examples/gpu-ann requires anncuda and
+// annmetal (`replace`-backed at ../..), so a `--fix` that bumps those to a new root version
+// and stops leaves gpu-ann requiring the OLD one, below its own dependencies: go.mod untidy,
+// `go list` broken, govulncheck unable to load it. Enumerated for the same reason `backends`
+// is — a new example that acquires a backend dependency is a deliberate edit here, not a
+// discovery, and getting it wrong is a red CI run, not a silent wrong answer.
+var dependents = []string{"examples/gpu-ann"}
 
 var (
 	reRootTag = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
@@ -193,33 +215,48 @@ func versionField(trimmed, modPath string) string {
 func runFix(root, wantRoot, wantGpu string) int {
 	changed, failed := 0, 0
 	for _, mod := range backends {
-		path := filepath.Join(root, mod, "go.mod")
-		data, err := os.ReadFile(path)
-		if err != nil {
-			fmt.Printf("  %-22s could not read: %v\n", mod, err)
-			failed++
-			continue
+		fixModule(root, mod, wantRoot, wantGpu, &changed, &failed)
+	}
+	// The dependents are printed under their own heading so the report never reads as though
+	// the pin invariant grew to nine modules — it did not; these are carried, not judged.
+	if len(dependents) > 0 {
+		fmt.Println("\n  carried along (not part of the invariant; MVS forces them):")
+		for _, mod := range dependents {
+			fixModule(root, mod, wantRoot, wantGpu, &changed, &failed)
 		}
-		out, edits := rewrite(string(data), wantRoot, wantGpu)
-		if len(edits) == 0 {
-			fmt.Printf("  %-22s already current\n", mod)
-			continue
-		}
-		if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
-			fmt.Printf("  %-22s could not write: %v\n", mod, err)
-			failed++
-			continue
-		}
-		fmt.Printf("  %-22s %s\n", mod, strings.Join(edits, "; "))
-		changed++
 	}
 	fmt.Println()
 	if failed > 0 {
 		fmt.Println(gate.Verdict(gate.Inconclusive, fmt.Sprintf("%d rewritten, %d could not be written", changed, failed)))
 		return 2
 	}
-	fmt.Println(gate.Verdict(gate.OK, fmt.Sprintf("%d backend(s) rewritten to %s + gpu %s", changed, wantRoot, wantGpu)))
+	fmt.Println(gate.Verdict(gate.OK, fmt.Sprintf("%d module(s) rewritten to %s + gpu %s", changed, wantRoot, wantGpu)))
 	return 0
+}
+
+// fixModule rewrites one go.mod's aikit requires in place, reporting one line about what it
+// did and folding the result into the caller's counters. A module that has no aikit require
+// at all is simply "already current" — rewrite makes no edits and none are needed.
+func fixModule(root, mod, wantRoot, wantGpu string, changed, failed *int) {
+	path := filepath.Join(root, mod, "go.mod")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Printf("  %-22s could not read: %v\n", mod, err)
+		*failed++
+		return
+	}
+	out, edits := rewrite(string(data), wantRoot, wantGpu)
+	if len(edits) == 0 {
+		fmt.Printf("  %-22s already current\n", mod)
+		return
+	}
+	if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
+		fmt.Printf("  %-22s could not write: %v\n", mod, err)
+		*failed++
+		return
+	}
+	fmt.Printf("  %-22s %s\n", mod, strings.Join(edits, "; "))
+	*changed++
 }
 
 // rewrite returns go.mod text with the two aikit require versions set to the targets, and a

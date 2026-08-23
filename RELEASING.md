@@ -56,6 +56,11 @@ Automated and CI-enforced.
    git in one command, so closing it here means the gate never reddens for a known, self-inflicted
    reason. Commit e.g. `release: bump gpu backends to aikit vX.Y.Z (gpupins --fix)`. (This is the
    root-release counterpart of the gpu-submodule ritual's step 3, which already runs `--fix`.)
+   `--fix` also carries `examples/gpu-ann` along — it is not part of the pin invariant and is
+   never in the gate's verdict, but it requires two of the eight, so MVS forces its own root
+   require up with them. Leaving it behind does not produce a stale-pin red; it produces an
+   untidy go.mod that `go list` refuses outright, which is how v1.25.0 went red on
+   *govulncheck* (`examples/gpu-ann UNSCANNED`, fixed in `71decd9`) rather than on `gpu-pins`.
 
 ## GPU submodule — `github.com/townsendmerino/aikit/gpu` (tags `gpu/vX.Y.Z`)
 
@@ -182,7 +187,8 @@ order is not optional:
    and `gpu/vX.Y.Z` tags and sets `require github.com/townsendmerino/aikit <root tag>` and
    `require github.com/townsendmerino/aikit/gpu <gpu tag>` in all eight go.mod files (keeping
    the replaces), so the version is derived from git rather than restated by hand in eight
-   places. Commit, then tag `gpu/anncuda/vX.Y.Z` and so on. `gpupins` (no `--fix`) is a CI
+   places (plus `examples/gpu-ann`, carried but not judged — see the root ritual's step 5).
+   Commit, then tag `gpu/anncuda/vX.Y.Z` and so on. `gpupins` (no `--fix`) is a CI
    gate on every push — the eight pinning a stale tag is the drift that shipped once (root at
    `v1.17.1`, backends still on `v1.17.0`); it is the HOME of the two-series fact, so if this
    bites a fifth time, read `tools/gpupins/main.go` first.
