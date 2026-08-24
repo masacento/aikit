@@ -39,6 +39,19 @@ type WeightMat struct {
 	w8a8   bool      // int8 weights run full int8×int8 (W8A8) instead of weight-only Q8
 	rows   int       // out features (N)
 	cols   int       // in features (K)
+
+	// q4Row4/q4Row4Scales: an OPTIONAL, additional arm64-only in-RAM layout —
+	// split-half nibbles + 4-row interleave (docs/task-w4a8-neon-bandwidth.md's
+	// item-3+4 harness, GO 2026-08-23/24) — set only by an explicit
+	// RepackInt4Row4 call (never probed for or built implicitly inside a
+	// matmul). Bit-identical to the canonical q4/q4s for the same logical
+	// weights (TestDotW4A8SplitHalf4Row_bitIdenticalToCanonical), so this is a
+	// pure performance cache, not a second source of truth: q4/q4s stay
+	// authoritative and are never dropped by RepackInt4Row4 itself (the
+	// drop-canonical-after-repack question is the plumbing phase's own
+	// load-time/resident-memory measurement to make, not decided here).
+	q4Row4       []byte    // non-nil ⇒ split-half + 4-row-interleaved packed nibbles (RepackW4A8Row4 layout)
+	q4Row4Scales []float32 // interleaved per-group scales (RepackW4A8Row4Scales layout)
 }
 
 // WrapF32 wraps an existing [rows, cols] f32 weight WITHOUT copying — the WeightMat
@@ -190,6 +203,18 @@ func (w *WeightMat) Int8() (q8 []int8, scales []float32, w8a8, ok bool) {
 // int4-resident).
 func (w *WeightMat) Int4() (q4 []byte, q4s []float32, group int, ok bool) {
 	return w.q4, w.q4s, w.group, w.q4 != nil
+}
+
+// Int4Row4 returns the split-half + 4-row-interleaved layout (RepackW4A8Row4/
+// RepackW4A8Row4Scales) if RepackInt4Row4 has populated it (ok=false
+// otherwise — the zero value on non-arm64 builds, on int4-less WeightMats,
+// and on any int4 WeightMat that hasn't been repacked, e.g. a paged-MoE
+// tensor built transient over an mmap span). Pure performance cache: use
+// (w *WeightMat) MatmulBTW4A8Into for the M=1 dispatch decision rather than
+// branching on this directly, unless you specifically need the raw bytes
+// (e.g. measuring the repack's resident-memory delta).
+func (w *WeightMat) Int4Row4() (packed4 []byte, scales4 []float32, ok bool) {
+	return w.q4Row4, w.q4Row4Scales, w.q4Row4 != nil
 }
 
 // F32 returns the dense weights (ok=false unless f32-resident) — e.g. for a GPU
