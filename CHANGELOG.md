@@ -9,6 +9,49 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.26.0] — 2026-08-24
+
+### Added
+
+A faster W4A8 CPU decode GEMV for arm64, plus the `WeightMat` plumbing to opt individual tensors
+into it. Additive only — no existing signature changes.
+
+- **`dotW4A8SplitHalf4Row`** (unexported kernel) — the winner of a harness campaign that started
+  from a wrong premise and found a better one along the way. The original hypothesis (an
+  issue-width probe reading `dotW4A8FoldSDOT` as issue-limited) did not reproduce under repeated
+  measurement on a settled box; the real bottleneck was a serial `VFMLA` accumulator chain, the
+  same failure mode the attention kernels above already fixed. Two independent accumulator
+  chains alone measured 1.4x; combined with a split-half nibble repack (removes two
+  `VZIP1`/`VZIP2` unpack instructions per group — invisible on its own until the accumulator
+  stall was gone, then it compounded) and a 4-row interleave (one activation load shared across
+  4 real output rows), the combined kernel measured 1.4-1.8x at the isolated-kernel level and
+  1.31-1.35x in real decode (~75-81% real/isolated efficiency). Bit-identical to the existing
+  per-row kernel by construction — proven exact (`==`), not tolerance, across hundreds of random
+  comparisons.
+- **`RepackW4A8Row4` / `RepackW4A8Row4Scales`** — one-time repack from the canonical group-int4
+  layout into the split-half + 4-row-interleaved layout the kernel above consumes. The canonical
+  packer, the `.giw` on-disk format, the scalar oracle, and amd64 are all untouched — this is
+  purely an additional in-RAM layout a caller opts a tensor into.
+- **`WeightMat.RepackInt4Row4`** — populates the optional layout on an int4-resident `WeightMat`
+  (a no-op on non-arm64 builds and any shape the repack rejects: rows not a multiple of 4, cols
+  not a multiple of the int4 group size). Explicit and caller-driven only, never probed for
+  automatically inside a matmul.
+- **`WeightMat.MatmulBTW4A8Into`** — dispatches to the row4 kernel when `RepackInt4Row4` has
+  populated it and M=1, falls back to the existing per-row kernel otherwise. Chosen over a
+  GPU-backend-style separate resident type: `WeightMat` is already the single choke point a
+  caller's dispatch funnels through, and attaching state to the struct that owns its lifetime
+  avoids external bookkeeping against a `WeightMat` with a paged/mmap-transient lifecycle — a
+  `WeightMat` nobody repacked (e.g. one built over a read-only mmap span for on-demand paging)
+  always takes the fallback branch automatically, no caller-side special case required.
+
+### Notes for downstream integrators
+
+Both new levers are measured, real, and reproduced — but the resident-memory cost of the repack
+is real too: every repacked tensor keeps its canonical bytes AND gains a same-size second copy
+(measured +100% on a real model's int4 weight set). `RepackInt4Row4` never drops the canonical
+copy itself; a caller deciding whether the doubled memory is worth the speedup for a given
+deployment is expected to weigh that per tensor, per model.
+
 ## [1.25.0] — 2026-08-23
 
 ### Added
@@ -2227,6 +2270,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.22.0...HEAD
+[1.26.0]: https://github.com/townsendmerino/aikit/compare/v1.25.0...v1.26.0
 [1.25.0]: https://github.com/townsendmerino/aikit/compare/v1.24.0...v1.25.0
 [1.24.0]: https://github.com/townsendmerino/aikit/compare/v1.23.0...v1.24.0
 [1.23.0]: https://github.com/townsendmerino/aikit/compare/v1.22.0...v1.23.0
