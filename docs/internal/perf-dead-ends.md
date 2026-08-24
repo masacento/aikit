@@ -380,6 +380,45 @@ analysis kept predicting load-reduction wins that do not exist on arm64.
   version keeps one encoder with two buffer policies instead. A local dead end inside a
   shipped win.
 
+### 8.9 · `dotW4A8Fold4AVX2` — four independent accumulators — **~1% (noise), not the bottleneck**, `nvidia-rtx2070s`, 2026-08-19
+- **Tried:** split `dotW4A8FoldAVX2`'s single f32 accumulator (one `VFMADD231PS` into
+  `Y10` per group, all 160 groups serialized on it) into four independent accumulators
+  (`Y10`-`Y13`, one group per accumulator per unrolled iteration, combined once at the
+  end) — `dot_w4a8_fold4_amd64.s`, candidate only, not wired into `dotW4A8`'s dispatch.
+- **Mechanism (the premise):** `dotI8AVX2`'s own comment says its four accumulators
+  exist to "break the dependency chain so the four interleaved groups issue
+  independently" — the marginal-FMA issue-width probe on the cold kernel had shown
+  ratio 0.91 (NOT issue-limited, idle ports even while streaming from DRAM), which read
+  as "latency-bound on the single-accumulator chain, not port-bound."
+- **Number / box:** hot 17.12 → 17.36 GMAC/s (+1.4%), cold 16.31 → 16.15 GMAC/s (−1.0%)
+  — both inside noise, `nvidia-rtx2070s` (K=5120, FFN gate/up/down shape). Correctness
+  held (`TestW4A8Fold4_dotMatchesScalar` 1e-5 rel-err vs scalar oracle,
+  `TestW4A8Fold4_matchesOriginal` vs the production kernel) — this is a clean measured
+  negative, not an untested one.
+- **Why — the probe answered a narrower question than it was read for:** "not
+  issue-limited" from marginal-FMA injection means idle capacity on the ports FMA
+  instructions use specifically. It does not rule out contention on a DIFFERENT port —
+  and the nibble-unpack prologue (`VPAND`/`VPSRLW`/`VPUNPCKLBW`/`VPUNPCKHBW`/`VPSUBB`×2,
+  8 shuffle/logic ops feeding the 3 MAC+fold ops per group) is exactly the kind of work
+  that would bottleneck a shuffle port while leaving FMA ports idle — the dead FMAs get
+  absorbed for free because they compete for a *different* resource than whatever is
+  actually saturated, producing the same "not issue-limited" reading a genuinely
+  memory-bound kernel would. The probe distinguishes "busy vs waiting" only for the one
+  port class it injects into; it does not localize which resource, if any, is actually
+  full. Left open (not re-chased without new evidence): isolating nibble-unpack's cost
+  specifically (a pre-unpacked-weights variant, still per-group-scaled) would need
+  building before either VNNI (hardware-gated, no VNNI box available) or a format
+  change is worth reconsidering — see `docs/internal/cpu-acceleration.md` item 4 and
+  goinfer's `docs/measurements/aikit-w4a8-opsperbyte.md`.
+- **Companion finding, 2026-08-23, `apple-m1pro` (NOT this entry's box) — the identical fix
+  measured real: 1.4-1.75x.** This entry stays a correct, amd64-scoped negative — the AVX2 kernel
+  really is port-bound, not latency-bound, and the accumulator-splitting fix really doesn't help
+  there. But the same fix on the NEON `dotW4A8FoldSDOT` kernel (a different ISA, a different
+  bottleneck) measured a real win once tried — see goinfer's
+  `docs/task-w4a8-neon-bandwidth.md`'s item-3 harness results and `priors-microgpt-c.md` §1's
+  demotion note. Two ISAs, two different resources saturated; neither result generalizes to the
+  other, and both are now measured rather than assumed.
+
 ---
 
 ## Reasoned out, not built — recorded so nobody re-chases them

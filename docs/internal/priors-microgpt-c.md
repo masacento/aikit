@@ -57,6 +57,34 @@ in `cpu-acceleration.md`'s Open follow-ups item 6, not restated here: not issue-
 either `apple-m1pro` or the `nvidia-rtx2070s` host's Ryzen/AVX2. This item is now a
 practice, not a prior.
 
+**Demotion, 2026-08-23 — this instrument is now 0-for-2 as a load-bearing decision input; treat
+it as a hint, never a verdict.** Two independent campaigns have now trusted a single reading from
+this probe and been wrong in different ways:
+
+- **AVX2 (`perf-dead-ends.md` §8.9, `nvidia-rtx2070s`):** ratio 0.91 read as "not issue-limited" →
+  built a 4-accumulator kernel expecting a real win → measured ~1%, noise. The probe wasn't
+  *wrong* about FMA-port occupancy, but it answered a narrower question than it was read for: idle
+  FMA-port capacity doesn't rule out a *different* port (here, the unpack prologue's shuffle ops)
+  being the actual bottleneck. A port-class blind spot.
+- **W4A8 NEON (goinfer `docs/task-w4a8-neon-bandwidth.md`, `apple-m1pro`, Gate 0 → item-3 harness
+  results):** ratio 1.11 read as "issue-limited" → motivated a whole grid of instruction-removing
+  kernel variants → the first one measured a flat 1.000x. Re-running the SAME probe 4 times on a
+  settled box gave ratio 0.99-1.03 every time — the 1.11 reading does not reproduce. Likely cause:
+  that measurement's own session ran a STREAM bandwidth probe that had *just* been caught
+  "accidentally measuring swap on a box with other sessions running" — the box was loaded when
+  the issue-width probe ran too, and a loaded box is the plausible culprit both times this
+  instrument has misled: measurement noise reads as a false verdict either direction, not just as
+  a wider error bar.
+
+**Consequence: this probe is a hint, never load-bearing.** Its correct use going forward is to
+motivate trying a fix cheaply (as intended, per the paragraph above), never to justify skipping a
+direct A/B measurement of the fix itself, and never to be read as ruling a mechanism out on one
+reading alone (the arm64 case above is the fix that DID work — dotW4A8FoldSDOT2Acc measured a real
+1.4-1.75x — precisely the mechanism a mistrusted "not issue-limited"-shaped reading would have
+told someone not to bother building). Before citing a ratio from this probe in a decision doc:
+re-run it at least twice on a settled box, and treat disagreement with a direct kernel A/B as the
+A/B winning, always.
+
 **Extension, 2026-08-19 — the norm/RoPE candidate this doc said "doesn't exist in `linalg`"
 turned out to exist in goinfer** (`decoder/rmsnorm.go`, `decoder/rope.go`) — flagged after a
 scoping correction, since this doc's own charter line only scoped the search to where the
