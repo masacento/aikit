@@ -258,3 +258,58 @@ func TestDotW4A8SplitHalf4Row_matchesOracle(t *testing.T) {
 		}
 	}
 }
+
+// TestDotW4A8SplitHalf4Row_bitIdenticalToCanonical is the load-bearing
+// correctness gate for the plumbing phase (docs/prompts/w4a8-plumbing.md):
+// dotW4A8SplitHalf4Row uses ONE accumulator per real output row (cross-row
+// independence alone was enough — see the campaign doc's item-4 result), so
+// its per-output fold is the SAME monotonic group-by-group order as
+// dotW4A8FoldSDOT's, unlike dotW4A8SplitHalf2Acc's within-row 2-way split
+// (which folds two independent partial sums together only at the end — a
+// genuinely different float reduction tree). Verified here with exact `==`
+// against dotW4A8FoldSDOT (canonical layout, production kernel), not
+// tolerance: **the winning kernel is bit-identical to the kernel it
+// replaces**, for the same logical weights. This means the plumbing phase
+// owes no golden regeneration and no cosine re-gate for this kernel swap —
+// the existing bit-identity guarantees (decode == prefill == verify) carry
+// over unchanged, because the per-output arithmetic literally didn't change,
+// only which bytes it reads from and which rows share an activation load.
+func TestDotW4A8SplitHalf4Row_bitIdenticalToCanonical(t *testing.T) {
+	if !hasDotProd {
+		t.Skip("DotProd required")
+	}
+	rng := rand.New(rand.NewSource(97))
+	const group = 32
+	for nGroups := 1; nGroups <= 20; nGroups++ {
+		K := nGroups * group
+		for trial := 0; trial < 10; trial++ {
+			act := make([]int8, K)
+			for i := range act {
+				act[i] = int8(rng.Intn(255) - 128)
+			}
+			rows := make([][]byte, 4)
+			scales := make([][]float32, 4)
+			for r := 0; r < 4; r++ {
+				w := make([]float32, K)
+				for i := range w {
+					w[i] = float32(rng.NormFloat64())
+				}
+				p, s := QuantizeGroupsInt4(w, 1, K, group)
+				rows[r] = p
+				scales[r] = s
+			}
+			packed4 := repackSplitHalf4RowBlock(rows[0], rows[1], rows[2], rows[3], K)
+			scales4 := interleaveScales4Row(scales[0], scales[1], scales[2], scales[3], nGroups)
+
+			var got [4]float32
+			dotW4A8SplitHalf4Row(&act[0], &packed4[0], &scales4[0], &got[0], nGroups)
+
+			for r := 0; r < 4; r++ {
+				want := dotW4A8FoldSDOT(&act[0], &rows[r][0], &scales[r][0], nGroups)
+				if got[r] != want {
+					t.Fatalf("nGroups=%d trial=%d row=%d: got %v want %v (bit mismatch — not identical to canonical)", nGroups, trial, r, got[r], want)
+				}
+			}
+		}
+	}
+}
