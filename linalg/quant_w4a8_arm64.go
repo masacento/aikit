@@ -13,6 +13,65 @@ package linalg
 //go:noescape
 func dotW4A8FoldSDOT(act *int8, packed *byte, scales *float32, nGroups int) float32
 
+// dotW4A8FoldSDOTv2 is dotW4A8FoldSDOT with the centering subtract dropped from
+// the main loop (uncentered nibbles + a separate, batched correction pass over
+// sumAct — see dot_w4a8_arm64.s and docs/task-w4a8-neon-bandwidth.md Gate 1,
+// items 1+2). NOT yet wired into dotW4A8's dispatch — kept side by side with
+// the original for correctness/perf comparison before any switch-over.
+// sumAct is nGroups long (SumActGroupsInto), the SAME activation row's
+// per-group sums dotW4A8FoldSDOT's caller would otherwise not need.
+//
+//go:noescape
+func dotW4A8FoldSDOTv2(act *int8, packed *byte, scales *float32, sumAct *int32, nGroups int) float32
+
+// dotW4A8SplitHalfSDOT is dotW4A8FoldSDOT with the layout changed to
+// split-half (repackSplitHalfRow) and signed centering kept — item 3's core
+// lever in isolation. NOT wired into dotW4A8's dispatch: packed must be in
+// the split-half layout, which dotW4A8's canonical-layout callers do not
+// produce. Harness-only until a winning grid cell funds the production
+// repack (docs/prompts/w4a8-item3-harness.md).
+//
+//go:noescape
+func dotW4A8SplitHalfSDOT(act *int8, packed *byte, scales *float32, nGroups int) float32
+
+// dotW4A8FoldSDOT2Acc is dotW4A8FoldSDOT with the fold split across two
+// independent accumulator chains (canonical layout, signed centering
+// unchanged) — a probe for whether the serial VFMLA fold, not instruction
+// count, is the kernel's real bottleneck. nGroups must be even. See
+// dot_w4a8_arm64.s for the motivating measurement.
+//
+//go:noescape
+func dotW4A8FoldSDOT2Acc(act *int8, packed *byte, scales *float32, nGroups int) float32
+
+// dotW4A8FoldSDOT4Acc extends the 2-accumulator probe to four independent
+// chains, matching dotI8SDOT's own four-accumulator design. nGroups must be
+// a multiple of 4. See dot_w4a8_arm64.s.
+//
+//go:noescape
+func dotW4A8FoldSDOT4Acc(act *int8, packed *byte, scales *float32, nGroups int) float32
+
+// dotW4A8SplitHalf2Acc combines the two confirmed levers: 2 independent
+// accumulator chains (dotW4A8FoldSDOT2Acc) plus the split-half layout
+// (dotW4A8SplitHalfSDOT) so each lane's unpack drops VZIP1/VZIP2. packed
+// must be split-half layout (repackSplitHalfRow). nGroups must be even.
+//
+//go:noescape
+func dotW4A8SplitHalf2Acc(act *int8, packed *byte, scales *float32, nGroups int) float32
+
+// dotW4A8SplitHalf4Acc extends dotW4A8SplitHalf2Acc to four accumulator
+// lanes. packed must be split-half layout. nGroups must be a multiple of 4.
+//
+//go:noescape
+func dotW4A8SplitHalf4Acc(act *int8, packed *byte, scales *float32, nGroups int) float32
+
+// dotW4A8SplitHalf4Row computes 4 REAL output rows in one call (item 4,
+// docs/prompts/w4a8-item3-harness.md), given packed4/scales4 in
+// repackSplitHalf4RowBlock / interleaveScales4Row's interleaved layout.
+// dst must have room for 4 float32s. See dot_w4a8_arm64.s.
+//
+//go:noescape
+func dotW4A8SplitHalf4Row(act *int8, packed4 *byte, scales4 *float32, dst *float32, nGroups int)
+
 // dotW4A8 computes one W4A8 output (before the activation scale). The DotProd
 // path folds the per-group weight scales inside the kernel and returns the f32
 // dot directly; only a ragged final group (K % 32 ≠ 0) is mopped up in Go.

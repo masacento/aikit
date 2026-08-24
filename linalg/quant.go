@@ -212,6 +212,38 @@ func QuantizeActivationsInto(aq []int8, scales []float32, a []float32, M, K int)
 	}
 }
 
+// SumActGroupsInto computes, for each of M already-quantized int8 activation
+// rows, the per-group sum Σ_{k in group g} int32(aq[k]) over K elements split
+// into ⌈K/group⌉ groups (the final group ragged when group doesn't divide K).
+// sumAct must be len ≥ M*nGroups.
+//
+// This is the W4A8 uncentered-nibble correction term's input: reconstructing a
+// weight nibble as (nib-8) instead of nib costs two vector subtracts per group
+// in the decode-time hot loop; the algebraic identity Σ(nib_k-8)·act_k =
+// Σnib_k·act_k - 8·Σact_k moves that cost here instead, computed ONCE per
+// token and reused across every output row a W4A8 matmul evaluates (the
+// activation is the same for all N columns of one M=1 GEMV) — see
+// docs/task-w4a8-neon-bandwidth.md (goinfer) for the full rationale.
+func SumActGroupsInto(sumAct []int32, aq []int8, M, K, group int) {
+	nGroups := (K + group - 1) / group
+	if len(sumAct) < M*nGroups || len(aq) < M*K {
+		panic("linalg: SumActGroupsInto short buffer")
+	}
+	for i := range M {
+		row := aq[i*K : i*K+K]
+		out := sumAct[i*nGroups : i*nGroups+nGroups]
+		for g := range nGroups {
+			ks := g * group
+			ke := min(ks+group, K)
+			var s int32
+			for _, v := range row[ks:ke] {
+				s += int32(v)
+			}
+			out[g] = s
+		}
+	}
+}
+
 // MatmulBTW8A8Pre is MatmulBTW8A8Into with the activations ALREADY quantized (aq +
 // aScales from QuantizeActivationsInto) — it skips the per-call requantization.
 // Bit-identical to MatmulBTW8A8Into given the same aq/aScales (same w8a8Span / dotI8
