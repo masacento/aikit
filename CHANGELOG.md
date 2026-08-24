@@ -9,6 +9,34 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.27.0] — 2026-08-24
+
+### Added
+
+`WeightMat` support for constructing an int4 tensor with the split-half + 4-row-interleaved
+layout (v1.26.0's `dotW4A8SplitHalf4Row`) from bytes computed elsewhere, instead of only via
+`RepackInt4Row4`'s in-RAM derivation — the forcing function is goinfer's `.giw` on-disk kind 4
+(`docs/task-w4a8-neon-bandwidth.md`'s "Format follow-on"), which bakes the row4 layout onto disk
+at prequant time so the paged-MoE path gets the faster kernel without an in-RAM repack (that
+repack doubles resident bytes for every repacked tensor — measured, `+100%`). Additive only.
+
+- **`WrapInt4Row4`** — `WrapInt4` plus already-repacked `q4Row4`/`q4Row4Scales` bytes, aliased
+  without copying (a loader mmap-aliasing them back from a serialized bundle, or any caller that
+  computed them itself rather than wanting `RepackInt4Row4` to derive them at call time). Gated on
+  the same `hasDotProd` check `RepackInt4Row4` already applies before populating `q4Row4` — a real
+  gap this closes: before this function existed, `RepackInt4Row4` was the ONLY way `q4Row4` got
+  set, so the CPU-feature gate lived entirely there. `WrapInt4Row4` is a second way in, populating
+  the field from bytes that may have been computed on a DIFFERENT machine than the one loading
+  them — without its own gate, a non-DotProd arm64 core could dispatch to a kernel it cannot
+  safely run. Silently keeps canonical-only (same as passing nil) when the gate fails, rather than
+  erroring — a build/core that can't use row4 gets exactly what it would have gotten from a plain
+  `WrapInt4` call.
+- **`MappedSpanRow4`** — `MappedSpan`'s counterpart for the row4 layout: the page-aligned interior
+  of `q4Row4` if it lies inside `[base, end)`, as a SEPARATE span from `MappedSpan`'s canonical
+  one (a WeightMat carrying both layouts has two independently-mmap'd byte ranges, not one range
+  twice). Lets a pager managing both layouts' residency (goinfer's `expertPager`/`layerPager`)
+  register and account for both.
+
 ## [1.26.0] — 2026-08-24
 
 ### Added
@@ -2270,6 +2298,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.22.0...HEAD
+[1.27.0]: https://github.com/townsendmerino/aikit/compare/v1.26.0...v1.27.0
 [1.26.0]: https://github.com/townsendmerino/aikit/compare/v1.25.0...v1.26.0
 [1.25.0]: https://github.com/townsendmerino/aikit/compare/v1.24.0...v1.25.0
 [1.24.0]: https://github.com/townsendmerino/aikit/compare/v1.23.0...v1.24.0

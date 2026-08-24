@@ -13,3 +13,7 @@ func (w *WeightMat) RepackInt4Row4() bool { return false }
 func (w *WeightMat) MatmulBTW4A8Into(ws *Workspace, a, dst []float32, M int) {
 	MatmulBTW4A8Into(ws, a, w.q4, w.q4s, dst, M, w.cols, w.rows, w.group)
 }
+
+// row4Usable is always false on non-arm64 — the split-half + 4-row kernel is
+// NEON-only. See the arm64 file's comment for why WrapInt4Row4 needs this.
+func row4Usable() bool { return false }

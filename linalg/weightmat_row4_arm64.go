@@ -52,3 +52,12 @@ func (w *WeightMat) MatmulBTW4A8Into(ws *Workspace, a, dst []float32, M int) {
 	}
 	MatmulBTW4A8Into(ws, a, w.q4, w.q4s, dst, M, w.cols, w.rows, w.group)
 }
+
+// row4Usable reports whether this CPU can safely dispatch the split-half +
+// 4-row-interleaved kernel — the same hasDotProd gate RepackInt4Row4 already
+// applies before ever setting q4Row4. WrapInt4Row4 (weightmat.go, portable)
+// calls this to apply the identical gate to EXTERNALLY-supplied bytes (a
+// .giw kind-4 load reading an already-repacked layout off disk) — a case
+// RepackInt4Row4's own gate never covered, since before WrapInt4Row4 existed
+// the only way q4Row4 got populated was RepackInt4Row4 itself.
+func row4Usable() bool { return hasDotProd }

@@ -120,6 +120,48 @@ func WrapInt4(q4 []byte, q4s []float32, rows, cols, group int) WeightMat {
 	return WeightMat{q4: q4, q4s: q4s, group: group, rows: rows, cols: cols}
 }
 
+// WrapInt4Row4 is WrapInt4 plus an ALREADY-repacked split-half + 4-row-interleaved
+// layout (q4Row4/q4Row4Scales, in RepackW4A8Row4/RepackW4A8Row4Scales's own output
+// shape) — for a caller that computed or read those bytes itself (a prequant tool
+// writing them to disk, or a loader mmap-aliasing them back from a serialized
+// bundle) rather than one that wants RepackInt4Row4 to derive them from q4/q4s at
+// call time. Portable (no build tag): on a non-arm64 build the fields are simply
+// unused, since MatmulBTW4A8Into's non-arm64 form never reads them.
+//
+// Aliases q4Row4/q4Row4Scales WITHOUT copying, same contract as WrapInt4 for
+// q4/q4s. Pass both nil to get exactly WrapInt4's result (no row4 layout attached).
+//
+// SAFETY GATE: silently keeps q4Row4/q4Row4Scales unset (canonical-only, same as
+// passing nil) when row4Usable() is false — a non-arm64 build, or an arm64 core
+// without the DotProd extension. RepackInt4Row4 already refuses to populate
+// q4Row4 on such a core; this is the same gate applied to bytes that arrived
+// from somewhere else (a .giw kind-4 file, computed on a DIFFERENT machine that
+// may have DotProd when this one doesn't) rather than derived locally. Without
+// this, MatmulBTW4A8Into's dispatch (which only checks q4Row4 != nil, not the
+// CPU feature — that was always RepackInt4Row4's job) could route to a kernel
+// this core cannot safely execute.
+//
+// Panics on the same q4/q4s length mismatches WrapInt4 checks, plus (when
+// q4Row4/q4Row4Scales are non-nil AND row4Usable()) if they don't match
+// RepackW4A8Row4's own output-length contract for this rows/cols/group — the
+// same shape the repack functions would have produced, applied to bytes that
+// arrived from elsewhere.
+func WrapInt4Row4(q4 []byte, q4s []float32, rows, cols, group int, q4Row4 []byte, q4Row4Scales []float32) WeightMat {
+	w := WrapInt4(q4, q4s, rows, cols, group)
+	if q4Row4 == nil && q4Row4Scales == nil {
+		return w
+	}
+	if !row4Usable() {
+		return w
+	}
+	nGroups, bpr := groupsFor(cols, group)
+	requireExactLen("WrapInt4Row4", "q4Row4", len(q4Row4), mul(rows, bpr))
+	requireExactLen("WrapInt4Row4", "q4Row4Scales", len(q4Row4Scales), mul(rows, nGroups))
+	w.q4Row4 = q4Row4
+	w.q4Row4Scales = q4Row4Scales
+	return w
+}
+
 // MatmulBT computes dst[M, rows] = a[M, cols] · weight[rows, cols]ᵀ, dispatching by
 // stored precision to the matching linalg kernel. CPU only — a consumer with a GPU
 // backend dispatches via the raw accessors and uses this as the fallback.
@@ -253,4 +295,22 @@ func (w *WeightMat) MappedSpan(base, end uintptr) []byte {
 		return nil // heap-backed, not part of the mapping
 	}
 	return mmap.PageAlignedInterior(raw)
+}
+
+// MappedSpanRow4 is MappedSpan for the split-half + 4-row-interleaved layout
+// (q4Row4) instead of the canonical q4 — same page-alignment/containment contract,
+// returned separately because a WeightMat carrying BOTH layouts (WrapInt4Row4) has
+// two independently-mmap'd byte arrays a pager must account for separately: they
+// are different spans at different offsets in the same file, not one span twice.
+// nil if q4Row4 was never populated, or if it's heap-backed rather than part of
+// [base, end).
+func (w *WeightMat) MappedSpanRow4(base, end uintptr) []byte {
+	if len(w.q4Row4) == 0 {
+		return nil
+	}
+	start := uintptr(unsafe.Pointer(&w.q4Row4[0]))
+	if start < base || start+uintptr(len(w.q4Row4)) > end {
+		return nil
+	}
+	return mmap.PageAlignedInterior(w.q4Row4)
 }
