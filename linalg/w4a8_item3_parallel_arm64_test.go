@@ -24,6 +24,7 @@ import (
 // efficiency could move either direction from the single-call win) — no
 // point polishing single-call variants that don't survive fan-out.
 func TestW4A8Item3ParallelAggregate(t *testing.T) {
+	harnessOnly(t)
 	if !hasDotProd {
 		t.Skip("DotProd required")
 	}

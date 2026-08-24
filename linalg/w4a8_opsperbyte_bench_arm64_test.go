@@ -30,6 +30,7 @@ import (
 // arm64/NEON only, box-specific (Apple M1 Pro) -- run this on the Mac, not the
 // amd64 box (different kernel: dot_w4a8_arm64.s vs quant_w4a8_amd64.go).
 func TestW4A8OpsPerByteARM64(t *testing.T) {
+	harnessOnly(t)
 	const (
 		K     = 5120
 		group = 32
@@ -151,6 +152,7 @@ func TestW4A8OpsPerByteARM64(t *testing.T) {
 // (fewer instructions/MAC would directly help) or leaves idle issue slots even
 // while streaming from DRAM (the memory system is the ceiling).
 func TestW4A8IssueWidthProbeARM64(t *testing.T) {
+	harnessOnly(t)
 	const (
 		K     = 5120
 		group = 32

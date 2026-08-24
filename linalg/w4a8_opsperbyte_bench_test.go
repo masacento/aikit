@@ -32,6 +32,7 @@ import (
 // run this on the same machine the goinfer profile came from, not the Mac
 // (different kernel: dot_w4a8_arm64.s, different memory subsystem).
 func TestW4A8OpsPerByte(t *testing.T) {
+	harnessOnly(t)
 	if !hasAVX2 {
 		t.Skip("AVX2 required")
 	}
@@ -129,6 +130,7 @@ func TestW4A8OpsPerByte(t *testing.T) {
 // ceiling, and shaving instructions off the inner loop would be hidden under
 // stalls rather than showing up as decode-time speedup)?
 func TestW4A8IssueWidthProbe(t *testing.T) {
+	harnessOnly(t)
 	if !hasAVX2 {
 		t.Skip("AVX2 required")
 	}

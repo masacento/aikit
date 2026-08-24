@@ -51,6 +51,7 @@ import (
 // the vector peak, since it's scalar work on one lane — if it isn't, the
 // measurement is measuring nothing and should not be trusted.
 func TestFMAIssueProbe(t *testing.T) {
+	harnessOnly(t)
 	const K = 768 // real weight-row width; see doc comment
 
 	rng := rand.New(rand.NewSource(1))

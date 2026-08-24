@@ -55,6 +55,7 @@ func benchW4A8Shape(t *testing.T, seed int64) (act []int8, packed, splitHalf []b
 }
 
 func TestW4A8Item3SplitHalfVsOriginal(t *testing.T) {
+	harnessOnly(t)
 	if !hasDotProd {
 		t.Skip("DotProd required")
 	}
@@ -147,6 +148,7 @@ func TestW4A8Item3SplitHalfVsOriginal(t *testing.T) {
 }
 
 func TestW4A8Item3TwoAccVsOriginal(t *testing.T) {
+	harnessOnly(t)
 	if !hasDotProd {
 		t.Skip("DotProd required")
 	}
@@ -239,6 +241,7 @@ func TestW4A8Item3TwoAccVsOriginal(t *testing.T) {
 }
 
 func TestW4A8Item3FourAccVsOriginal(t *testing.T) {
+	harnessOnly(t)
 	if !hasDotProd {
 		t.Skip("DotProd required")
 	}
@@ -331,6 +334,7 @@ func TestW4A8Item3FourAccVsOriginal(t *testing.T) {
 }
 
 func TestW4A8Item3SplitHalf2AccVsOriginal(t *testing.T) {
+	harnessOnly(t)
 	if !hasDotProd {
 		t.Skip("DotProd required")
 	}
@@ -423,6 +427,7 @@ func TestW4A8Item3SplitHalf2AccVsOriginal(t *testing.T) {
 }
 
 func TestW4A8Item3SplitHalf4AccVsOriginal(t *testing.T) {
+	harnessOnly(t)
 	if !hasDotProd {
 		t.Skip("DotProd required")
 	}
@@ -524,6 +529,7 @@ func TestW4A8Item3SplitHalf4AccVsOriginal(t *testing.T) {
 // amortization across real outputs) than the accumulator-lane question the
 // 4-lane check already settled.
 func TestW4A8Item4Row4VsBaselines(t *testing.T) {
+	harnessOnly(t)
 	if !hasDotProd {
 		t.Skip("DotProd required")
 	}

@@ -19,6 +19,7 @@ import (
 // decode's per-layer-fresh-weights access pattern) so this isn't just
 // measuring cache-resident reuse of one matrix.
 func TestW4A8_parallelScaling(t *testing.T) {
+	harnessOnly(t)
 	if !hasDotProd {
 		t.Skip("DotProd required")
 	}
