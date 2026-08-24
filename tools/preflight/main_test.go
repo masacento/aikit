@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -98,6 +99,82 @@ func TestCoreStepsAccountedFor(t *testing.T) {
 				"but buildChecks has no such check", name, wantName)
 		}
 	}
+}
+
+// crossVetChecks are the two checks buildChecks runs that are NOT core-job mirrors: a
+// cross-GOOS/GOARCH `go vet ./...` front-running ci.yml's separate `windows` job (and the
+// amd64 legs of `simd`/`perf-smoke`). See main.go's CROSS-VET paragraph for why an "another
+// OS" exclusion covers that job's build/test steps but not its vet step.
+//
+// They are asserted here rather than left to buildChecks alone because the two enforcement
+// tests above only iterate coreSteps: a check with no ci.yml core step behind it is invisible
+// to them, so it could be dropped in a refactor with nothing going red. That is precisely the
+// failure mode this package's own doc comment warns about ("a prose exclusion policy is not
+// checked against reality"), applied to an addition instead of an omission.
+var crossVetChecks = []string{"cross-vet windows", "cross-vet linux"}
+
+// TestCrossVetChecksPresent pins the two cross-compile vet checks into buildChecks, and
+// re-verifies the premise that justifies them: ci.yml's `windows` job really does run
+// `go vet ./...`, so front-running it locally is mirroring a real check rather than
+// inventing one. If CI's windows job stops vetting, this fails and the justification in
+// main.go gets re-read instead of quietly becoming false.
+func TestCrossVetChecksPresent(t *testing.T) {
+	root, err := gpumod.RepoRoot()
+	if err != nil {
+		t.Fatalf("repo root: %v", err)
+	}
+	have := map[string]bool{}
+	for _, c := range buildChecks(root, false) {
+		have[c.Name] = true
+	}
+	for _, name := range crossVetChecks {
+		if !have[name] {
+			t.Errorf("buildChecks is missing %q — the cross-GOOS/GOARCH vet that catches "+
+				"missing build tags before a push (see main.go's CROSS-VET paragraph; 9724289 "+
+				"is the round trip it exists to prevent)", name)
+		}
+	}
+
+	steps, err := jobRunSteps(filepath.Join(root, ".github", "workflows", "ci.yml"), "windows")
+	if err != nil {
+		t.Fatalf("reading ci.yml windows job: %v", err)
+	}
+	if !slices.Contains(steps, "go vet ./...") {
+		t.Errorf("ci.yml's `windows` job no longer runs `go vet ./...` (got %v) — the premise for "+
+			"preflight's cross-vet checks changed; re-read main.go's CROSS-VET paragraph and "+
+			"decide whether the local mirror still makes sense", steps)
+	}
+}
+
+// jobRunSteps reads ci.yml as TEXT and returns the `- run:` commands inside the named job,
+// in order, stopping at the next 2-space-indented job header — the `- run:` counterpart of
+// coreJobStepNames, for jobs whose steps are bare commands rather than named blocks.
+func jobRunSteps(ymlPath, job string) ([]string, error) {
+	b, err := os.ReadFile(ymlPath)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(b), "\n")
+	start := -1
+	for i, ln := range lines {
+		if strings.TrimRight(ln, " ") == "  "+job+":" {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return nil, fmt.Errorf("no `  %s:` job found in %s", job, ymlPath)
+	}
+	var runs []string
+	for _, ln := range lines[start+1:] {
+		if len(ln) > 2 && ln[0] == ' ' && ln[1] == ' ' && isJobNameStart(ln[2]) {
+			break
+		}
+		if t := strings.TrimSpace(ln); strings.HasPrefix(t, "- run:") {
+			runs = append(runs, strings.TrimSpace(t[len("- run:"):]))
+		}
+	}
+	return runs, nil
 }
 
 // coreJobStepNames reads ci.yml as TEXT and returns the `- name:` step names inside the

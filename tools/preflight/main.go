@@ -18,10 +18,28 @@
 // (which is exactly how "no cgo deps in core graph" and "test (aikit_checks)" went unmirrored
 // for a while despite fitting none of the reasons this comment used to give).
 //
-// preflight covers ONLY the core job. arm64, treesitter, vulncheck, perf-smoke,
-// scripts-boundary, gpu-pins, and gpu-kernels are separate ci.yml jobs that genuinely need
-// network, a GPU, another OS, or another module, and aren't attempted here;
-// gpugate/gpudevice/scriptsguard/gpupins are the local tools for the pieces that have one.
+// preflight covers the core job, PLUS one thing the core job cannot cover: a cross-GOOS/
+// GOARCH vet. arm64, treesitter, vulncheck, perf-smoke, scripts-boundary, gpu-pins, and
+// gpu-kernels are separate ci.yml jobs that genuinely need network, a GPU, another OS, or
+// another module, and aren't attempted here; gpugate/gpudevice/scriptsguard/gpupins are the
+// local tools for the pieces that have one.
+//
+// THE CROSS-VET IS THE ONE DELIBERATE ADDITION, and it is not a core-job mirror — it is the
+// only check here that front-runs a DIFFERENT ci.yml job. The reason "another OS" excuses
+// the windows job's `go build` and `go test` but not its `go vet`: vet cross-compiles, so
+// the check needs no runner, no network, and about three seconds. Meanwhile every local
+// build on this repo's development box (darwin/arm64) type-checks only the arm64 file set,
+// which makes "compiles for me, undefined symbol everywhere else" a class of mistake that
+// CANNOT be found locally without this — and it is not hypothetical: 9724289 landed a test
+// file referencing arm64-only symbols with no build tag, went green locally, and reddened
+// four non-arm64 jobs at once (windows, perf, both GOEXPERIMENT=simd legs) for one missing
+// `//go:build arm64` line, costing a full round trip plus e4613bb to fix.
+//
+// Two targets, not one: windows/amd64 covers the windows job's own vet step, and linux/amd64
+// covers the amd64-only breakage the windows leg can miss (a linux-tagged file, a cgo-free
+// path that differs). Together they cover every non-arm64 job 9724289 broke. Note these vet
+// the arm64 host's NON-arm64 file sets — the arm64 files themselves are already covered by
+// the plain "vet" step above, so the pair genuinely widens coverage rather than repeating it.
 //
 // ENVIRONMENT PARITY IS PART OF EACH CHECK. Reproducing a command without its environment is
 // not reproducing the check. Every go step runs through gpumod.Exec, which pins GOWORK=off
@@ -72,6 +90,15 @@ func buildChecks(root string, fast bool) []gate.Check {
 		{Name: "gofmt", Run: func() gate.Cell { return checkGofmt(root) }},
 		{Name: "build", Run: func() gate.Cell { return goStep(root, "build", nil, "build", "./...") }},
 		{Name: "vet", Run: func() gate.Cell { return goStep(root, "vet", nil, "vet", "./...") }},
+		// Not core-job steps — see main.go's CROSS-VET paragraph. Placed here because they
+		// are seconds-cheap and catch a whole-package build break, so failing now beats
+		// failing after golangci-lint and go test have run.
+		{Name: "cross-vet windows", Run: func() gate.Cell {
+			return goStep(root, "cross-vet windows", []string{"GOOS=windows", "GOARCH=amd64"}, "vet", "./...")
+		}},
+		{Name: "cross-vet linux", Run: func() gate.Cell {
+			return goStep(root, "cross-vet linux", []string{"GOOS=linux", "GOARCH=amd64"}, "vet", "./...")
+		}},
 		{Name: "golangci-lint", Run: func() gate.Cell { return checkLint(root) }},
 		{Name: "no cgo deps in core graph", Run: func() gate.Cell { return checkNoCgoDeps(root) }},
 		// Redundant with "build" above now that gpumod.Exec pins CGO_ENABLED=0 for every
@@ -107,7 +134,7 @@ func run(args []string) int {
 	cells := gate.RunAll(buildChecks(root, fast))
 
 	for _, c := range cells {
-		fmt.Printf("  %-18s %-26s %s\n", c.Name, "["+c.Field("env")+"]", statusWord(c.Outcome))
+		fmt.Printf("  %-25s %-52s %s\n", c.Name, "["+c.Field("env")+"]", statusWord(c.Outcome))
 		for _, f := range c.Fields {
 			if f.Key == "line" {
 				fmt.Printf("      %s\n", f.State)
@@ -127,7 +154,8 @@ func run(args []string) int {
 	}
 	fmt.Println(gate.Verdict(gate.OK, fmt.Sprintf("%d/%d clean", rep.Pass, rep.Total)))
 	fmt.Println("         CI also runs go test WITH -race and the fuzz (smoke) pass; arm64/treesitter/")
-	fmt.Println("         vulncheck/perf-smoke/scripts-boundary/gpu-pins/gpu-kernels are separate CI jobs.")
+	fmt.Println("         vulncheck/perf-smoke/scripts-boundary/gpu-pins/gpu-kernels are separate CI jobs")
+	fmt.Println("         (windows: its vet step IS covered above by cross-vet windows; its build/test are not).")
 	return 0
 }
 
