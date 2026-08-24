@@ -260,6 +260,109 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
      VPMOVSXBW+VPMADDWD pair) behind the same CPUID gate, for Zen 4+ / Intel
      Cascade Lake+. Can't be validated on the Zen 2 box (no VNNI), so it's a
      drop-in for a VNNI-capable machine; the AVX2 path is the proven fallback.
+   - **Ops-per-byte measured, 2026-08-19** (`linalg/w4a8_opsperbyte_bench_test.go`,
+     requested from goinfer after Qwen3.8-27B CPU decode measured 2.55× slower than
+     an Ollama/Q4_K_M engine on the same Ryzen 7 3700X — the parallelization
+     threshold and the quant format's byte-count were each ruled out first, at
+     ×5-1200 headroom and ~11% respectively, neither close to 2.55×). Measured on
+     the same box: `dotW4A8FoldAVX2` at the FFN gate/up/down shape (K=5120)
+     achieves **16.62 GMAC/s hot** (L1-resident) and **15.90 GMAC/s cold**
+     (streaming 55.7 MB, forcing real DRAM reads) — cold is only **1.05× slower
+     than hot**, at 9.94 GB/s against this box's ~51 GB/s DDR4-3200 peak. Neither
+     regime is memory-bound; the kernel is compute-limited at both.
+     Against `dotI8AVX2` (same K, no nibble-unpack prologue, no per-group scale
+     fold) at 51.20 GMAC/s hot, `dotW4A8FoldAVX2` is **3.08× slower per MAC** —
+     the measured cost of int4's unpack + fold, achieving only ~32% of that
+     reference's throughput.
+     The marginal-FMA issue-width probe (`priors-microgpt-c.md` §1) on the cold
+     kernel gives ratio **0.91 — NOT issue-limited**: idle execution-port
+     capacity exists even while streaming from DRAM, so the bottleneck is not
+     raw instruction/uop count competing for ports. Leading hypothesis, from the
+     assembly (not yet perf-counter-confirmed — `perf` wasn't available on the
+     measurement box): `dotW4A8FoldAVX2` accumulates into **one** f32 register
+     (`Y10`, via `VFMADD231PS` every one of the 160 groups) — a serial RAW
+     dependency chain across the whole K-loop, unlike `dotI8AVX2`'s **four**
+     independent accumulators, whose own comment states they exist specifically
+     to break this exact chain ("issue independently"). A single accumulator
+     caps the loop at roughly one iteration per FMA-latency cycle count
+     regardless of free ports — consistent with "not issue-limited" (ports are
+     idle) yet still far below `dotI8AVX2`'s throughput (latency-bound, not
+     issue-bound).
+     It answered no: `dotW4A8FoldAVX2` is not close to `dotI8AVX2`'s achievable
+     throughput on this box, so quant-format work is not the next step.
+     **The obvious fix was tried and measured negative** — a 4-independent-
+     accumulator variant (mirroring `dotI8AVX2` exactly) was built same-day,
+     passed correctness (1e-5 rel-err vs the scalar oracle and vs the
+     production kernel), and moved throughput by ~1%, inside noise (hot
+     +1.4%, cold −1.0%). The dependency-chain hypothesis was wrong, or at
+     least not dominant: "not issue-limited" from the marginal-FMA probe only
+     rules out FMA-port contention specifically, not contention on a
+     different port — the nibble-unpack prologue (8 shuffle/logic ops/group)
+     is the more likely remaining suspect, unproven. Recorded as a measured
+     dead end, not a re-triable one: `perf-dead-ends.md` §8.9.
+     **Follow-up, same day — the unpack suspicion confirmed and quantified,
+     but it's only half the story.** A diagnostic-only kernel (weights
+     pre-unpacked to one int8/weight instead of packed nibbles — never
+     shippable, it doubles the weight footprint) held everything else fixed
+     (single accumulator, per-group scale-fold) and isolated the unpack cost
+     directly: 295ns production → 188ns unpack-free → 106ns `dotI8AVX2`
+     reference. Removing unpack alone recovers **1.57×**; the remaining
+     **1.77×** to the reference is the per-group scale-fold
+     (`VCVTDQ2PS`+`VBROADCASTSS`+`VFMADD231PS`, 3 instructions/group) that
+     `dotI8AVX2` doesn't pay either (one overall scale, not per-32-group).
+     Roughly a 57/43 split of the total overhead — no third factor: unpack +
+     scale-fold fully account for the gap to `dotI8AVX2`. Diagnostic kernel
+     removed after recording the number (same disposition as the accumulator
+     experiment). Next lever considered, NOT started: a cheaper unpack
+     sequence via `VPMADDUBSW` on raw unsigned nibbles (ggml's usual AVX2 Q4
+     trick), skipping the explicit center-then-widen this kernel does.
+     **Worked the saturation math before touching assembly** (`dotI8AVX2`'s
+     own comment defers `VPMADDUBSW` for full int8×int8 over exactly this
+     risk): the concern is general u8 range (max product magnitude
+     `2×255×128=65,280`, over int16's ±32,767 ceiling), but a 4-bit nibble
+     caps the unsigned operand at 15, not 255 — worst case
+     `2×15×128=3,840`, over 8× inside the ceiling regardless of activation
+     values. **Provably safe, no saturation risk.** But the instruction-count
+     win is smaller than the naive "skip 4 ops" framing suggests: raw
+     (uncentered) nibbles compute `Σnib·act`, not the true `Σ(nib-8)·act`,
+     so a per-group correction `8·Σact` has to be added back somewhere.
+     Handled optimally — precomputing `Σact` per group ONCE per token
+     (mirroring `QuantizeActivationsInto`'s existing "quantize once, reuse
+     across all N rows" pattern, since the activation row is shared across
+     every weight row in one M=1 matmul) rather than recomputing it per
+     row — the realistic count is **18 instructions/group vs the current
+     20** (~10%, not the ~50% removing 4 ops alone implied), and getting
+     even that needs a real calling-convention change to `MatmulBTW4A8Into`
+     (a precomputed per-group activation-sum array threaded through), not a
+     drop-in kernel swap like the two prior experiments. Given §8.9's
+     accumulator experiment already measured a plausible-sounding
+     instruction-count argument land at ~0% real speedup, a ~10% reduction
+     needing an API change was judged not worth building blind — **stopped
+     here, not built**, math and estimate recorded so it isn't re-derived
+     from scratch if revisited. VNNI (`VPDPBUSD`) remains the more promising
+     lever if a VNNI-capable box ever becomes available — one instruction
+     class removes the unpack-widen AND the scale-fold's separate convert
+     step, not just the unpack. Full numbers and the revised recommendation:
+     goinfer's `docs/measurements/aikit-w4a8-opsperbyte.md`, answering
+     `docs/prompts/aikit-w4a8-ops-per-byte.md`.
+     **Cross-ISA status (2026-08-24) — this entry is amd64-scoped; three of its
+     conclusions INVERT on arm64/NEON, measured in the later campaign** (full
+     record: goinfer's `docs/task-w4a8-neon-bandwidth.md`):
+     (1) the accumulator dead end does not transfer — `dotW4A8FoldSDOT` was
+     latency-bound where this kernel is port-bound, a 2-accumulator NEON variant
+     measured a real 1.4-1.47x, and the shipped fix (`dotW4A8SplitHalf4Row`,
+     v1.26.0: split-half repacked layout + 4-row interleave, one accumulator per
+     real row, bit-identical fold order) landed 1.6-1.75x isolated —
+     `perf-dead-ends.md` §8.9's companion note carries the same narrowing;
+     (2) the marginal-FMA issue-width probe is demoted to a hint, never a
+     decision input — 0-for-2: here it pointed away from the true (shuffle-port)
+     bottleneck, and on arm64 its original "issue-limited, ratio 1.11" reading
+     failed to reproduce on a settled box (~0.99-1.03 across 4 re-runs);
+     (3) the uncentered-`Σact` idea got its arm64 trial after all — a decoupled
+     correction-pass shape measured 0.972x on NEON, consistent with this entry's
+     stopped-not-built call; folding the correction into a repacked layout
+     remains the only sanctioned retry. The VNNI paragraph above is unaffected
+     (still hardware-gated, still amd64's most promising lever).
 
 5. **`packedFill` m-blocking (item 23) — DEFERRED WITH MEASUREMENT, not dead.**
    `packedFill` re-reads the a-panel once per 8-column group (it lost `blockedFill`'s
