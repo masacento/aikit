@@ -419,6 +419,37 @@ analysis kept predicting load-reduction wins that do not exist on arm64.
   demotion note. Two ISAs, two different resources saturated; neither result generalizes to the
   other, and both are now measured rather than assumed.
 
+### 8.10 · `q8Span` SIMD int8→f32 widen — **MEASURED NET-ZERO**, `apple-m1pro`, 2026-08-10
+- **Tried:** `q8Span` (the `MatmulBTQ8Into` inner span) re-widened each int8 weight row to f32
+  with a scalar `for k := range K { deq[k] = float32(bq[k]) }` on every call. Replaced with the
+  SIMD-dispatched `dequantRowInt8(deq[:K], bq, 1.0)` (NEON/AVX2 + scalar tail) — `scale=1.0`
+  makes it a pure widen, and `float32(int8)*1.0` is exact in IEEE-754, so the result is
+  bit-identical, not merely close.
+- **Mechanism (the premise):** audit #2 predicted several ms/token at M=1 (the decode LM head,
+  N=vocab), where the widen is roughly half the per-column work and is never amortized across
+  rows the way it is at larger M.
+- **Number / box:** `BenchmarkQ8LMHeadDecode_fused`, M=1 K=1536 N=151936, best-of-3 on
+  `apple-m1pro`: scalar widen **6.79-6.85 ms/op**, SIMD widen **6.83-6.87 ms/op** — flat, inside
+  noise. Correctness held (`TestMatmulBTQ8Fused_bitIdentical` / `_Into` green), so this is a
+  clean measured negative, not an untested one.
+- **Why — the widen was never the bottleneck at this shape.** It overlaps the 233 MB int8 head
+  read; memory latency, `dotF32`, and parallel overhead dominate. This is *predicted* by
+  `cpu-acceleration.md` item 6, which had already measured `dequantRowInt8` itself as **NOT
+  issue-limited** (marginal-FMA probe, `apple-m1pro` stacked/alone **0.94-0.97**): a kernel with
+  idle issue slots is waiting on memory, and handing it fewer/wider instructions wins nothing.
+  The prediction and the measurement agree — worth noting because §8.9's probe reading did *not*
+  survive contact, and this one did.
+- **amd64/AVX2 is UNMEASURED** — a different memory subsystem, so not formally closed. But temper
+  the expectation: item 6's same probe put the Ryzen/AVX2 host at **0.79-0.82**, i.e. *more* idle
+  issue slack than arm64, not less. The evidence that explains the arm64 null points the same way
+  on amd64, only harder. Measure before building, and do not treat "unmeasured" as "promising".
+- **The code is not preserved, on purpose.** The change was ~43 lines (`linalg/quant.go` +7/-3,
+  plus a 33-line decode bench) and is fully re-derivable from the description above — one call
+  swapped for one loop. It lived on branch `q8span-simd-widen` (`3df4ec6`, never pushed), deleted
+  2026-08-24 once this entry existed: a 43-line patch whose approach is written down is cheaper
+  to rewrite than to curate, and the sole record of a negative must not be a commit title on an
+  unpushed local branch.
+
 ---
 
 ## Reasoned out, not built — recorded so nobody re-chases them

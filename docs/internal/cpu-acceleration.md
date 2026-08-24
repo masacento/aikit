@@ -392,7 +392,11 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
    Implication: `dequantRowInt8` has idle issue slots on both boxes — it is
    waiting on something else (memory is the obvious suspect, given the kernel is a
    load/sign-extend/convert/multiply/store chain), not issue-width bound, so a
-   scheduling/unrolling change here would have nothing to win against. No load
+   scheduling/unrolling change here would have nothing to win against.
+   **Confirmed by a later negative:** routing `q8Span`'s scalar int8→f32 widen
+   through this kernel measured flat at the decode LM-head shape (6.79-6.85 →
+   6.83-6.87 ms/op, `apple-m1pro`) — exactly what "not issue-limited" predicts.
+   `perf-dead-ends.md` §8.10. No load
    profile currently justifies chasing the memory side further at this kernel's
    real call frequency; revisit only if a profile flags it as a real hot path.
 7. **`SoftmaxRowInto` vectorized via Go 1.27's `simd` package — ✅ DONE
