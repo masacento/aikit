@@ -180,3 +180,29 @@ func TestSpanCache_addDropsEmptySpansAndDedups(t *testing.T) {
 		t.Fatalf("a member with no real spans should not be touchable, misses = %d", m)
 	}
 }
+
+// TestSpanCache_advisedBytesCountsWillneedNotResident is the durable check the .giw
+// kind-4 paged-decode regression should have caught: AdvisedBytes must reflect what
+// was actually passed to the WILLNEED hint (every span under a touched key, on a
+// miss), NOT a member's Resident-accounting size and NOT double-counted on a hit.
+// Registering redundant spans under one key (the real bug: a kind-4 tensor's unused
+// canonical copy alongside its row4 copy) would show up here directly, independent of
+// any external I/O tool and immune to whatever else the machine is doing.
+func TestSpanCache_advisedBytesCountsWillneedNotResident(t *testing.T) {
+	c := NewSpanCache[int](1 << 20)
+	c.Add(0, [][]byte{span(100), span(50)}) // two spans, one member — 150 bytes total
+	c.Add(1, [][]byte{span(30)})
+
+	c.Touch(0) // miss: WILLNEEDs both spans
+	if got := c.AdvisedBytes(); got != 150 {
+		t.Fatalf("AdvisedBytes after one miss = %d, want 150", got)
+	}
+	c.Touch(0) // hit: no new WILLNEED
+	if got := c.AdvisedBytes(); got != 150 {
+		t.Fatalf("AdvisedBytes after a hit must not grow, got %d, want 150", got)
+	}
+	c.Touch(1) // miss: WILLNEEDs its one span
+	if got := c.AdvisedBytes(); got != 180 {
+		t.Fatalf("AdvisedBytes after second member's miss = %d, want 180", got)
+	}
+}

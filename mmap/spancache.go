@@ -56,6 +56,7 @@ type SpanCache[K comparable] struct {
 	policy   EvictPolicy              // which member to release over budget (see EvictPolicy)
 
 	hits, misses, evictions int64
+	advisedBytes            int64 // cumulative bytes passed to advise(_, true) (WILLNEED) over all Touch calls
 }
 
 // NewSpanCache returns a cache that caps resident registered spans at budget bytes,
@@ -125,6 +126,7 @@ func (c *SpanCache[K]) Touch(key K) {
 	c.misses++
 	for _, s := range spans {
 		_ = c.advise(s, true) //nolint:errcheck // WILLNEED: hint the fault we're about to take (advisory)
+		c.advisedBytes += int64(len(s))
 	}
 	el := c.lru.PushFront(key)
 	c.pos[key] = el
@@ -182,3 +184,16 @@ func (c *SpanCache[K]) Registered() int64 {
 func (c *SpanCache[K]) Stats() (hits, misses, evictions int64) {
 	return c.hits, c.misses, c.evictions
 }
+
+// AdvisedBytes reports the cumulative bytes passed to the WILLNEED residency hint
+// over every miss across all Touch calls — what THIS cache asked the OS to fetch,
+// independent of what else the machine's disk did meanwhile. A durable, contamination-
+// proof I/O check a benchmark can assert on directly (bytes advised / tokens generated
+// should track the expected per-token working set), unlike an external tool (iostat,
+// /proc/diskstats) that counts physical reads shared with every other process on the
+// box. Divide by Misses() (via Stats) for bytes-per-miss; the fix this exists to catch
+// is exactly a member whose registered spans are bigger than they need to be — kind-4
+// briefly registered a tensor's canonical AND row4 spans together, doubling this number
+// for no read the kernel ever performed (docs/task-zeno-compare.md's "At-scale
+// acceptance run" in goinfer, the forcing function for this method).
+func (c *SpanCache[K]) AdvisedBytes() int64 { return c.advisedBytes }

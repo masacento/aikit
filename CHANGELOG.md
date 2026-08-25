@@ -9,6 +9,24 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.28.0] — 2026-08-24
+
+### Added
+
+`SpanCache.AdvisedBytes() int64`: cumulative bytes passed to the `WILLNEED` residency hint over
+every miss across all `Touch` calls — what the cache asked the OS to fetch, independent of
+whatever else the machine's disk is doing. The forcing function: goinfer's `.giw` kind-4 paged
+decode measured a real ~25-30% throughput regression (`docs/task-zeno-compare.md`'s "At-scale
+acceptance run"), root-caused to a member registering redundant spans (a tensor's unused
+canonical copy alongside its row4 copy) under one key — `Touch`'s `WILLNEED` loop faults in
+EVERY span under a key, so the redundant one doubled real disk I/O per miss though the kernel
+never read it. `AdvisedBytes` makes that class of bug directly, durably assertable inside a
+benchmark or test (bytes-advised-per-token should track the expected working set) — proof
+against a bug like this one that an external tool (`iostat`, `/proc/diskstats`) can't give,
+since those count physical reads shared with every other process on the box, not what THIS
+cache specifically requested. Purely additive; `Stats()`'s existing (hits, misses, evictions)
+is unchanged.
+
 ## [1.27.0] — 2026-08-24
 
 ### Added
@@ -2298,6 +2316,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.22.0...HEAD
+[1.28.0]: https://github.com/townsendmerino/aikit/compare/v1.27.0...v1.28.0
 [1.27.0]: https://github.com/townsendmerino/aikit/compare/v1.26.0...v1.27.0
 [1.26.0]: https://github.com/townsendmerino/aikit/compare/v1.25.0...v1.26.0
 [1.25.0]: https://github.com/townsendmerino/aikit/compare/v1.24.0...v1.25.0
