@@ -72,6 +72,27 @@ func dotW4A8SplitHalf4Acc(act *int8, packed *byte, scales *float32, nGroups int)
 //go:noescape
 func dotW4A8SplitHalf4Row(act *int8, packed4 *byte, scales4 *float32, dst *float32, nGroups int)
 
+// dotW4A8SplitHalf4RowPrefetch is dotW4A8SplitHalf4Row plus one PRFM
+// PLDL1KEEP per outer iteration, issued prefetchDistance BYTES ahead of the
+// current group's packed4 pointer (docs/task-w4a8-neon-bandwidth.md's
+// cold-fix harness pass, PRFM remedy). Pure hint, bit-identical to
+// dotW4A8SplitHalf4Row by construction. See dot_w4a8_arm64.s.
+//
+//go:noescape
+func dotW4A8SplitHalf4RowPrefetch(act *int8, packed4 *byte, scales4 *float32, dst *float32, nGroups int, prefetchDistance int)
+
+// dotW4A8SplitHalf4RowDeshared is dotW4A8SplitHalf4Row with the 4 rows' bytes
+// kept in 4 separate slices (repackSplitHalfRow's plain per-row layout, no
+// interleave) instead of one contiguous interleaved block —
+// docs/task-w4a8-neon-bandwidth.md's cold-fix harness pass, chain/line
+// de-sharing remedy. The activation is still loaded once per group and
+// shared across all 4 SDOTs; only the weight/scale memory is de-shared.
+// Bit-identical to dotW4A8SplitHalf4Row by construction (same per-row math,
+// different source pointers). See dot_w4a8_arm64.s.
+//
+//go:noescape
+func dotW4A8SplitHalf4RowDeshared(act *int8, packed0, packed1, packed2, packed3 *byte, scales0, scales1, scales2, scales3 *float32, dst *float32, nGroups int)
+
 // dotW4A8 computes one W4A8 output (before the activation scale). The DotProd
 // path folds the per-group weight scales inside the kernel and returns the f32
 // dot directly; only a ragged final group (K % 32 ≠ 0) is mopped up in Go.

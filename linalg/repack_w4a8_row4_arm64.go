@@ -94,6 +94,19 @@ func repackSplitHalf4RowBlock(row0, row1, row2, row3 []byte, K int) []byte {
 	return out
 }
 
+// repackSplitHalf4RowDeshared is repackSplitHalf4RowBlock's non-interleaved
+// counterpart (docs/task-w4a8-neon-bandwidth.md's cold-fix harness pass,
+// chain/line de-sharing remedy): same per-row split-half packing
+// (repackSplitHalfRow), but the 4 rows are returned as 4 SEPARATE slices
+// instead of interleaved into one contiguous block — de-sharing the cache
+// line dotW4A8SplitHalf4RowDeshared's 4 concurrent accumulator chains would
+// otherwise read from on a cold miss. Scales need no repacking at all here
+// (the caller's existing per-row scale slices are already separate); this
+// only exists for the weight bytes.
+func repackSplitHalf4RowDeshared(row0, row1, row2, row3 []byte, K int) (b0, b1, b2, b3 []byte) {
+	return repackSplitHalfRow(row0, K), repackSplitHalfRow(row1, K), repackSplitHalfRow(row2, K), repackSplitHalfRow(row3, K)
+}
+
 // interleaveScales4Row is repackSplitHalf4RowBlock's counterpart for the
 // per-group f32 scales: 4 scales per group (row0..row3), contiguous, same
 // locality reasoning.

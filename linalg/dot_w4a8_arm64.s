@@ -596,6 +596,230 @@ splithalfpairloop:
 	FMOVS F9, ret+32(FP)
 	RET
 
+// func dotW4A8SplitHalf4RowPrefetch(act *int8, packed4 *byte, scales4 *float32, dst *float32, nGroups int, prefetchDistance int)
+//
+// docs/task-w4a8-neon-bandwidth.md's cold-fix harness pass (goinfer's
+// docs/task-zeno-compare.md confirmed the mechanism: dotW4A8SplitHalf4Row's 4
+// simultaneous accumulator chains share each cold cache-line region, so one
+// miss stalls 4 rows' in-flight work at once). Identical to
+// dotW4A8SplitHalf4Row byte-for-byte except for one added PRFM PLDL1KEEP per
+// outer iteration, issued prefetchDistance BYTES ahead of the current group's
+// packed4 pointer — a pure hint (never faults, changes no register any SDOT
+// or FMLA reads), so this is bit-identical to dotW4A8SplitHalf4Row by
+// construction, not by a separate proof. prefetchDistance is a harness knob
+// (2/4/8 cache lines, one page-crossing distance — see the campaign doc for
+// the actual sweep points), not a compile-time constant, so one kernel
+// covers the whole sweep instead of one hand-copy per distance.
+//
+// PRFM (immediate) has no Go mnemonic → raw WORD, PLDL1KEEP (Rt=0b00000),
+// register-computed address (imm12=0) so the harness-variable distance never
+// needs encoding into the immediate field itself: PRFM [Rn] = 0xF9800000 |
+// (Rn<<5). Here Rn=R9 (the precomputed prefetch address) → 0xF9800120.
+TEXT ·dotW4A8SplitHalf4RowPrefetch(SB), NOSPLIT, $0-48
+	MOVD act+0(FP), R0
+	MOVD packed4+8(FP), R1
+	MOVD scales4+16(FP), R2
+	MOVD dst+24(FP), R4
+	MOVD nGroups+32(FP), R3
+	MOVD prefetchDistance+40(FP), R14
+
+	VMOVI $0x0F, V30.B16
+	VMOVI $8, V31.B16
+	VEOR  V20.B16, V20.B16, V20.B16 // row0 acc
+	VEOR  V21.B16, V21.B16, V21.B16 // row1 acc
+	VEOR  V27.B16, V27.B16, V27.B16 // row2 acc
+	VEOR  V10.B16, V10.B16, V10.B16 // row3 acc
+
+row4prefetchloop:
+	ADD  R14, R1, R9  // prefetch address = this group's packed4 ptr + distance
+	WORD $0xF9800120  // PRFM PLDL1KEEP, [R9]
+
+	VLD1.P 32(R0), [V6.B16, V7.B16] // activation for this group — loaded ONCE
+
+	// row0 → V20
+	VLD1.P 16(R1), [V0.B16]
+	VAND   V30.B16, V0.B16, V1.B16
+	VUSHR  $4, V0.B16, V2.B16
+	VSUB   V31.B16, V1.B16, V3.B16
+	VSUB   V31.B16, V2.B16, V4.B16
+	VMOVI  $0, V16.B16
+	WORD   $0x4E8394D0 // SDOT V16.4S, V6.16B, V3.16B
+	WORD   $0x4E8494F0 // SDOT V16.4S, V7.16B, V4.16B
+	WORD   $0x4E21DA12 // SCVTF V18.4S, V16.4S
+	VLD1R  (R2), [V19.S4]
+	VFMLA  V19.S4, V18.S4, V20.S4
+	ADD    $4, R2, R2
+
+	// row1 → V21
+	VLD1.P 16(R1), [V0.B16]
+	VAND   V30.B16, V0.B16, V1.B16
+	VUSHR  $4, V0.B16, V2.B16
+	VSUB   V31.B16, V1.B16, V3.B16
+	VSUB   V31.B16, V2.B16, V4.B16
+	VMOVI  $0, V17.B16
+	WORD   $0x4E8394D1 // SDOT V17.4S, V6.16B, V3.16B
+	WORD   $0x4E8494F1 // SDOT V17.4S, V7.16B, V4.16B
+	WORD   $0x4E21DA36 // SCVTF V22.4S, V17.4S
+	VLD1R  (R2), [V23.S4]
+	VFMLA  V23.S4, V22.S4, V21.S4
+	ADD    $4, R2, R2
+
+	// row2 → V27
+	VLD1.P 16(R1), [V0.B16]
+	VAND   V30.B16, V0.B16, V1.B16
+	VUSHR  $4, V0.B16, V2.B16
+	VSUB   V31.B16, V1.B16, V3.B16
+	VSUB   V31.B16, V2.B16, V4.B16
+	VMOVI  $0, V24.B16
+	WORD   $0x4E8394D8 // SDOT V24.4S, V6.16B, V3.16B
+	WORD   $0x4E8494F8 // SDOT V24.4S, V7.16B, V4.16B
+	WORD   $0x4E21DB19 // SCVTF V25.4S, V24.4S
+	VLD1R  (R2), [V26.S4]
+	VFMLA  V26.S4, V25.S4, V27.S4
+	ADD    $4, R2, R2
+
+	// row3 → V10
+	VLD1.P 16(R1), [V0.B16]
+	VAND   V30.B16, V0.B16, V1.B16
+	VUSHR  $4, V0.B16, V2.B16
+	VSUB   V31.B16, V1.B16, V3.B16
+	VSUB   V31.B16, V2.B16, V4.B16
+	VMOVI  $0, V28.B16
+	WORD   $0x4E8394DC // SDOT V28.4S, V6.16B, V3.16B
+	WORD   $0x4E8494FC // SDOT V28.4S, V7.16B, V4.16B
+	WORD   $0x4E21DB88 // SCVTF V8.4S, V28.4S
+	VLD1R  (R2), [V9.S4]
+	VFMLA  V9.S4, V8.S4, V10.S4
+	ADD    $4, R2, R2
+
+	SUBS $1, R3, R3
+	BNE  row4prefetchloop
+
+	WORD  $0x6E34D694 // FADDP V20 → lane0 = row0 sum
+	WORD  $0x6E34D694
+	FMOVS F20, (R4)
+	WORD  $0x6E35D6B5 // FADDP V21 → lane0 = row1 sum
+	WORD  $0x6E35D6B5
+	FMOVS F21, 4(R4)
+	WORD  $0x6E3BD77B // FADDP V27 → lane0 = row2 sum
+	WORD  $0x6E3BD77B
+	FMOVS F27, 8(R4)
+	WORD  $0x6E2AD54A // FADDP V10 → lane0 = row3 sum
+	WORD  $0x6E2AD54A
+	FMOVS F10, 12(R4)
+	RET
+
+// func dotW4A8SplitHalf4RowDeshared(act *int8, packed0, packed1, packed2, packed3 *byte, scales0, scales1, scales2, scales3 *float32, dst *float32, nGroups int)
+//
+// docs/task-w4a8-neon-bandwidth.md's cold-fix harness pass, second remedy:
+// instead of interleaving the 4 rows' split-half bytes contiguously
+// (repackSplitHalf4RowBlock — the production row4 layout, which is exactly
+// what puts all 4 chains' data on the SAME cold cache line), keep each row's
+// split-half bytes and scales in 4 SEPARATE slices (each in
+// repackSplitHalfRow's plain per-row layout — no new packing scheme, just no
+// final interleave step). The activation is still loaded ONCE per group and
+// reused across all 4 SDOTs (the actual warm-path win), but each row's own
+// memory now lives in a different Go allocation, de-sharing the cache line 4
+// concurrent chains would otherwise contend on a cold miss. Per-row math is
+// byte-for-byte identical to dotW4A8SplitHalf4Row's (same
+// AND/USHR/SUB/SDOT/SCVTF/FMLA sequence per row) — only which pointer each
+// row reads from differs, so this is bit-identical by construction.
+TEXT ·dotW4A8SplitHalf4RowDeshared(SB), NOSPLIT, $0-88
+	MOVD act+0(FP), R0
+	MOVD packed0+8(FP), R1
+	MOVD packed1+16(FP), R5
+	MOVD packed2+24(FP), R6
+	MOVD packed3+32(FP), R7
+	MOVD scales0+40(FP), R2
+	MOVD scales1+48(FP), R8
+	MOVD scales2+56(FP), R9
+	MOVD scales3+64(FP), R10
+	MOVD dst+72(FP), R4
+	MOVD nGroups+80(FP), R3
+
+	VMOVI $0x0F, V30.B16
+	VMOVI $8, V31.B16
+	VEOR  V20.B16, V20.B16, V20.B16 // row0 acc
+	VEOR  V21.B16, V21.B16, V21.B16 // row1 acc
+	VEOR  V27.B16, V27.B16, V27.B16 // row2 acc
+	VEOR  V10.B16, V10.B16, V10.B16 // row3 acc
+
+desharedloop:
+	VLD1.P 32(R0), [V6.B16, V7.B16] // activation for this group — loaded ONCE
+
+	// row0 → V20 (from its own separate packed0/scales0 stream)
+	VLD1.P 16(R1), [V0.B16]
+	VAND   V30.B16, V0.B16, V1.B16
+	VUSHR  $4, V0.B16, V2.B16
+	VSUB   V31.B16, V1.B16, V3.B16
+	VSUB   V31.B16, V2.B16, V4.B16
+	VMOVI  $0, V16.B16
+	WORD   $0x4E8394D0 // SDOT V16.4S, V6.16B, V3.16B
+	WORD   $0x4E8494F0 // SDOT V16.4S, V7.16B, V4.16B
+	WORD   $0x4E21DA12 // SCVTF V18.4S, V16.4S
+	VLD1R  (R2), [V19.S4]
+	VFMLA  V19.S4, V18.S4, V20.S4
+	ADD    $4, R2, R2
+
+	// row1 → V21 (from packed1/scales1)
+	VLD1.P 16(R5), [V0.B16]
+	VAND   V30.B16, V0.B16, V1.B16
+	VUSHR  $4, V0.B16, V2.B16
+	VSUB   V31.B16, V1.B16, V3.B16
+	VSUB   V31.B16, V2.B16, V4.B16
+	VMOVI  $0, V17.B16
+	WORD   $0x4E8394D1 // SDOT V17.4S, V6.16B, V3.16B
+	WORD   $0x4E8494F1 // SDOT V17.4S, V7.16B, V4.16B
+	WORD   $0x4E21DA36 // SCVTF V22.4S, V17.4S
+	VLD1R  (R8), [V23.S4]
+	VFMLA  V23.S4, V22.S4, V21.S4
+	ADD    $4, R8, R8
+
+	// row2 → V27 (from packed2/scales2)
+	VLD1.P 16(R6), [V0.B16]
+	VAND   V30.B16, V0.B16, V1.B16
+	VUSHR  $4, V0.B16, V2.B16
+	VSUB   V31.B16, V1.B16, V3.B16
+	VSUB   V31.B16, V2.B16, V4.B16
+	VMOVI  $0, V24.B16
+	WORD   $0x4E8394D8 // SDOT V24.4S, V6.16B, V3.16B
+	WORD   $0x4E8494F8 // SDOT V24.4S, V7.16B, V4.16B
+	WORD   $0x4E21DB19 // SCVTF V25.4S, V24.4S
+	VLD1R  (R9), [V26.S4]
+	VFMLA  V26.S4, V25.S4, V27.S4
+	ADD    $4, R9, R9
+
+	// row3 → V10 (from packed3/scales3)
+	VLD1.P 16(R7), [V0.B16]
+	VAND   V30.B16, V0.B16, V1.B16
+	VUSHR  $4, V0.B16, V2.B16
+	VSUB   V31.B16, V1.B16, V3.B16
+	VSUB   V31.B16, V2.B16, V4.B16
+	VMOVI  $0, V28.B16
+	WORD   $0x4E8394DC // SDOT V28.4S, V6.16B, V3.16B
+	WORD   $0x4E8494FC // SDOT V28.4S, V7.16B, V4.16B
+	WORD   $0x4E21DB88 // SCVTF V8.4S, V28.4S
+	VLD1R  (R10), [V9.S4]
+	VFMLA  V9.S4, V8.S4, V10.S4
+	ADD    $4, R10, R10
+
+	SUBS $1, R3, R3
+	BNE  desharedloop
+
+	WORD  $0x6E34D694 // FADDP V20 → lane0 = row0 sum
+	WORD  $0x6E34D694
+	FMOVS F20, (R4)
+	WORD  $0x6E35D6B5 // FADDP V21 → lane0 = row1 sum
+	WORD  $0x6E35D6B5
+	FMOVS F21, 4(R4)
+	WORD  $0x6E3BD77B // FADDP V27 → lane0 = row2 sum
+	WORD  $0x6E3BD77B
+	FMOVS F27, 8(R4)
+	WORD  $0x6E2AD54A // FADDP V10 → lane0 = row3 sum
+	WORD  $0x6E2AD54A
+	FMOVS F10, 12(R4)
+	RET
+
 // func dotW4A8SplitHalf4Acc(act *int8, packed *byte, scales *float32, nGroups int) float32
 //
 // dotW4A8SplitHalf2Acc extended to four lanes, matching dotW4A8FoldSDOT4Acc's
