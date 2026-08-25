@@ -33,6 +33,22 @@ settle the question, and the specific ways ours have failed.
    instruction mix (load ports, uop counts) was wrong, and every ceiling measured this
    way was right — including one that showed a shipped benchmark had been dividing by
    another machine's constant for months. See [`roofline-2026-08.md`](roofline-2026-08.md).
+7. **When conditions can be interleaved on the same input, DIFFERENCE THE MATCHED
+   OBSERVATIONS — do not pool them.** Pooled means carry the variance *between* inputs,
+   which is usually far larger than the effect and hides it completely. Interleave the
+   variants within each (input, repeat), then compare observation *i* of A against
+   observation *i* of B and report the paired mean **with a win count**.
+
+   Measured, 2026-08-25 (goinfer, verify-width sweep, n=12): the same data read
+   **pooled** gave per-condition sd of **10–35 tok/s** against an ~8% effect — unreadable —
+   and read **paired** gave sd **5.5–8.7** with the winner taking **11 of 12** pairs. The two
+   views disagreed about whether there was an effect at all. In an adjacent cell the paired
+   view was what *refuted* an effect: a headline "+5.1%" from n=2 came back **+3.1% on 6/12
+   pairs**, a coin flip, and a wrong default was avoided.
+
+   This composes with rule 3 rather than replacing it: same-process comparison removes
+   cross-invocation drift, pairing removes between-input variance. Neither substitutes for
+   the other, and a sub-5% claim needs both.
 
 ---
 
