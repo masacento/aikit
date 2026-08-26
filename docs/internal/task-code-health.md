@@ -150,15 +150,28 @@ prover, so all eight indexings regain their checks — **7 extra bounds checks p
 the library's hottest loop.** The third row isolates the cause: keeping `&v0[0]`-style arguments and
 changing *only* the guard still costs 36, so it is the guard, not how `Dot8x4` is indexed.
 
-**Benchmarks could not settle this, which is why the assembly did.** `BenchmarkFlatQuery` on this
-box, best-of-6 then median-of-8 warm and interleaved, gave N1k 0.90×, N10k 1.02×, N50k 0.92× — two
-directions at once, with N1k's own spread at 119%. A first attempt also compared a cold `before` run
-against a warm `after` one, which flattered the change by ~7%; re-running both warm removed that but
-not the noise. Do not re-attempt this on a shared laptop.
+**Then it WAS measured, on a quiet box, and the cost is below the floor.** 15 samples per variant,
+three interleaved passes, `benchtime=2000x`: N1k **1.010×**, N10k **1.002×**, N50k **0.993×** — all
+inside ±1%, spreads 12–37%. That matches the arithmetic: 7 compares per 8-vector group against
+8×(d/4) SIMD ops is ~0.1% at d=768. **So the bounds checks are real and their cost is not
+measurable.**
 
-**Reverted; `ann/flat.go` is byte-identical to its prior compiled form.** The file keeps its 1.9/10.
-That score is the honest cost of an 8-way unrolled SIMD dispatch with a defensive ragged-group
-guard, and paying it is the right call.
+(Worth keeping for method: the first attempt at this compared a *cold* `before` run against a *warm*
+`after` one and flattered the change by ~7%; best-of-6 also let a single lucky 117430 sample set the
+N10k baseline. Interleaved passes on a quiet machine, compared on medians, is the only version of
+this that meant anything.)
+
+**Left reverted — but on a judgement call, not on the evidence, and the evidence changed.** What
+the numbers support is "the readability variant costs less than 1% and probably ~0.1%", not "it is
+free". Against that: this is the hottest loop in the library's headline path, the change makes the
+compiler provably emit more work there, and the gain is that eight slices are named once instead of
+three times. In a package whose entire value proposition is query throughput, "unmeasurable" is a
+weaker warrant than "no extra work", so the as-is form stays and the file keeps its 1.9/10 — the
+honest cost of an 8-way unrolled SIMD dispatch with a defensive ragged-group guard.
+
+**This is the one item here that a reasonable person could decide the other way**, and if the call
+is ever "maintainability wins", the variant is the three-row table above, reverts cleanly, and needs
+no re-measuring. `ann/flat.go` is currently byte-identical to its prior compiled form.
 
 ### 4.3-old · original scoping note
 
