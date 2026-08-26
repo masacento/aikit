@@ -2,7 +2,8 @@
 
 > Scoping doc. Opened 2026-08-26 from the repowise trial (`docs/prompts/repowise-trial-results.md`),
 > the first index+health run over this repo. Sibling to goinfer's `docs/task-code-health.md`, which
-> came out of the same run. **Status: IN PROGRESS — §4.1 done 2026-08-26 (`1db67bb`); the `linalg/` freeze in §3.1 lifted the same day.** Unlike goinfer's,
+> came out of the same run. **Status: IN PROGRESS — §4.1 done (`1db67bb`), §4.1a examined and mostly declined, the two
+> worthwhile non-`linalg` clusters done (`d671787`), all 2026-08-26.** Unlike goinfer's,
 > this list is mostly real: 13 of the 20 targets are production files, not tests. Two hard
 > constraints shape it, §3.
 
@@ -87,6 +88,37 @@ caller has used the aliasing slice it just returned. The guard stays in each exp
 the dtype check and the `reinterpretLE` call are shared.
 
 See `embed/safetensors.go` and the commit that lands this for the resulting shape.
+
+### 4.1a · The `linalg/` clusters — EXAMINED 2026-08-26, MOSTLY DECLINED
+
+The freeze lifting (§3.1) made nine clusters / 164 duplicated lines available, which looked like
+the bulk of the value on this list. Read rather than applied, most of it is **deliberate
+duplication that should stay**, and two cases would have caused real regressions.
+
+**`linalg/quant.go`'s four span-dispatch sites (12-line cluster) — DECLINED, would regress a
+tested invariant.** `MatmulBTQ8Into`, `MatmulBTW8A8Into`, `MatmulBTW4A8Into` and `MatmulBTQ4`
+each carry the same shape: serial short-circuit under `ws.thr()`, else `ws.parallel(N, closure)`.
+The code says why it is written twice — *"Serial fast-path calls the named span directly (no
+closure → no heap escape → zero alloc, the steady-state decode case). Only the parallel branch
+pays a closure allocation."* Extracting a helper that takes a `func(j0, j1 int)` puts a closure on
+the **serial** path too, and since the helper also hands it to `ws.parallel`, escape analysis
+marks it escaping in both. That is an allocation added to the decode hot path, and it is gated:
+`batch_test.go:148` asserts `AllocsPerRun == 0`. The refactor would turn that test red, correctly.
+
+**`linalg/exp_simd.go`'s five clusters (33+28+27+14+8 lines) — DECLINED, the duplication buys the
+speed.** `softmaxRowIntoRaw` and `softmaxRowScaledIntoRaw` share their pass structure and differ
+by folding a scale into pass 2 — which is the entire reason the second exists (it replaces a
+caller's separate O(L²) pass and is bit-identical to that sequence, not an approximation).
+Unifying them means either a per-lane branch or a multiply-by-1.0 in the unscaled path, inside a
+`//go:build goexperiment.simd` kernel whose measured reason for existing is 2.5–4.6×. Cosmetic
+gain, real risk to a validated number.
+
+**Still open in `linalg/`:** `quant.go`'s 24-line and 10-line clusters and `kquant.go`'s 8-line
+pair were not examined in that pass. They may be genuine; they are also small.
+
+**The lesson worth carrying:** 164 of the 227 duplicated lines this tool reported sit behind an
+explicit comment or a passing test explaining why they are duplicated. The count was never the
+finding.
 
 ### 4.2 · `embed/safetensors.go` sharded-open pair — NOT STARTED
 
