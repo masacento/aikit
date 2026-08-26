@@ -49,6 +49,33 @@ var reVuln = regexp.MustCompile(`Vulnerability #[0-9]+:`)
 
 func main() { os.Exit(run()) }
 
+// reportCells prints one line per module — plus the reachable-advisory detail
+// lines under a VULNERABLE one — and returns the tally the STATEMENT is built
+// from. Split out of run() because it was the only nesting in an otherwise flat
+// precondition-then-scan-then-report flow: range → switch → case → range → if,
+// five deep, against run()'s own two.
+func reportCells(cells []gate.Cell) (clean, vuln, unscanned int) {
+	for _, c := range cells {
+		switch c.Field("status") {
+		case "CLEAN":
+			clean++
+			fmt.Printf("  %-30s CLEAN\n", c.Name)
+		case "VULNERABLE":
+			vuln++
+			fmt.Printf("  %-30s VULNERABLE (%s reachable)\n", c.Name, c.Field("count"))
+			for _, f := range c.Fields {
+				if f.Key == "line" {
+					fmt.Printf("      %s\n", f.State)
+				}
+			}
+		default: // UNSCANNED
+			unscanned++
+			fmt.Printf("  %-30s UNSCANNED — %s\n", c.Name, c.Field("detail"))
+		}
+	}
+	return clean, vuln, unscanned
+}
+
 func run() int {
 	root, err := gpumod.RepoRoot()
 	if err != nil {
@@ -85,26 +112,7 @@ func run() int {
 	}
 	cells := gate.RunAll(checks)
 
-	var clean, vuln, unscanned int
-	for _, c := range cells {
-		status := c.Field("status")
-		switch status {
-		case "CLEAN":
-			clean++
-			fmt.Printf("  %-30s CLEAN\n", c.Name)
-		case "VULNERABLE":
-			vuln++
-			fmt.Printf("  %-30s VULNERABLE (%s reachable)\n", c.Name, c.Field("count"))
-			for _, f := range c.Fields {
-				if f.Key == "line" {
-					fmt.Printf("      %s\n", f.State)
-				}
-			}
-		default: // UNSCANNED
-			unscanned++
-			fmt.Printf("  %-30s UNSCANNED — %s\n", c.Name, c.Field("detail"))
-		}
-	}
+	clean, vuln, unscanned := reportCells(cells)
 	total := clean + vuln + unscanned
 
 	fmt.Println()
