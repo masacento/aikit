@@ -184,3 +184,6 @@ testdata/arctic2-m
 testdata/siglip-tiny
 testdata/siglip-bench/
 testdata/siglip-bench-l/
+
+# repowise index — generated codebase-intelligence artifacts, never committed
+.repowise/
