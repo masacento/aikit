@@ -52,6 +52,23 @@ type modelConfig struct {
 // Paths inside fsys follow the fs.FS slash convention (use the path
 // package, not path/filepath). LoadFromFS is the canonical entry point;
 // Load is a thin deprecated wrapper.
+// parseModelConfig decodes and validates a model's config.json. Only the PARSE
+// half is shared: the two callers reach the bytes differently (fs.ReadFile over
+// an fs.FS vs os.ReadFile over a directory), and folding that in would mean
+// threading a filesystem abstraction through purely to satisfy a helper. The
+// error text is carried over unchanged from the two inline copies, so callers
+// see exactly the same messages they did before.
+func parseModelConfig(cfgBytes []byte) (modelConfig, error) {
+	var cfg modelConfig
+	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+		return cfg, fmt.Errorf("parse config.json: %w", err)
+	}
+	if cfg.EmbeddingDType != "" && cfg.EmbeddingDType != "float32" {
+		return cfg, fmt.Errorf("unsupported embedding_dtype %q (only float32 supported)", cfg.EmbeddingDType)
+	}
+	return cfg, nil
+}
+
 func LoadFromFS(fsys fs.FS, dir string) (*StaticModel, error) {
 	join := func(name string) string { return path.Join(dir, name) }
 
@@ -64,12 +81,9 @@ func LoadFromFS(fsys fs.FS, dir string) (*StaticModel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config.json: %w", err)
 	}
-	var cfg modelConfig
-	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config.json: %w", err)
-	}
-	if cfg.EmbeddingDType != "" && cfg.EmbeddingDType != "float32" {
-		return nil, fmt.Errorf("unsupported embedding_dtype %q (only float32 supported)", cfg.EmbeddingDType)
+	cfg, err := parseModelConfig(cfgBytes)
+	if err != nil {
+		return nil, err
 	}
 
 	st, err := OpenSafetensorsFromFS(fsys, join("model.safetensors"))
@@ -122,12 +136,9 @@ func LoadMmap(dir string) (*StaticModel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config.json: %w", err)
 	}
-	var cfg modelConfig
-	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config.json: %w", err)
-	}
-	if cfg.EmbeddingDType != "" && cfg.EmbeddingDType != "float32" {
-		return nil, fmt.Errorf("unsupported embedding_dtype %q (only float32 supported)", cfg.EmbeddingDType)
+	cfg, err := parseModelConfig(cfgBytes)
+	if err != nil {
+		return nil, err
 	}
 	st, err := OpenSafetensorsMmap(filepath.Join(dir, "model.safetensors"))
 	if err != nil {

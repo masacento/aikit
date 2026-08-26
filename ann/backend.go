@@ -104,11 +104,7 @@ func (f *FlatI8) QueryBatch(queries [][]float32, k int) [][]Hit {
 		// written. TestQueryBatch_pooledScratchIsInert poisons the pool to check it.
 		sc := batchScratchPool.Get().(*batchScratch)
 		defer batchScratchPool.Put(sc)
-		need := len(queries) * f.n
-		if cap(sc.dst) < need {
-			sc.dst = make([]float32, need)
-		}
-		dst := sc.dst[:need]
+		dst := sc.buf(len(queries) * f.n)
 		if err := bi.ScoreBatch(queries, dst); err == nil {
 			for m := range queries {
 				out[m] = f.topHits(dst[m*f.n:(m+1)*f.n], k, nil)
@@ -128,6 +124,20 @@ func (f *FlatI8) QueryBatch(queries [][]float32, k int) [][]Hit {
 // one is M·N per batch — sharing would inflate every single-query scratch to a
 // batch-sized buffer for the rest of the process.
 type batchScratch struct{ dst []float32 }
+
+// buf returns a need-long slice of sc.dst, growing the backing array when it is
+// too small. Callers do the Get/Put themselves rather than having this method
+// wrap them, and that is deliberate: `defer batchScratchPool.Put(sc)` has to sit
+// in the frame that USES the returned slice. A helper that acquired and released
+// around its own body would hand back a slice it had already returned to the
+// pool, so a concurrent Get could hand the same backing array to another
+// goroutine mid-read. Sizing is the only part that is safe to share.
+func (sc *batchScratch) buf(need int) []float32 {
+	if cap(sc.dst) < need {
+		sc.dst = make([]float32, need)
+	}
+	return sc.dst[:need]
+}
 
 var batchScratchPool = sync.Pool{New: func() any { return new(batchScratch) }}
 
@@ -293,11 +303,7 @@ func (f *FlatI8) scoreShardGPU(queries [][]float32, k int) ([][]Hit, bool) {
 	}
 	sc := batchScratchPool.Get().(*batchScratch)
 	defer batchScratchPool.Put(sc)
-	need := len(queries) * f.gpuShardRows
-	if cap(sc.dst) < need {
-		sc.dst = make([]float32, need)
-	}
-	dst := sc.dst[:need]
+	dst := sc.buf(len(queries) * f.gpuShardRows)
 	if err := bi.ScoreBatch(queries, dst); err != nil {
 		return nil, false
 	}
