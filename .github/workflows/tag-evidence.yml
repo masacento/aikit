@@ -1,0 +1,82 @@
+name: gpu tag evidence
+
+# THE GPU DEVICE TESTS CANNOT RUN IN CI, SO CI CHECKS THAT THEY RAN.
+#
+# RELEASING.md § "GPU submodule": root CI does not exercise gpu/ — its device tests need a
+# real GPU, and no hosted runner has one. Metal is worse than absent: macos-latest's
+# paravirtual Metal layer SIGSEGVs inside objc_msgSend the moment a test touches the
+# device, so the tests cannot even attempt-and-skip. A self-hosted runner is out of scope
+# by decision (2026-08-26).
+#
+# What IS automatable is the EVIDENCE. The ritual requires the tagger to run
+# tools/gpudevice on BOTH a Mac and an NVIDIA box — no single machine covers all nine
+# modules — and paste both VERDICT: lines into the annotated tag message. That step was
+# enforced by prose, which is to say by memory. This job reads the pushed tag's message and
+# fails if either half is missing.
+#
+# WHAT IT CANNOT DO, and the name must not imply otherwise. It cannot tell a real verdict
+# from a copy-pasted one, it cannot check the verdict matches the tagged commit, and — like
+# consumer-resolution — a Go module tag is IMMUTABLE once the proxy fetches it, so a red run
+# here cannot unpublish anything. It converts "silently skipped" into "loudly recorded as
+# skipped". That is a smaller claim than "the device tests passed", and it is the one this
+# job can actually support.
+
+on:
+  push:
+    tags:
+      - 'gpu/v*'
+      - 'gpu/*/v*'
+
+permissions:
+  contents: read
+
+jobs:
+  verdicts:
+    name: both device verdicts present in the tag message
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0          # annotated tag OBJECTS, not just the ref
+      - name: Fetch tag objects
+        # actions/checkout gives the commit; the annotation (where the verdicts live) needs
+        # an explicit tag fetch. --force because the checkout may have created a lightweight
+        # ref that would otherwise win.
+        run: git fetch --force --tags origin
+      - name: Assert a darwin AND a linux verdict
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          MSG="$(git tag -l --format='%(contents)' "$TAG")"
+          if [ -z "$MSG" ]; then
+            echo "::error::$TAG is LIGHTWEIGHT (no annotation). RELEASING.md requires an" \
+                 "annotated tag carrying the device verdicts."
+            exit 1
+          fi
+          echo "--- tag message ---"; echo "$MSG"; echo "-------------------"
+
+          # tools/gpudevice prints e.g.
+          #   VERDICT: PASS — 5/5 applicable gpu modules green at <sha> (<host> Darwin/arm64, backend:metal, <ts>)
+          # One line per platform; the tag needs both halves.
+          missing=0
+          if ! grep -qE '^VERDICT:.*[Dd]arwin' <<<"$MSG"; then
+            echo "::error::no Darwin device verdict in $TAG. Run 'go run -C tools ./gpudevice'" \
+                 "on a Mac and paste its VERDICT: line into the tag message."
+            missing=1
+          fi
+          if ! grep -qE '^VERDICT:.*[Ll]inux' <<<"$MSG"; then
+            echo "::error::no Linux device verdict in $TAG. Run 'go run -C tools ./gpudevice'" \
+                 "on an NVIDIA box and paste its VERDICT: line into the tag message."
+            missing=1
+          fi
+          # A FAIL verdict pasted verbatim is not evidence of a green run.
+          if grep -qE '^VERDICT:\s*(FAIL|INCONCLUSIVE)' <<<"$MSG"; then
+            echo "::error::$TAG carries a FAIL or INCONCLUSIVE verdict line."
+            missing=1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::This gate REPORTS; it cannot unpublish a tag (the proxy pins it on" \
+                 "first fetch). Fix forward with a follow-up tag."
+            exit 1
+          fi
+          echo "both device verdicts present, neither FAIL/INCONCLUSIVE"
