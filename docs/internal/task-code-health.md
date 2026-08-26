@@ -2,7 +2,7 @@
 
 > Scoping doc. Opened 2026-08-26 from the repowise trial (`docs/prompts/repowise-trial-results.md`),
 > the first index+health run over this repo. Sibling to goinfer's `docs/task-code-health.md`, which
-> came out of the same run. **Status: IN PROGRESS — §4.1 started 2026-08-26.** Unlike goinfer's,
+> came out of the same run. **Status: IN PROGRESS — §4.1 done 2026-08-26 (`1db67bb`); the `linalg/` freeze in §3.1 lifted the same day.** Unlike goinfer's,
 > this list is mostly real: 13 of the 20 targets are production files, not tests. Two hard
 > constraints shape it, §3.
 
@@ -46,13 +46,19 @@ rather than dismissing wholesale.
 
 ## 3 · Two constraints on anything in this list
 
-**3.1 · `linalg/` is off-limits right now.** AVX-512 VNNI kernel work is in flight and uncommitted
-in the working tree (`linalg/quant_i8_amd64.go`, `linalg/quant_w4a8_amd64.go` modified, eight
-untracked `dot_*_avx512vnni_amd64.*` files), authored in a cloud session because neither local box
-can execute VNNI — the MacBook is arm64 and the Linux box is Zen 2. **Four of the 20 targets live
-in `linalg/`** (`quant_w4a8_arm64.go`, `rowblock_amd64.go`, `quant.go`, `matmul_blocked.go`), plus
-the largest duplication clusters (`exp_simd.go`, `quant.go`). Touching them now would conflict with
-work that cannot be rebased from here. Defer all of it until that lands.
+**3.1 · `linalg/` was off-limits; the freeze LIFTED 2026-08-26.** AVX-512 VNNI kernel work was in
+flight and uncommitted in the working tree, authored in a cloud session because neither local box
+can execute VNNI — the MacBook is arm64 and the Linux box is Zen 2. It landed in `2a7199a`, so the
+conflict is gone. **Four of the 20 targets live in `linalg/`** (`quant_w4a8_arm64.go`,
+`rowblock_amd64.go`, `quant.go`, `matmul_blocked.go`), and so do **nine of the fourteen duplication
+clusters — 164 of the 227 duplicated lines**, concentrated in `exp_simd.go` (four clusters, the
+largest 33 lines across 2 sites and 28 across 3) and `quant.go` (three clusters). That is the bulk
+of the mechanical work on this list and it is now available.
+
+One caveat inherited from what just landed: `dotW4A8` is no longer single-valued on amd64 — the
+VNNI kernel matches the scalar oracle to 1e-5 but is not bit-identical to the AVX2 one, so hosts
+now split by VNNI+VL. Anything touching `quant.go`'s W4A8 side should hold that tolerance, not
+tighten to `==`.
 
 **3.2 · The 33 unused exports are NOT free to delete.** aikit is a published library at v1.27.0
 with goinfer and ken as consumers, and the two-series module invariant (`tools/gpupins`) means
