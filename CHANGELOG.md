@@ -9,6 +9,75 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.29.0] — 2026-08-26
+
+### Added
+
+**An AVX-512 VNNI tier for the int8 kernels.** `VPDPBUSD` does in one instruction what the AVX2
+path spends a `VPMADDUBSW`+`VPMADDWD` pair on, and for W4A8 it also removes the separate convert
+step in the per-group scale fold. `docs/internal/cpu-acceleration.md` item 4 had named this the most
+promising amd64 lever since the ops-per-byte campaign, blocked the whole time on hardware. Both
+dispatchers gate on CPUID+XGETBV like the existing AVX2 tier, so a CPU without the extension never
+reaches the assembly.
+
+- `dotI8` now peels three tiers — VNNI over the 64-multiple, AVX2 over the 16-multiple of what
+  remains, scalar for the rest. Integer arithmetic throughout, no reassociation, so the result is
+  **bit-identical on every input** to what shipped before regardless of which tiers a given length
+  exercises.
+- `dotW4A8` prefers a VNNI+VL kernel over the AVX2 one at `group == 32`.
+
+Measured on a VNNI-capable Xeon at the FFN gate/up/down shape (K=5120, group=32, N=17408 — 55.7 MB,
+past L3), four runs: **hot 1.226–1.280× over AVX2**, cold **1.109–1.270×**. The hot ratio is settled
+(±2.2%); the cold one is real (above 1.0 in 4/4) but not settled (±6.8%) on a shared virtualized
+host. Treat "~1.25× hot and measurably faster cold" as supported and any specific cold multiplier as
+not. Full numbers, method and caveats: `docs/internal/cpu-acceleration.md` item 4.
+
+**Row4 cold-touch remedies — exported, deliberately NOT wired.** `MatmulBTW4A8Row4PrefetchInto`
+(software `PRFM` prefetch, parametrized distance) and `MatmulBTW4A8Row4DesharedInto` with its
+`RepackW4A8Row4Deshared` / `RepackW4A8Row4DesharedScales` layout helpers (the four rows' bytes in
+separate allocations instead of interleaved). Both are proven bit-identical to the production row4
+kernel across five shapes and warm-intact (every prefetch distance exactly 1.000×, de-sharing
+0.993×). They are **not** in any dispatch path: the cold penalty they were built to fix did not
+reproduce under a corrected same-day re-measurement, so they are recorded rather than adopted, and
+a caller must reach for them explicitly. See goinfer's `docs/task-zeno-compare.md`.
+
+### Release gates
+
+`perfgate`, `apple-m1pro`, working tree vs v1.28.0 interleaved:
+
+```
+VERDICT: PASS — no regression vs v1.28.0 above each shape's floor — 5/10 shapes resolve the 5.0% class
+sensitivity: 5/10 shapes have a floor ≤ 5.0% (the class this gate targets)
+```
+
+All ten shapes measured flat (Δ between −2.47% and +0.46%, every branch `flat`). Read the green as
+"no regression above each shape's floor": five shapes carry floors of ±14–21% and are BLIND to the
+5% class, so there they are only evidence against a larger regression.
+
+`vulncheck`, from CI's linux runner at `00055a9`:
+
+```
+STATEMENT: no reachable vulnerabilities in 15/15 modules at 00055a9
+```
+
+(The same command on `darwin/arm64` reports `INCOMPLETE — 11 clean, 0 vulnerable, 4 unscanned`:
+the four cuda backends have every file excluded by build tags on macOS, so govulncheck matches no
+packages there. The linux run above is the one that scans all fifteen.)
+
+**The perf gate cannot see this release's headline change.** It runs on `apple-m1pro`, and the VNNI
+tier is amd64-only — on arm64 those files are not even compiled in. The evidence for that change is
+the correctness suite on VNNI silicon plus the numbers above, not this gate. `releasegate` v1.29.0:
+PASS, 4/4, including `apidiff` Hard tier v1.28.0 → current (additive only).
+
+### Notes for downstream integrators
+
+**`dotW4A8` is no longer single-valued on amd64.** The VNNI kernel matches the scalar oracle to 1e-5
+relative — the same bar `dotW4A8FoldAVX2` already meets — but it is *not* bit-identical to the AVX2
+kernel, so an amd64 host with VNNI+VL and one without now produce W4A8 results that differ within
+that tolerance. This does not reach aikit's own golden fixtures (W4A8 has no caller in `encoder/`,
+`embed/` or `vision/`; it is linalg-internal), but a consumer comparing decode output **across
+machines** should expect the difference. `dotI8` carries no such caveat — it is exact on every tier.
+
 ## [1.28.0] — 2026-08-24
 
 ### Added
@@ -2316,6 +2385,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.22.0...HEAD
+[1.29.0]: https://github.com/townsendmerino/aikit/compare/v1.28.0...v1.29.0
 [1.28.0]: https://github.com/townsendmerino/aikit/compare/v1.27.0...v1.28.0
 [1.27.0]: https://github.com/townsendmerino/aikit/compare/v1.26.0...v1.27.0
 [1.26.0]: https://github.com/townsendmerino/aikit/compare/v1.25.0...v1.26.0
