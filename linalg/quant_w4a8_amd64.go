@@ -12,14 +12,23 @@ package linalg
 //go:noescape
 func dotW4A8FoldAVX2(act *int8, packed *byte, scales *float32, nGroups int) float32
 
-// dotW4A8 computes one W4A8 output (before the activation scale). The AVX2 path
-// folds the per-group weight scales inside the kernel and returns the f32 dot
-// directly; only a ragged final group (K % 32 ≠ 0) is mopped up in Go.
-// Everything off the fast path falls back to the portable reference.
+// dotW4A8 computes one W4A8 output (before the activation scale). The
+// AVX-512 VNNI and AVX2 paths both fold the per-group weight scales inside
+// the kernel and return the f32 dot directly; only a ragged final group
+// (K % 32 ≠ 0) is mopped up in Go. Everything off the fast path falls back
+// to the portable reference.
 func dotW4A8(act []int8, packed []byte, scales []float32, group, K int) float32 {
-	if hasAVX2 && group == 32 && K >= 32 {
+	if group == 32 && K >= 32 {
 		nFull := K / 32
-		total := dotW4A8FoldAVX2(&act[0], &packed[0], &scales[0], nFull)
+		var total float32
+		switch {
+		case hasAVX512VNNIVL:
+			total = dotW4A8FoldAVX512VNNI(&act[0], &packed[0], &scales[0], nFull)
+		case hasAVX2:
+			total = dotW4A8FoldAVX2(&act[0], &packed[0], &scales[0], nFull)
+		default:
+			return dotW4A8Scalar(act, packed, scales, group, K)
+		}
 		if done := nFull * 32; done < K {
 			// Ragged final group (K not a multiple of 32): scalar, scales[nFull].
 			var acc int32
