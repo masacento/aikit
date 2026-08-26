@@ -275,24 +275,40 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
      | 1 | 15.28 | 19.10 | **1.250×** | 11.96 | 13.37 | **1.117×** | 7.48→8.36 |
      | 2 | 15.61 | 19.25 | **1.233×** | 11.96 | 13.76 | **1.151×** | 7.48→8.60 |
      | 3 | 15.47 | 18.96 | **1.226×** | 10.04 | 11.13 | **1.109×** | 6.27→6.96 |
+     | 4 | — | — | **1.280×** | 10.16 | ~12.90 | **1.270×** | — |
 
-     (GMAC/s.) **The question this answers is whether the hot win survives
-     going cold** — §8.9's issue-width probe had already found the AVX2 kernel
-     with idle issue slots while streaming from DRAM, which is exactly the
-     shape where a wider instruction buys nothing. **It survives, compressed:**
-     hot is tight at ~1.23–1.25×, cold tight at ~1.11–1.15× — consistently
-     above 1.0 by more than the run-to-run spread, but only ~47–65% of the hot
-     relative gain reaches the streaming case. So there is real compute-bound
-     headroom even cold, and it is also not the free lunch hot numbers alone
-     would imply.
+     (GMAC/s. Run 4 was added when the harness's own gate was being proved;
+     its cold VNNI figure is derived from the reported ratio and baseline.)
 
-     **Trust the ratios, not the absolutes.** Cold AVX2 itself swings
-     10.04–11.96 GMAC/s across the three runs (~19%) — a shared/virtualized
-     cloud host, the same hazard that blew a 600s CI timeout on the measurement
-     harnesses (`perf-dead-ends.md` §8.10's sibling; the AIKIT_HARNESS gate in
-     `dd28f90` exists for it). The ratios are paired within a run and hold to
-     ±0.02, so they are the trustworthy part; treat every absolute here as
-     indicative only, and re-measure on settled silicon before quoting one.
+     **The question this answers is whether the hot win survives going cold** —
+     §8.9's issue-width probe had already found the AVX2 kernel with idle issue
+     slots while streaming from DRAM, exactly the shape where a wider
+     instruction should buy nothing. **It survives. How much of it survives is
+     NOT settled by these four runs**, and the first three alone would have
+     overstated the confidence:
+
+     - **Hot is settled**: 1.226–1.280× across all four, ±2.2% about the mean.
+     - **Cold is real but unsettled**: 1.109–1.270×, ±6.8%. Above 1.0 in 4/4,
+       so the win itself is not in question — its size is.
+     - **Survival** (cold gain ÷ hot gain) is therefore **47%, 65%, 48%, 96%**.
+       An earlier revision of this entry read the first three as "compressed to
+       roughly half." Run 4 breaks that; the honest range is ~47–96%, which is
+       too wide to support any claim about the compression factor.
+
+     **The obvious explanation for run 4 does not hold.** A high ratio usually
+     means a depressed baseline, but run 4's cold AVX2 (10.16) is within 1% of
+     run 3's (10.04) — the *VNNI* cold figure is what moved, 11.13 → ~12.90
+     (+16%) at an essentially identical baseline. So this is genuine variance in
+     the measured quantity, not a ratio artifact, and it cannot be dismissed.
+
+     **Trust the hot ratio; do not quote a cold one.** Cold AVX2 swings
+     10.04–11.96 GMAC/s across the runs (~19%) on a shared/virtualized cloud
+     host — the same hazard that blew a 600s CI timeout on the measurement
+     harnesses (the AIKIT_HARNESS gate in `dd28f90` exists for it). Pairing
+     within a run fixes that for the hot ratio but demonstrably not for the
+     cold one. **Settling the cold number needs quiet silicon, not more runs on
+     this host.** Until then: "VNNI is ~1.25× hot and measurably faster cold" is
+     supported; any specific cold multiplier is not.
 
      **Scope, so this is not over-read.** It answers the SIMD-width question
      only. It says nothing about the thread-scaling gap this campaign already
@@ -302,11 +318,13 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
      VNNI+VL. `dotI8`'s VNNI tier is exact on every path (integer, no
      reassociation) and carries no such caveat.
 
-     **Not reproducible in-tree yet:** the harness that produced these numbers
-     (`w4a8_vnni_opsperbyte_bench_test.go`) has not landed here — the bridge
-     dropped before it was written. When it does, it must call `harnessOnly(t)`
-     like every other measurement harness (`harness_gate_test.go`), or it will
-     reintroduce the CI timeout that gate was added to stop.
+     **Reproducible in-tree:** `w4a8_vnni_opsperbyte_bench_test.go`, gated on
+     `harnessOnly(t)` as its first statement — before the `hasAVX2` /
+     `hasAVX512VNNIVL` checks, so the skip reason is the harness gate rather
+     than the hardware. Verified both directions (skips bare, runs under
+     `AIKIT_HARNESS=1`), so it does not reintroduce the CI timeout `dd28f90`
+     added that gate to stop. Run it with:
+     `AIKIT_HARNESS=1 go test ./linalg/ -run TestW4A8VNNIOpsPerByte -v`
    - **Ops-per-byte measured, 2026-08-19** (`linalg/w4a8_opsperbyte_bench_test.go`,
      requested from goinfer after Qwen3.8-27B CPU decode measured 2.55× slower than
      an Ollama/Q4_K_M engine on the same Ryzen 7 3700X — the parallelization
