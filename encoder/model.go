@@ -46,6 +46,20 @@ type Model struct {
 // fs.FS/embed.FS route (fs.ReadFile, heap) for callers without a real directory.
 // Audit #2: previously Load delegated to LoadFromFS, so no caller used the mmap
 // path and Close on a Load-built model was a no-op.
+// lengthSortedOrder returns indices 0..n-1 ordered by ascending lens, stably.
+// Sorting the DISPATCH ORDER rather than the texts keeps each bucket's members
+// close in length, so a worker's padded batch wastes less on short rows — the
+// number of dispatchable units is unchanged, only their contents. Stable so
+// equal-length texts keep caller order, which keeps EncodeBatch deterministic.
+func lengthSortedOrder(lens []int, n int) []int {
+	order := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(a, b int) bool { return lens[order[a]] < lens[order[b]] })
+	return order
+}
+
 func Load(dir string) (*Model, error) {
 	w, err := LoadWeights(dir)
 	if err != nil {
@@ -265,11 +279,7 @@ func encodeBatch(tok *embed.Tokenizer, maxSeq int, fwd func([][]int32) [][]float
 		return nil, firstErr
 	}
 
-	order := make([]int, len(texts))
-	for i := range order {
-		order[i] = i
-	}
-	sort.SliceStable(order, func(a, b int) bool { return lens[order[a]] < lens[order[b]] })
+	order := lengthSortedOrder(lens, len(texts))
 	// Same number of dispatchable units the old partition produced, so worker
 	// occupancy is unchanged; only their CONTENTS are length-sorted.
 	perBucket := (len(texts) + concurrency - 1) / concurrency

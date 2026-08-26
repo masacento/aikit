@@ -2,8 +2,8 @@
 
 > Scoping doc. Opened 2026-08-26 from the repowise trial (`docs/prompts/repowise-trial-results.md`),
 > the first index+health run over this repo. Sibling to goinfer's `docs/task-code-health.md`, which
-> came out of the same run. **Status: IN PROGRESS — §4.1 done (`1db67bb`), §4.1a examined and mostly declined, the two
-> worthwhile non-`linalg` clusters done (`d671787`), all 2026-08-26.** Unlike goinfer's,
+> came out of the same run. **Status: §4.1, §4.1a, §4.3 and §4.4 all resolved 2026-08-26 — four items landed, four
+> declined with evidence. §4.2 and five §4.4-old complexity findings remain genuinely open.** Unlike goinfer's,
 > this list is mostly real: 13 of the 20 targets are production files, not tests. Two hard
 > constraints shape it, §3.
 
@@ -128,7 +128,39 @@ one mmaps and must `finalizeMmaps` on failure, the other `fs.ReadFile`s and has 
 The shared prologue is real; the extraction is worth doing only if it does not force the divergent
 cleanup through a shared abstraction. Medium value, non-trivial.
 
-### 4.3 · `ann/flat.go` — the worst file, and a hot path
+### 4.3 · `ann/flat.go` — ATTEMPTED AND REVERTED 2026-08-26; the conditional is load-bearing
+
+**The finding: `scanFlat`'s 8-term `||` guard cannot be simplified without costing bounds-check
+elimination in the hot loop.** repowise flags it as a *critical* complex-conditional, and it reads
+like one — the eight slices are spelled out three times over (destructure, guard, array literal).
+Replacing the guard with `for _, v := range group { if len(v) != d { ... } }` is the obvious fix and
+it is wrong.
+
+Measured on the generated code, because the box could not resolve it otherwise (see below):
+
+| | code size | instructions | `panicBounds` sites |
+|---|--:|--:|--:|
+| as-is (8-term `||`) | 1344 B | 463 | **22** |
+| range-loop guard, array-indexed call | 1296 B | 444 | **36** |
+| range-loop guard, named-slice call | 1216 B | 419 | **36** |
+
+The explicit `||` chain gives the compiler a per-slice `len(v) == d` proof it carries into the eight
+`&vN[0]` uses. A range loop over the array proves the same fact to a human and *nothing* to the
+prover, so all eight indexings regain their checks — **7 extra bounds checks per 8-vector group in
+the library's hottest loop.** The third row isolates the cause: keeping `&v0[0]`-style arguments and
+changing *only* the guard still costs 36, so it is the guard, not how `Dot8x4` is indexed.
+
+**Benchmarks could not settle this, which is why the assembly did.** `BenchmarkFlatQuery` on this
+box, best-of-6 then median-of-8 warm and interleaved, gave N1k 0.90×, N10k 1.02×, N50k 0.92× — two
+directions at once, with N1k's own spread at 119%. A first attempt also compared a cold `before` run
+against a warm `after` one, which flattered the change by ~7%; re-running both warm removed that but
+not the noise. Do not re-attempt this on a shared laptop.
+
+**Reverted; `ann/flat.go` is byte-identical to its prior compiled form.** The file keeps its 1.9/10.
+That score is the honest cost of an 8-way unrolled SIMD dispatch with a defensive ragged-group
+guard, and paying it is the right call.
+
+### 4.3-old · original scoping note
 
 Score 1.9. `scanFlat` carries a **critical** complex-conditional finding plus a nested-complexity
 and a complex-method finding, and the file is in the top 5% for change entropy. `ann/flat_i8.go`
@@ -136,7 +168,26 @@ is in the **top 1%**. These are the query hot paths, so any change is a benchmar
 not a readability one — `BenchmarkFlat*` and the ANN parity tests are the gate. Real finding,
 real cost; do not start it casually.
 
-### 4.4 · The rest, unstarted and unranked
+### 4.4 · Extract-method plans — two done, one declined, rest open
+
+**Done (`resolveUnkID`, `lengthSortedOrder`).** Both are cold-path — a tokenizer parse and a
+per-batch dispatch-order build — so neither carries §4.3's hazard. Both landed **with new tests**,
+and that detail is the point: every test that would otherwise cover them
+(`TestEncodeBatch_*`, `TestBPESpan_*`) is gated on a model checkpoint and **skips** on a machine
+without `testdata/`. A green `go test` proved nothing about either extraction. `encoder/order_test.go`
+and `embed/unkid_test.go` need no checkpoint, and both were run against the pre-refactor inline
+logic as well to prove behaviour identity rather than assert it.
+
+**Declined: `topKWANDState` (bm25/wand.go).** The 14-line insertion sort sits inside WAND's main
+walk — the sparse-query hot loop — and a helper holding a nested double loop is far over Go's
+inline budget, so extracting it adds a real call per iteration there. Same trap as §4.3, different
+mechanism.
+
+**Still open:** `chunkWith` (chunk/regex/chunker.go) — extractable, but the region ends in a closure
+capturing `boundaries`, so it wants a small struct rather than a function, and that is a design call
+rather than a mechanical lift.
+
+### 4.4-old · The rest, unstarted and unranked
 
 `encoder/mlp.go` (`moeMLP` CCN 16), `encoder/forward_batch.go` (`forwardBatch` CCN 16),
 `encoder/weights.go` (`buildWeightsFromSafetensors` nests 5 deep), `tools/vulncheck/main.go` (`run`

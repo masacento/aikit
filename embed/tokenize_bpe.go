@@ -37,6 +37,21 @@ var gpt2Pattern = regexp.MustCompile(`'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+|
 // themselves; the other 68 map, in ascending byte order, to U+0100, U+0101, …
 // This is a bijection onto a set of printable runes, so merges never straddle a
 // UTF-8 boundary and every byte has a vocab symbol.
+// resolveUnkID finds the <unk> token id, preferring the added-tokens table over
+// the base vocab (an added entry overrides a same-named vocab entry everywhere
+// else in this parser, so it does here too). Byte-level BPE never actually emits
+// <unk> — every byte is representable — but the id is exposed when the
+// checkpoint defines one, and 0 is the documented "absent" value.
+func resolveUnkID(added map[string]int32, vocab map[string]int32) int32 {
+	if id, ok := added["<unk>"]; ok {
+		return id
+	}
+	if id, ok := vocab["<unk>"]; ok {
+		return id
+	}
+	return 0
+}
+
 func bytesToUnicode() [256]rune {
 	printable := func(b int) bool {
 		return (b >= '!' && b <= '~') || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF)
@@ -316,13 +331,7 @@ func parseBPETokenizer(data []byte) (*bpeBackend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bpe: post_processor sep: %w", err)
 	}
-	// unk id: byte-level BPE never emits it, but expose <unk> if present.
-	unkID := int32(0)
-	if id, ok := added["<unk>"]; ok {
-		unkID = id
-	} else if id, ok := raw.Model.Vocab["<unk>"]; ok {
-		unkID = id
-	}
+	unkID := resolveUnkID(added, raw.Model.Vocab)
 
 	return &bpeBackend{
 		byte2rune:   bytesToUnicode(),
