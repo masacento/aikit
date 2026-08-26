@@ -9,6 +9,27 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`gpu` (Metal): the OS thread is now pinned for an autorelease pool's whole lifetime**
+  (ships as `gpu/v0.30.1`). An `NSAutoreleasePool` is per-OS-thread, and Go may migrate a
+  goroutine between any two calls — draining a pool on a thread other than the one that pushed
+  it is undefined behaviour. It presented as an intermittent `SIGSEGV` (`fault 0x10`) inside
+  `objc_msgSend`, at a crash site that MOVED between runs, which is what made it look like
+  flakiness rather than a defect. `Run1D`/`Run2D`/`Run1DBatch` create and drain within one call
+  and pin with a `defer`; `Queue.Begin()`/`Encoder.End()` span two calls, so the pin is held on
+  the `Encoder` and released only after the drain. `BeginNP` is unchanged — it owns no pool, and
+  its caller owns both the pool and the pin. `runtime.LockOSThread` nests, so a consumer that
+  already pins (goinfer's resident `Forward`/`BuildResident` do) is unaffected.
+
+  Measured on an M1 Pro against goinfer's Metal suite: **20/20 runs clean with the pin; 2 of 8
+  crashed with it reverted**, at two different call sites — the site migration reproducing under
+  the mutation is what identifies it as the same defect rather than a coincidence.
+
+  **Contract this makes explicit:** an `Encoder` from `Begin()` must reach `End()` on the same
+  goroutine and must not be handed to another. That was always true of the pool semantics; it is
+  now enforced rather than assumed.
+
 ## [1.29.0] — 2026-08-26
 
 ### Added

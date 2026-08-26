@@ -577,6 +577,14 @@ func (b Buffer) U32() uint32 { return *objc.Send[*uint32](b.id, selContents) }
 // discipline (no ARC): the per-token commandBuffer/encoder are autoreleased into the
 // pool and drained here, so the decode loop won't leak (doc risk #2).
 func (q Queue) Run1D(p Pipeline, n, tg int, bufs ...Buffer) {
+	// G22: pin the OS thread for the pool's whole lifetime. An NSAutoreleasePool is
+	// PER-OS-THREAD, and Go may migrate a goroutine between any two calls — draining
+	// a pool on a thread other than the one that pushed it is undefined behaviour,
+	// and shows up as an intermittent SIGSEGV (fault 0x10) inside objc_msgSend.
+	// Consumers that already pin are unaffected: LockOSThread nests.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	pool := objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc).Send(selInit)
 	defer pool.Send(selDrain)
 
@@ -604,6 +612,14 @@ func (q Queue) Run1D(p Pipeline, n, tg int, bufs ...Buffer) {
 // bounds-checks its own global (m,n,k) index, exactly like the CUDA tiled kernels.
 // Blocks until the GPU finishes. Manual autoreleasepool discipline, like Run1D.
 func (q Queue) Run2D(p Pipeline, gx, gy, tgx, tgy int, bufs ...Buffer) {
+	// G22: pin the OS thread for the pool's whole lifetime. An NSAutoreleasePool is
+	// PER-OS-THREAD, and Go may migrate a goroutine between any two calls — draining
+	// a pool on a thread other than the one that pushed it is undefined behaviour,
+	// and shows up as an intermittent SIGSEGV (fault 0x10) inside objc_msgSend.
+	// Consumers that already pin are unaffected: LockOSThread nests.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	pool := objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc).Send(selInit)
 	defer pool.Send(selDrain)
 
@@ -629,8 +645,12 @@ func (q Queue) Run2D(p Pipeline, gx, gy, tgx, tgy int, bufs ...Buffer) {
 // dispatches (like WGSL's storage barriers), so chained kernels see prior writes.
 type Encoder struct {
 	pool objc.ID
-	cb   objc.ID
-	enc  objc.ID
+	// pinned records that Begin() locked this goroutine to its OS thread for the
+	// pool's lifetime (G22); End() releases it after the drain. False for BeginNP,
+	// which has no pool of its own.
+	pinned bool
+	cb     objc.ID
+	enc    objc.ID
 	// Encode-tax trims (measured: together only ~0.5ms of the ~2.4ms/token overhead — the
 	// rest is GPU-side per-Dispatch latency, not Go-side msgSend): skip setComputePipelineState
 	// when the pipeline is unchanged, and batch all buffer binds into ONE setBuffers call.
@@ -646,9 +666,19 @@ type Encoder struct {
 }
 
 func (q Queue) Begin() *Encoder {
+	// G22: this pool is drained in End(), a DIFFERENT call, so the pin must span the
+	// encoder's lifetime rather than one function. Unpinned, Go can migrate the
+	// goroutine in between and End() drains on the wrong thread — undefined
+	// behaviour, observed as an intermittent SIGSEGV (fault 0x10) in objc_msgSend
+	// whose crash site moves between runs.
+	//
+	// The pairing is the contract: an Encoder from Begin() MUST reach End(), and
+	// must not be handed to another goroutine. BeginNP() takes no pool of its own
+	// and is the API for callers that own a longer-lived pool (and their own pin).
+	runtime.LockOSThread()
 	pool := objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc).Send(selInit)
 	cb := q.id.Send(selCommandBuffer)
-	return &Encoder{pool: pool, cb: cb, enc: cb.Send(selComputeEncoder)}
+	return &Encoder{pool: pool, pinned: true, cb: cb, enc: cb.Send(selComputeEncoder)}
 }
 
 // ARPool is an NSAutoreleasePool handle — the pipelined executor owns one long-lived pool
@@ -791,6 +821,10 @@ func (e *Encoder) End() {
 	e.captureErr() // BEFORE the drain frees the cb (C-09)
 	e.ReadTimes()
 	e.pool.Send(selDrain)
+	if e.pinned { // G22: released only AFTER the drain, never before
+		e.pinned = false
+		runtime.UnlockOSThread()
+	}
 }
 
 // SharedEvent is an MTLSharedEvent — a monotonic counter both the GPU (encodeSignalEvent /
@@ -832,6 +866,14 @@ func (e *Encoder) DrainPool() { e.pool.Send(selDrain) }
 // command buffer, one commit/wait). Isolates the per-commit round-trip tax (reps=1)
 // from the marginal per-encoded-Dispatch msgSend cost (the slope over reps).
 func (q Queue) Run1DBatch(p Pipeline, n, tg, reps int, bufs ...Buffer) {
+	// G22: pin the OS thread for the pool's whole lifetime. An NSAutoreleasePool is
+	// PER-OS-THREAD, and Go may migrate a goroutine between any two calls — draining
+	// a pool on a thread other than the one that pushed it is undefined behaviour,
+	// and shows up as an intermittent SIGSEGV (fault 0x10) inside objc_msgSend.
+	// Consumers that already pin are unaffected: LockOSThread nests.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	pool := objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc).Send(selInit)
 	defer pool.Send(selDrain)
 
