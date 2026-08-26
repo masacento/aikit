@@ -2,8 +2,9 @@
 
 > Scoping doc. Opened 2026-08-26 from the repowise trial (`docs/prompts/repowise-trial-results.md`),
 > the first index+health run over this repo. Sibling to goinfer's `docs/task-code-health.md`, which
-> came out of the same run. **Status: §4.1, §4.1a, §4.3 and §4.4 all resolved 2026-08-26 — four items landed, four
-> declined with evidence. §4.2 and five §4.4-old complexity findings remain genuinely open.** Unlike goinfer's,
+> came out of the same run. **Status: CLOSED 2026-08-26. Every item resolved — five landed, the rest declined with
+> evidence recorded per item. The one that is merely blocked (§4.5, `encoder/weights.go`)
+> says what unblocks it.** Unlike goinfer's,
 > this list is mostly real: 13 of the 20 targets are production files, not tests. Two hard
 > constraints shape it, §3.
 
@@ -120,7 +121,21 @@ pair were not examined in that pass. They may be genuine; they are also small.
 explicit comment or a passing test explaining why they are duplicated. The count was never the
 finding.
 
-### 4.2 · `embed/safetensors.go` sharded-open pair — NOT STARTED
+### 4.2 · `embed/safetensors.go` sharded-open pair — DECLINED 2026-08-26
+
+Examined against this section's own condition ("worth doing only if it does not force the divergent
+cleanup through a shared abstraction") and it fails that test. The genuinely common region is ~8
+lines — `parseShardIndex` plus the `agg`/`shards` init. Everything around it diverges: the index
+read (`os.ReadFile` vs `fs.ReadFile`), the path join (`filepath` vs `path`), the shard read, and
+most of all the unwinding — the mmap path must `finalizeMmaps(agg)` on **every** error return and
+set a finalizer at the end, the fs path must do neither. Extracting the 8 lines needs either a
+five-value return or a small struct, and the struct turns every later `agg`/`shards` reference into
+`p.agg`/`p.shards` in both loops. Net readability is a wash at best.
+
+The two have already diverged in the way that matters, and it is the error paths — which a shared
+prologue would not have protected anyway.
+
+### 4.2-old · original scoping note
 
 `OpenSafetensorsShardedMmap` and `OpenSafetensorsShardedFromFS` share ~13 lines of index-parse and
 aggregate-setup (205-217 / 243-255). Genuinely duplicated, but the two diverge immediately after:
@@ -199,6 +214,36 @@ mechanism.
 **Still open:** `chunkWith` (chunk/regex/chunker.go) — extractable, but the region ends in a closure
 capturing `boundaries`, so it wants a small struct rather than a function, and that is a design call
 rather than a mechanical lift.
+
+### 4.5 · The five complexity findings — one done, four declined
+
+**Done: `tools/vulncheck/main.go`** → `reportCells`. A CLI tool, off any hot path, with running
+coverage; verified by running the gate end-to-end (identical output, canary fired).
+
+**Declined: `encoder/weights.go` (`buildWeightsFromSafetensors`), `encoder/mlp.go` (`moeMLP`),
+`encoder/forward_batch.go` (`forwardBatch`) — no running coverage on this machine.** `weights.go`
+is the tempting one: ~20 repetitions of `if x, err = loadF32(...); err != nil { return nil, err }`
+that an error-accumulating loader would collapse to one-liners. It is also *behaviour-affecting*
+(the accumulator must be re-checked before `transposeExpertsW2`, or a failed load hands it a nil
+slice), and the skip census says the encoder package runs **110 passed, 67 skipped — 63 of them
+missing-asset**, with `testdata/{encoder-model,model,minilm-model}` all absent. Refactoring model
+loading with zero tests actually executing over it is not a thing to do. **This unblocks the moment
+a checkpoint is fetched** — it is a coverage problem, not a code problem. `moeMLP` and
+`forwardBatch` are hot-path *and* uncovered, so they fail twice.
+
+**Declined: `ann/hnsw.go` — it is §4.3 again.** The flagged conditional at `hnsw.go:346` is the
+identical 8-term `len(vN) != d` guard from `scanFlat`, in an identical 8-way unrolled `Dot8x4`
+dispatch. §4.3's measurement transfers verbatim: the chain is what earns the bounds-check
+elimination.
+
+**An aside the tool missed.** `scanFlat` (`ann/flat.go`) and this hnsw loop are ~22 lines of
+near-identical structure — same unroll, same guard, same 4-lane fold, same scalar tail — differing
+only in how vectors are fetched (`vecs[i]` vs `h.vecs[ids[i]]`) and how results are emitted (`emit`
+callback vs `append`). repowise reported **fourteen** duplication clusters and did not report this
+one, which is arguably the most real of them. Not extracted here either — the same BCE constraint
+applies, and unifying across the two fetch/emit shapes needs generics or callbacks in a hot loop —
+but it is the honest counterpoint to §5's "the count was never the finding": the count was also not
+complete.
 
 ### 4.4-old · The rest, unstarted and unranked
 
