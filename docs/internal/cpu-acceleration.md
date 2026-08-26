@@ -256,10 +256,57 @@ the checkpoint is absent (CI), and run when `testdata/encoder-model` is present.
    VNNI):** matches the scalar oracle bit-for-bit, race-clean; at M=1 decode it
    lands ~1.7–1.9× of W8A8 and ~32× faster than `MatmulBTQ4` — on par with the
    arm64 SDOT kernel (~2.0–2.3×).
-   - **Remaining: a VNNI variant** (`VPDPBUSD`, one instruction replacing the
-     VPMOVSXBW+VPMADDWD pair) behind the same CPUID gate, for Zen 4+ / Intel
-     Cascade Lake+. Can't be validated on the Zen 2 box (no VNNI), so it's a
-     drop-in for a VNNI-capable machine; the AVX2 path is the proven fallback.
+   - **The VNNI variant — BUILT, MEASURED, SHIPPED 2026-08-26 (`2a7199a`).**
+     `VPDPBUSD`, one instruction replacing the VPMOVSXBW+VPMADDWD pair, behind
+     its own CPUID+XGETBV gate. This entry predicted it "can't be validated on
+     the Zen 2 box"; that stayed true — neither local machine can execute it
+     (Ryzen 3700X is Zen 2, the other box is arm64), so it was written and run
+     on a VNNI-capable Xeon in a cloud session (`hasAVX512VNNIVL=true`
+     confirmed via CPUID/XGETBV, not assumed). Correctness first: the
+     scalar-oracle tests pass on real VNNI silicon
+     (`TestAVX512VNNI_dotW4A8FoldAVX512VNNI_matchesScalar`,
+     `..._dispatchesThroughEveryTier`, `TestW4A8_dotMatchesScalar`).
+     **THE NUMBERS**, at `TestW4A8OpsPerByte`'s own shape (K=5120, group=32,
+     N=17408 → 55.7 MB, well past that box's L3, so it extends the existing
+     harness rather than measuring something else), three separate runs:
+
+     | run | hot AVX2 | hot VNNI | hot | cold AVX2 | cold VNNI | cold | cold GB/s |
+     |--:|--:|--:|--:|--:|--:|--:|--:|
+     | 1 | 15.28 | 19.10 | **1.250×** | 11.96 | 13.37 | **1.117×** | 7.48→8.36 |
+     | 2 | 15.61 | 19.25 | **1.233×** | 11.96 | 13.76 | **1.151×** | 7.48→8.60 |
+     | 3 | 15.47 | 18.96 | **1.226×** | 10.04 | 11.13 | **1.109×** | 6.27→6.96 |
+
+     (GMAC/s.) **The question this answers is whether the hot win survives
+     going cold** — §8.9's issue-width probe had already found the AVX2 kernel
+     with idle issue slots while streaming from DRAM, which is exactly the
+     shape where a wider instruction buys nothing. **It survives, compressed:**
+     hot is tight at ~1.23–1.25×, cold tight at ~1.11–1.15× — consistently
+     above 1.0 by more than the run-to-run spread, but only ~47–65% of the hot
+     relative gain reaches the streaming case. So there is real compute-bound
+     headroom even cold, and it is also not the free lunch hot numbers alone
+     would imply.
+
+     **Trust the ratios, not the absolutes.** Cold AVX2 itself swings
+     10.04–11.96 GMAC/s across the three runs (~19%) — a shared/virtualized
+     cloud host, the same hazard that blew a 600s CI timeout on the measurement
+     harnesses (`perf-dead-ends.md` §8.10's sibling; the AIKIT_HARNESS gate in
+     `dd28f90` exists for it). The ratios are paired within a run and hold to
+     ±0.02, so they are the trustworthy part; treat every absolute here as
+     indicative only, and re-measure on settled silicon before quoting one.
+
+     **Scope, so this is not over-read.** It answers the SIMD-width question
+     only. It says nothing about the thread-scaling gap this campaign already
+     flagged as the larger lever, and `dotW4A8`'s VNNI path is NOT
+     bit-identical to its AVX2 one (1e-5 relative to the scalar oracle, the
+     same bar AVX2 meets) — so amd64 now has two W4A8 result classes split by
+     VNNI+VL. `dotI8`'s VNNI tier is exact on every path (integer, no
+     reassociation) and carries no such caveat.
+
+     **Not reproducible in-tree yet:** the harness that produced these numbers
+     (`w4a8_vnni_opsperbyte_bench_test.go`) has not landed here — the bridge
+     dropped before it was written. When it does, it must call `harnessOnly(t)`
+     like every other measurement harness (`harness_gate_test.go`), or it will
+     reintroduce the CI timeout that gate was added to stop.
    - **Ops-per-byte measured, 2026-08-19** (`linalg/w4a8_opsperbyte_bench_test.go`,
      requested from goinfer after Qwen3.8-27B CPU decode measured 2.55× slower than
      an Ollama/Q4_K_M engine on the same Ryzen 7 3700X — the parallelization
