@@ -580,16 +580,30 @@ func reinterpretLE[T any](name string, raw []byte) ([]T, error) {
 	return out, nil
 }
 
+// typedLE is the shared body of the typed tensor accessors (Float32s, Float64s,
+// Int64s, Int32s): check the dtype, then reinterpret the raw little-endian payload.
+//
+// WHY THE KeepAlive IS NOT IN HERE. Each accessor opens with
+// `defer runtime.KeepAlive(t.owner)` (§2.5), guarding the read against a mid-decode
+// munmap. That line cannot move into this helper: a deferred KeepAlive fires when the
+// frame it was deferred in returns, so a KeepAlive deferred HERE would release the
+// mapping at typedLE's return — before the caller has touched the aliasing slice it was
+// just handed. The guard has to live in the frame that outlives the read, which is the
+// exported method. Only the dtype check and the reinterpretLE call are shared.
+func typedLE[T any](t Tensor, want string) ([]T, error) {
+	if t.DType != want {
+		return nil, fmt.Errorf("tensor %q: expected %s, got %s", t.Name, want, t.DType)
+	}
+	return reinterpretLE[T](t.Name, t.raw)
+}
+
 // Float32s returns the tensor data as []float32. Requires DType "F32". The
 // result aliases the file's bytes when they are element-aligned (the common
 // case); on a misaligned payload it is a decoded copy (see reinterpretLE). Do
 // not mutate. Assumes a little-endian host (x86, arm64).
 func (t Tensor) Float32s() ([]float32, error) {
 	defer runtime.KeepAlive(t.owner) // §2.5: guard the read against a mid-decode munmap
-	if t.DType != "F32" {
-		return nil, fmt.Errorf("tensor %q: expected F32, got %s", t.Name, t.DType)
-	}
-	return reinterpretLE[float32](t.Name, t.raw)
+	return typedLE[float32](t, "F32")
 }
 
 // Uint8s returns the tensor's raw bytes, for the byte-wide dtypes ("U8", "I8",
@@ -623,20 +637,14 @@ func (t Tensor) Uint8s() ([]byte, error) {
 // when aligned, else a copy (see reinterpretLE).
 func (t Tensor) Float64s() ([]float64, error) {
 	defer runtime.KeepAlive(t.owner) // §2.5
-	if t.DType != "F64" {
-		return nil, fmt.Errorf("tensor %q: expected F64, got %s", t.Name, t.DType)
-	}
-	return reinterpretLE[float64](t.Name, t.raw)
+	return typedLE[float64](t, "F64")
 }
 
 // Int64s returns the tensor data as []int64. Requires DType "I64". Aliases when
 // aligned, else a copy (see reinterpretLE).
 func (t Tensor) Int64s() ([]int64, error) {
 	defer runtime.KeepAlive(t.owner) // §2.5
-	if t.DType != "I64" {
-		return nil, fmt.Errorf("tensor %q: expected I64, got %s", t.Name, t.DType)
-	}
-	return reinterpretLE[int64](t.Name, t.raw)
+	return typedLE[int64](t, "I64")
 }
 
 // Int32s returns the tensor data as []int32. Requires DType "I32" — used for
@@ -644,10 +652,7 @@ func (t Tensor) Int64s() ([]int64, error) {
 // reinterpretLE).
 func (t Tensor) Int32s() ([]int32, error) {
 	defer runtime.KeepAlive(t.owner) // §2.5
-	if t.DType != "I32" {
-		return nil, fmt.Errorf("tensor %q: expected I32, got %s", t.Name, t.DType)
-	}
-	return reinterpretLE[int32](t.Name, t.raw)
+	return typedLE[int32](t, "I32")
 }
 
 // BFloat16sToF32 decodes a BF16 tensor to a freshly-allocated []float32.
