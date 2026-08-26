@@ -187,3 +187,9 @@ testdata/siglip-bench-l/
 
 # repowise index — generated codebase-intelligence artifacts, never committed
 .repowise/
+
+# Task briefs / working prompts — drafts, not deliverables. Untracked here by
+# choice: goinfer commits its docs/prompts (they are cited work orders), aikit
+# treats them as scratch. Ignored rather than left untracked so they cannot make
+# the release gates report a DIRTY tree and refuse a verdict.
+docs/prompts/
