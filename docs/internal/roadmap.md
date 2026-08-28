@@ -20,6 +20,39 @@
 > through §2's triggers.** If a future session finds itself adding kernels
 > with no trigger fired, stop.
 
+## 0. The asset-blocked cluster — one fetch clears three records (2026-08-28)
+
+**Not new engineering, so it does not need a §2 trigger** — this is three things already
+recorded as blocked that share a single cause, plus the fetch that clears them. It is listed
+here because "aikit has no live work" is true and kept being read as "aikit has nothing worth
+doing", which is a different claim.
+
+The cause: `testdata/{encoder-model,model,minilm-model}` are absent on the dev box. Measured
+2026-08-28 — the encoder package runs **110 passed / 67 skipped, 63 of them missing-asset**.
+What that single absence is currently holding:
+
+1. **`task-native-gpu.md`'s last open item.** Every phase of that plan is ✅ and the doc says
+   "nothing is gated behind an unfired trigger any more" — what remains is *one measurement*,
+   the batched encoder end-to-end wall-time, and it is checkpoint-blocked, not code-blocked.
+2. **`task-code-health.md` §4.5's one blocked item.** `buildWeightsFromSafetensors` carries
+   ~20 identical `loadF32` error blocks an accumulator would collapse. It was declined on
+   COVERAGE, not taste: the refactor is behaviour-affecting (the accumulator must be re-checked
+   before `transposeExpertsW2` or a failed load hands it a nil slice), and no test executes
+   over it here.
+3. **The 63 skips themselves**, which make a green `go test ./encoder/` mean much less than it
+   looks like it means — the false-clean shape the skip census exists to surface.
+
+**The move:** fetch one encoder checkpoint. It is the cheapest thing on any aikit list and it
+converts three "blocked" entries into either done or genuinely-decided. Nothing else here is
+gated behind it, and nothing new gets built as a result.
+
+**Separately, unblocked but unsettled:** the AVX-512 VNNI cold multiplier (`cpu-acceleration.md`
+item 4) is real in 4/4 runs but ranges 1.109–1.270×, and the hot ratio is settled at ±2.2% while
+the cold one is not (±6.8%). The lever is method, not hardware: interleave the AVX2 and VNNI
+arms **inside one process** and compare medians, rather than separate runs. That is what turned
+an inconclusive `scanFlat` measurement into a ±1% answer, and it may settle the cold number on
+the shared Xeon without needing quiet silicon.
+
 ## Scorecard (cumulative, v1.2.0 → v1.5.0)
 
 Retrieval: Flat / FlatI8 / HNSW (Alg-4, recall@10 0.68→1.00) / int8 HNSW
