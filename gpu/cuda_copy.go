@@ -28,6 +28,14 @@ type DeviceCopy struct {
 // The same bytes device-to-device cost ~446 µs. That is ~18×, and it moves the
 // operation from "costs a token" to "costs a few percent of one".
 //
+// MEASURED HERE, 2070 SUPER, idle box, median of 5: one contiguous 20 MiB copy
+// takes 0.127 ms — 165 GB/s of bytes copied, 331 GB/s of memory TRAFFIC, 74% of
+// the card's 448 GB/s ceiling. Quote whichever you mean and say which: a DtoD
+// copy reads n and writes n, so the two conventions differ by exactly 2× and the
+// hardware ceiling bounds the traffic one. See trafficGBs in cuda_copy_test.go —
+// that factor of two is why an earlier version of the test reported 37% for a
+// copy running at 74%.
+//
 // THE SYNCHRONIZATION IS NOT INCIDENTAL — READ THIS BEFORE "OPTIMIZING" IT AWAY.
 // The underlying gocudrv call dispatches cuMemcpyDtoD_v2, which the CUDA driver
 // defines as ASYNCHRONOUS with respect to the host for device-to-device copies.
@@ -64,7 +72,8 @@ func CopyDevice(dst, src Buffer, nBytes int) error {
 // see. One contiguous 20 MiB device-to-device copy runs at ~347 GB/s (78% of a
 // 2070 SUPER's 448 GB/s peak). The real consumer does not issue one copy — it
 // issues 36 (18 layers × two buffers, 73 KB and 1 MiB each), and that shape runs
-// at ~174 GB/s, 39% of peak, because a small copy is dominated by its ~9 µs of
+// at ~174 GB/s of traffic, 39% of peak (reproduced here: 172.5 GB/s median of 5,
+// against 331 for the contiguous shape), because a small copy is dominated by its ~9 µs of
 // dispatch rather than by bandwidth. Batching removes 35 of the 36 synchronizes,
 // and coalesce (copy_coalesce.go) removes whole dispatches wherever the caller's
 // pairs are already adjacent. Benchmark both shapes before quoting a number

@@ -34,6 +34,25 @@ func peakBandwidthGBs(t *testing.T, d *Device) float64 {
 	return float64(clkKHz) * 1e3 * float64(busBits) / 8 * 2 / 1e9
 }
 
+// trafficGBs converts bytes COPIED into memory TRAFFIC, which is what the ceiling
+// above actually bounds.
+//
+// WHY THIS FUNCTION EXISTS — IT IS A FACTOR OF TWO, AND IT BIT ME. A device-to-
+// device copy reads n bytes and writes n bytes, so it moves 2n across the memory
+// bus. peakBandwidthGBs is derived from clock × bus width, which is a bus-traffic
+// figure. Comparing bytes-copied against it therefore understates utilisation by
+// exactly 2×: the first version of this test measured a settled 166.6 GB/s on a
+// 2070 SUPER and reported "37% of peak" for a copy that was really running at
+// 333 GB/s of traffic, i.e. 74% — which is what the originating goinfer
+// measurement meant when it said 347 GB/s / 78%.
+//
+// Both numbers are honest and neither is wrong; they answer different questions.
+// Bytes-copied is what a caller budgets against ("how long to move my 20 MiB").
+// Traffic is what the hardware ceiling bounds. Reporting only one of them, against
+// the other's ceiling, is how two repos end up quoting numbers that differ by 2×
+// forever without either being mistaken.
+func trafficGBs(copiedGBs float64) float64 { return copiedGBs * 2 }
+
 // TestCopyDevice_bandwidthUnderPhysicalCeiling is the gate for this whole change,
 // and its job is to FAIL on an impossible number rather than print one.
 //
@@ -85,13 +104,14 @@ func TestCopyDevice_bandwidthUnderPhysicalCeiling(t *testing.T) {
 	el := time.Since(start)
 
 	gbs := float64(n) * reps / el.Seconds() / 1e9
-	t.Logf("contiguous %d MiB × %d: %.3f ms/copy, %.1f GB/s (%.0f%% of peak)",
-		n>>20, reps, float64(el.Microseconds())/1e3/reps, gbs, gbs/peak*100)
+	traffic := trafficGBs(gbs)
+	t.Logf("contiguous %d MiB × %d: %.3f ms/copy, %.1f GB/s copied = %.1f GB/s traffic (%.0f%% of %.1f peak)",
+		n>>20, reps, float64(el.Microseconds())/1e3/reps, gbs, traffic, traffic/peak*100, peak)
 
-	if gbs > peak {
-		t.Fatalf("device-to-device measured %.1f GB/s, above the device's physical ceiling of %.1f GB/s — "+
-			"the copy is almost certainly not being awaited (cuMemcpyDtoD is async wrt the host); "+
-			"this is the 8145 GB/s failure mode", gbs, peak)
+	if traffic > peak {
+		t.Fatalf("device-to-device moved %.1f GB/s of traffic (%.1f GB/s copied), above the device's physical "+
+			"ceiling of %.1f GB/s — the copy is almost certainly not being awaited (cuMemcpyDtoD is async "+
+			"wrt the host); this is the 8145 GB/s failure mode", traffic, gbs, peak)
 	}
 	if gbs <= 0 {
 		t.Fatalf("measured %.1f GB/s — the timer or the copy did nothing", gbs)
@@ -100,10 +120,15 @@ func TestCopyDevice_bandwidthUnderPhysicalCeiling(t *testing.T) {
 
 // TestCopyDeviceBatch_bandwidthUnderPhysicalCeiling covers the shape the consumer
 // actually issues, which is NOT the contiguous one. The real caller snapshots 18
-// layers × two buffers = 36 copies of 73 KB and 1 MiB, and that ran at ~174 GB/s
-// (39% of peak) against ~347 GB/s (78%) for one contiguous copy of the same
-// bytes. Benchmarking only the big copy would overstate what callers see by 2×,
-// so both shapes are gated and both are reported.
+// layers × two buffers = 36 copies of 73 KB and 1 MiB. Reproduced on a 2070
+// SUPER: 172.5 GB/s of traffic (39% of peak, median of 5) against 331 GB/s (74%)
+// for one contiguous copy of the same bytes — so benchmarking only the big copy
+// overstates what callers see by ~1.9×. Both shapes are gated and both reported.
+//
+// This shape is also the NOISY one: across five idle-box runs the contiguous
+// number held to ±2% while this one ranged 133–207 GB/s. That is consistent with
+// it being dispatch-bound rather than bandwidth-bound — it is measuring scheduler
+// latency 36 times, not the memory system once. Take a median, not a best.
 func TestCopyDeviceBatch_bandwidthUnderPhysicalCeiling(t *testing.T) {
 	d, err := CreateSystemDefaultDevice()
 	if err != nil {
@@ -156,12 +181,13 @@ func TestCopyDeviceBatch_bandwidthUnderPhysicalCeiling(t *testing.T) {
 	el := time.Since(start)
 
 	gbs := float64(bytes) * reps / el.Seconds() / 1e9
-	t.Logf("batch %d copies (%d MiB) × %d: %.3f ms/batch, %.1f GB/s (%.0f%% of peak)",
-		len(copies), bytes>>20, reps, float64(el.Microseconds())/1e3/reps, gbs, gbs/peak*100)
+	traffic := trafficGBs(gbs)
+	t.Logf("batch %d copies (%d MiB) × %d: %.3f ms/batch, %.1f GB/s copied = %.1f GB/s traffic (%.0f%% of %.1f peak)",
+		len(copies), bytes>>20, reps, float64(el.Microseconds())/1e3/reps, gbs, traffic, traffic/peak*100, peak)
 
-	if gbs > peak {
-		t.Fatalf("batched device-to-device measured %.1f GB/s, above the physical ceiling of %.1f GB/s — "+
-			"the batch is not being awaited", gbs, peak)
+	if traffic > peak {
+		t.Fatalf("batched device-to-device moved %.1f GB/s of traffic (%.1f GB/s copied), above the physical "+
+			"ceiling of %.1f GB/s — the batch is not being awaited", traffic, gbs, peak)
 	}
 }
 
