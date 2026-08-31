@@ -52,6 +52,15 @@ type WeightMat struct {
 	// load-time/resident-memory measurement to make, not decided here).
 	q4Row4       []byte    // non-nil ⇒ split-half + 4-row-interleaved packed nibbles (RepackW4A8Row4 layout)
 	q4Row4Scales []float32 // interleaved per-group scales (RepackW4A8Row4Scales layout)
+
+	// q4SplitHalf: the amd64 counterpart of q4Row4 — an OPTIONAL, additional in-RAM layout,
+	// split-half only (no row interleave), set exclusively by an explicit RepackInt4SplitHalf
+	// call and never probed for or built implicitly. q4/q4s stay authoritative and are never
+	// dropped, so M>1 and any non-AVX2 path keep working unchanged. NO separate scale array:
+	// split-half permutes nibbles within a group and never reorders groups, so q4s serves both
+	// layouts. See dot_w4a8_amd64.s for why the shuffle port, not the accumulator chain, is the
+	// AVX2 bottleneck this addresses.
+	q4SplitHalf []byte
 }
 
 // WrapF32 wraps an existing [rows, cols] f32 weight WITHOUT copying — the WeightMat
