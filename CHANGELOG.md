@@ -32,6 +32,39 @@ could see `dtype=F8_E4M3` and a correct shape and then be unable to read the pay
 has a typed accessor and would hand out an endianness-dependent view.
 
 
+### Release gates
+
+`vulncheck`, run on `nobara` (linux) at `304fa83`:
+
+```
+STATEMENT: no reachable vulnerabilities in 15/15 modules at 304fa83
+```
+
+`perfgate`, `nobara` (Ryzen 7 3700X, linux/amd64), working tree vs v1.30.0 interleaved. **It was
+run TWICE and both runs are recorded, because the first one FAILED:**
+
+```
+run 1  VERDICT: FAIL — 1 regression(s) vs v1.30.0 across 10 shapes
+       GEMV_W8A8_baseline/K2048_N2048  Δ=+3.74%  floor=±2.85%  REGRESSION
+run 2  VERDICT: PASS — no regression vs v1.30.0 above each shape's floor
+       GEMV_W8A8_baseline/K2048_N2048  Δ=-8.35%  floor=±11.04%  flat (BLIND)
+```
+
+**The flagged shape reversed sign by 12 points three minutes later, on the same code and the same
+box, with its derived floor moving 4x (±2.85% → ±11.04%).** A regression does not become an 8%
+speedup on re-run. `K2048_N2048` is an unstable shape whose characterization pass occasionally
+derives a floor far tighter than its own variance and then reads ordinary session drift as a
+verdict — the same shape carried ±20.18% in the v1.30.0 run and is BLIND in most.
+
+**The mechanism check is what makes this a defensible read rather than a convenient one.** This
+release changes **zero `linalg` files**; the entire executable diff is two strings added to a
+switch case and one error message, in `embed`. The benchmark is a `linalg` W8A8 GEMV. There is no
+path from one to the other, and "the numbers moved" would have had to overturn that to be real.
+
+**Both runs are published deliberately.** Quoting run 2 alone would be the exact motivated
+reasoning perfgate exists to prevent, and the durable finding here is not "it passed" — it is that
+**K2048_N2048 must not be trusted to resolve the 5% class on a single sample.**
+
 ## [1.30.0] — 2026-08-30
 
 ### Added
