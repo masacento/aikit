@@ -9,7 +9,68 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.30.0] — 2026-08-30
+
+### Added
+
+**A split-half W4A8 nibble layout for amd64, and the AVX2 kernel that reads it.** The canonical
+int4 packing interleaves nibbles, so every group costs the AVX2 kernel two `VPUNPCK{L,H}BW` in
+its unpack prologue. The split-half layout puts weight `i`'s low nibble and weight `i+16`'s high
+nibble in byte `i`, and both shuffles disappear. `dotW4A8SplitHalfAVX2` measures **1.12x, hot
+(L1-resident) and cold alike** on Zen 2.
+
+That is the first AVX2 W4A8 win after two accumulator-depth dead ends, and the two results
+together identify the bottleneck: fewer instructions per group pays, deeper accumulator chains do
+not, so the shuffle port — not the FMA dependency chain — is what this kernel is short of.
+
+New API, all Experimental tier:
+
+- `RepackW4A8SplitHalf(packed, rows, cols, group)` — portable, allocating repack.
+- `(*WeightMat).RepackInt4SplitHalf() bool` — **opt-in**, never probed for or applied
+  implicitly. Gated on amd64 + AVX2 + `group == 32` + `cols % 32 == 0`; returns false otherwise
+  and is a no-op on every other architecture, so it is safe to call unconditionally.
+- `(*WeightMat).SplitHalfBytes() int` — the layout's size, which is exactly the extra resident
+  memory it cost.
+
+**Scales are not repacked.** Split-half permutes nibbles *within* a group and never reorders
+groups, so one scale array serves both layouts — unlike the arm64 row4 layout, which interleaves
+across rows and therefore needs its own.
+
+**The canonical bytes are never written through.** The repack allocates; `q4`/`q4s` stay
+authoritative and are never dropped, so `M > 1` and every non-AVX2 path keep working unchanged.
+This is load-bearing rather than tidy: a consumer may have mmap-aliased those bytes zero-copy
+from a file (goinfer's `.giw` kind=3 does), and rewriting them in place would silently misdecode
+every existing bundle — no error, wrong numbers. `TestWeightMatSplitHalf_canonicalUntouched`
+pins both halves of that: bytes unchanged, and the new layout a distinct allocation.
+
+**What it is worth end to end, since 1.12x on a kernel is not a claim about a system.** goinfer
+wired the repack into its int4 load path and ran an interleaved, same-binary A/B: **+2.10%
+decode tok/s** on Qwen2.5-Coder-1.5B (Ryzen 7 3700X) — real, with the two arms' sample ranges not
+overlapping, but bought with a second copy of every eligible tensor's nibbles (**+80%** on int4
+weight bytes). goinfer parked it default-off against its own pre-registered bar. Recorded here
+because the same trade faces anyone calling `RepackInt4SplitHalf`, and the honest headline is
+"1.12x on the kernel, ~2% on the token, at ~80% more weight memory".
+
+**`gpu`: `UploadBatch`** (ships as `gpu/v0.32.0`) — N host-to-device copies behind ONE
+synchronize, instead of one synchronize each. In goinfer's CUDA expert cache this cut syncs by
+**10.3x** and moved decode **+9.3%** (2.98 ms/token).
+
+**`gpu`: `CopyDevice` / `CopyDeviceBatch`** (ships as `gpu/v0.31.0`) — device-to-device copy on
+both backends.
+
+### Changed
+
+**`gpu` reports bandwidth in both conventions** (ships as `gpu/v0.31.0`). The previous figure
+counted each copied byte twice (read + write); the doubling was a reporting choice, not
+something the hardware did. Both conventions are now stated so a number cannot be read as the
+wrong one.
+
 ### Fixed
+
+**`linalg`: `q4SplitHalf` was flagged unused (U1000) off amd64.** The field is declared portably
+but written and read only from amd64-tagged files, so `staticcheck` reported it as dead on every
+other target — invisible to CI, which analyses linux/amd64, and reddening on arm64 dev machines
+instead. `SplitHalfBytes` gives it a portable reader that is worth having anyway.
 
 - **`gpu` (Metal): the OS thread is now pinned for an autorelease pool's whole lifetime**
   (ships as `gpu/v0.30.1`). An `NSAutoreleasePool` is per-OS-thread, and Go may migrate a
@@ -29,6 +90,48 @@ excluded from that promise and may change in any release until it graduates.
   **Contract this makes explicit:** an `Encoder` from `Begin()` must reach `End()` on the same
   goroutine and must not be handed to another. That was always true of the pool semantics; it is
   now enforced rather than assumed.
+
+### Release gates
+
+`perfgate`, `nobara` (Ryzen 7 3700X, linux/amd64), working tree vs v1.29.0 interleaved:
+
+```
+VERDICT: PASS — no regression vs v1.29.0 above each shape's floor — 5/10 shapes resolve the 5.0% class
+sensitivity: 5/10 shapes have a floor ≤ 5.0% (the class this gate targets)
+```
+
+All ten shapes measured flat. Read the green as "no regression above each shape's floor": five
+shapes carry floors of ±7.9–26.3% and are BLIND to the 5% class, so there the green is only
+evidence against a larger regression.
+
+**The perf gate cannot see this release's headline change, and this time not because of the
+machine.** It ran on the right architecture — amd64, where the split-half kernel lives — but its
+instrument is `BenchmarkW8A8SpanShapes` / `BenchmarkGEMV_W8A8_baseline`, which are **W8A8**. The
+split-half work is **W4A8**, and nothing in the gate dispatches to it. A flat result is therefore
+the *expected* one and says nothing about the new kernel either way.
+
+That is also the correct outcome for a different reason: `RepackInt4SplitHalf` is opt-in and no
+aikit code path calls it, so the default behaviour of every existing consumer is unchanged by
+this release. The evidence for the new kernel is its own A/B (1.12x kernel; +2.10% end-to-end in
+goinfer), not this gate.
+
+`vulncheck`, run on `nobara` (linux) at `f459341`:
+
+```
+STATEMENT: no reachable vulnerabilities in 15/15 modules at f459341
+```
+
+(The same command on `darwin/arm64` reports `INCOMPLETE — 11 clean, 0 vulnerable, 4 unscanned`:
+the four cuda backends have every file excluded by build tags on macOS, so govulncheck matches no
+packages there. The linux run above is the one that scans all fifteen.)
+
+### Measured and rejected
+
+**`dotW4A8Fold2AccAVX2` — two accumulator chains, ~0.5% SLOWER.** Kept in the tree rather than
+deleted, per this project's convention that a documented negative is worth something and a
+silently reverted one is not. It also duplicated an earlier `dotW4A8Fold4AVX2` result recorded in
+goinfer's dead-ends notes; the earlier explanation was the sharper one, and both now agree that
+the serial fold is not this kernel's ceiling.
 
 ## [1.29.0] — 2026-08-26
 
@@ -2405,7 +2508,8 @@ broad slice of the open-weights ecosystem.
   golden cosine 1.000000 vs PyTorch+MPS CodeRankEmbed. See
   [README.md](README.md) for stability tiers.
 
-[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.22.0...HEAD
+[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.30.0...HEAD
+[1.30.0]: https://github.com/townsendmerino/aikit/compare/v1.29.0...v1.30.0
 [1.29.0]: https://github.com/townsendmerino/aikit/compare/v1.28.0...v1.29.0
 [1.28.0]: https://github.com/townsendmerino/aikit/compare/v1.27.0...v1.28.0
 [1.27.0]: https://github.com/townsendmerino/aikit/compare/v1.26.0...v1.27.0
