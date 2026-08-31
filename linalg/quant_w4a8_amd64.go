@@ -60,3 +60,15 @@ func dotW4A8(act []int8, packed []byte, scales []float32, group, K int) float32 
 //
 //go:noescape
 func dotW4A8Fold2AccAVX2(act *int8, packed *byte, scales *float32, nGroups int) float32
+
+// dotW4A8SplitHalfAVX2 is dotW4A8FoldAVX2 over the split-half weight layout (byte i of a group
+// carries weight i low, weight i+16 high), which deletes the two VPUNPCK shuffles per group.
+// Item 3 of goinfer's task-w4a8-neon-bandwidth.md, ported to AVX2 — see dot_w4a8_amd64.s for why
+// the shuffle port, not the accumulator chain, is the AVX2-specific candidate.
+//
+// packed MUST already be in split-half layout. NOT wired into dotW4A8's dispatch: the canonical
+// packer and the .giw kind=3 zero-copy load path produce the interleaved layout, and changing
+// those would silently misdecode existing bundles.
+//
+//go:noescape
+func dotW4A8SplitHalfAVX2(act *int8, packed *byte, scales *float32, nGroups int) float32

@@ -214,3 +214,79 @@ loop2:
 	MOVSS        X10, ret+32(FP)
 	VZEROUPPER
 	RET
+
+// func dotW4A8SplitHalfAVX2(act *int8, packed *byte, scales *float32, nGroups int) float32
+//
+// dotW4A8FoldAVX2 over the SPLIT-HALF weight layout: byte i of a group holds weight i in its
+// low nibble and weight i+16 in its high nibble, so one 16-byte load yields two contiguous
+// 16-weight halves with no interleave to undo. Against the canonical layout that deletes the
+// two VPUNPCKLBW/VPUNPCKHBW per group and nothing else — 8 shuffle/logic prologue ops become 6.
+//
+// WHY THIS AND NOT MORE ACCUMULATORS. Two accumulator attempts on this kernel are recorded
+// negatives: dotW4A8Fold4AVX2 (perf-dead-ends.md §8.9, ~1%) and dotW4A8Fold2AccAVX2 above
+// (~0.5%). §8.9's own explanation is that the marginal-FMA probe's "not issue-limited" reading
+// only means idle capacity on the FMA ports, and that the nibble-unpack prologue is "exactly the
+// kind of work that would bottleneck a shuffle port while leaving FMA ports idle". VPUNPCKLBW and
+// VPUNPCKHBW are shuffle-port instructions. If that diagnosis is right, deleting two of them is
+// the lever that fits this kernel's actual bottleneck — where deeper accumulator chains, twice
+// measured, are not.
+//
+// arm64 is the counter-case and explains why this was not obviously worth trying: there,
+// dotW4A8SplitHalfSDOT measured a FLAT 1.000x alone, because that kernel is latency-bound on its
+// FMLA chain and shortening the prologue changed nothing until 2Acc removed the stall. AVX2 is
+// diagnosed as the opposite — port-bound, not latency-bound — so the same change should behave
+// differently here. That is the prediction; the A/B is the arbiter.
+//
+// LAYOUT IS THE CALLER'S PROBLEM. packed must already be split-half (harness repack). The
+// canonical packer, the .giw on-disk format and dotW4A8Scalar are untouched — the same discipline
+// arm64's repack follows, and the reason the .giw kind=3 zero-copy load path cannot be disturbed.
+TEXT ·dotW4A8SplitHalfAVX2(SB), NOSPLIT, $0-36
+	MOVQ act+0(FP), SI
+	MOVQ packed+8(FP), DI
+	MOVQ scales+16(FP), BX
+	MOVQ nGroups+24(FP), CX
+
+	LEAQ    mask0F<>(SB), AX
+	VMOVDQU (AX), X14
+	LEAQ    const8<>(SB), AX
+	VMOVDQU (AX), X15
+	VXORPS  Y10, Y10, Y10
+
+loopsh:
+	// Split-half unpack: low nibbles ARE w0..w15, high nibbles ARE w16..w31.
+	// No VPUNPCK — that is the whole change.
+	VMOVDQU   (DI), X0
+	VPAND     X14, X0, X1
+	VPSRLW    $4, X0, X2
+	VPAND     X14, X2, X2
+	VPSUBB    X15, X1, X1
+	VPSUBB    X15, X2, X2
+	VPMOVSXBW X1, Y3
+	VPMOVSXBW X2, Y4
+
+	VMOVDQU   (SI), X5
+	VMOVDQU   16(SI), X6
+	VPMOVSXBW X5, Y5
+	VPMOVSXBW X6, Y6
+
+	VPMADDWD Y5, Y3, Y7
+	VPMADDWD Y6, Y4, Y8
+	VPADDD   Y8, Y7, Y7
+
+	VCVTDQ2PS    Y7, Y9
+	VBROADCASTSS (BX), Y11
+	VFMADD231PS  Y11, Y9, Y10
+
+	ADDQ $16, DI
+	ADDQ $32, SI
+	ADDQ $4, BX
+	SUBQ $1, CX
+	JNZ  loopsh
+
+	VEXTRACTF128 $1, Y10, X11
+	VADDPS       X11, X10, X10
+	VHADDPS      X10, X10, X10
+	VHADDPS      X10, X10, X10
+	MOVSS        X10, ret+32(FP)
+	VZEROUPPER
+	RET
