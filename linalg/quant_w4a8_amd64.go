@@ -46,3 +46,17 @@ func dotW4A8(act []int8, packed []byte, scales []float32, group, K int) float32 
 	}
 	return dotW4A8Scalar(act, packed, scales, group, K)
 }
+
+// dotW4A8Fold2AccAVX2 is dotW4A8FoldAVX2 with the f32 fold split across two independent
+// accumulator chains — a probe for whether the serial VFMADD231PS fold, rather than
+// instruction count, is the AVX2 kernel's real ceiling (see dot_w4a8_amd64.s for the
+// motivating measurement, and dotW4A8FoldSDOT2Acc for the arm64 case where the same
+// change measured a real 1.4-1.75x).
+//
+// nGroups must be EVEN. NOT wired into dotW4A8's dispatch: the two chains sum groups in a
+// different order, so the f32 result may differ from dotW4A8FoldAVX2's in the last ulp,
+// and this repo's callers are bit-identity-gated. Harness-only until an A/B funds the
+// switch-over and a parity decision is made explicitly.
+//
+//go:noescape
+func dotW4A8Fold2AccAVX2(act *int8, packed *byte, scales *float32, nGroups int) float32

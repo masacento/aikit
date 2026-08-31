@@ -86,3 +86,131 @@ loop:
 	MOVSS        X10, ret+32(FP)
 	VZEROUPPER
 	RET
+
+// func dotW4A8Fold2AccAVX2(act *int8, packed *byte, scales *float32, nGroups int) float32
+//
+// dotW4A8FoldAVX2 with the f32 fold split across TWO independent accumulator chains.
+//
+// WHY. dotW4A8FoldAVX2's inner loop ends in `VFMADD231PS Y11, Y9, Y10`, and every
+// iteration's FMA reads the previous iteration's Y10 — one serial dependency chain
+// across the whole row. On Zen 2 an FMA is ~5 cycles of latency at 2/cycle throughput,
+// so a single chain bounds the loop at ~5 cycles per 32-MAC group no matter how many
+// issue slots are free. TestW4A8IssueWidthProbe measures exactly that signature: the
+// cold kernel is NOT issue-limited — idle slots exist — which is the shape of a
+// latency-bound chain rather than a throughput-bound one.
+//
+// The same change on arm64 (dotW4A8FoldSDOT2Acc) measured a real 1.4-1.75x, and that
+// case is on record precisely because a "not issue-limited" reading would have argued
+// against trying it. Two chains halve the dependent latency per group; the unpack and
+// VPMADDWD work is unchanged and simply fills the slots that were idle.
+//
+// nGroups MUST BE EVEN — the caller routes odd counts elsewhere. Same operand contract
+// as dotW4A8FoldAVX2 otherwise, and bit-identical to it only in exact arithmetic: the
+// two accumulators sum groups in a different order, so f32 rounding may differ in the
+// last ulp. Callers that need the original's exact bits must keep calling it.
+//
+// MEASURED NEGATIVE, 2026-08-31, Ryzen 7 3700X, K=5120, order-alternated, two passes:
+//
+//	1Acc  17.26 / 17.38 GMAC/s
+//	2Acc  17.45 / 17.41 GMAC/s     ~0.5%, inside noise
+//
+// So the serial fold is NOT this kernel's ceiling, unlike arm64's, and the hypothesis
+// this function was built to test is refuted. Kept rather than deleted, matching the
+// arm64 2Acc/4Acc probes and this repo's "a documented negative is worth something, a
+// silently reverted one is not" convention — and because a future 128-bit or
+// shorter-prologue variant would want to re-ask the question against a different
+// instruction budget.
+//
+// LEADING EXPLANATION, UNVERIFIED (no uop counters were read). The loop body is ~20
+// vector instructions per 32-MAC group, and Zen 2 cracks every 256-bit AVX2 op into two
+// 128-bit uops — so ~40 uops/group, a 6.7-10 cycle/group floor at 4-6 uops/cycle. The
+// measurement is 1.854 ns/group = 6.7-8.2 cycles depending on clock, i.e. already at
+// that floor. Breaking a 5-cycle FMA chain frees nothing when uop throughput is the
+// binding constraint. arm64 NEON is 128-bit natively and pays no such split, which is
+// also the leading explanation for its 1.47x advantage on the same algorithm.
+//
+// WHAT THAT IMPLIES FOR THE NEXT ATTEMPT: the lever is fewer instructions per group —
+// the unpack prologue — not chain depth. That is what the split-half repack
+// (dotW4A8SplitHalfSDOT, and goinfer's task-w4a8-neon-bandwidth.md item 3) attacks, and
+// this result is independent evidence for the same conclusion that page reached on
+// arm64 by a different route.
+TEXT ·dotW4A8Fold2AccAVX2(SB), NOSPLIT, $0-36
+	MOVQ act+0(FP), SI
+	MOVQ packed+8(FP), DI
+	MOVQ scales+16(FP), BX
+	MOVQ nGroups+24(FP), CX
+	SHRQ $1, CX             // two groups per iteration
+
+	LEAQ    mask0F<>(SB), AX
+	VMOVDQU (AX), X14
+	LEAQ    const8<>(SB), AX
+	VMOVDQU (AX), X15
+	VXORPS  Y10, Y10, Y10   // accumulator A
+	VXORPS  Y12, Y12, Y12   // accumulator B
+
+loop2:
+	// ---- group A → Y10
+	VMOVDQU    (DI), X0
+	VPAND      X14, X0, X1
+	VPSRLW     $4, X0, X2
+	VPAND      X14, X2, X2
+	VPUNPCKLBW X2, X1, X3
+	VPUNPCKHBW X2, X1, X4
+	VPSUBB     X15, X3, X3
+	VPSUBB     X15, X4, X4
+	VPMOVSXBW  X3, Y3
+	VPMOVSXBW  X4, Y4
+
+	VMOVDQU   (SI), X5
+	VMOVDQU   16(SI), X6
+	VPMOVSXBW X5, Y5
+	VPMOVSXBW X6, Y6
+
+	VPMADDWD Y5, Y3, Y7
+	VPMADDWD Y6, Y4, Y8
+	VPADDD   Y8, Y7, Y7
+
+	VCVTDQ2PS    Y7, Y9
+	VBROADCASTSS (BX), Y11
+	VFMADD231PS  Y11, Y9, Y10
+
+	// ---- group B → Y12 (independent chain)
+	VMOVDQU    16(DI), X0
+	VPAND      X14, X0, X1
+	VPSRLW     $4, X0, X2
+	VPAND      X14, X2, X2
+	VPUNPCKLBW X2, X1, X3
+	VPUNPCKHBW X2, X1, X4
+	VPSUBB     X15, X3, X3
+	VPSUBB     X15, X4, X4
+	VPMOVSXBW  X3, Y3
+	VPMOVSXBW  X4, Y4
+
+	VMOVDQU   32(SI), X5
+	VMOVDQU   48(SI), X6
+	VPMOVSXBW X5, Y5
+	VPMOVSXBW X6, Y6
+
+	VPMADDWD Y5, Y3, Y7
+	VPMADDWD Y6, Y4, Y8
+	VPADDD   Y8, Y7, Y7
+
+	VCVTDQ2PS    Y7, Y9
+	VBROADCASTSS 4(BX), Y11
+	VFMADD231PS  Y11, Y9, Y12
+
+	ADDQ $32, DI
+	ADDQ $64, SI
+	ADDQ $8, BX
+	SUBQ $1, CX
+	JNZ  loop2
+
+	// Join the two chains, then the same single horizontal reduce.
+	VADDPS       Y12, Y10, Y10
+	VEXTRACTF128 $1, Y10, X11
+	VADDPS       X11, X10, X10
+	VHADDPS      X10, X10, X10
+	VHADDPS      X10, X10, X10
+	MOVSS        X10, ret+32(FP)
+	VZEROUPPER
+	RET
