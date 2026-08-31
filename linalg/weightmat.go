@@ -63,6 +63,25 @@ type WeightMat struct {
 	q4SplitHalf []byte
 }
 
+// SplitHalfBytes reports the size of the optional split-half nibble layout, or 0
+// when this WeightMat has none (every arch but amd64, any CPU without AVX2, any
+// shape RepackInt4SplitHalf rejected, or simply no repack requested).
+//
+// The layout is a SECOND copy — q4 is never dropped — so this is exactly the
+// extra resident memory the repack cost, and a caller deciding whether to opt in
+// needs it. It exists so that caller does not have to re-derive rows x ceil(cols/2)
+// from the outside and thereby duplicate this package's knowledge of the layout's
+// size; goinfer's load-time accounting for the split-half A/B does exactly that
+// and reads this instead.
+//
+// It also keeps q4SplitHalf referenced on architectures with no split-half kernel.
+// Without it the field is written and read only from amd64-tagged files, so
+// `staticcheck` on any other target reports it as an unused field (U1000) — a red
+// that has nothing to do with the code under test and that this repo's CI, which
+// analyses linux/amd64, would never show. That is the same build-tag/U1000 trap
+// that has held CI red here before, arrived at from the opposite direction.
+func (w *WeightMat) SplitHalfBytes() int { return len(w.q4SplitHalf) }
+
 // WrapF32 wraps an existing [rows, cols] f32 weight WITHOUT copying — the WeightMat
 // aliases w (the caller keeps it alive, e.g. an mmap'd tensor). A consumer that must
 // release the source after construction should pass a copy.
