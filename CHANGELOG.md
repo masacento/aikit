@@ -9,6 +9,29 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.31.0] — 2026-08-31
+
+### Added
+
+**`Tensor.Uint8s` now admits the fp8 dtypes, `F8_E4M3` and `F8_E5M2`.** This is the accessor's
+existing rule applied, not an exception carved into it. Its restriction is to **byte-wide**
+dtypes, and the reason is that raw bytes are only safe when there is nothing to reinterpret:
+fp8 is one byte per element, so there is no endianness to get wrong, and aikit cannot offer a
+typed accessor without inventing a decode convention that belongs to the caller.
+
+The checkpoints that use these dtypes — DeepSeek V3/V3.2/V4, Qwen3-FP8 — are **block**-quantized:
+the scales live in a SEPARATE tensor (`<weight>.weight_scale_inv`) covering 2-D blocks of the
+weight (128×128 in both). A lone fp8 tensor therefore does not carry enough information to become
+floats, which is the same argument the MXFP4 note above already makes for its `*_blocks` /
+`*_scales` pair.
+
+Header parsing already handled these dtypes; only the accessor gate refused them, so a consumer
+could see `dtype=F8_E4M3` and a correct shape and then be unable to read the payload.
+
+`BF16`/`F16`/`F32`/`I32` still refuse, and `TestUint8s_fp8Dtypes` pins both halves — a wide dtype
+has a typed accessor and would hand out an endianness-dependent view.
+
+
 ## [1.30.0] — 2026-08-30
 
 ### Added
@@ -2518,7 +2541,8 @@ broad slice of the open-weights ecosystem.
   golden cosine 1.000000 vs PyTorch+MPS CodeRankEmbed. See
   [README.md](README.md) for stability tiers.
 
-[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.30.0...HEAD
+[Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.31.0...HEAD
+[1.31.0]: https://github.com/townsendmerino/aikit/compare/v1.30.0...v1.31.0
 [1.30.0]: https://github.com/townsendmerino/aikit/compare/v1.29.0...v1.30.0
 [1.29.0]: https://github.com/townsendmerino/aikit/compare/v1.28.0...v1.29.0
 [1.28.0]: https://github.com/townsendmerino/aikit/compare/v1.27.0...v1.28.0

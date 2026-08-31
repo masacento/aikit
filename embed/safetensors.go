@@ -620,12 +620,19 @@ func (t Tensor) Float32s() ([]float32, error) {
 // It is restricted to byte-wide dtypes deliberately. Returning raw bytes for, say, an
 // F32 tensor would silently hand out a little-endian-dependent view and invite callers
 // to reimplement reinterpretLE badly; those dtypes already have typed accessors.
+//
+// The fp8 dtypes belong here for exactly that reason, not as an exception to it. F8_E4M3
+// and F8_E5M2 are one byte per element, so there is no endianness to get wrong, and aikit
+// cannot offer a typed accessor without choosing a decode convention the CALLER owns: the
+// checkpoints that use them (DeepSeek V3/V4, Qwen3-FP8) keep the scales in a SEPARATE
+// tensor over 2-D blocks (`*.weight_scale_inv`, block 128x128), so a lone fp8 tensor does
+// not carry enough information to become floats. Same shape of argument as MXFP4 above.
 func (t Tensor) Uint8s() ([]byte, error) {
 	defer runtime.KeepAlive(t.owner) // §2.5: guard the read against a mid-decode munmap
 	switch t.DType {
-	case "U8", "I8", "BOOL":
+	case "U8", "I8", "BOOL", "F8_E4M3", "F8_E5M2":
 	default:
-		return nil, fmt.Errorf("tensor %q: Uint8s requires a byte-wide dtype (U8/I8/BOOL), got %s", t.Name, t.DType)
+		return nil, fmt.Errorf("tensor %q: Uint8s requires a byte-wide dtype (U8/I8/BOOL/F8_E4M3/F8_E5M2), got %s", t.Name, t.DType)
 	}
 	if n := t.Elements(); n < 0 || n != len(t.raw) {
 		return nil, fmt.Errorf("tensor %q: shape %v implies %d bytes, payload has %d", t.Name, t.Shape, n, len(t.raw))
