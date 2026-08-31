@@ -15,7 +15,29 @@ package linalg
 // Scales are shared, not repacked: split-half permutes nibbles within a group and never reorders
 // groups, so w.q4s serves both layouts (unlike row4, which needs RepackW4A8Row4Scales).
 func (w *WeightMat) RepackInt4SplitHalf() bool {
-	if w.q4 == nil || !hasAVX2 {
+	// !hasAVX512VNNIVL is not caution, it is correctness in both currencies.
+	//
+	// The canonical W4A8 dot (quant_w4a8_amd64.go) prefers the AVX-512 VNNI
+	// tier whenever the host has it and only falls back to AVX2 otherwise,
+	// while the split-half kernel exists at the AVX2 tier ONLY. So on a VNNI
+	// host, opting into this layout would swap a VNNI kernel for an AVX2 one:
+	//
+	//   PERFORMANCE — that is a downgrade, not the 1.12x speedup this repack
+	//   is for. The lever points the wrong way on exactly the newest hardware.
+	//
+	//   NUMERICS — the two tiers accumulate differently, so the split-half
+	//   result stops being bit-identical to canonical. Measured by CI, which
+	//   is how this was found: TestWeightMatSplitHalf_matchesCanonical passed
+	//   on a Zen 2 box (AVX2, no VNNI) at every shape and failed on a VNNI
+	//   runner at the largest one, rel 1.09e-4. Bit-identity between the AVX2
+	//   canonical and AVX2 split-half kernels holds and is still asserted; it
+	//   was never a claim about AVX2-vs-VNNI, and this gate is what keeps the
+	//   comparison to the pair it was true of.
+	//
+	// A split-half VNNI kernel would lift this, and is the obvious follow-up
+	// if the layout ever earns its memory. Until then, declining here means
+	// the repack is a no-op on VNNI hosts rather than a silent pessimization.
+	if w.q4 == nil || !hasAVX2 || hasAVX512VNNIVL {
 		return false
 	}
 	if w.group != 32 || w.cols%32 != 0 {

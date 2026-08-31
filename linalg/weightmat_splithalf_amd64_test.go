@@ -20,6 +20,20 @@ func TestWeightMatSplitHalf_matchesCanonical(t *testing.T) {
 	if !hasAVX2 {
 		t.Skip("AVX2 required")
 	}
+	// On a VNNI host the repack declines by design (weightmat_splithalf_amd64.go):
+	// canonical would use the AVX-512 VNNI tier and split-half only exists at AVX2,
+	// so opting in would be both a downgrade and a numerics change. Assert the
+	// decline rather than merely skipping past it — a repack that stopped declining
+	// here is exactly the regression this gate should catch, and a bare Skip would
+	// hide it. (This is how the VNNI problem was found: before the gate existed,
+	// this test passed on Zen 2 and failed on a VNNI runner at rel 1.09e-4.)
+	if hasAVX512VNNIVL {
+		probe := WrapInt4(make([]byte, 32*16), make([]float32, 32), 32, 32, 32)
+		if probe.RepackInt4SplitHalf() {
+			t.Fatal("VNNI host: RepackInt4SplitHalf ACCEPTED, but canonical dispatches to the VNNI tier here — the layout would downgrade the kernel and diverge numerically")
+		}
+		t.Skip("VNNI host: repack correctly declines; the AVX2-vs-AVX2 equivalence this asserts is not defined here")
+	}
 	const group = 32
 	rng := rand.New(rand.NewSource(3))
 	// Shapes chosen to exercise both the serial and the parallel branch of the span split, and a
@@ -69,6 +83,20 @@ func TestWeightMatSplitHalf_matchesCanonical(t *testing.T) {
 func TestWeightMatSplitHalf_canonicalUntouched(t *testing.T) {
 	if !hasAVX2 {
 		t.Skip("AVX2 required")
+	}
+	// On a VNNI host the repack declines by design (weightmat_splithalf_amd64.go):
+	// canonical would use the AVX-512 VNNI tier and split-half only exists at AVX2,
+	// so opting in would be both a downgrade and a numerics change. Assert the
+	// decline rather than merely skipping past it — a repack that stopped declining
+	// here is exactly the regression this gate should catch, and a bare Skip would
+	// hide it. (This is how the VNNI problem was found: before the gate existed,
+	// this test passed on Zen 2 and failed on a VNNI runner at rel 1.09e-4.)
+	if hasAVX512VNNIVL {
+		probe := WrapInt4(make([]byte, 32*16), make([]float32, 32), 32, 32, 32)
+		if probe.RepackInt4SplitHalf() {
+			t.Fatal("VNNI host: RepackInt4SplitHalf ACCEPTED, but canonical dispatches to the VNNI tier here — the layout would downgrade the kernel and diverge numerically")
+		}
+		t.Skip("VNNI host: repack correctly declines; the AVX2-vs-AVX2 equivalence this asserts is not defined here")
 	}
 	const rows, cols, group = 8, 256, 32
 	rng := rand.New(rand.NewSource(5))

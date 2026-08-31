@@ -27,8 +27,18 @@ New API, all Experimental tier:
 
 - `RepackW4A8SplitHalf(packed, rows, cols, group)` — portable, allocating repack.
 - `(*WeightMat).RepackInt4SplitHalf() bool` — **opt-in**, never probed for or applied
-  implicitly. Gated on amd64 + AVX2 + `group == 32` + `cols % 32 == 0`; returns false otherwise
-  and is a no-op on every other architecture, so it is safe to call unconditionally.
+  implicitly. Gated on amd64 + AVX2 + `group == 32` + `cols % 32 == 0` + **no AVX-512 VNNI**;
+  returns false otherwise and is a no-op on every other architecture, so it is safe to call
+  unconditionally.
+
+  **The VNNI exclusion is the interesting half of that gate.** The canonical W4A8 dot prefers
+  the AVX-512 VNNI tier added in v1.29.0 and only falls back to AVX2; the split-half kernel
+  exists at AVX2 only. So on a VNNI host, opting in would swap a VNNI kernel for an AVX2 one —
+  a downgrade, on precisely the newest hardware — and the two tiers accumulate differently, so
+  the result would also stop matching canonical. CI found this: the equivalence test passed on
+  a Zen 2 box at every shape and failed on a VNNI runner at the largest one (rel 1.09e-4).
+  Declining there makes the repack a no-op rather than a silent pessimization. A split-half
+  VNNI kernel would lift the restriction and is the obvious follow-up.
 - `(*WeightMat).SplitHalfBytes() int` — the layout's size, which is exactly the extra resident
   memory it cost.
 
