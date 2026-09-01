@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -179,8 +180,81 @@ func TestEncodeBatch_speedup(t *testing.T) {
 			return
 		}
 	}
+	// BEFORE BLAMING THE CODE, ASK WHETHER THE HOST CAN FAN OUT AT ALL RIGHT NOW.
+	// The message this test used to end on — "genuine fan-out failure, not a small
+	// host" — names two causes and misses the third. A BUSY host produces exactly
+	// this signature: the sequential arm is unaffected (it wants one core and gets
+	// one), while the parallel arm cannot find `width` free cores, so the ratio
+	// collapses without anything being wrong with EncodeBatch.
+	//
+	// Observed 2026-09-01, and it is why this guard exists: on an 8-core Mac with a
+	// neighbouring decode benchmark holding ~4 cores (load 29), this reported
+	// 1.87x and asserted a "genuine fan-out failure". The same commit on an idle
+	// 16-core box reached 4.68x on the first attempt. Nothing was wrong with the
+	// code, and the failure message said there was.
+	//
+	// Note the sequential arm does NOT reveal this — it was 443ms and 442ms on
+	// attempts 2 and 3 of the loaded run, i.e. perfectly stable. Only a direct
+	// measurement of available parallelism separates the two, so that is what this
+	// does: a pure-CPU probe at the same width, with no encoder involved. If the
+	// probe cannot clear the floor, the machine cannot, and this test has nothing
+	// to say about the code.
+	if probe := hostFanOut(width); probe < floor {
+		t.Skipf("INCONCLUSIVE: a pure-CPU probe at width %d reached only %.2fx (floor %.1fx), so this "+
+			"host cannot currently fan out — EncodeBatch's %.2fx says nothing about the code. "+
+			"Re-run on a quiet machine.", width, probe, floor, best)
+	}
 	t.Errorf("best parallelism speedup over %d attempts was %.2fx, below floor %.1fx "+
-		"(width %d — genuine fan-out failure, not a small host)", attempts, best, floor, width)
+		"(width %d — genuine fan-out failure: a pure-CPU probe at the same width DID clear "+
+		"the floor on this host just now, so the cores were available and EncodeBatch did not "+
+		"use them)", attempts, best, floor, width)
+}
+
+// hostFanOut measures the parallel speedup this machine can deliver RIGHT NOW at
+// the given width, using a pure-CPU loop with no allocation, no encoder and no
+// shared state — so the only thing it can be limited by is available cores.
+//
+// It is a canary for the measurement rather than a test of anything: its job is to
+// tell TestEncodeBatch_speedup's failure branch whether to blame the code or the
+// box, which that test could not previously distinguish.
+func hostFanOut(width int) float64 {
+	const span = 1 << 22
+	burn := func(lo, hi int) uint64 {
+		var acc uint64
+		for i := lo; i < hi; i++ {
+			acc = acc*1664525 + uint64(i) + 1013904223
+		}
+		return acc
+	}
+	t0 := time.Now()
+	sink := burn(0, span)
+	seq := time.Since(t0)
+
+	// Each worker owns its own slot: no shared writes, so this stays clean under
+	// -race (which CI runs) and the probe measures cores rather than contention on
+	// its own accumulator.
+	out := make([]uint64, width)
+	t1 := time.Now()
+	var wg sync.WaitGroup
+	chunk := span / width
+	for w := range width {
+		wg.Add(1)
+		go func(w, lo int) {
+			defer wg.Done()
+			hi := lo + chunk
+			if hi > span {
+				hi = span
+			}
+			out[w] = burn(lo, hi)
+		}(w, w*chunk)
+	}
+	wg.Wait()
+	par := time.Since(t1)
+	_, _ = sink, out
+	if par <= 0 {
+		return 0
+	}
+	return float64(seq) / float64(par)
 }
 
 // BenchmarkEncodeBatch_rerankN50 wraps the same workload as
