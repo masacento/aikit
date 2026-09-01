@@ -323,8 +323,8 @@ gate correctness sharply and say nothing about throughput, so all GEMM tuning wa
 native backends (`gpu/enccuda`, `gpu/encmetal`) ship, parity-gated, with the production GEMMs.
 The int8 (`LoadQ8`) path is also **built** — weight-only, routed through the existing `WeightMat`
 W8A8 GEMV via the optional `encoder.Q8Backend` capability, NOT by widening `Backend` (the scope
-note below records why). The only item left is a **published batched end-to-end wall-time number**,
-which is **checkpoint-blocked**, not a code gap (see below).
+note below records why). **The batched end-to-end number is now published — see below. Phase 4,
+and with it every phase of this plan, is closed.**
 
 The plan said "`encoder.Backend` already has `webgpu`; add native Metal/CUDA", which read as
 *plug a backend into a working seam*. It wasn't: the interface existed, `NewBackend` resolved
@@ -444,6 +444,28 @@ MiniLM `Encode`, CPU vs the `"metal"` backend: **CPU 88.9ms, Metal 89.1ms (1.00�
 single short-sequence forward (small L, hidden 384) has no matmul above it, so the backend
 correctly stays entirely on the CPU and the numerics are identical — the device pays for batched
 or larger-model encode. (`BENCH-gpu.md`: microbenchmarks tune, end-to-end publishes.)
+
+**Batched end-to-end — ✅ DONE on Metal, 2026-08-29, and it took a different checkpoint than
+this plan assumed.** `TestEncMetal_endToEndBatched`: 8 ragged texts through `Model.EncodeBatch`,
+CPU vs the `"metal"` backend — **CPU ~440 ms, Metal ~272 ms, ~1.5×, worst cosine 1.000000000.**
+
+The single-text figure above is 1.0×; this is ~1.5×. That is the plan's own hypothesis confirmed:
+a short sequence has no matmul above the backend's crossover so the device correctly stays on the
+CPU, and a batch packs B sequences into one `[B*Lmax]` block that clears it.
+
+**It was never blocked on `testdata/minilm-model`.** `forwardBatch`'s padded-batch kernel is
+SwiGLU-only — `if w.hasMoE() || !w.Cfg.gatedMLP() || w.Cfg.QKVProjBias` falls back to per-sequence
+`forwardInner` — and MiniLM is BERT-family with no `activation_function`, so a "batched" run on it
+is N single forwards and measures nothing new. The checkpoint this number needs is
+`testdata/encoder-model` (CodeRankEmbed: `activation_function=swiglu`, `qkv_proj_bias=false`),
+which is the one that actually drives the batch kernel. Recorded because the plan named the wrong
+blocker for months.
+
+**Treat ~1.5× as a median, not a settled figure.** Four runs gave 1.54 / 1.81 / 1.51 / 1.08×, and
+the low one coincided with a `decoder.test` restarting on the same box (load 6.07) — the CPU arm
+fell from ~440 ms to ~274 ms, which moves the ratio without telling you anything about the
+backend. Parity is the part that is settled: worst cosine 1.000000000 across all runs. A quiet-box
+re-run would tighten the multiplier; the direction and the mechanism are not in doubt.
 
 **int8 encoder path — ✅ DONE on CUDA + Metal (weight-only, via `WeightMat`).** The int8 forward
 called `matmulBTQ8Into` directly, so int8 encoders got *zero* GPU acceleration even with a
@@ -579,7 +601,7 @@ goinfer-Metal device re-point) → **Phase 2 ✅** (ANN-GPU batch-GEMM — the h
 re-point, all parity-gated on an RTX 2070 SUPER) → **Phase 3 ✅** (SigLIP and Qwen2.5-VL both done
 on BOTH CUDA and Metal, tiled and then simdgroup-GEMM'd) → **Phase 4 ✅ (f32 + int8)** (encoder
 native: seam wired, `enccuda` + `encmetal` shipped with production GEMMs; the int8 path built via
-`WeightMat` / `Q8Backend`; only a checkpoint-blocked batched end-to-end wall-time number remains).
+`WeightMat` / `Q8Backend`; the batched end-to-end number published 2026-08-29 at ~1.5× on Metal).
 
 **Nothing is gated behind an unfired trigger any more.** Every "wait for X to settle" in this
 plan has been discharged: the tuned kernels stabilized, the blob-split turned out to be a clean

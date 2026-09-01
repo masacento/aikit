@@ -483,3 +483,113 @@ func BenchmarkEncoderMatmulBTQ8(b *testing.B) {
 		})
 	}
 }
+
+// TestEncMetal_endToEndBatched is the last open item in docs/task-native-gpu.md —
+// the "published batched end-to-end wall-time number" every phase of that plan was
+// waiting on. It was recorded as checkpoint-blocked, and it was, but not on the
+// checkpoint the plan named.
+//
+// WHY NOT MiniLM, WHICH THE SINGLE TEST USES. forwardBatch's padded-batch kernel is
+// SwiGLU-only and refuses MoE, dense-GELU and qkv-bias checkpoints, falling back to
+// per-sequence forwardInner:
+//
+//	if w.hasMoE() || !w.Cfg.gatedMLP() || w.Cfg.QKVProjBias { ... per-sequence ... }
+//
+// testdata/minilm-model is BERT-family with no activation_function, so it takes that
+// fallback and a "batched" run on it is just N single forwards — which the sibling
+// test above already measures. CodeRankEmbed (testdata/encoder-model) is
+// activation_function=swiglu, qkv_proj_bias=false, so it is the checkpoint that
+// actually drives the batch kernel and therefore the only one this number means
+// anything on.
+//
+// The measurement matters because of what the single-text result showed: a short
+// sequence has no matmul above the backend's crossover, so Metal correctly stays on
+// the CPU and reports ~1.0×. A batch packs B sequences into one [B*Lmax] block,
+// which is precisely the shape that should cross it. This test publishes whichever
+// way that lands — BENCH-gpu.md's rule is that end-to-end publishes and
+// microbenchmarks tune, so a 1.0× here is a result, not a failure.
+func TestEncMetal_endToEndBatched(t *testing.T) {
+	const dir = "../../testdata/encoder-model"
+	if _, err := os.Stat(dir + "/model.safetensors"); err != nil {
+		t.Skipf("no SwiGLU model at %s — fetch via scripts/README.md", dir)
+	}
+	be := mustBackend(t)
+	defer be.Close()
+
+	cpuM, err := encoder.Load(dir)
+	if err != nil {
+		t.Fatalf("Load(cpu): %v", err)
+	}
+	defer cpuM.Close()
+	gpuM, err := encoder.Load(dir)
+	if err != nil {
+		t.Fatalf("Load(gpu): %v", err)
+	}
+	defer gpuM.Close()
+	gpuM.UseBackend(be)
+
+	// Ragged on purpose: equal lengths would hide whether padding is handled, and
+	// the batch kernel pads to Lmax.
+	texts := []string{
+		"func add(a, b int) int { return a + b }",
+		"compute the sha256 hash of a file and print it as hex",
+		"class Dog:\n    def bark(self):\n        print('woof')",
+		"SELECT id, name FROM users WHERE created_at > now() - interval '7 days'",
+		"a short one",
+		"parse the JSON body, validate the schema, and return 422 on failure with the offending field named",
+		"import numpy as np\nx = np.zeros((16, 16), dtype=np.float32)",
+		"binary search over a sorted slice, returning the insertion point when absent",
+	}
+	isQ := make([]bool, len(texts))
+
+	cpuOut, err := cpuM.EncodeBatch(texts, isQ, 1)
+	if err != nil {
+		t.Fatalf("cpu EncodeBatch: %v", err)
+	}
+	gpuOut, err := gpuM.EncodeBatch(texts, isQ, 1)
+	if err != nil {
+		t.Fatalf("gpu EncodeBatch: %v", err)
+	}
+
+	// Parity first: a wall-time number over a forward that changed the numerics is
+	// worthless, and the seam is exactly where that could happen.
+	worst := 1.0
+	for i := range cpuOut {
+		var dot, na, nb float64
+		for j := range cpuOut[i] {
+			dot += float64(cpuOut[i][j]) * float64(gpuOut[i][j])
+			na += float64(cpuOut[i][j]) * float64(cpuOut[i][j])
+			nb += float64(gpuOut[i][j]) * float64(gpuOut[i][j])
+		}
+		if cos := dot / (math.Sqrt(na)*math.Sqrt(nb) + 1e-30); cos < worst {
+			worst = cos
+		}
+	}
+	if worst < 1-1e-5 {
+		t.Fatalf("batched CPU≡Metal worst cosine %.9f below 1-1e-5 — the backend changed the forward's numerics", worst)
+	}
+
+	timeBatch := func(m *encoder.Model) time.Duration {
+		for range 2 { // warm
+			if _, err := m.EncodeBatch(texts, isQ, 1); err != nil {
+				t.Fatalf("EncodeBatch warm: %v", err)
+			}
+		}
+		const reps = 10
+		best := time.Hour
+		for range reps {
+			t0 := time.Now()
+			if _, err := m.EncodeBatch(texts, isQ, 1); err != nil {
+				t.Fatalf("EncodeBatch: %v", err)
+			}
+			if d := time.Since(t0); d < best {
+				best = d
+			}
+		}
+		return best
+	}
+	cpuT := timeBatch(cpuM)
+	gpuT := timeBatch(gpuM)
+	t.Logf("end-to-end batched Encode (%d texts, SwiGLU/CodeRankEmbed): CPU %v, Metal %v (%.2fx), worst cosine %.9f",
+		len(texts), cpuT, gpuT, float64(cpuT)/float64(gpuT), worst)
+}
