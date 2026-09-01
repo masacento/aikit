@@ -266,48 +266,68 @@ func LoadWeightsFromFS(fsys fs.FS, dir string) (*Weights, error) {
 // heap-loaded (fs.FS) and mmap-loaded (LoadWeights) paths share the
 // tensor-name + shape-validation contract — a future schema change is
 // one edit, not two.
+// tensorLoader accumulates the FIRST error across a run of tensor loads so a
+// caller can write the loads as plain assignments instead of wrapping each one in
+// a three-line error block.
+//
+// WHY: buildWeightsFromSafetensors loads 23 tensors, and every one of them used to
+// cost the same four lines — `if X, err = loadF32(...); err != nil { return nil,
+// err }`. That is ~69 of the function's 103 lines spent on identical punctuation,
+// and it is what repowise flagged the file for (nesting five deep, the worst
+// nesting score in the package).
+//
+// SEMANTICS ARE UNCHANGED, deliberately. f32 short-circuits once err is set, so no
+// load runs after the first failure and the error returned is the SAME error value
+// the immediate-return version returned. The only difference is that the caller
+// walks to the end of its loop doing nothing before returning it — an error path,
+// where a few no-op iterations cost nothing.
+//
+// THE HAZARD, because it is not obvious: a short-circuited f32 returns nil, and a
+// nil is harmless only while nobody READS it. Storing it is fine; passing it to
+// something that indexes is not. buildWeightsFromSafetensors has exactly one such
+// consumer (transposeExpertsW2) and drains the accumulator immediately before it.
+// Any future consumer of a loaded value inside this run needs the same guard.
+type tensorLoader struct {
+	st  *embed.SafetensorsFile
+	err error
+}
+
+// f32 loads one tensor, or returns nil if an earlier load in this run already
+// failed. The shape is variadic to match loadF32's own `want ...int` at the call
+// site without a []int literal at each of the 23 of them.
+func (l *tensorLoader) f32(name string, want ...int) []float32 {
+	if l.err != nil {
+		return nil
+	}
+	v, err := loadF32(l.st, name, want)
+	if err != nil {
+		l.err = err
+	}
+	return v
+}
+
 func buildWeightsFromSafetensors(cfg *Config, st *embed.SafetensorsFile) (*Weights, error) {
 	w := &Weights{Cfg: *cfg, st: st, Layers: make([]LayerWeights, cfg.NumLayers)}
-	var err error
+	ld := &tensorLoader{st: st}
 
 	// Embeddings + emb_ln.
-	if w.WordEmb, err = loadF32(st, "embeddings.word_embeddings.weight", []int{cfg.VocabSize, cfg.HiddenDim}); err != nil {
-		return nil, err
-	}
-	if w.TokenTypeEmb, err = loadF32(st, "embeddings.token_type_embeddings.weight", []int{cfg.TypeVocabSize, cfg.HiddenDim}); err != nil {
-		return nil, err
-	}
-	if w.EmbLN_W, err = loadF32(st, "emb_ln.weight", []int{cfg.HiddenDim}); err != nil {
-		return nil, err
-	}
-	if w.EmbLN_B, err = loadF32(st, "emb_ln.bias", []int{cfg.HiddenDim}); err != nil {
-		return nil, err
-	}
+	w.WordEmb = ld.f32("embeddings.word_embeddings.weight", cfg.VocabSize, cfg.HiddenDim)
+	w.TokenTypeEmb = ld.f32("embeddings.token_type_embeddings.weight", cfg.TypeVocabSize, cfg.HiddenDim)
+	w.EmbLN_W = ld.f32("emb_ln.weight", cfg.HiddenDim)
+	w.EmbLN_B = ld.f32("emb_ln.bias", cfg.HiddenDim)
 
 	// Per-layer (9 tensors × 12 layers = 108, plus 4 above = 112 total).
 	for i := 0; i < cfg.NumLayers; i++ {
 		pfx := fmt.Sprintf("encoder.layers.%d.", i)
 		l := &w.Layers[i]
-		if l.Wqkv, err = loadF32(st, pfx+"attn.Wqkv.weight", []int{3 * cfg.HiddenDim, cfg.HiddenDim}); err != nil {
-			return nil, err
-		}
-		if l.OutProj, err = loadF32(st, pfx+"attn.out_proj.weight", []int{cfg.HiddenDim, cfg.HiddenDim}); err != nil {
-			return nil, err
-		}
-		if l.Norm1W, err = loadF32(st, pfx+"norm1.weight", []int{cfg.HiddenDim}); err != nil {
-			return nil, err
-		}
-		if l.Norm1B, err = loadF32(st, pfx+"norm1.bias", []int{cfg.HiddenDim}); err != nil {
-			return nil, err
-		}
+		l.Wqkv = ld.f32(pfx+"attn.Wqkv.weight", 3*cfg.HiddenDim, cfg.HiddenDim)
+		l.OutProj = ld.f32(pfx+"attn.out_proj.weight", cfg.HiddenDim, cfg.HiddenDim)
+		l.Norm1W = ld.f32(pfx+"norm1.weight", cfg.HiddenDim)
+		l.Norm1B = ld.f32(pfx+"norm1.bias", cfg.HiddenDim)
 		// Optional attention biases (present iff the checkpoint has them).
 		if cfg.QKVProjBias {
-			if l.WqkvB, err = loadF32(st, pfx+"attn.Wqkv.bias", []int{3 * cfg.HiddenDim}); err != nil {
-				return nil, err
-			}
-			if l.OutProjB, err = loadF32(st, pfx+"attn.out_proj.bias", []int{cfg.HiddenDim}); err != nil {
-				return nil, err
-			}
+			l.WqkvB = ld.f32(pfx+"attn.Wqkv.bias", 3*cfg.HiddenDim)
+			l.OutProjB = ld.f32(pfx+"attn.out_proj.bias", cfg.HiddenDim)
 		}
 
 		switch {
@@ -315,57 +335,43 @@ func buildWeightsFromSafetensors(cfg *Config, st *embed.SafetensorsFile) (*Weigh
 			// MoE FFN: router + experts stacked into two [E*I, D] tensors.
 			l.IsMoE = true
 			E, I, D := cfg.NumExperts, cfg.IntermediateDim, cfg.HiddenDim
-			if l.Router, err = loadF32(st, pfx+"mlp.router.layer.weight", []int{E, D}); err != nil {
-				return nil, err
-			}
-			if l.ExpW1, err = loadF32(st, pfx+"mlp.experts.mlp.w1", []int{E * I, D}); err != nil {
-				return nil, err
-			}
-			if l.ExpW2, err = loadF32(st, pfx+"mlp.experts.mlp.w2", []int{E * I, D}); err != nil {
-				return nil, err
-			}
+			l.Router = ld.f32(pfx+"mlp.router.layer.weight", E, D)
+			l.ExpW1 = ld.f32(pfx+"mlp.experts.mlp.w1", E*I, D)
+			l.ExpW2 = ld.f32(pfx+"mlp.experts.mlp.w2", E*I, D)
 			// Store each expert's W2 transposed [I,D] → [D,I] so the FFN's second
 			// projection can run through the SIMD A·Bᵀ matmul instead of a scalar
 			// triple-loop (audit #10). One transpose per expert, once at load.
+			//
+			// THE ONE PLACE THE ACCUMULATOR MUST BE CHECKED MID-FUNCTION. Every other
+			// statement here just stores what ld.f32 returned, and a nil on the error
+			// path is harmless because it is never read. This one CONSUMES ExpW2, and
+			// transposeExpertsW2 over a nil slice with non-zero E/I/D would index out
+			// of range. So the accumulator is drained here, before the only consumer.
+			if ld.err != nil {
+				return nil, ld.err
+			}
 			l.ExpW2 = transposeExpertsW2(l.ExpW2, E, I, D)
-			if l.ExpBias, err = loadF32(st, pfx+"mlp.experts.bias", []int{D}); err != nil {
-				return nil, err
-			}
+			l.ExpBias = ld.f32(pfx+"mlp.experts.bias", D)
 		case cfg.gatedMLP():
-			if l.Fc11, err = loadF32(st, pfx+"mlp.fc11.weight", []int{cfg.IntermediateDim, cfg.HiddenDim}); err != nil {
-				return nil, err
-			}
-			if l.Fc12, err = loadF32(st, pfx+"mlp.fc12.weight", []int{cfg.IntermediateDim, cfg.HiddenDim}); err != nil {
-				return nil, err
-			}
-			if l.Fc2, err = loadF32(st, pfx+"mlp.fc2.weight", []int{cfg.HiddenDim, cfg.IntermediateDim}); err != nil {
-				return nil, err
-			}
+			l.Fc11 = ld.f32(pfx+"mlp.fc11.weight", cfg.IntermediateDim, cfg.HiddenDim)
+			l.Fc12 = ld.f32(pfx+"mlp.fc12.weight", cfg.IntermediateDim, cfg.HiddenDim)
+			l.Fc2 = ld.f32(pfx+"mlp.fc2.weight", cfg.HiddenDim, cfg.IntermediateDim)
 		default:
 			// Dense two-matrix GELU MLP.
-			if l.Fc1, err = loadF32(st, pfx+"mlp.fc1.weight", []int{cfg.IntermediateDim, cfg.HiddenDim}); err != nil {
-				return nil, err
-			}
-			if l.Fc2, err = loadF32(st, pfx+"mlp.fc2.weight", []int{cfg.HiddenDim, cfg.IntermediateDim}); err != nil {
-				return nil, err
-			}
+			l.Fc1 = ld.f32(pfx+"mlp.fc1.weight", cfg.IntermediateDim, cfg.HiddenDim)
+			l.Fc2 = ld.f32(pfx+"mlp.fc2.weight", cfg.HiddenDim, cfg.IntermediateDim)
 			if cfg.MLPFc1Bias {
-				if l.Fc1B, err = loadF32(st, pfx+"mlp.fc1.bias", []int{cfg.IntermediateDim}); err != nil {
-					return nil, err
-				}
+				l.Fc1B = ld.f32(pfx+"mlp.fc1.bias", cfg.IntermediateDim)
 			}
 			if cfg.MLPFc2Bias {
-				if l.Fc2B, err = loadF32(st, pfx+"mlp.fc2.bias", []int{cfg.HiddenDim}); err != nil {
-					return nil, err
-				}
+				l.Fc2B = ld.f32(pfx+"mlp.fc2.bias", cfg.HiddenDim)
 			}
 		}
-		if l.Norm2W, err = loadF32(st, pfx+"norm2.weight", []int{cfg.HiddenDim}); err != nil {
-			return nil, err
-		}
-		if l.Norm2B, err = loadF32(st, pfx+"norm2.bias", []int{cfg.HiddenDim}); err != nil {
-			return nil, err
-		}
+		l.Norm2W = ld.f32(pfx+"norm2.weight", cfg.HiddenDim)
+		l.Norm2B = ld.f32(pfx+"norm2.bias", cfg.HiddenDim)
+	}
+	if ld.err != nil {
+		return nil, ld.err
 	}
 	return w, nil
 }

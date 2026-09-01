@@ -1,10 +1,15 @@
 package encoder
 
 import (
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"testing"
 	"testing/fstest"
 )
@@ -226,5 +231,114 @@ func TestValidateAssumptions_acceptsMoE(t *testing.T) {
 		if plain.isMoELayer(i) {
 			t.Fatalf("non-MoE config reported layer %d as MoE", i)
 		}
+	}
+}
+
+// safetensorsBlob builds a minimal safetensors file containing the named f32
+// tensors, zero-filled. Written for TestBuildWeights_moeMissingExpertTensor
+// below, which needs a checkpoint where the EARLY tensors load and a later one
+// does not — a state the empty-header fixture above cannot express, because it
+// fails on the very first tensor.
+func safetensorsBlob(t *testing.T, tensors map[string][]int) []byte {
+	t.Helper()
+	names := make([]string, 0, len(tensors))
+	for n := range tensors {
+		names = append(names, n)
+	}
+	sort.Strings(names) // deterministic offsets
+	var hdr strings.Builder
+	hdr.WriteByte('{')
+	off := 0
+	for i, n := range names {
+		elems := 1
+		for _, d := range tensors[n] {
+			elems *= d
+		}
+		shape := make([]string, len(tensors[n]))
+		for j, d := range tensors[n] {
+			shape[j] = strconv.Itoa(d)
+		}
+		if i > 0 {
+			hdr.WriteByte(',')
+		}
+		fmt.Fprintf(&hdr, `%q:{"dtype":"F32","shape":[%s],"data_offsets":[%d,%d]}`,
+			n, strings.Join(shape, ","), off, off+elems*4)
+		off += elems * 4
+	}
+	hdr.WriteByte('}')
+	h := []byte(hdr.String())
+	out := make([]byte, 8+len(h)+off)
+	binary.LittleEndian.PutUint64(out[:8], uint64(len(h)))
+	copy(out[8:], h)
+	return out
+}
+
+// TestBuildWeights_moeMissingExpertTensor covers the ONE failure mode the
+// tensorLoader accumulator introduces, and it had no coverage at all before:
+// f32 returns nil once an earlier load has failed, and nil is harmless only
+// while nobody reads it. transposeExpertsW2 READS it —
+//
+//	src := w2[e*I*D : (e+1)*I*D]
+//
+// — so a MoE layer whose expert weights are missing would slice a nil and PANIC
+// rather than return an error, if the accumulator were not drained immediately
+// before the transpose. This test is what makes that guard load-bearing instead
+// of decorative: delete it and this fails with a panic, not an error.
+//
+// It also fills a real gap. testdata/moe-model carries a config and a tokenizer
+// but no weights, so nothing else in the package exercises the MoE branch of
+// buildWeightsFromSafetensors at all.
+func TestBuildWeights_moeMissingExpertTensor(t *testing.T) {
+	const D, I, V, E = 4, 8, 4, 2
+	cfg := fmt.Sprintf(`{
+"vocab_size":%d, "n_embd":%d, "n_layer":2, "n_head":2, "n_inner":%d,
+"n_positions":16, "type_vocab_size":2,
+"rotary_emb_base":1000, "rotary_emb_fraction":1.0, "rotary_emb_interleaved":false,
+"layer_norm_epsilon":1e-12, "activation_function":"gelu",
+"prenorm":false, "use_rms_norm":false,
+"qkv_proj_bias":false, "mlp_fc1_bias":false, "mlp_fc2_bias":false,
+"scale_attn_weights":true, "causal":false, "parallel_block":false,
+"num_experts":%d, "moe_top_k":1, "moe_every_n_layers":2
+}`, V, D, I, E)
+
+	// Everything layer 1 (the MoE layer) needs EXCEPT mlp.experts.mlp.w2 — the
+	// tensor transposeExpertsW2 consumes. Layer 0 is dense and complete, so the
+	// loader gets well past the start before it fails.
+	tensors := map[string][]int{
+		"embeddings.word_embeddings.weight":       {V, D},
+		"embeddings.token_type_embeddings.weight": {2, D},
+		"emb_ln.weight": {D},
+		"emb_ln.bias":   {D},
+	}
+	for _, l := range []int{0, 1} {
+		p := fmt.Sprintf("encoder.layers.%d.", l)
+		tensors[p+"attn.Wqkv.weight"] = []int{3 * D, D}
+		tensors[p+"attn.out_proj.weight"] = []int{D, D}
+		tensors[p+"norm1.weight"] = []int{D}
+		tensors[p+"norm1.bias"] = []int{D}
+		tensors[p+"norm2.weight"] = []int{D}
+		tensors[p+"norm2.bias"] = []int{D}
+	}
+	tensors["encoder.layers.0.mlp.fc1.weight"] = []int{I, D}
+	tensors["encoder.layers.0.mlp.fc2.weight"] = []int{D, I}
+	tensors["encoder.layers.1.mlp.router.layer.weight"] = []int{E, D}
+	tensors["encoder.layers.1.mlp.experts.mlp.w1"] = []int{E * I, D}
+	// mlp.experts.mlp.w2 deliberately ABSENT.
+	tensors["encoder.layers.1.mlp.experts.bias"] = []int{D}
+
+	fsys := fstest.MapFS{
+		"config.json":       {Data: []byte(cfg)},
+		"model.safetensors": {Data: safetensorsBlob(t, tensors)},
+	}
+
+	// The assertion is as much "does not panic" as "returns an error": a panic
+	// here escapes as a test failure with a stack through transposeExpertsW2,
+	// which is exactly the regression this guards.
+	_, err := LoadWeightsFromFS(fsys, ".")
+	if err == nil {
+		t.Fatal("expected an error for the missing expert w2, got nil")
+	}
+	if !contains(err.Error(), "mlp.experts.mlp.w2") {
+		t.Errorf("error should name the missing tensor; got: %v", err)
 	}
 }
