@@ -20,7 +20,20 @@
 > through §2's triggers.** If a future session finds itself adding kernels
 > with no trigger fired, stop.
 
-## 0. The asset-blocked cluster — one fetch clears three records (2026-08-28)
+## 0. The asset-blocked cluster — CLEARED 2026-08-29
+
+> **All three records closed.** `testdata/encoder-model` (CodeRankEmbed, 523 MB) and
+> `testdata/minilm-model` (all-MiniLM-L6-v2, 87 MB) fetched; both gitignored, so nothing entered
+> git. Encoder skips went **67 → 35** (missing-asset **63 → 33**), 41 more tests now execute.
+> (1) `task-native-gpu.md`'s last item published at ~1.5× batched on Metal (`a9fd0af`) — and it
+> was never blocked on the checkpoint that plan named; `forwardBatch`'s kernel is SwiGLU-only, so
+> MiniLM could not drive it and CodeRankEmbed was the one that could. (2)
+> `buildWeightsFromSafetensors` refactored, 103 → 69 lines, with the MoE-transpose guard proven
+> load-bearing by removal (`d0f6bf7`). (3) The skips are counted rather than silent. The 33
+> remaining need *other* fixtures (nomic-embed, crossencoder-model, model) — a smaller,
+> separate cluster.
+
+## 0-old. The original entry (2026-08-28)
 
 **Not new engineering, so it does not need a §2 trigger** — this is three things already
 recorded as blocked that share a single cause, plus the fetch that clears them. It is listed
