@@ -18,7 +18,7 @@
 >
 > **Status: SCOPED 2026-09-03. Done so far (all 2026-09-03): the four no-hardware items —
 > S-09.2, S-09.3, S-10.1, S-10.2; S-08.1 (the 3700X's bandwidth, and a 30% correction to
-> `gpu-assessment.md` that has NOT yet been applied at the source); S-04 step 1 (the pure-Go AV
+> `gpu-assessment.md` — **applied at the source 2026-09-03, goinfer `72df161`**); S-04 step 1 (the pure-Go AV
 > accumulator blocks, 2.35× arm64 / 1.36–1.46× amd64); **S-01's arm64 half** — the M-invariance
 > gate and then the register-blocked 4×4 tile, `dotW4A8Row4Tile4x4`, measured 2.88× on the
 > prefill kernel; and **S-01b's arm64 half** — `dotI8Tile4x4`, 3.5–3.9× on W8A8 at M≥4 in every
@@ -65,7 +65,7 @@ M2+); STREAM triad 71.9 GB/s one thread, 121 at six. `nvidia-rtx2070s` host: Ryz
 > **This settles the two anchors this paragraph used to lean on.** Ollama's 27.6 GB/s of weights
 > (P14) is **~90% of the measured read ceiling** — not anomalous, close to optimal. The
 > "~40 GB/s" estimate in `gpu-assessment.md` is **too high by ~30%** and should be corrected to
-> ~30 GB/s.
+> ~30 GB/s. ✅ **DONE — goinfer `72df161` carries the correction.**
 >
 > **It also sharpens §1's amd64 verdict rather than contradicting it.** "2–4 cores already exceed
 > any plausible DRAM figure" is right, and tighter than stated: read bandwidth SATURATES AT TWO
@@ -370,6 +370,13 @@ prefill == speculative verify` guarantees rest on.
 > cell, the number that decides whether the int4/int8int8 inversion is actually gone — that needs
 > their repo and `scripts/bench_peer_prefill.py`. A VNNI-host tile for both kernels remains
 > S-08.3's file-do-not-build case.
+>
+> **goinfer needs no code change to get any of this**, which is worth stating because it was not
+> true of the row4 layout when that landed. `decoder/weightmat.go:212` already calls
+> `RepackInt4Row4`, and `serialize.go:1327` already takes the `WrapInt4Row4` path for kind-4
+> `.giw`, so every eligible tensor is row4-resident and `WeightMat.MatmulBTW4A8Into` picks the
+> tile up at M>1 on its own. The amd64 tiles hook `w4a8Span`/`w8a8Span` directly and need no
+> opt-in at all. A dependency bump is the whole adoption.
 
 - **Where:** `quant.go:585-597` (`w4a8Span`), `quant.go:280-330` (`w8a8Span`);
   `weightmat_splithalf_amd64.go:67-73` and `weightmat_row4_arm64.go:48-54` route every M≠1 call
