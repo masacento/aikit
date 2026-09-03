@@ -27,10 +27,15 @@
 > S-02/S-03/S-05/S-06/S-07, and the items needing hardware neither box has (I8MM, VNNI). S-09.1
 > needs goinfer's decode bench in their repo.**
 >
-> **UPDATE 2026-09-03: S-01 and S-01b are complete on BOTH arches.** The amd64 halves were built
-> and measured on an idle 3700X — W4A8 1.65–1.90×, W8A8 1.17–1.44×. The W8A8 amd64 tile's first
-> shape regressed 1.75× on streamed B and was replaced; see the S-01b annotation, which is the
-> most useful thing in this document for whoever writes the next kernel.
+> **UPDATE 2026-09-03: S-01 and S-01b are COMPLETE and CLOSED on both arches, end to end.** The
+> amd64 halves were built and measured on an idle 3700X — W4A8 1.65–1.90×, W8A8 1.17–1.44×. The
+> W8A8 amd64 tile's first shape regressed 1.75× on streamed B and was replaced; see the S-01b
+> annotation, which is the most useful thing in this document for whoever writes the next kernel.
+> goinfer then measured the end-to-end prefill cell and **both pre-registered gates pass — 1.66×
+> before/after and the int4/int8int8 inversion is gone.** S-09.1 is also done and refuted the
+> 2026-08-11 result: fork/join is worth **1.70×** on decode, which confirms S-02's magnitude and
+> leaves ~2.7× on the table that bandwidth does not explain. **Step 0 is now one item: S-02's
+> per-shard timestamp harness.**
 >
 > **Original status: nothing started.** Static read of aikit `v1.31.0-5-gca817a4`
 > (`linalg/`, 16 assembly files, the Go dispatch, the docs and bench records) and goinfer
@@ -366,10 +371,52 @@ prefill == speculative verify` guarantees rest on.
 > one ULP fails `TestMatmulBTW4A8_MConsistent` / `TestMatmulBTW8A8_MConsistent` at every shape,
 > including the N-tail and ragged-K ones, so both remainder strips are genuinely exercised.
 >
-> **Still open in S-01:** nothing on either arch. Not yet measured: goinfer's end-to-end prefill
-> cell, the number that decides whether the int4/int8int8 inversion is actually gone — that needs
-> their repo and `scripts/bench_peer_prefill.py`. A VNNI-host tile for both kernels remains
-> S-08.3's file-do-not-build case.
+> **S-01 IS CLOSED — goinfer measured the end-to-end prefill cell 2026-09-03 and BOTH pre-registered
+> gates pass.** 1.5B q4_k_m, M1 Pro, quiet box, paired and interleaved with ROTATING ARM ORDER,
+> n=5, spreads 0.9–5.6%:
+>
+> | arm | K=512 tok/s | K=3900 tok/s | marginal tok/s |
+> |---|--:|--:|--:|
+> | int4, new aikit (the change) | **115.4** | **103.5** | **101.9** |
+> | int8int8, new aikit (the do-nothing arm) | 104.6 | 90.5 | 88.7 |
+> | int4, pre-bump | 65.8 | 61.9 | 61.4 |
+> | **new/old** | **1.754×** | **1.672×** | **1.659×** |
+> | **int4 / int8int8** | 1.103× | 1.144× | 1.148× |
+>
+> **Gate 1 — ≥1.5× on the int4 prefill cell: PASSES at 1.66–1.75×.** The referent is before/after
+> (int4-new vs int4-old), which is the convention every other decision rule in this document uses
+> — S-03 says "before/after" in as many words, and S-02/S-04 quote bare ship ratios with no
+> comparator arm. The "do-nothing arm: `--quant int8int8`" line names the comparator for gate 2 and
+> for the product decision, not for gate 1. The `park below 1.2×` clause confirms it: on the
+> int8int8 reading this rule would park a kernel that is a verified 1.66× improvement AND removed
+> the inversion, which is plainly not what it was written to do.
+>
+> **Gate 2 — int4 ≥ int8int8 at every M: PASSES at 1.103× and 1.144×. THE INVERSION IS GONE.**
+> This was S-01's actual thesis. "int8int8 prefill beats int4 by 25–33%" was the observation the
+> whole finding was built on; int4 now wins at both depths. The mechanism named in §3 — that at
+> M>1 int4's byte saving is served from cache anyway while its unpack ALU cost is paid M times —
+> is confirmed by removing the unpack repetition and watching the ordering flip.
+>
+> **The 2.88× kernel win compresses to 1.66× end-to-end, as predicted and for the predicted
+> reasons.** S-02's fork/join is untouched and S-06's serial f32 transcendentals (estimated 7–25%
+> of a prefill) are still in the path. The compression is the residue those two findings name, not
+> a shortfall in this one.
+>
+> **Bit-identity held across the bump, checked and not assumed:** goinfer's
+> `TestForwardN_matchesSequential` is bit-identical across **19,447,808 logits** at K=128, and
+> `TestMoEExpertMajor_bitIdentical` is green over 56 expert-major chunks. That is the cross-repo
+> confirmation that `decode == batched prefill == speculative verify` survives a change that
+> re-shaped how every M>1 matmul is computed.
+>
+> **A contamination catch worth propagating into the campaign rules.** goinfer's first pass ran
+> S-09.1 concurrently with the prefill benchmark. Both numbers moved on clean re-takes:
+> int4/int8int8 from 1.153× to **1.103×** (the contamination had flattered int4 by slowing the
+> int8int8 arm) and S-09.1 from 1.35× to **1.70×**. Note the direction — contamination did not
+> merely add noise, it biased the RATIO, because the two arms were not equally sensitive to the
+> interference. "Quiet box" has to mean quiet of one's own other benchmarks too.
+>
+> **Still open in S-01:** nothing. A VNNI-host tile for both kernels remains S-08.3's
+> file-do-not-build case.
 >
 > **goinfer needs no code change to get any of this**, which is worth stating because it was not
 > true of the row4 layout when that landed. `decoder/weightmat.go:212` already calls
@@ -669,13 +716,37 @@ prefill == speculative verify` guarantees rest on.
 ### S-09 · Eng — three gates that vouch for less than they read as
 
 1. **The "serial ties parallel, fork/join is net-neutral" A/B compared two parallel arms.**
-   goinfer's `BenchmarkDecode` `GOINFER_PAR_THRESHOLD` sets only the process global
-   (goinfer `decoder/decode_bench_test.go:91-99`); since 2026-08-01 decode uses the per-Workspace 300K override
-   (`decoder/scratch.go:84-85`), so the 2026-08-11 "serial 54.77 vs parallel 54.34"
-   (`perf-campaign.md:386-401`, cited from `queue-release.md:758-766`) measured nothing. The
-   trace-derived ~1%/token scheduler latency stands; "removing every fork/join changes nothing"
-   does not. Re-run with `cache.scr.ws.SetThreshold(1<<62)` and confirm zero `parallelSpawnCols`
-   in the trace — S-02's premise depends on it.
+   ✅ **DONE 2026-09-03, and the 2026-08-11 result is REFUTED.** goinfer re-ran it with
+   `ws.SetThreshold(1<<62)` on a quiet box:
+
+   | arm | tok/s (×4 runs) | excess goroutines |
+   |---|---|--:|
+   | serial | 51.4 / 52.3 / 52.4 / 52.2 | 5 |
+   | parallel | 85.8 / 88.5 / 89.3 / 88.5 | 31–33 |
+
+   **parallel / serial = 1.70×.** Fork/join is not net-neutral; the earlier "serial 54.77 vs
+   parallel 54.34" (`perf-campaign.md:386-401`, from `queue-release.md:758-766`) was two parallel
+   arms, exactly as this finding suspected — `GOINFER_PAR_THRESHOLD` set only the process global
+   while decode had used the per-Workspace 300K override since 2026-08-01. The new serial arm is
+   proven serial TWO independent ways rather than one: the goroutine count does not scale, and at
+   `GOMAXPROCS=1` it is unchanged (42.6) while the parallel arm collapses onto it (43.3). The
+   residual 5 goroutines appear in both arms at one core, so they are runtime, not matmul spawn.
+   A first pass run concurrently with the prefill benchmark read 1.35× — see S-01's contamination
+   note.
+
+   **This CONFIRMS S-02 rather than unsettling it, and the direction matters.** S-02's premise is
+   "each core delivers 26–35% of what it does alone". At 1.70× across ~6 workers that is **28% per
+   worker — inside the predicted band**. What is refuted is only the corollary the old A/B was
+   used for; the trace-derived ~1%/token scheduler latency still stands. S-02 now has a
+   measurement under it instead of an inference.
+
+   **And the headroom is real rather than a bandwidth ceiling** — the check worth doing before
+   building any S-02 remedy. One worker runs at 26 GB/s, which is 91–97% of its PORT ceiling but
+   only ~36% of the M1 Pro's 71.9 GB/s single-thread STREAM, so a lone worker is issue-bound, not
+   memory-bound. Six workers at that rate would want 156 GB/s against a 121 GB/s triad ceiling, so
+   bandwidth alone permits ~4.65× — and the read-only ceiling is higher still than triad's, by the
+   same RFO argument S-08.1 made for the 3700X. Realized is 1.70×. Roughly **2.7× is being left on
+   the table that memory bandwidth does not explain**, which is S-02's to collect.
 2. **Zero-alloc is pinned only on the serial path.** ✅ **DONE 2026-09-03.**
    `TestW8A8Into_zeroAllocWhenReused` runs at 4.35M MACs, below the default threshold, so it
    only ever pinned the serial path. `TestW8A8Into_boundedAllocOnParallelPath` now forces the
@@ -751,7 +822,7 @@ items; G4/G5 (f32 silu/gelu) were parity-gated; G10 (RoPE table) bit-identical. 
 
 | step | item | prize (counted, not measured) | numerics | prerequisite |
 |---|---|---|---|---|
-| 0 | S-09.1 re-run the serial/parallel A/B correctly; S-08.1 STREAM the 3700X; the per-shard timestamp harness for S-02 | decides where the decode gap is | none | none |
+| 0 | S-09.1 re-run the A/B correctly ✅ **DONE — 1.70×, the old result refuted**; S-08.1 STREAM the 3700X ✅ **DONE**; the per-shard timestamp harness for S-02 — still open | decides where the decode gap is | none | none |
 | 1 | S-01 W4A8 M-invariance gate ✅ **DONE**, the 4×4 tile on row4 (arm64) ✅ **DONE 2026-09-03, 2.88×**; the unpack-once span (amd64) still open | CPU prefill 2–2.7× at the kernel; the int4/int8int8 inversion; verify rounds cheaper on every spec path | bit-identical | the gate |
 | 2 | S-02 remedy that step 0 selects (dynamic chunking and/or `MatmulBTW4A8Batch`) + S-03 NEON quantiser | decode 1.15–1.7× on the fan-out term; −3 barriers, −3 quantisations per layer | bit-identical | step 0 |
 | 3 | S-04 AV pure-Go accumulator blocks → NEON AV → NEON QK | ~1.9× token at depth 8k; ~1.1× at 128 | bit-identical (exact products) | none |

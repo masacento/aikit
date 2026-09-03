@@ -101,6 +101,21 @@ however the loop is blocked and issues on a single Zen 2 port, so ~67 GMAC/s bin
 already sat at 72–76% of it. arm64's 3.5–3.9× does not transfer — SDOT does 16 MACs on four pipes,
 VPMADDWD does 16 on one.
 
+**Validated end to end, in the consumer.** goinfer measured its CPU prefill cell against these
+kernels on a quiet M1 Pro (1.5B q4_k_m, paired and interleaved with rotating arm order, n=5,
+spreads 0.9–5.6%): **1.66–1.75× before/after**, and — the thing this work existed for — int4
+prefill now beats `int8int8` by 1.10–1.14× at both depths, where int8int8 had been winning by
+25–33%. That inversion was the symptom; paying the nibble unpack once per weight row instead of
+once per activation row was the cause. The 2.88× kernel win compressing to 1.66× end to end is
+expected: prefill is not all matmul, and neither the fork/join nor the serial f32 transcendentals
+were touched here.
+
+Bit-identity held across the bump in the consumer's own gates, not just aikit's:
+`TestForwardN_matchesSequential` came back bit-identical across 19,447,808 logits, and
+`TestMoEExpertMajor_bitIdentical` green over 56 expert-major chunks — the cross-repo confirmation
+that `decode == batched prefill == speculative verify` survives a change that re-shaped how every
+M>1 quantized matmul is computed.
+
 **New M-invariance gates for the quantized kernels**, landed before the tile rather than with
 it: `TestMatmulBTW4A8_MConsistent`, `TestMatmulBTW8A8_MConsistent` and
 `TestWeightMatW4A8_MConsistentAcrossRow4Dispatch` pin that an output row computed inside an
