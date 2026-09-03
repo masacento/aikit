@@ -27,6 +27,11 @@
 > S-02/S-03/S-05/S-06/S-07, and the items needing hardware neither box has (I8MM, VNNI). S-09.1
 > needs goinfer's decode bench in their repo.**
 >
+> **UPDATE 2026-09-03: S-01 and S-01b are complete on BOTH arches.** The amd64 halves were built
+> and measured on an idle 3700X — W4A8 1.65–1.90×, W8A8 1.17–1.44×. The W8A8 amd64 tile's first
+> shape regressed 1.75× on streamed B and was replaced; see the S-01b annotation, which is the
+> most useful thing in this document for whoever writes the next kernel.
+>
 > **Original status: nothing started.** Static read of aikit `v1.31.0-5-gca817a4`
 > (`linalg/`, 16 assembly files, the Go dispatch, the docs and bench records) and goinfer
 > `30b168e` (the callers). Three independent reviewers (arm64 assembly, amd64 assembly, Go
@@ -84,7 +89,7 @@ heads / 2 kv heads, hd 128, vocab 151936); ~1.05 GB of int4 weights + scales per
 |---|---|---|---|---|
 | **decode M=1, arm64** (Mac, 1.5B, depth ≤ 512) | ~85% weight stream | `dotW4A8SplitHalf4Row` (SDOT, 4 rows, f32 fold in register), W8A8 head via `dotI8SDOT` | **kernel at 91–97% of its issue ceiling per core; the 6-worker aggregate at 26–35% of six cores** | S-02 (fan-out), S-05 (9→7 µops), S-03 (batch entry) |
 | **decode M=1, amd64** (3700X) | same | `dotW4A8FoldAVX2` (25 instr/32 MACs, 1 acc), `dotI8AVX2` (4 acc) | kernel at ~53% of its port floor but **2–4 cores already exceed any plausible DRAM figure**; 16 SMT shards per call | S-02, S-08 (measure the box first) |
-| **prefill / verify M>1, both archs** | the whole prefill | `w4a8Span`: `for col { for row { dotW4A8(row, col) } }` — the M=1 GEMV per pair | ✅ **arm64 FIXED 2026-09-03** — `dotW4A8Row4Tile4x4` reuses each unpacked weight row across four activation rows, measured **2.88×** (24.1 → 69.5 GMAC/s per core). amd64 still spends 9 unpack instructions per 32 MACs per row. | **S-01** (4×4 tile on the row4 layout; 2.7× counted, **2.88× measured**) |
+| **prefill / verify M>1, both archs** | the whole prefill | `w4a8Span`: `for col { for row { dotW4A8(row, col) } }` — the M=1 GEMV per pair | ✅ **FIXED ON BOTH ARCHES 2026-09-03** — arm64 `dotW4A8Row4Tile4x4` **2.88×** (24.1 → 69.5 GMAC/s); amd64 `dotW4A8Tile4RowAVX2` **1.65–1.90×** (15.6 → 27.6). W8A8 too: arm64 3.5–3.9×, amd64 1.17–1.44×. | **S-01** (2.7× counted; 2.88× measured arm64, 1.78× amd64 — AVX2's 16 registers cap the tile at 4×1) |
 | **decode attention, depth ≥ 2k** | 75% of the token at 8k | `MatmulQKAcc64` / `MatmulAVAcc64` — pure Go f64, 8 scalar chains / memory accumulators | QK at 80% of its scalar issue bound; AV at ~40% (accumulators in memory) | **S-04** (NEON f64 lane-per-output, bit-identical) |
 | **Go-side serial work** | 8–10% at short context | `quantizeRowInt8Core` ×7 per layer (3 redundant), `silu` via f64 `math.Exp`, norms, fork/join | scalar, single goroutine, between parallel matmuls | S-03, S-06 |
 | **weight-only `int8` mode** | every projection | `q8Span` → `dequantRowInt8` + `dotNEON4` (**one** FMLA chain) | 3.2 GMAC/s per core — the mechanism behind the LM head's old 11–13 GB/s | S-07 (bit-identical 8-column form) |
@@ -292,10 +297,79 @@ prefill == speculative verify` guarantees rest on.
 > question. It did not — 32 SDOTs in a 24-cycle window fit in two pipes — but the direct probe
 > does.
 >
-> **Still open in S-01:** the amd64 unpack-once span and an amd64 W8A8 M-tile over `dotI8AVX2`'s
-> four accumulators (both need the 3700X). Not yet measured: goinfer's end-to-end prefill cell,
-> the number that decides whether the int4/int8int8 inversion is actually gone — that needs their
-> repo and `scripts/bench_peer_prefill.py`.
+> **BOTH amd64 HALVES ARE DONE, 2026-09-03, measured on an IDLE 3700X** (`nobara-pc`, load
+> 0.00–0.07, the quiet box the campaign rules ask for). Serial, one core, median of three
+> interleaved paired passes, against the pre-tile span as the do-nothing arm.
+>
+> **S-01 amd64 — `dotW4A8Tile4RowAVX2` (`dot_w4a8_tile_amd64.s`): 1.65–1.90×, everywhere.**
+> The shape is ONE weight row × FOUR activation rows, not arm64's 4×4, because AVX2 has 16 YMM
+> registers against NEON's 32 and sixteen live accumulators plus operands does not fit. Blocking
+> the activation dimension alone is the part that matters anyway: the 10-instruction nibble unpack
+> and the scale broadcast belong to the weight row and were being repeated per activation row.
+> 13 instructions per 32 MACs per row against 25.
+>
+> | K | N | M=4 | M=8 | M=16 |
+> |--:|--:|--:|--:|--:|
+> | 1536 | 8960 (the prefill cell) | 1.78× | 1.75× | 1.73× |
+> | 768 | 8192 | 1.85× | 1.83× | 1.77× |
+> | 1536 | 18944 | 1.80× | 1.83× | 1.75× |
+> | 3584 | 18944 | 1.73× | 1.70× | 1.65× |
+> | 768 | 100000 | 1.90× | 1.85× | 1.79× |
+>
+> The prefill cell goes 15.6 → 27.6 GMAC/s. Pre-registered expectation was "roughly 2×, and the
+> Zen 2 VPMADDWD floor does not bind"; measured 1.65–1.90×, so slightly under the count — the
+> opposite sign from arm64, where the count was conservative.
+>
+> One correctness point that no measurement here could have found: **the tile is excluded on
+> AVX-512 VNNI hosts.** `dotW4A8` prefers `dotW4A8FoldAVX512VNNI`, which folds through TWO f32
+> accumulators where the AVX2 kernel uses one — a different summation order. An AVX2-based tile
+> running at M>1 on a VNNI host while M=1 kept the VNNI kernel would make the result depend on M,
+> which is exactly what `TestMatmulBTW4A8_MConsistent` forbids and what speculative verify rests
+> on. Neither project box has VNNI, so this is excluded by construction rather than by test.
+>
+> **S-01b amd64 — and the first shape had to be thrown away.** The instruction-efficient shape is
+> 4 activation × 2 weight rows: it fits the 16 YMM registers, costs 0.172 instructions per MAC
+> against a 4×1's 0.203, and on cache-resident B it measured 1.34–1.52×. On streamed B it measured
+> **0.70× and 0.57×** — a 1.75× REGRESSION:
+>
+> | K | N | B | 4×2 at M=4 | 4×1 at M=4 |
+> |--:|--:|--|--:|--:|
+> | 1536 | 8960 | 13 MB resident | 1.41× | 1.25× |
+> | 768 | 8192 | 6 MB resident | 1.46× | 1.35× |
+> | 1536 | 18944 | 29 MB streamed | **0.70×** | 1.40× |
+> | 3584 | 18944 | 68 MB streamed | 1.17× | 1.44× |
+> | 768 | 100000 | 73 MB streamed | **0.57×** | 1.32× |
+>
+> **That is `dotI8Cols8`'s failure, reproduced exactly** — a kernel that wins on cache-resident B
+> and loses on streamed B because it interleaves weight streams where the span it replaces walks
+> one. It is the third appearance of this trap in this one file's history, and the only reason it
+> was caught is that the grid straddles the LLC; measured on the prefill cell alone it would have
+> read as a clean 1.41× and shipped. **Note also that arm64's 4×4 tile advances FOUR weight
+> streams and shows no such effect** — so "fewer streams" is not the rule; the M1's memory system
+> tolerates what the 3700X's does not, and the rule is only ever "measure both regimes".
+>
+> The shipped kernel is therefore `dotI8Tile4x1AVX2`: four activation rows against ONE weight row,
+> B walked exactly as before, **1.17–1.44× at every shape and every M with no regression
+> anywhere.** This is the redo `w8a8Span`'s own comment asked for — "a form that does not trade
+> the access pattern for it".
+>
+> **The ceiling was predicted correctly and it is low.** Written before the first run: VPMADDWD
+> stays at one per 16 MACs however the loop is blocked, and it issues on a SINGLE Zen 2 port, so
+> ~67 GMAC/s at 4.2 GHz binds; `dotI8AVX2` already sits at 48.3–51.3, i.e. 72–76% of it, capping
+> any tile near 1.35×. Measured peak is 1.44×, a little above — the tile also removes three of
+> every four Go↔asm transitions, which the instruction count does not see. **So S-01b's "2–4×" is
+> an arm64 number and does not transfer:** SDOT does 16 MACs on four pipes, VPMADDWD does 16 MACs
+> on one.
+>
+> All gates green on the 3700X: `go vet`, `linalg`, `-tags aikit_checks`, `go test -race ./linalg/`,
+> and the whole repo's build/vet/test. Both tiles canary-verified there too — perturbing each by
+> one ULP fails `TestMatmulBTW4A8_MConsistent` / `TestMatmulBTW8A8_MConsistent` at every shape,
+> including the N-tail and ragged-K ones, so both remainder strips are genuinely exercised.
+>
+> **Still open in S-01:** nothing on either arch. Not yet measured: goinfer's end-to-end prefill
+> cell, the number that decides whether the int4/int8int8 inversion is actually gone — that needs
+> their repo and `scripts/bench_peer_prefill.py`. A VNNI-host tile for both kernels remains
+> S-08.3's file-do-not-build case.
 
 - **Where:** `quant.go:585-597` (`w4a8Span`), `quant.go:280-330` (`w8a8Span`);
   `weightmat_splithalf_amd64.go:67-73` and `weightmat_row4_arm64.go:48-54` route every M≠1 call

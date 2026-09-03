@@ -72,6 +72,35 @@ assumption. It asserts the ceiling and never a floor — a reading above four pi
 was folded or the clock constant is wrong, which is the failure that has produced bogus bandwidth
 numbers before, while a low reading on a busy box is not a defect and must not fail CI.
 
+**Both tiles now have amd64 halves, measured on an idle Ryzen 7 3700X.** `dotW4A8Tile4RowAVX2`
+gives the W4A8 prefill path **1.65–1.90×** (15.6 → 27.6 GMAC/s at K=1536 N=8960) and
+`dotI8Tile4x1AVX2` gives W8A8 **1.17–1.44×**, both at every shape and batch size tested and with
+no regression anywhere. Neither is arm64's shape: AVX2 has 16 YMM registers against NEON's 32, so
+sixteen live accumulators plus their operands does not fit and the amd64 tiles block only the
+activation dimension.
+
+The W4A8 tile is excluded on AVX-512 VNNI hosts, and that exclusion is about correctness rather
+than speed: `dotW4A8` prefers the VNNI kernel, which folds through two f32 accumulators where the
+AVX2 kernel uses one. An AVX2-based tile running at M>1 while M=1 kept the VNNI kernel would make
+the result depend on M. Neither project box has VNNI, so this is ruled out by construction.
+
+**The W8A8 amd64 tile's first shape was measured and thrown away, which is the part worth
+reading.** A 4-activation × 2-weight version costs fewer instructions per MAC (0.172 vs 0.203) and
+measured 1.34–1.52× on cache-resident B — then **0.70× and 0.57× on streamed B**, a 1.75×
+regression. That is precisely the failure that got the eight-column `dotI8Cols8` deleted in
+v1.17.0: a kernel that interleaves weight streams where the span it replaces walks one. Measured
+on the prefill cell alone it would have read as a clean 1.41× and shipped. The grid straddling the
+LLC is what caught it. The shipped shape is 4 activation rows × one weight row, which leaves B's
+access pattern exactly as it was — the redo `w8a8Span`'s own comment had asked for.
+
+Worth recording alongside it: arm64's tile advances *four* weight streams and shows no such
+effect. "Fewer streams" is not the rule. Measuring both cache regimes is.
+
+The amd64 ceiling is low and was predicted before the first run: VPMADDWD stays at one per 16 MACs
+however the loop is blocked and issues on a single Zen 2 port, so ~67 GMAC/s binds and `dotI8AVX2`
+already sat at 72–76% of it. arm64's 3.5–3.9× does not transfer — SDOT does 16 MACs on four pipes,
+VPMADDWD does 16 on one.
+
 **New M-invariance gates for the quantized kernels**, landed before the tile rather than with
 it: `TestMatmulBTW4A8_MConsistent`, `TestMatmulBTW8A8_MConsistent` and
 `TestWeightMatW4A8_MConsistentAcrossRow4Dispatch` pin that an output row computed inside an

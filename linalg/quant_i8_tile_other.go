@@ -1,4 +1,4 @@
-//go:build !arm64
+//go:build !arm64 && !amd64
 
 package linalg
 
@@ -7,9 +7,8 @@ package linalg
 // took no rows and no columns", so w8a8Span's first fallback call covers the
 // whole span and the second is empty — the pre-tile code path exactly.
 //
-// amd64's equivalent would be an M-tile over dotI8AVX2's four accumulators; it is
-// listed as open in S-01b and needs the other box to measure, so it is not
-// guessed at here.
+// arm64 has dotI8Tile4x4 and amd64 has dotI8Tile4x2AVX2; this file covers every
+// other target, where the span keeps its original per-(row, column) shape.
 func w8a8TileRect(aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, M, K, N, j0, j1 int) (mTiled, jTiled int) {
 	return 0, j0
 }

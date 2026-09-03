@@ -603,10 +603,27 @@ func MatmulBTW4A8Into(ws *Workspace, a []float32, w4 []byte, wScales []float32, 
 // w4a8Span computes output columns [j0,j1) for every row: dst[i,j] =
 // (Σ_g scale[g]·(aq_i·w4_j)_g) · aScale_i, with a zero-activation-row shortcut.
 func w4a8Span(aq []int8, aScales []float32, w4 []byte, wScales, dst []float32, M, K, N, group, nGroups, bpr, j0, j1 int) {
+	// S-01's amd64 half (docs/task-simd-audit.md): at M>=4 a tile takes the first
+	// 4-row blocks of activations over this whole column span, sharing each weight
+	// row's nibble unpack across four rows instead of repeating it per row. Where
+	// no tile applies — every non-amd64 target, M<4, a non-AVX2 core — w4a8TileRows
+	// returns 0 and the call below is the whole span, byte-for-byte the code that
+	// shipped before.
+	mTiled := w4a8TileRows(aq, aScales, w4, wScales, dst, M, K, N, group, nGroups, bpr, j0, j1)
+	if mTiled < M {
+		w4a8SpanRows(aq, aScales, w4, wScales, dst, K, N, group, nGroups, bpr, mTiled, M, j0, j1)
+	}
+}
+
+// w4a8SpanRows is w4a8Span's kernel over an explicit row range as well as a
+// column range. Column-outer and row-inner, walking each weight row once per
+// column — a factoring of the original loop, not a rewrite, so the tile's leftover
+// activation rows run exactly the code the whole span used to run.
+func w4a8SpanRows(aq []int8, aScales []float32, w4 []byte, wScales, dst []float32, K, N, group, nGroups, bpr, i0, i1, j0, j1 int) {
 	for j := j0; j < j1; j++ {
 		prow := w4[j*bpr : j*bpr+bpr]
 		srow := wScales[j*nGroups : j*nGroups+nGroups]
-		for i := range M {
+		for i := i0; i < i1; i++ {
 			if aScales[i] == 0 {
 				dst[i*N+j] = 0
 				continue
