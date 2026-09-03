@@ -31,9 +31,40 @@
 
 **Boxes.** `apple-m1pro`: 6 P + 2 E cores, FEAT_DotProd (SDOT), **no FEAT_I8MM** (SMMLA is
 M2+); STREAM triad 71.9 GB/s one thread, 121 at six. `nvidia-rtx2070s` host: Ryzen 7 3700X (Zen
-2: AVX2+FMA, no VNNI, no AVX-512; 4.2 GHz implied by the FMA probe); **no STREAM-class
-bandwidth number exists for it in either repo** — the only anchors are Ollama's 27.6 GB/s of
-weights (P14) and a "~40 GB/s" estimate in `gpu-assessment.md`.
+2: AVX2+FMA, no VNNI, no AVX-512; 4.2 GHz implied by the FMA probe).
+
+> **S-08.1 MEASURED 2026-09-03 — the 3700X's bandwidth gap is closed, and the standing estimate
+> was 30% high.** Idle box (load 0.07), 480 MB arrays past the 32 MB L3, pthread, best-of-5:
+>
+> | probe | 1 thread | 2 | 4 | 8 | 16 |
+> |---|--:|--:|--:|--:|--:|
+> | **pure read** (weights are read-only — the decode-relevant one) | 22.6 | **30.5** | 30.0 | 28.9 | 27.5 |
+> | **STREAM triad** (2R+1W, reported as 24 B/iter) | 19.4 | 21.2 | 20.6 | 19.8 | 19.3 |
+>
+> GB/s. Ceiling for reference: DDR4-3200 dual channel = 2 × 8 B × 3200 MT/s = **51.2 GB/s**, so
+> reads reach ~60% of theoretical — unremarkable for Zen 2. DIMM speed is UNCONFIRMED (no sudo
+> for `dmidecode`), so 51.2 is the assumed config, not a verified one.
+>
+> **Read, not triad, is the right anchor for a decode roofline.** Triad also writes, and unless
+> the store is non-temporal the line is fetched for ownership first, so triad moves ~32 B of DRAM
+> traffic per 24 B it reports — understating a read-only ceiling by ~1.33×. That reconciles the
+> two: 21.2 triad ≈ 28 GB/s of actual traffic ≈ the 30.5 read figure.
+>
+> **This settles the two anchors this paragraph used to lean on.** Ollama's 27.6 GB/s of weights
+> (P14) is **~90% of the measured read ceiling** — not anomalous, close to optimal. The
+> "~40 GB/s" estimate in `gpu-assessment.md` is **too high by ~30%** and should be corrected to
+> ~30 GB/s.
+>
+> **It also sharpens §1's amd64 verdict rather than contradicting it.** "2–4 cores already exceed
+> any plausible DRAM figure" is right, and tighter than stated: read bandwidth SATURATES AT TWO
+> THREADS and then declines slightly. More decode workers cannot buy memory bandwidth on this
+> box.
+>
+> A first attempt at the read probe reported 135 GB/s single-thread and 616 at 16 — the compiler
+> had folded the reduction over a constant-filled array. It was caught by comparing against the
+> 51.2 GB/s ceiling, the same discipline that caught `gpu`'s 8145 GB/s DtoD reading, and fixed
+> with a data-dependent fill plus a volatile sink. A bandwidth probe without a ceiling assert is
+> not a probe.
 
 **Reference model** throughout: Qwen2.5-Coder-1.5B (hidden 1536, inter 8960, 28 layers, 12 q
 heads / 2 kv heads, hd 128, vocab 151936); ~1.05 GB of int4 weights + scales per decode token.
@@ -244,6 +275,11 @@ prefill == speculative verify` guarantees rest on.
 >
 > `BenchmarkMatmulAVAcc64` was added at the same time: this kernel had no local bench, which is
 > why the figures below had to be quoted from goinfer's records at all.
+>
+> **Confirmed on amd64 too (idle 3700X, three interleaved passes):** depth130 10,489 → 7,710 ns
+> (**1.36×**), depth2048 166,349 → 123,275 (**1.35×**), depth8192 715,851 → 491,217 (**1.46×**).
+> The win transfers — it is pure Go — but is roughly 0.6× of arm64's, so the register pressure it
+> relieves matters more on NEON. Both arches clear the ≥1.3× ship gate.
 >
 > **Still open in S-04:** the NEON AV port (~3× bound), the NEON QK port (~1.7–2.1×), and the
 > GQA-group V-widen sharing. The block size 16 is a guess the audit named, not a measured
