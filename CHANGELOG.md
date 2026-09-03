@@ -9,6 +9,8 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+## [1.32.0] — 2026-09-03
+
 ### Added
 
 **A register-blocked W4A8 tile for arm64, and int4 prefill gets 2.88× on the kernel.**
@@ -124,6 +126,54 @@ had been the only M-invariance gate in the package and it covers f32 `MatmulBT` 
 is the one that matters most: `WeightMat.MatmulBTW4A8Into` sends M=1 to one kernel and M>1 to
 another, which is exactly the pair speculative verify exercises when a draft proposes at M=1 and
 a target verifies at M=K.
+
+
+### Release gates
+
+`vulncheck`, run on `nobara` (linux) at `0f55bae` — the prep commit above it changes only
+`CHANGELOG.md`:
+
+```
+STATEMENT: no reachable vulnerabilities in 15/15 modules at 0f55bae (2026-09-03T04:49:50Z)
+```
+
+`perfgate`, `nobara` (Ryzen 7 3700X, linux/amd64), working tree vs v1.31.0 interleaved. **Run
+twice, both recorded, because the first run FAILED — and unlike v1.31.0's failure, this one was
+REAL:**
+
+```
+run 1 (faf4b80)  VERDICT: FAIL — 3 regression(s) vs v1.31.0 across 10 shapes
+                 W8A8SpanShapes/K1536_N8960       Δ=+15.53%  floor=±12.83%  REGRESSION
+                 W8A8SpanShapes/K768_N8192        Δ=+8.00%   floor=±5.43%   REGRESSION
+                 GEMV_W8A8_baseline/K4096_N4096   Δ=+11.18%  floor=±11.08%  REGRESSION
+                 sensitivity: 4/10 shapes have a floor ≤ 5.0%
+
+run 2 (0f55bae)  VERDICT: PASS — no regression vs v1.31.0 above each shape's floor
+                 W8A8SpanShapes/K1536_N8960       Δ=-0.36%   floor=±4.75%   flat
+                 W8A8SpanShapes/K768_N8192        Δ=+1.50%   floor=±2.00%   flat
+                 GEMV_W8A8_baseline/K4096_N4096   Δ=+3.84%   floor=±8.75%   flat (BLIND)
+                 sensitivity: 7/10 shapes have a floor ≤ 5.0% (the class this gate targets)
+                 BLIND on 3 shape(s): K4096_N4096(±8.7%) K2048_N2048(±16.8%) K3584_N4096(±14.9%)
+```
+
+**The two runs are separated by a commit that fixes a real defect, which is the whole difference
+from v1.31.0's double run.** There, a flagged shape reversed sign by 12 points on identical code
+and its floor moved 4×, and the correct reading was shape instability. Here the flagged shapes did
+not reverse on identical code — they were fixed. On the path where the S-01b tile DECLINES (M<4,
+i.e. every decode call) `w8a8Span` was still making its leftover-column call with a zero-height row
+range, and because that loop iterates columns on the outside, an empty row range still walked all N
+columns constructing slices for zero rows. Every correctness test passed the whole time, because
+the results were right, and the A/B harnesses for the tile could not see it because they measure
+M≥4 where the tile engages.
+
+The tell that this was a fix rather than a re-roll is that `K1536_N8960` did not merely go green —
+it went from +15.53% at a ±12.83% floor to **−0.36% at a ±4.75% floor**, moving from BLIND into the
+5% class it now resolves. A shape whose floor tightens 2.7× while its delta collapses to zero is
+not drifting.
+
+`TestSpanRows_emptyRowRangeVisitsNoColumns` gates it with no timing assertion: it hands the span a
+weight slice deliberately too short for the column range, so a function that walks columns panics
+and one that returns early cannot. Verified to fail on both spans with the guard removed.
 
 
 ## [1.31.0] — 2026-08-31
@@ -2692,6 +2742,7 @@ broad slice of the open-weights ecosystem.
   [README.md](README.md) for stability tiers.
 
 [Unreleased]: https://github.com/townsendmerino/aikit/compare/v1.31.0...HEAD
+[1.32.0]: https://github.com/townsendmerino/aikit/compare/v1.31.0...v1.32.0
 [1.31.0]: https://github.com/townsendmerino/aikit/compare/v1.30.0...v1.31.0
 [1.30.0]: https://github.com/townsendmerino/aikit/compare/v1.29.0...v1.30.0
 [1.29.0]: https://github.com/townsendmerino/aikit/compare/v1.28.0...v1.29.0
