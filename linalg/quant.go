@@ -325,7 +325,7 @@ func w8a8Span(aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, M
 	if mTiled < M {
 		w8a8SpanRows(aq, aScales, bQ, bScales, dst, K, N, mTiled, M, j0, j1)
 	}
-	if jTiled < j1 {
+	if mTiled > 0 && jTiled < j1 {
 		w8a8SpanRows(aq, aScales, bQ, bScales, dst, K, N, 0, mTiled, jTiled, j1)
 	}
 }
@@ -336,6 +336,14 @@ func w8a8Span(aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, M
 // argues for, and are unchanged — this is a factoring, not a rewrite, so that the
 // tile's leftover strips run exactly the code the whole span used to run.
 func w8a8SpanRows(aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, K, N, i0, i1, j0, j1 int) {
+	// An empty ROW range still costs a full walk of the column range without this
+	// — the outer loop's slice construction and scale load are not free, and on
+	// the tile-declines path (M<4, i.e. every decode call) that walk is pure
+	// waste. perfgate caught exactly this as an 8-15.5% regression on the M=1
+	// shapes; the correctness tests could not, because the result is right.
+	if i0 >= i1 {
+		return
+	}
 	for j := j0; j < j1; j++ {
 		bj := bQ[j*K : j*K+K]
 		bScale := bScales[j]
@@ -620,6 +628,11 @@ func w4a8Span(aq []int8, aScales []float32, w4 []byte, wScales, dst []float32, M
 // column — a factoring of the original loop, not a rewrite, so the tile's leftover
 // activation rows run exactly the code the whole span used to run.
 func w4a8SpanRows(aq []int8, aScales []float32, w4 []byte, wScales, dst []float32, K, N, group, nGroups, bpr, i0, i1, j0, j1 int) {
+	// Same empty-row-range guard as w8a8SpanRows. This path has no caller that
+	// can hit it today, which is precisely why it is worth pinning now.
+	if i0 >= i1 {
+		return
+	}
 	for j := j0; j < j1; j++ {
 		prow := w4[j*bpr : j*bpr+bpr]
 		srow := wScales[j*nGroups : j*nGroups+nGroups]
