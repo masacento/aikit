@@ -220,6 +220,35 @@ prefill == speculative verify` guarantees rest on.
 
 ### S-04 · Perf-major at long context — NEON f64 lane-per-output ports of the acc64 attention kernels, bit-identical
 
+> **STEP 1 DONE 2026-09-03 — the pure-Go AV intermediate, and it beat its own prediction.**
+> `MatmulAVAcc64` now blocks its output dims into 16 NAMED f64 accumulators with keys inner,
+> so the accumulator lives in registers instead of the `acc` slice. No assembly.
+>
+> **Measured on `apple-m1pro`, three interleaved A/B passes (load ~4, hd=128, M=1):**
+>
+> | depth | old (memory acc) | new (16 registers) | |
+> |--:|--:|--:|--:|
+> | 130 | 9,210 ns | 3,848 ns | **2.39×** |
+> | 2048 | 139,952 ns | 59,567 ns | **2.35×** |
+> | 8192 | 569,935 ns | 241,997 ns | **2.35×** |
+>
+> Against this section's ~2× estimate for the Go intermediate and its ≥1.3× ship gate. The
+> measured OLD figures reproduce the baselines quoted below to within 3% (9,210 vs 8,929;
+> 569,935 vs 565,038), so this is a same-box A/B rather than a comparison against another
+> machine's records — the failure mode the campaign rules exist to prevent.
+>
+> **Identity is checked, not argued:** `TestMatmulAVAcc64_exactMatchesStrided` compares against
+> the independent strided kernel and passes. The mechanism is confirmed deterministically too —
+> `go build -gcflags=-S` shows `FMADDD` 1 → 17 and `FCVTSD` 2 → 19 with accumulator spill stores
+> **unchanged at 2**, i.e. sixteen accumulators resident in registers, none spilling.
+>
+> `BenchmarkMatmulAVAcc64` was added at the same time: this kernel had no local bench, which is
+> why the figures below had to be quoted from goinfer's records at all.
+>
+> **Still open in S-04:** the NEON AV port (~3× bound), the NEON QK port (~1.7–2.1×), and the
+> GQA-group V-widen sharing. The block size 16 is a guess the audit named, not a measured
+> optimum — hd/16 = 8 passes over V, where the assembly form's 24 registers would give 3.
+
 - **Where:** `matmul_qk_acc64.go:21-67` (8 keys as 8 named f64 accumulators; per d-step the
   arm64 compiler emits per key `LDR s` + `FCVTSD` + `FMADDD`), `matmul_av_acc64.go:33-52`
   (`acc[d] += w * float64(vrow[d])` with `acc` in memory: two loads, a convert, an FMADD, a
