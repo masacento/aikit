@@ -18,6 +18,28 @@ import (
 // to a single relevance logit. Reuses the §2.2 BERT trunk + WordPiece tokenizer; the
 // only new weights are the pooler and the classifier.
 
+// Reranker is the surface a cross-encoder reranker presents: score a (query,
+// document) pair jointly, higher meaning more relevant, and rank a candidate list
+// by descending score. Two families implement it — *CrossEncoder (BERT) and
+// *ModernBERTCrossEncoder — which is why it exists at all; the trunks and the
+// classification heads have nothing in common, so callers that want to swap one for
+// the other need a name for what they do share.
+type Reranker interface {
+	// Score is the relevance logit for one pair. For a multi-label model this is
+	// label 0; the concrete types expose ScoreAll for the rest.
+	Score(query, doc string) (float32, error)
+	// ScoreBatch scores one query against many documents, returning label 0's
+	// logit per document IN THE CALLER'S ORDER. concurrency <= 0 means NumCPU.
+	ScoreBatch(query string, docs []string, concurrency int) ([]float32, error)
+	// Close releases the model's mmap-backed weights. Idempotent.
+	Close() error
+}
+
+var (
+	_ Reranker = (*CrossEncoder)(nil)
+	_ Reranker = (*ModernBERTCrossEncoder)(nil)
+)
+
 // CrossEncoder is a loaded BERT cross-encoder reranker.
 type CrossEncoder struct {
 	bert        *BERT

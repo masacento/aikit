@@ -52,6 +52,11 @@ type Tokenizer struct {
 	// non-nil, the public methods dispatch to it. See tokenize_bpe.go.
 	bpe *bpeBackend
 
+	// spbpe is set for SentencePiece-style BPE tokenizers (Metaspace + byte-fallback;
+	// ModernBERT / bekko family); when non-nil, the public methods dispatch to it.
+	// See tokenize_sp_bpe.go.
+	spbpe *spBPEBackend
+
 	// wp memoizes wordPiece(word) → ids (the WordPiece path only; nil for uni/bpe).
 	// Immutable vocab ⇒ pure function ⇒ safe to cache; ~98% of calls repeat.
 	wp *wpCache
@@ -146,6 +151,16 @@ func parseTokenizer(data []byte) (*Tokenizer, error) {
 			return nil, err
 		}
 		return &Tokenizer{uni: uni, unkID: uni.unkID}, nil
+	}
+	// SentencePiece-style BPE (Metaspace + byte-fallback, e.g. ModernBERT / bekko):
+	// model.type is "BPE" but the Metaspace pre-tokenizer distinguishes it from the
+	// GPT-2 byte-level path below, which would otherwise mis-parse it.
+	if probe.Model.Type == "BPE" && isMetaspaceBPETokenizer(data) {
+		spbpe, err := parseSPBPETokenizer(data)
+		if err != nil {
+			return nil, err
+		}
+		return &Tokenizer{spbpe: spbpe, unkID: spbpe.unkID}, nil
 	}
 	// Byte-level BPE (GPT-2 / RoBERTa family, e.g. granite-embedding-english).
 	if isBPETokenizer(probe.Model.Type) {
@@ -259,6 +274,9 @@ func (t *Tokenizer) Encode(text string) []int32 {
 	}
 	if t.bpe != nil {
 		return t.bpe.encode(text)
+	}
+	if t.spbpe != nil {
+		return t.spbpe.encode(text)
 	}
 	if len(t.addedKeys) == 0 {
 		return t.encodeSegment(text)
@@ -391,6 +409,9 @@ func (t *Tokenizer) VocabSize() int {
 	if t.bpe != nil {
 		return t.bpe.vocabSize
 	}
+	if t.spbpe != nil {
+		return t.spbpe.vocabSize
+	}
 	return len(t.vocab)
 }
 
@@ -410,8 +431,40 @@ func (t *Tokenizer) SpecialID(literal string) (int32, bool) {
 		id, ok := t.bpe.addedTokens[literal]
 		return id, ok
 	}
+	if t.spbpe != nil {
+		id, ok := t.spbpe.addedTokens[literal]
+		return id, ok
+	}
 	id, ok := t.addedTokens[literal]
 	return id, ok
+}
+
+// TemplateSpecials reports the ids this tokenizer wraps a sequence with — what
+// EncodeWithSpecials prepends and appends, typically [CLS] … [SEP] or <s> … </s>.
+// Either may be empty (potion has no specials at all).
+//
+// It exists for heads that build their own sequence and so cannot call
+// EncodeWithSpecials: GLiNER interleaves label markers with the words, so it needs
+// the wrapping ids without the wrapping. SpecialID is not a substitute — these ids
+// come from the model's bos/eos or its post-processor template, and for a
+// SentencePiece model [CLS] is a CONTROL piece, deliberately absent from the
+// added-token table that SpecialID searches (the literal text "[CLS]" must not
+// tokenize to id 1).
+func (t *Tokenizer) TemplateSpecials() (prefix, suffix []int32) {
+	switch {
+	case t.uni != nil:
+		return t.uni.prefixIDs, t.uni.suffixIDs
+	case t.bpe != nil:
+		return t.bpe.prefixIDs, t.bpe.suffixIDs
+	case t.spbpe != nil:
+		return t.spbpe.prefixIDs, t.spbpe.suffixIDs
+	}
+	if cls, ok := t.addedTokens["[CLS]"]; ok {
+		if sep, ok := t.addedTokens["[SEP]"]; ok {
+			return []int32{cls}, []int32{sep}
+		}
+	}
+	return nil, nil
 }
 
 // EncodeWithSpecials runs Encode and wraps the result as
@@ -436,6 +489,9 @@ func (t *Tokenizer) EncodeWithSpecials(text string, maxLen int) ([]int32, error)
 	}
 	if t.bpe != nil {
 		return t.bpe.encodeWithSpecials(text, maxLen), nil
+	}
+	if t.spbpe != nil {
+		return t.spbpe.encodeWithSpecials(text, maxLen), nil
 	}
 	cls, ok := t.addedTokens["[CLS]"]
 	if !ok {

@@ -183,6 +183,27 @@ func TestSafetensorsFile_typedAccessors(t *testing.T) {
 	}
 }
 
+// TestTensorF32_I8ScalarBadScaleReturnsError covers the malformed companion-scale
+// path. A scalar I8 tensor has no Shape[0], so reporting the invalid two-element
+// scale must return an error rather than panic while formatting that error.
+func TestTensorF32_I8ScalarBadScaleReturnsError(t *testing.T) {
+	blob := buildSafetensors(map[string]stEntry{
+		"w":       {"I8", []int{}, []byte{1}},
+		"w.scale": {"F32", []int{2}, f32raw(1, 2)},
+	})
+	sf, err := OpenSafetensorsFromFS(fstest.MapFS{
+		"m.safetensors": &fstest.MapFile{Data: blob},
+	}, "m.safetensors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sf.Close()
+
+	if _, err := sf.TensorF32("w"); err == nil {
+		t.Fatal("TensorF32 accepted a scalar I8 tensor with a two-element scale")
+	}
+}
+
 // TestParseSafetensors_shapeDtypeCrossValidation (H2): the header's declared
 // shape × dtype must match the byte range, so a hostile file can't pair a giant
 // shape with a tiny byte range (which parsed before, then panicked at inference

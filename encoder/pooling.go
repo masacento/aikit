@@ -60,9 +60,25 @@ func poolingFromBytes(raw []byte, fallback pooling) (pooling, error) {
 		Mean     bool `json:"pooling_mode_mean_tokens"`
 		Max      bool `json:"pooling_mode_max_tokens"`
 		MeanSqrt bool `json:"pooling_mode_mean_sqrt_len_tokens"`
+		// Mode is sentence-transformers 5.x's spelling: one string replacing the
+		// four booleans above. It is checked FIRST because a 5.x file sets no
+		// boolean at all, so reading only those falls through to the caller's
+		// family default — which is a silent mispool, the exact failure this
+		// function's hard errors exist to prevent.
+		Mode string `json:"pooling_mode"`
 	}
 	if err := json.Unmarshal(raw, &pc); err != nil {
 		return "", fmt.Errorf("encoder: parse 1_Pooling/config.json: %w", err)
+	}
+	switch pc.Mode {
+	case "":
+		// 4.x file (or none): fall through to the boolean flags below.
+	case "cls":
+		return poolCLS, nil
+	case "mean":
+		return poolMean, nil
+	default:
+		return "", fmt.Errorf("encoder: unsupported pooling_mode %q in 1_Pooling/config.json", pc.Mode)
 	}
 	switch {
 	case pc.Max || pc.MeanSqrt:

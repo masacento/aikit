@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"slices"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -41,6 +43,13 @@ func newPrecompiled(b64 string) (*precompiled, error) {
 	if err != nil {
 		return nil, fmt.Errorf("precompiled_charsmap: base64: %w", err)
 	}
+	return newPrecompiledBytes(raw)
+}
+
+// newPrecompiledBytes is newPrecompiled over an already-decoded blob. A raw
+// spm.model stores the same payload verbatim in NormalizerSpec.precompiled_charsmap
+// with no base64 layer (see tokenize_spm.go), so both entry points share the parse.
+func newPrecompiledBytes(raw []byte) (*precompiled, error) {
 	if len(raw) < 4 {
 		return nil, fmt.Errorf("precompiled_charsmap: too short (%d bytes)", len(raw))
 	}
@@ -203,6 +212,12 @@ type unigram struct {
 	minScore float64
 	maxBytes int // longest vocab piece in bytes — bounds the DP inner scan
 	fuseUnk  bool
+	// byteFallback decomposes a character absent from the vocab into its UTF-8
+	// bytes as "<0xNN>" tokens (cl-nagoya/ruri-v3-*) instead of a single <unk>.
+	// byteIDs maps a raw byte to its "<0xNN>" token id (only valid when
+	// byteFallback is true).
+	byteFallback bool
+	byteIDs      [256]int32
 }
 
 // viterbiIDs segments sentence (already normalized + metaspace-prefixed) into the
@@ -251,13 +266,37 @@ func (u *unigram) viterbiIDs(sentence string) []int32 {
 				}
 			}
 			if !hasSingle {
-				tn := &best[startAt+mblen]
-				cand := unkScore + till
-				if !tn.reached || cand > tn.score {
-					tn.reached = true
-					tn.score = cand
-					tn.startAt = startAt
-					tn.id = u.unkID
+				if u.byteFallback {
+					// The character has no vocab piece of its own: decompose its UTF-8
+					// bytes [startAt, startAt+mblen) into a chain of "<0xNN>" byte-token
+					// nodes, each scored by its vocab log-prob (SentencePiece's
+					// byte_fallback). Continuation-byte positions can't begin a vocab
+					// piece (pieces are valid UTF-8), so they're only ever reached through
+					// this chain — the outer loop steps by rune and never expands them,
+					// which is exactly right.
+					var cum float64
+					prev := startAt
+					for bi := startAt; bi < startAt+mblen; bi++ {
+						id := u.byteIDs[sentence[bi]]
+						cum += u.scores[id]
+						tn := &best[bi+1]
+						if cand := cum + till; !tn.reached || cand > tn.score {
+							tn.reached = true
+							tn.score = cand
+							tn.startAt = prev
+							tn.id = id
+						}
+						prev = bi + 1
+					}
+				} else {
+					tn := &best[startAt+mblen]
+					cand := unkScore + till
+					if !tn.reached || cand > tn.score {
+						tn.reached = true
+						tn.score = cand
+						tn.startAt = startAt
+						tn.id = u.unkID
+					}
 				}
 			}
 		}
@@ -275,11 +314,11 @@ func (u *unigram) viterbiIDs(sentence string) []int32 {
 		endsAt = n.startAt
 	}
 	ids := make([]int32, 0, len(rev))
-	for _, r := range slices.Backward(rev) {
-		if u.fuseUnk && r == u.unkID && len(ids) > 0 && ids[len(ids)-1] == u.unkID {
+	for i := len(rev) - 1; i >= 0; i-- {
+		if u.fuseUnk && rev[i] == u.unkID && len(ids) > 0 && ids[len(ids)-1] == u.unkID {
 			continue // fuse consecutive <unk>
 		}
-		ids = append(ids, r)
+		ids = append(ids, rev[i])
 	}
 	return ids
 }
@@ -289,6 +328,35 @@ func (u *unigram) viterbiIDs(sentence string) []int32 {
 // ──────────────────────────────────────────────────────────────────────────────
 
 const metaspace = '▁' // ▁ — SentencePiece's space marker
+
+// metaspaceKind selects which Metaspace pre-tokenizer variant the Unigram backend
+// reproduces. The three differ only in how the normalized text is mapped into
+// ▁-marked chunks before the Viterbi pass; the Unigram model itself is shared.
+type metaspaceKind int
+
+const (
+	// metaspaceKindPrepend: a BARE Metaspace(add_prefix_space=true / prepend_scheme
+	// "always") — replace every ASCII space with ▁ and prepend a leading ▁, then
+	// split so each chunk begins with ▁ (bge-m3). The default.
+	metaspaceKindPrepend metaspaceKind = iota
+	// metaspaceKindWhitespaceSplit: Sequence[WhitespaceSplit, Metaspace(add_prefix_space
+	// =true)] — split on Unicode whitespace (dropping it) and prepend ▁ to each
+	// piece (XLM-R / e5).
+	metaspaceKindWhitespaceSplit
+	// metaspaceKindNever: Metaspace(prepend_scheme="never", split=false) — replace
+	// every ASCII space with ▁, prepend nothing, and return the whole text as ONE
+	// chunk; the Unigram Viterbi does the splitting (cl-nagoya/ruri-v3-*).
+	metaspaceKindNever
+	// metaspaceKindSPM: sentencepiece's OWN normalization tail, used when the
+	// tokenizer was loaded from a raw spm.model rather than a tokenizer.json
+	// (mDeBERTa-v3 / GLiNER). It is neither of the two above: like Never it emits ONE
+	// chunk (so a vocab piece may span what used to be a space — spm encodes the whole
+	// normalized string in a single Viterbi pass), but like Prepend it inserts a
+	// leading ▁ (add_dummy_prefix). It additionally applies remove_extra_whitespaces.
+	// Both flags are read from the model's NormalizerSpec into spmAddDummyPrefix /
+	// spmRemoveExtraWS.
+	metaspaceKindSPM
+)
 
 // metaspaceSplit reproduces the XLM-R / e5 pre_tokenizer Sequence[WhitespaceSplit,
 // Metaspace(add_prefix_space=true)]: split the normalized text on Unicode
@@ -340,6 +408,19 @@ func metaspaceBare(text string) []string {
 	return out
 }
 
+// metaspaceNever reproduces a Metaspace(prepend_scheme="never", split=false)
+// pre-tokenizer (cl-nagoya/ruri-v3-*): replace every ASCII space with ▁, prepend
+// NOTHING (so a leading word keeps no ▁), and return the whole text as a single
+// chunk — the Unigram Viterbi segments it, splitting before each ▁. Only U+0020 is
+// replaced (a tab etc. passes through), matching HF's Metaspace " " pattern. Empty
+// input yields nothing.
+func metaspaceNever(text string) []string {
+	if text == "" {
+		return nil
+	}
+	return []string{strings.ReplaceAll(text, " ", string(metaspace))}
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Unigram tokenizer backend
 // ──────────────────────────────────────────────────────────────────────────────
@@ -349,16 +430,23 @@ func metaspaceBare(text string) []string {
 // added-token carve-out, and the TemplateProcessing specials. It plugs into the
 // public embed.Tokenizer, which dispatches to it when tokenizer.json is Unigram.
 type unigramBackend struct {
-	norm            *precompiled
-	replaces        []replaceRule // Replace normalizers applied after the charsmap (Sequence tail)
-	whitespaceSplit bool          // pre_tokenizer splits on whitespace before Metaspace (XLM-R/e5) vs bare Metaspace (bge-m3)
-	model           *unigram
-	addedTokens     map[string]int32
-	addedKeys       []string // longest-first carve-out scan order
-	unkID           int32
-	vocabSize       int
-	prefixIDs       []int32 // TemplateProcessing single: specials before the sequence (<s>)
-	suffixIDs       []int32 // ... and after (</s>)
+	norm        *precompiled  // nil = identity normalizer (no Precompiled charsmap; cl-nagoya/ruri-v3-*)
+	replaces    []replaceRule // Replace normalizers applied after the charsmap (Sequence tail)
+	nfc         bool          // NFC normalizer step (gliner2's mDeBERTa tokenizer.json)
+	stripRight  bool          // Strip(strip_right=true) normalizer step (gliner2's mDeBERTa tokenizer.json)
+	metaspace   metaspaceKind // Metaspace pre-tokenizer variant (see metaspaceKind)
+	model       *unigram
+	addedTokens map[string]int32
+	addedKeys   []string // longest-first carve-out scan order
+	unkID       int32
+	vocabSize   int
+	prefixIDs   []int32 // TemplateProcessing single: specials before the sequence (<s>)
+	suffixIDs   []int32 // ... and after (</s>)
+
+	// spmAddDummyPrefix / spmRemoveExtraWS drive metaspaceKindSPM; both come from
+	// the spm.model NormalizerSpec and are ignored by the other Metaspace variants.
+	spmAddDummyPrefix bool
+	spmRemoveExtraWS  bool
 }
 
 // replaceRule is a Replace normalizer (regex pattern → literal content), e.g.
@@ -368,22 +456,85 @@ type replaceRule struct {
 	content string
 }
 
-// normalizeText runs the normalizer pipeline: the Precompiled charsmap, then any
-// Replace rules, in Sequence order.
+// normalizeText runs the normalizer pipeline: the Precompiled charsmap (when
+// present), then any Replace rules, in Sequence order. A nil norm is the identity
+// normalizer — tokenizer.json normalizer:null (cl-nagoya/ruri-v3-*), which applies
+// no normalization at all.
 func (u *unigramBackend) normalizeText(text string) string {
-	s := u.norm.normalize(text)
+	s := text
+	if u.norm != nil {
+		s = u.norm.normalize(s)
+	}
 	for _, r := range u.replaces {
 		s = r.re.ReplaceAllString(s, r.content)
+	}
+	if u.nfc {
+		s = norm.NFC.String(s)
+	}
+	if u.stripRight {
+		s = strings.TrimRightFunc(s, unicode.IsSpace)
 	}
 	return s
 }
 
 // preTokenize dispatches to the configured Metaspace variant.
 func (u *unigramBackend) preTokenize(text string) []string {
-	if u.whitespaceSplit {
+	switch u.metaspace {
+	case metaspaceKindWhitespaceSplit:
 		return metaspaceSplit(text)
+	case metaspaceKindNever:
+		return metaspaceNever(text)
+	case metaspaceKindSPM:
+		return u.metaspaceSPM(text)
+	default:
+		return metaspaceBare(text)
 	}
-	return metaspaceBare(text)
+}
+
+// metaspaceSPM reproduces the tail of sentencepiece's Normalizer::Normalize that
+// runs after the charsmap: optionally collapse runs of spaces and trim the ends
+// (remove_extra_whitespaces), optionally insert a leading space (add_dummy_prefix),
+// then escape every space to ▁. The result is returned as a SINGLE chunk because
+// that is what spm does — one Viterbi pass over the whole normalized string.
+//
+// Two things follow, and only the second is observable for mDeBERTa-v3. A single
+// chunk permits a vocab piece to span what used to be a space (this vocab happens
+// to contain no piece with an internal ▁, so that half is inert here). It also
+// means whitespace the charsmap does NOT fold to U+0020 stays in the text instead
+// of being dropped — U+000B and U+0085 are the live cases, and they are why the
+// whitespace-split variant is not a legal substitute (see the break-it-first gate
+// in tokenize_spm_test.go).
+//
+// Empty input (or input that is all whitespace with remove_extra_whitespaces on)
+// yields nothing: spm short-circuits an empty normalized string rather than
+// emitting a bare ▁ from the dummy prefix.
+func (u *unigramBackend) metaspaceSPM(text string) []string {
+	s := text
+	if u.spmRemoveExtraWS {
+		var b strings.Builder
+		b.Grow(len(s))
+		prevSpace := true // leading run is dropped, same as an interior collapse
+		for _, r := range s {
+			if r == ' ' {
+				if prevSpace {
+					continue
+				}
+				prevSpace = true
+				b.WriteRune(' ')
+				continue
+			}
+			prevSpace = false
+			b.WriteRune(r)
+		}
+		s = strings.TrimSuffix(b.String(), " ")
+	}
+	if s == "" {
+		return nil
+	}
+	if u.spmAddDummyPrefix {
+		s = " " + s
+	}
+	return []string{strings.ReplaceAll(s, " ", string(metaspace))}
 }
 
 // encode runs normalize → metaspace pre-tokenize → Unigram over the added-token
@@ -469,9 +620,10 @@ type unigramJSON struct {
 	Normalizer   json.RawMessage `json:"normalizer"`
 	PreTokenizer json.RawMessage `json:"pre_tokenizer"`
 	Model        struct {
-		Type  string            `json:"type"`
-		UnkID *int32            `json:"unk_id"`
-		Vocab []json.RawMessage `json:"vocab"`
+		Type         string            `json:"type"`
+		UnkID        *int32            `json:"unk_id"`
+		ByteFallback bool              `json:"byte_fallback"`
+		Vocab        []json.RawMessage `json:"vocab"`
 	} `json:"model"`
 	PostProcessor struct {
 		Type          string                       `json:"type"`
@@ -494,54 +646,94 @@ func isUnigramTokenizer(model, normalizer string) bool {
 	return model == "Unigram" || (model == "" && normalizer == "Precompiled")
 }
 
-// parseUnigramTokenizer builds a unigramBackend from tokenizer.json bytes.
-func parseUnigramTokenizer(data []byte) (*unigramBackend, error) {
+// decodeUnigramJSON returns the tokenizer.json fields the Unigram backend needs,
+// with the vocab already split into pieces and scores (index = token id).
+//
+// The fast scanner runs first; it handles every tokenizer.json shape seen in the
+// wild and is ~4× the speed of a whole-document unmarshal on a 100k-entry vocab
+// (see tokenize_unigram_scan.go). Anything it does not recognise falls through to
+// the generic decoder below, which stays the source of truth for error messages.
+func decodeUnigramJSON(data []byte) (*unigramJSON, []string, []float64, error) {
+	if raw, pieces, scores, ok := scanUnigramJSON(data); ok {
+		return raw, pieces, scores, nil
+	}
 	var raw unigramJSON
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parse tokenizer.json (unigram): %w", err)
+		return nil, nil, nil, fmt.Errorf("parse tokenizer.json (unigram): %w", err)
+	}
+	// Vocab: [piece, score] pairs; index is the id.
+	pieces := make([]string, len(raw.Model.Vocab))
+	scores := make([]float64, len(raw.Model.Vocab))
+	for i, entry := range raw.Model.Vocab {
+		var pair []json.RawMessage
+		if err := json.Unmarshal(entry, &pair); err != nil || len(pair) != 2 {
+			return nil, nil, nil, fmt.Errorf("unigram: vocab[%d] not a [piece,score] pair", i)
+		}
+		if err := json.Unmarshal(pair[0], &pieces[i]); err != nil {
+			return nil, nil, nil, fmt.Errorf("unigram: vocab[%d] piece: %w", i, err)
+		}
+		if err := json.Unmarshal(pair[1], &scores[i]); err != nil {
+			return nil, nil, nil, fmt.Errorf("unigram: vocab[%d] score: %w", i, err)
+		}
+	}
+	return &raw, pieces, scores, nil
+}
+
+// parseUnigramTokenizer builds a unigramBackend from tokenizer.json bytes.
+func parseUnigramTokenizer(data []byte) (*unigramBackend, error) {
+	raw, pieces, scores, err := decodeUnigramJSON(data)
+	if err != nil {
+		return nil, err
 	}
 	if raw.Model.UnkID == nil {
 		return nil, fmt.Errorf("unigram: model.unk_id missing")
 	}
-	charsmap, replaces, err := buildNormalizer(raw.Normalizer)
+	charsmap, replaces, nfc, stripRight, err := buildNormalizer(raw.Normalizer)
 	if err != nil {
 		return nil, err
 	}
-	norm, err := newPrecompiled(charsmap)
-	if err != nil {
-		return nil, err
+	// A null/absent normalizer (cl-nagoya/ruri-v3-*) is the identity: there is no
+	// Precompiled charsmap, so norm stays nil and normalizeText passes text through
+	// unchanged. NFC / Strip steps (gliner2's mDeBERTa tokenizer.json) may be the
+	// only steps present, which is equally legal.
+	var normPC *precompiled
+	if charsmap != "" {
+		if normPC, err = newPrecompiled(charsmap); err != nil {
+			return nil, err
+		}
 	}
-	whitespaceSplit, err := preTokWhitespaceSplit(raw.PreTokenizer)
+	metaspace, err := parseMetaspaceKind(raw.PreTokenizer)
 	if err != nil {
 		return nil, err
 	}
 
-	// Vocab: [piece, score] pairs; index is the id.
-	n := len(raw.Model.Vocab)
+	n := len(pieces)
 	piece2id := make(map[string]int32, n)
-	scores := make([]float64, n)
 	minScore := 0.0
 	maxBytes := 1
-	for i, entry := range raw.Model.Vocab {
-		var pair []json.RawMessage
-		if err := json.Unmarshal(entry, &pair); err != nil || len(pair) != 2 {
-			return nil, fmt.Errorf("unigram: vocab[%d] not a [piece,score] pair", i)
-		}
-		var piece string
-		var score float64
-		if err := json.Unmarshal(pair[0], &piece); err != nil {
-			return nil, fmt.Errorf("unigram: vocab[%d] piece: %w", i, err)
-		}
-		if err := json.Unmarshal(pair[1], &score); err != nil {
-			return nil, fmt.Errorf("unigram: vocab[%d] score: %w", i, err)
-		}
+	for i, piece := range pieces {
 		piece2id[piece] = int32(i)
-		scores[i] = score
-		if score < minScore {
-			minScore = score
+		if scores[i] < minScore {
+			minScore = scores[i]
 		}
 		if len(piece) > maxBytes {
 			maxBytes = len(piece)
+		}
+	}
+
+	// byte_fallback (cl-nagoya/ruri-v3-*): an unknown character decomposes into its
+	// UTF-8 bytes as "<0xNN>" (uppercase hex) tokens. Map each raw byte to its token
+	// id up front; the Viterbi fallback path indexes this directly. All 256 byte
+	// tokens must be present when the flag is on.
+	var byteIDs [256]int32
+	if raw.Model.ByteFallback {
+		for b := range 256 {
+			piece := fmt.Sprintf("<0x%02X>", b)
+			id, ok := piece2id[piece]
+			if !ok {
+				return nil, fmt.Errorf("unigram: byte_fallback set but vocab lacks %q", piece)
+			}
+			byteIDs[b] = id
 		}
 	}
 
@@ -549,21 +741,34 @@ func parseUnigramTokenizer(data []byte) (*unigramBackend, error) {
 	for _, at := range raw.AddedTokens {
 		added[at.Content] = at.ID
 	}
-	addedKeys := sortedAddedKeys(added)
+	addedKeys := make([]string, 0, len(added))
+	for k := range added {
+		addedKeys = append(addedKeys, k)
+	}
+	sort.Slice(addedKeys, func(i, j int) bool {
+		if len(addedKeys[i]) != len(addedKeys[j]) {
+			return len(addedKeys[i]) > len(addedKeys[j])
+		}
+		return addedKeys[i] < addedKeys[j]
+	})
 
 	prefixIDs, suffixIDs := templateSpecials(raw.PostProcessor.Single, raw.PostProcessor.SpecialTokens)
 
 	return &unigramBackend{
-		norm:            norm,
-		replaces:        replaces,
-		whitespaceSplit: whitespaceSplit,
+		norm:       normPC,
+		replaces:   replaces,
+		nfc:        nfc,
+		stripRight: stripRight,
+		metaspace:  metaspace,
 		model: &unigram{
-			piece2id: piece2id,
-			scores:   scores,
-			unkID:    *raw.Model.UnkID,
-			minScore: minScore,
-			maxBytes: maxBytes,
-			fuseUnk:  true,
+			piece2id:     piece2id,
+			scores:       scores,
+			unkID:        *raw.Model.UnkID,
+			minScore:     minScore,
+			maxBytes:     maxBytes,
+			fuseUnk:      true,
+			byteFallback: raw.Model.ByteFallback,
+			byteIDs:      byteIDs,
 		},
 		addedTokens: added,
 		addedKeys:   addedKeys,
@@ -574,13 +779,18 @@ func parseUnigramTokenizer(data []byte) (*unigramBackend, error) {
 	}, nil
 }
 
-// buildNormalizer walks a tokenizer.json normalizer (a bare Precompiled, or a
-// Sequence of them) and returns the single charsmap plus any Replace rules to run
-// after it. It supports exactly the SentencePiece normalizers the multilingual
-// embedders use — Precompiled and Replace (regex → literal) — and errors on any
-// other type so an unsupported normalizer fails loudly (→ best-effort nil in the
-// loader) rather than silently mis-normalizing.
-func buildNormalizer(raw json.RawMessage) (charsmap string, replaces []replaceRule, err error) {
+// buildNormalizer walks a tokenizer.json normalizer — a bare Precompiled, or a
+// Sequence of the SentencePiece-style steps the multilingual embedders use:
+// Precompiled, Replace (regex → literal), NFC, and Strip (right/whitespace only,
+// as configured by gliner2's mDeBERTa tokenizer.json). It errors on any other type
+// so an unsupported normalizer fails loudly (→ best-effort nil in the loader)
+// rather than silently mis-normalizing. A null/absent normalizer
+// (cl-nagoya/ruri-v3-*) is the identity: it returns an empty charsmap (→ nil
+// precompiled) and no rules.
+func buildNormalizer(raw json.RawMessage) (charsmap string, replaces []replaceRule, nfc, stripRight bool, err error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil, false, false, nil
+	}
 	var n struct {
 		Type                string            `json:"type"`
 		PrecompiledCharsmap string            `json:"precompiled_charsmap"`
@@ -589,14 +799,16 @@ func buildNormalizer(raw json.RawMessage) (charsmap string, replaces []replaceRu
 			Regex  string `json:"Regex"`
 			String string `json:"String"`
 		} `json:"pattern"`
-		Content string `json:"content"`
+		Content    string `json:"content"`
+		StripLeft  bool   `json:"strip_left"`
+		StripRight bool   `json:"strip_right"`
 	}
 	if err = json.Unmarshal(raw, &n); err != nil {
-		return "", nil, fmt.Errorf("unigram: normalizer: %w", err)
+		return "", nil, false, false, fmt.Errorf("unigram: normalizer: %w", err)
 	}
 	switch n.Type {
 	case "Precompiled":
-		return n.PrecompiledCharsmap, nil, nil
+		return n.PrecompiledCharsmap, nil, false, false, nil
 	case "Replace":
 		pat := n.Pattern.Regex
 		if pat == "" { // a literal-string Replace: match it verbatim
@@ -604,48 +816,60 @@ func buildNormalizer(raw json.RawMessage) (charsmap string, replaces []replaceRu
 		}
 		re, cerr := regexp.Compile(pat)
 		if cerr != nil {
-			return "", nil, fmt.Errorf("unigram: Replace pattern %q: %w", pat, cerr)
+			return "", nil, false, false, fmt.Errorf("unigram: Replace pattern %q: %w", pat, cerr)
 		}
-		return "", []replaceRule{{re: re, content: n.Content}}, nil
+		return "", []replaceRule{{re: re, content: n.Content}}, false, false, nil
+	case "NFC":
+		return "", nil, true, false, nil
+	case "Strip":
+		// Only right-strip is wired through: no checkpoint this package supports
+		// strips left, and a left-strip misread would silently change every
+		// encoding. Extend rather than ignore if one ever appears.
+		if n.StripLeft {
+			return "", nil, false, false, fmt.Errorf("unigram: Strip(strip_left=true) unsupported")
+		}
+		return "", nil, false, n.StripRight, nil
 	case "Sequence":
 		for _, sub := range n.Normalizers {
-			cm, rs, serr := buildNormalizer(sub)
+			cm, rs, nSub, srSub, serr := buildNormalizer(sub)
 			if serr != nil {
-				return "", nil, serr
+				return "", nil, false, false, serr
 			}
 			if cm != "" {
 				if charsmap != "" {
-					return "", nil, fmt.Errorf("unigram: multiple Precompiled normalizers")
+					return "", nil, false, false, fmt.Errorf("unigram: multiple Precompiled normalizers")
 				}
 				charsmap = cm
 			}
 			replaces = append(replaces, rs...)
+			nfc = nfc || nSub
+			stripRight = stripRight || srSub
 		}
-		if charsmap == "" {
-			return "", nil, fmt.Errorf("unigram: no Precompiled normalizer in Sequence")
-		}
-		return charsmap, replaces, nil
+		return charsmap, replaces, nfc, stripRight, nil
 	default:
-		return "", nil, fmt.Errorf("unigram: unsupported normalizer.type %q", n.Type)
+		return "", nil, false, false, fmt.Errorf("unigram: unsupported normalizer.type %q", n.Type)
 	}
 }
 
-// preTokWhitespaceSplit reports whether the pre_tokenizer splits on whitespace
-// before Metaspace (XLM-R/e5 Sequence[WhitespaceSplit, Metaspace]) vs a bare
-// Metaspace (bge-m3). Errors on any other shape.
-func preTokWhitespaceSplit(raw json.RawMessage) (bool, error) {
+// parseMetaspaceKind classifies the pre_tokenizer into its Metaspace variant:
+// Sequence[WhitespaceSplit, Metaspace] → metaspaceKindWhitespaceSplit (XLM-R/e5); a
+// bare Metaspace → metaspaceKindPrepend (bge-m3) or metaspaceKindNever
+// (cl-nagoya/ruri-v3-*) per its prepend config. Errors on any other shape.
+func parseMetaspaceKind(raw json.RawMessage) (metaspaceKind, error) {
 	var p struct {
-		Type          string `json:"type"`
-		Pretokenizers []struct {
+		Type           string `json:"type"`
+		PrependScheme  string `json:"prepend_scheme"`
+		AddPrefixSpace *bool  `json:"add_prefix_space"`
+		Pretokenizers  []struct {
 			Type string `json:"type"`
 		} `json:"pretokenizers"`
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return false, fmt.Errorf("unigram: pre_tokenizer: %w", err)
+		return metaspaceKindPrepend, fmt.Errorf("unigram: pre_tokenizer: %w", err)
 	}
 	switch p.Type {
 	case "Metaspace":
-		return false, nil
+		return bareMetaspaceKind(p.PrependScheme, p.AddPrefixSpace), nil
 	case "Sequence":
 		hasWS, hasMeta := false, false
 		for _, pt := range p.Pretokenizers {
@@ -655,16 +879,36 @@ func preTokWhitespaceSplit(raw json.RawMessage) (bool, error) {
 			case "Metaspace":
 				hasMeta = true
 			default:
-				return false, fmt.Errorf("unigram: unsupported pre_tokenizer %q in sequence", pt.Type)
+				return metaspaceKindPrepend, fmt.Errorf("unigram: unsupported pre_tokenizer %q in sequence", pt.Type)
 			}
 		}
 		if !hasMeta {
-			return false, fmt.Errorf("unigram: pre_tokenizer sequence lacks Metaspace")
+			return metaspaceKindPrepend, fmt.Errorf("unigram: pre_tokenizer sequence lacks Metaspace")
 		}
-		return hasWS, nil
+		if hasWS {
+			return metaspaceKindWhitespaceSplit, nil
+		}
+		// A Metaspace-only sequence behaves like a bare Metaspace (its prepend config
+		// lives on the sub-element; no current model uses this path, so default to the
+		// historical prepend behaviour rather than mis-reading the Sequence's fields).
+		return metaspaceKindPrepend, nil
 	default:
-		return false, fmt.Errorf("unigram: unsupported pre_tokenizer.type %q", p.Type)
+		return metaspaceKindPrepend, fmt.Errorf("unigram: unsupported pre_tokenizer.type %q", p.Type)
 	}
+}
+
+// bareMetaspaceKind maps a bare Metaspace's prepend config to its kind.
+// prepend_scheme="never" — or the legacy add_prefix_space=false — prepends no
+// leading ▁ (cl-nagoya/ruri-v3-*); anything else ("always"/"first"/absent, or legacy
+// add_prefix_space=true) prepends one (bge-m3), the historical default.
+func bareMetaspaceKind(prependScheme string, addPrefixSpace *bool) metaspaceKind {
+	if prependScheme == "never" {
+		return metaspaceKindNever
+	}
+	if prependScheme == "" && addPrefixSpace != nil && !*addPrefixSpace {
+		return metaspaceKindNever
+	}
+	return metaspaceKindPrepend
 }
 
 // templateSpecials reads a TemplateProcessing "single" template into the special

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"unicode/utf8"
 	"unsafe"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -19,6 +21,14 @@ import (
 // ranked merges are applied within each piece. Every one of the 256 byte-runes is
 // in the vocab, so this model never emits <unk>. Wrapped <s>…</s> by a
 // RobertaProcessing post-processor. This reproduces HF `tokenizers` id-for-id.
+//
+// The OLMo/ModernBERT exports (Ettin, cross-encoder/ettin-reranker-*) are the same
+// model with three newer spellings, all handled below: `merges` as [a,b] pairs
+// rather than "a b" strings (`tokenizers` ≥0.20), a TemplateProcessing
+// post-processor rather than RobertaProcessing, and an explicit NFC normalizer
+// rather than none. The first is a hard parse failure; the other two are silent —
+// an unhandled post-processor drops [CLS]/[SEP] from every sequence and an ignored
+// normalizer only diverges on non-ASCII — so both are validated, not skipped.
 //
 // The one subtlety is the pre-tokenizer. GPT-2's regex ends with
 // `…|\s+(?!\S)|\s+`; Go's RE2 has no lookahead, so we drop the `(?!\S)` clause and
@@ -41,13 +51,18 @@ var gpt2Pattern = regexp.MustCompile(`'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+|
 // the base vocab (an added entry overrides a same-named vocab entry everywhere
 // else in this parser, so it does here too). Byte-level BPE never actually emits
 // <unk> — every byte is representable — but the id is exposed when the
-// checkpoint defines one, and 0 is the documented "absent" value.
+// checkpoint defines one, and 0 is the documented "absent" value. The OLMo
+// family spells it [UNK]; GPT-2/RoBERTa spell it <unk>. Without the [UNK]
+// probe the fallback leaves unkID at 0, which for those checkpoints is a
+// real added token rather than a sentinel.
 func resolveUnkID(added map[string]int32, vocab map[string]int32) int32 {
-	if id, ok := added["<unk>"]; ok {
-		return id
-	}
-	if id, ok := vocab["<unk>"]; ok {
-		return id
+	for _, lit := range [...]string{"<unk>", "[UNK]"} {
+		if id, ok := added[lit]; ok {
+			return id
+		}
+		if id, ok := vocab[lit]; ok {
+			return id
+		}
 	}
 	return 0
 }
@@ -77,10 +92,28 @@ type bpeBackend struct {
 	rank        map[[2]string]int // adjacent-symbol pair → merge priority (lower = earlier)
 	addedTokens map[string]int32
 	addedKeys   []string // longest-first carve-out scan order
+	// addedLstrip / addedRstrip hold only the added tokens whose flag is set (a
+	// handful per vocab, usually just [MASK]); absent means false.
+	addedLstrip map[string]bool
+	addedRstrip map[string]bool
 	unkID       int32
 	vocabSize   int
-	prefixIDs   []int32 // RobertaProcessing: <s> before the sequence
-	suffixIDs   []int32 // ... and </s> after
+	// normNFC applies Unicode NFC before pre-tokenization, for the exports that
+	// declare it (OLMo/ModernBERT). GPT-2 and RoBERTa declare no normalizer.
+	normNFC   bool
+	prefixIDs []int32 // specials before the sequence (<s> / [CLS])
+	suffixIDs []int32 // ... and after (</s> / [SEP])
+}
+
+// isSpaceByteASCII reports whether c is one of the ASCII whitespace bytes. In valid
+// UTF-8 none of these can occur inside a multi-byte rune, so the lstrip/rstrip scans
+// in encode may walk bytes rather than runes.
+func isSpaceByteASCII(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\r', '\f', '\v':
+		return true
+	}
+	return false
 }
 
 // isAllSpaceASCII reports whether s is a non-empty run of ASCII whitespace.
@@ -89,9 +122,7 @@ func isAllSpaceASCII(s string) bool {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
-		switch s[i] {
-		case ' ', '\t', '\n', '\r', '\f', '\v':
-		default:
+		if !isSpaceByteASCII(s[i]) {
 			return false
 		}
 	}
@@ -200,16 +231,22 @@ func (b *bpeBackend) bpeInto(mapped string, sc *bpeScratch, ids []int32) []int32
 
 // encode runs the added-token carve-out, then byte-level BPE over each segment,
 // producing the BARE id sequence (no <s>/</s>).
+//
+// Segments are contiguous ranges of text, so they are sliced rather than rebuilt.
+// A matched added token honours its lstrip / rstrip flags: HF's AddedVocabulary
+// compiles those into the match pattern as `\s*`, so the whitespace they name is
+// consumed by the added token instead of reaching the BPE. [MASK] is lstrip in
+// every BERT-lineage vocab (and <mask> in RoBERTa's), so ignoring the flags leaves
+// a stray space token before every mask.
 func (b *bpeBackend) encode(text string) []int32 {
 	if len(b.addedKeys) == 0 {
 		return b.encodeSegment(text)
 	}
 	var out []int32
-	var seg strings.Builder
-	flush := func() {
-		if seg.Len() > 0 {
-			out = append(out, b.encodeSegment(seg.String())...)
-			seg.Reset()
+	segStart := 0
+	flush := func(end int) {
+		if end > segStart {
+			out = append(out, b.encodeSegment(text[segStart:end])...)
 		}
 	}
 	for i := 0; i < len(text); {
@@ -220,24 +257,44 @@ func (b *bpeBackend) encode(text string) []int32 {
 				break
 			}
 		}
-		if matched != "" {
-			flush()
-			out = append(out, b.addedTokens[matched])
-			i += len(matched)
+		if matched == "" {
+			_, size := utf8.DecodeRuneInString(text[i:])
+			if size == 0 {
+				size = 1
+			}
+			i += size
 			continue
 		}
-		_, size := utf8.DecodeRuneInString(text[i:])
-		if size == 0 {
-			size = 1
+		// lstrip only ever reaches whitespace that was NOT itself carved out as an
+		// added token: this scan is left-to-right, so a vocab whitespace run (ids
+		// 50254-50276 in the OLMo vocab) has already been emitted at its own
+		// position — which is what HF's leftmost-match regex does too.
+		end := i
+		if b.addedLstrip[matched] {
+			for end > segStart && isSpaceByteASCII(text[end-1]) {
+				end--
+			}
 		}
-		seg.WriteString(text[i : i+size])
-		i += size
+		flush(end)
+		out = append(out, b.addedTokens[matched])
+		i += len(matched)
+		if b.addedRstrip[matched] {
+			for i < len(text) && isSpaceByteASCII(text[i]) {
+				i++
+			}
+		}
+		segStart = i
 	}
-	flush()
+	flush(len(text))
 	return out
 }
 
 func (b *bpeBackend) encodeSegment(text string) []int32 {
+	// Normalize HERE, not in encode: HF's AddedVocabulary carves added-token
+	// literals out of the RAW text and normalizes only what is left between them.
+	if b.normNFC {
+		text = norm.NFC.String(text)
+	}
 	var ids []int32
 	var sc bpeScratch // reused across this segment's pieces
 	for _, piece := range b.preTokenize(text) {
@@ -281,16 +338,25 @@ type bpeJSON struct {
 	AddedTokens []struct {
 		ID      int32  `json:"id"`
 		Content string `json:"content"`
+		Lstrip  bool   `json:"lstrip"`
+		Rstrip  bool   `json:"rstrip"`
 	} `json:"added_tokens"`
-	Model struct {
-		Type   string           `json:"type"`
-		Vocab  map[string]int32 `json:"vocab"`
-		Merges []string         `json:"merges"`
+	Normalizer json.RawMessage `json:"normalizer"`
+	Model      struct {
+		Type   string            `json:"type"`
+		Vocab  map[string]int32  `json:"vocab"`
+		Merges []json.RawMessage `json:"merges"`
 	} `json:"model"`
 	PostProcessor struct {
 		Type string            `json:"type"`
-		Cls  []json.RawMessage `json:"cls"` // ["<s>", 0]
-		Sep  []json.RawMessage `json:"sep"` // ["</s>", 2]
+		Cls  []json.RawMessage `json:"cls"` // RobertaProcessing: ["<s>", 0]
+		Sep  []json.RawMessage `json:"sep"` // ...                ["</s>", 2]
+		// TemplateProcessing: single is the one-sequence template, e.g.
+		// [CLS] $A [SEP]; special_tokens maps each literal to its ids.
+		Single        []map[string]templateElement `json:"single"`
+		SpecialTokens map[string]struct {
+			IDs []int32 `json:"ids"`
+		} `json:"special_tokens"`
 	} `json:"post_processor"`
 }
 
@@ -307,29 +373,54 @@ func parseBPETokenizer(data []byte) (*bpeBackend, error) {
 		return nil, fmt.Errorf("bpe: empty vocab")
 	}
 
-	rank := make(map[[2]string]int, len(raw.Model.Merges))
-	for i, m := range raw.Model.Merges {
-		parts := strings.SplitN(m, " ", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("bpe: merge[%d] %q not a space-joined pair", i, m)
-		}
-		rank[[2]string{parts[0], parts[1]}] = i
+	normNFC, err := bpeNormalizer(raw.Normalizer)
+	if err != nil {
+		return nil, err
+	}
+	rank, err := parseBPEMerges(raw.Model.Merges, "bpe")
+	if err != nil {
+		return nil, err
 	}
 
 	added := make(map[string]int32, len(raw.AddedTokens))
+	var lstrip, rstrip map[string]bool
 	for _, at := range raw.AddedTokens {
 		added[at.Content] = at.ID
+		if at.Lstrip {
+			if lstrip == nil {
+				lstrip = map[string]bool{}
+			}
+			lstrip[at.Content] = true
+		}
+		if at.Rstrip {
+			if rstrip == nil {
+				rstrip = map[string]bool{}
+			}
+			rstrip[at.Content] = true
+		}
 	}
 	addedKeys := sortedAddedKeys(added)
 
-	// RobertaProcessing wraps <s> (cls) ++ body ++ </s> (sep).
-	prefixIDs, err := postProcID(raw.PostProcessor.Cls)
-	if err != nil {
-		return nil, fmt.Errorf("bpe: post_processor cls: %w", err)
-	}
-	suffixIDs, err := postProcID(raw.PostProcessor.Sep)
-	if err != nil {
-		return nil, fmt.Errorf("bpe: post_processor sep: %w", err)
+	var prefixIDs, suffixIDs []int32
+	switch raw.PostProcessor.Type {
+	case "", "ByteLevel":
+		// A bare LM checkpoint: no wrap.
+	case "RobertaProcessing":
+		// Wraps <s> (cls) ++ body ++ </s> (sep).
+		if prefixIDs, err = postProcID(raw.PostProcessor.Cls); err != nil {
+			return nil, fmt.Errorf("bpe: post_processor cls: %w", err)
+		}
+		if suffixIDs, err = postProcID(raw.PostProcessor.Sep); err != nil {
+			return nil, fmt.Errorf("bpe: post_processor sep: %w", err)
+		}
+	case "TemplateProcessing":
+		// Shared with the Unigram and SentencePiece-BPE paths — the template shape
+		// is the same regardless of which model type sits under it.
+		prefixIDs, suffixIDs = templateSpecials(raw.PostProcessor.Single, raw.PostProcessor.SpecialTokens)
+	default:
+		// Not skipped: an unhandled post-processor yields no specials at all, and a
+		// sequence silently missing its [CLS]/[SEP] mis-scores every downstream head.
+		return nil, fmt.Errorf("bpe: unsupported post_processor.type %q", raw.PostProcessor.Type)
 	}
 	unkID := resolveUnkID(added, raw.Model.Vocab)
 
@@ -339,11 +430,64 @@ func parseBPETokenizer(data []byte) (*bpeBackend, error) {
 		rank:        rank,
 		addedTokens: added,
 		addedKeys:   addedKeys,
+		addedLstrip: lstrip,
+		addedRstrip: rstrip,
 		unkID:       unkID,
 		vocabSize:   len(raw.Model.Vocab),
+		normNFC:     normNFC,
 		prefixIDs:   prefixIDs,
 		suffixIDs:   suffixIDs,
 	}, nil
+}
+
+// bpeNormalizer reads tokenizer.json's normalizer for a byte-level BPE model and
+// reports whether NFC must be applied. GPT-2 / RoBERTa declare none (null);
+// OLMo/ModernBERT declare {"type":"NFC"}. Anything else is rejected rather than
+// ignored: a normalizer that silently does not run diverges from the reference
+// only on the inputs that need it most.
+func bpeNormalizer(raw json.RawMessage) (bool, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false, nil
+	}
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false, fmt.Errorf("bpe: normalizer: %w", err)
+	}
+	switch probe.Type {
+	case "NFC":
+		return true, nil
+	case "":
+		return false, nil
+	default:
+		return false, fmt.Errorf("bpe: unsupported normalizer.type %q (NFC or none)", probe.Type)
+	}
+}
+
+// parseBPEMerges ranks a BPE merge table, accepting BOTH spellings HF has shipped:
+// the original space-joined string ("Ġ t") and the [a, b] pair array that
+// `tokenizers` ≥0.20 writes. Rank is the position in the list, lower merging first.
+// what names the caller for error messages.
+func parseBPEMerges(merges []json.RawMessage, what string) (map[[2]string]int, error) {
+	rank := make(map[[2]string]int, len(merges))
+	for i, m := range merges {
+		var pair [2]string
+		if err := json.Unmarshal(m, &pair); err == nil {
+			rank[pair] = i
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(m, &s); err != nil {
+			return nil, fmt.Errorf("%s: merge[%d]: neither a [a,b] pair nor a string", what, i)
+		}
+		parts := strings.SplitN(s, " ", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("%s: merge[%d] %q not a space-joined pair", what, i, s)
+		}
+		rank[[2]string{parts[0], parts[1]}] = i
+	}
+	return rank, nil
 }
 
 // postProcID reads a RobertaProcessing ["<literal>", id] pair into a 1-element id
