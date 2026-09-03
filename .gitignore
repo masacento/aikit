@@ -185,6 +185,14 @@ testdata/siglip-tiny
 testdata/siglip-bench/
 testdata/siglip-bench-l/
 
+# ner / GLiNER / mDeBERTa-v3 — per-machine checkpoints, never committed. Only the
+# small goldens are committed; every test t.Skip()s without its checkpoint.
+# Regenerate: scripts/fetch_gliner.sh, scripts/fetch_mdeberta.sh,
+# scripts/oracle/pin_gliner2.py, scripts/oracle/pin_tokenclassification.py
+testdata/mdeberta-v3-base
+testdata/gliner-multi-v2.5
+testdata/distilbert-secret-masker-v3.3a-rs
+
 # repowise index — generated codebase-intelligence artifacts, never committed
 .repowise/
 

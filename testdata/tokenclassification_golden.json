@@ -1,0 +1,857 @@
+{
+ "model": "AndrewAndrewsen/distilbert-secret-masker-v3.3a-rs",
+ "reference": "span_infer.py (model repo), max_length=512 stride=128",
+ "tau": 0.99,
+ "mask": "***MASKED***",
+ "cases": [
+  {
+   "text": "aws_access_key_id = AKIAIOSFODNN7EXAMPLE\naws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+   "spans": [
+    {
+     "start": 20,
+     "end": 40,
+     "line": 1,
+     "value": "AKIAIOSFODNN7EXAMPLE",
+     "score": 0.999938
+    },
+    {
+     "start": 65,
+     "end": 105,
+     "line": 2,
+     "value": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+     "score": 0.997985
+    }
+   ],
+   "spans_tau": [
+    {
+     "start": 20,
+     "end": 40,
+     "line": 1,
+     "value": "AKIAIOSFODNN7EXAMPLE",
+     "score": 0.999938
+    },
+    {
+     "start": 65,
+     "end": 105,
+     "line": 2,
+     "value": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+     "score": 0.997985
+    }
+   ],
+   "masked": "aws_access_key_id = ***MASKED***\naws_secret_access_key = ***MASKED***",
+   "invalid_bio_transitions": 0,
+   "pieces": [
+    {
+     "start": 0,
+     "end": 2,
+     "label": 0,
+     "p": 3.4e-05
+    },
+    {
+     "start": 2,
+     "end": 3,
+     "label": 0,
+     "p": 0.000377
+    },
+    {
+     "start": 3,
+     "end": 4,
+     "label": 0,
+     "p": 6.4e-05
+    },
+    {
+     "start": 4,
+     "end": 10,
+     "label": 0,
+     "p": 4e-05
+    },
+    {
+     "start": 10,
+     "end": 11,
+     "label": 0,
+     "p": 3.8e-05
+    },
+    {
+     "start": 11,
+     "end": 14,
+     "label": 0,
+     "p": 4.7e-05
+    },
+    {
+     "start": 14,
+     "end": 15,
+     "label": 0,
+     "p": 4.3e-05
+    },
+    {
+     "start": 15,
+     "end": 17,
+     "label": 0,
+     "p": 5.3e-05
+    },
+    {
+     "start": 18,
+     "end": 19,
+     "label": 0,
+     "p": 4.2e-05
+    },
+    {
+     "start": 20,
+     "end": 22,
+     "label": 1,
+     "p": 0.999912
+    },
+    {
+     "start": 22,
+     "end": 24,
+     "label": 2,
+     "p": 0.999955
+    },
+    {
+     "start": 24,
+     "end": 27,
+     "label": 2,
+     "p": 0.999951
+    },
+    {
+     "start": 27,
+     "end": 29,
+     "label": 2,
+     "p": 0.999942
+    },
+    {
+     "start": 29,
+     "end": 30,
+     "label": 2,
+     "p": 0.999948
+    },
+    {
+     "start": 30,
+     "end": 32,
+     "label": 2,
+     "p": 0.999949
+    },
+    {
+     "start": 32,
+     "end": 33,
+     "label": 2,
+     "p": 0.999943
+    },
+    {
+     "start": 33,
+     "end": 35,
+     "label": 2,
+     "p": 0.999932
+    },
+    {
+     "start": 35,
+     "end": 38,
+     "label": 2,
+     "p": 0.999929
+    },
+    {
+     "start": 38,
+     "end": 40,
+     "label": 2,
+     "p": 0.99992
+    },
+    {
+     "start": 41,
+     "end": 43,
+     "label": 0,
+     "p": 0.000159
+    },
+    {
+     "start": 43,
+     "end": 44,
+     "label": 0,
+     "p": 0.000728
+    },
+    {
+     "start": 44,
+     "end": 45,
+     "label": 0,
+     "p": 0.000584
+    },
+    {
+     "start": 45,
+     "end": 51,
+     "label": 0,
+     "p": 0.000423
+    },
+    {
+     "start": 51,
+     "end": 52,
+     "label": 0,
+     "p": 0.000346
+    },
+    {
+     "start": 52,
+     "end": 58,
+     "label": 0,
+     "p": 0.000281
+    },
+    {
+     "start": 58,
+     "end": 59,
+     "label": 0,
+     "p": 0.000158
+    },
+    {
+     "start": 59,
+     "end": 62,
+     "label": 0,
+     "p": 0.000203
+    },
+    {
+     "start": 63,
+     "end": 64,
+     "label": 0,
+     "p": 0.000105
+    },
+    {
+     "start": 65,
+     "end": 66,
+     "label": 1,
+     "p": 0.999947
+    },
+    {
+     "start": 66,
+     "end": 69,
+     "label": 2,
+     "p": 0.999954
+    },
+    {
+     "start": 69,
+     "end": 70,
+     "label": 2,
+     "p": 0.999961
+    },
+    {
+     "start": 70,
+     "end": 71,
+     "label": 2,
+     "p": 0.999966
+    },
+    {
+     "start": 71,
+     "end": 73,
+     "label": 2,
+     "p": 0.999963
+    },
+    {
+     "start": 73,
+     "end": 74,
+     "label": 2,
+     "p": 0.999964
+    },
+    {
+     "start": 74,
+     "end": 76,
+     "label": 2,
+     "p": 0.999964
+    },
+    {
+     "start": 76,
+     "end": 78,
+     "label": 2,
+     "p": 0.999957
+    },
+    {
+     "start": 78,
+     "end": 79,
+     "label": 2,
+     "p": 0.999936
+    },
+    {
+     "start": 79,
+     "end": 80,
+     "label": 2,
+     "p": 0.999969
+    },
+    {
+     "start": 80,
+     "end": 81,
+     "label": 2,
+     "p": 0.999962
+    },
+    {
+     "start": 81,
+     "end": 83,
+     "label": 2,
+     "p": 0.999964
+    },
+    {
+     "start": 83,
+     "end": 86,
+     "label": 2,
+     "p": 0.999955
+    },
+    {
+     "start": 86,
+     "end": 87,
+     "label": 2,
+     "p": 0.99991
+    },
+    {
+     "start": 87,
+     "end": 89,
+     "label": 2,
+     "p": 0.999968
+    },
+    {
+     "start": 89,
+     "end": 90,
+     "label": 2,
+     "p": 0.999963
+    },
+    {
+     "start": 90,
+     "end": 92,
+     "label": 2,
+     "p": 0.999949
+    },
+    {
+     "start": 92,
+     "end": 94,
+     "label": 2,
+     "p": 0.999952
+    },
+    {
+     "start": 94,
+     "end": 96,
+     "label": 2,
+     "p": 0.999953
+    },
+    {
+     "start": 96,
+     "end": 98,
+     "label": 2,
+     "p": 0.999945
+    },
+    {
+     "start": 98,
+     "end": 102,
+     "label": 2,
+     "p": 0.999906
+    },
+    {
+     "start": 102,
+     "end": 105,
+     "label": 2,
+     "p": 0.956653
+    }
+   ],
+   "trunk": {
+    "ids": [
+     101,
+     22091,
+     2015,
+     1035,
+     3229,
+     1035,
+     3145,
+     1035,
+     8909,
+     1027,
+     17712,
+     2401,
+     10735,
+     14876,
+     2094,
+     10695,
+     2581,
+     10288,
+     16613,
+     2571,
+     22091,
+     2015,
+     1035,
+     3595,
+     1035,
+     3229,
+     1035,
+     3145,
+     1027,
+     1059,
+     25787,
+     2099,
+     2595,
+     4904,
+     2078,
+     7959,
+     4328,
+     1013,
+     1047,
+     2581,
+     26876,
+     13159,
+     1013,
+     17531,
+     2595,
+     12881,
+     2594,
+     6672,
+     18684,
+     23344,
+     14839,
+     102
+    ],
+    "mean": -0.020043853670358658,
+    "abs_mean": 0.48716041445732117,
+    "min": -6.92218017578125,
+    "max": 2.827981948852539,
+    "row0": [
+     0.4618799388408661,
+     0.7652040123939514,
+     0.3000349998474121,
+     -0.23835250735282898,
+     0.1319483518600464,
+     -0.7243976593017578,
+     0.6474584341049194,
+     0.41790205240249634,
+     0.11953676491975784,
+     0.08346999436616898,
+     -0.3022274971008301,
+     -0.4172993302345276,
+     -0.4936821758747101,
+     -0.4157230257987976,
+     -0.8801868557929993,
+     0.3083861172199249
+    ],
+    "row1": [
+     0.7635142803192139,
+     1.7945621013641357,
+     0.608015775680542,
+     -0.29015836119651794,
+     0.17601530253887177,
+     -0.7869113087654114,
+     0.492424339056015,
+     0.21456223726272583,
+     0.18031640350818634,
+     0.7821969985961914,
+     -0.20103506743907928,
+     -0.7287401556968689,
+     -0.3418304920196533,
+     -0.8475540280342102,
+     -0.9886265993118286,
+     0.49678730964660645
+    ]
+   }
+  },
+  {
+   "text": "token: ghp_16CharsFFFFFFFFFFFFFFFF1234  # github PAT",
+   "spans": [
+    {
+     "start": 7,
+     "end": 38,
+     "line": 1,
+     "value": "ghp_16CharsFFFFFFFFFFFFFFFF1234",
+     "score": 0.999902
+    },
+    {
+     "start": 46,
+     "end": 48,
+     "line": 1,
+     "value": "ub",
+     "score": 0.903086
+    }
+   ],
+   "spans_tau": [
+    {
+     "start": 7,
+     "end": 38,
+     "line": 1,
+     "value": "ghp_16CharsFFFFFFFFFFFFFFFF1234",
+     "score": 0.999902
+    }
+   ],
+   "masked": "token: ***MASKED***  # gith***MASKED*** PAT",
+   "invalid_bio_transitions": 1,
+   "pieces": [
+    {
+     "start": 0,
+     "end": 5,
+     "label": 0,
+     "p": 3.1e-05
+    },
+    {
+     "start": 5,
+     "end": 6,
+     "label": 0,
+     "p": 2.9e-05
+    },
+    {
+     "start": 7,
+     "end": 8,
+     "label": 1,
+     "p": 0.999904
+    },
+    {
+     "start": 8,
+     "end": 10,
+     "label": 2,
+     "p": 0.999909
+    },
+    {
+     "start": 10,
+     "end": 11,
+     "label": 2,
+     "p": 0.999902
+    },
+    {
+     "start": 11,
+     "end": 13,
+     "label": 2,
+     "p": 0.999907
+    },
+    {
+     "start": 13,
+     "end": 16,
+     "label": 2,
+     "p": 0.999921
+    },
+    {
+     "start": 16,
+     "end": 18,
+     "label": 2,
+     "p": 0.99992
+    },
+    {
+     "start": 18,
+     "end": 20,
+     "label": 2,
+     "p": 0.999921
+    },
+    {
+     "start": 20,
+     "end": 22,
+     "label": 2,
+     "p": 0.999915
+    },
+    {
+     "start": 22,
+     "end": 24,
+     "label": 2,
+     "p": 0.99991
+    },
+    {
+     "start": 24,
+     "end": 26,
+     "label": 2,
+     "p": 0.999906
+    },
+    {
+     "start": 26,
+     "end": 28,
+     "label": 2,
+     "p": 0.999902
+    },
+    {
+     "start": 28,
+     "end": 30,
+     "label": 2,
+     "p": 0.999897
+    },
+    {
+     "start": 30,
+     "end": 32,
+     "label": 2,
+     "p": 0.999892
+    },
+    {
+     "start": 32,
+     "end": 34,
+     "label": 2,
+     "p": 0.999871
+    },
+    {
+     "start": 34,
+     "end": 36,
+     "label": 2,
+     "p": 0.999877
+    },
+    {
+     "start": 36,
+     "end": 38,
+     "label": 2,
+     "p": 0.999877
+    },
+    {
+     "start": 40,
+     "end": 41,
+     "label": 0,
+     "p": 0.000267
+    },
+    {
+     "start": 42,
+     "end": 44,
+     "label": 0,
+     "p": 0.002702
+    },
+    {
+     "start": 44,
+     "end": 46,
+     "label": 0,
+     "p": 6.8e-05
+    },
+    {
+     "start": 46,
+     "end": 48,
+     "label": 2,
+     "p": 0.903086
+    },
+    {
+     "start": 49,
+     "end": 52,
+     "label": 0,
+     "p": 6.8e-05
+    }
+   ]
+  },
+  {
+   "text": "password = hunter2!",
+   "spans": [
+    {
+     "start": 11,
+     "end": 18,
+     "line": 1,
+     "value": "hunter2",
+     "score": 0.985979
+    }
+   ],
+   "spans_tau": [],
+   "masked": "password = ***MASKED***!",
+   "invalid_bio_transitions": 0,
+   "pieces": [
+    {
+     "start": 0,
+     "end": 8,
+     "label": 0,
+     "p": 0.000217
+    },
+    {
+     "start": 9,
+     "end": 10,
+     "label": 0,
+     "p": 7.3e-05
+    },
+    {
+     "start": 11,
+     "end": 17,
+     "label": 1,
+     "p": 0.991157
+    },
+    {
+     "start": 17,
+     "end": 18,
+     "label": 2,
+     "p": 0.980801
+    },
+    {
+     "start": 18,
+     "end": 19,
+     "label": 0,
+     "p": 0.287267
+    }
+   ]
+  },
+  {
+   "text": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7X\nabc123def456\n-----END RSA PRIVATE KEY-----",
+   "spans": [
+    {
+     "start": 0,
+     "end": 93,
+     "line": 1,
+     "value": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7X\nabc123def456\n-----END RSA PRIVATE KEY-----",
+     "score": 0.996802
+    }
+   ],
+   "spans_tau": [
+    {
+     "start": 0,
+     "end": 93,
+     "line": 1,
+     "value": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7X\nabc123def456\n-----END RSA PRIVATE KEY-----",
+     "score": 0.996802
+    }
+   ],
+   "masked": "***MASKED***",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": "{\"api_key\": \"sk-live-9hK2mL\", \"Authorization\": \"Bearer eyJhbGciOi.eyJzdWIi.9f8e7d\", \"debug\": true}",
+   "spans": [
+    {
+     "start": 13,
+     "end": 27,
+     "line": 1,
+     "value": "sk-live-9hK2mL",
+     "score": 0.998828
+    },
+    {
+     "start": 55,
+     "end": 81,
+     "line": 1,
+     "value": "eyJhbGciOi.eyJzdWIi.9f8e7d",
+     "score": 0.999715
+    }
+   ],
+   "spans_tau": [
+    {
+     "start": 13,
+     "end": 27,
+     "line": 1,
+     "value": "sk-live-9hK2mL",
+     "score": 0.998828
+    },
+    {
+     "start": 55,
+     "end": 81,
+     "line": 1,
+     "value": "eyJhbGciOi.eyJzdWIi.9f8e7d",
+     "score": 0.999715
+    }
+   ],
+   "masked": "{\"api_key\": \"***MASKED***\", \"Authorization\": \"Bearer ***MASKED***\", \"debug\": true}",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": "DATABASE_URL=postgres://admin:s3cr3t!pass@prod-db.example.com:5432/main",
+   "spans": [
+    {
+     "start": 30,
+     "end": 37,
+     "line": 1,
+     "value": "s3cr3t!",
+     "score": 0.99992
+    }
+   ],
+   "spans_tau": [
+    {
+     "start": 30,
+     "end": 37,
+     "line": 1,
+     "value": "s3cr3t!",
+     "score": 0.99992
+    }
+   ],
+   "masked": "DATABASE_URL=postgres://admin:***MASKED***pass@prod-db.example.com:5432/main",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": "def add(a, b):\n    return a + b\n\nprint(add(1, 2))",
+   "spans": [],
+   "spans_tau": [],
+   "masked": "def add(a, b):\n    return a + b\n\nprint(add(1, 2))",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": "The quick brown fox jumps over the lazy dog.",
+   "spans": [],
+   "spans_tau": [],
+   "masked": "The quick brown fox jumps over the lazy dog.",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": "",
+   "spans": [],
+   "spans_tau": [],
+   "masked": "",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": " ",
+   "spans": [],
+   "spans_tau": [],
+   "masked": " ",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": "パスワード: P@sswörd-2026! éè",
+   "spans": [],
+   "spans_tau": [],
+   "masked": "パスワード: P@sswörd-2026! éè",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": "café token = ghp_ naïve ünïcode password1234",
+   "spans": [
+    {
+     "start": 13,
+     "end": 23,
+     "line": 1,
+     "value": "ghp_ naïve",
+     "score": 0.974414
+    }
+   ],
+   "spans_tau": [],
+   "masked": "café token = ***MASKED*** ünïcode password1234",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": "[MASK] = supersecret123",
+   "spans": [],
+   "spans_tau": [],
+   "masked": "[MASK] = supersecret123",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": "[CLS] suspicious [SEP] = hunter2",
+   "spans": [],
+   "spans_tau": [],
+   "masked": "[CLS] suspicious [SEP] = hunter2",
+   "invalid_bio_transitions": 0
+  },
+  {
+   "text": "service_0: api_key = AKIA0000000000000000\npostgresql://root:pw-0-hunter2@db-0.internal:5432/app0\nservice_1: api_key = AKIA0000000000000001\npostgresql://root:pw-1-hunter2@db-1.internal:5432/app1\nservice_2: api_key = AKIA0000000000000002\npostgresql://root:pw-2-hunter2@db-2.internal:5432/app2\nservice_3: api_key = AKIA0000000000000003\npostgresql://root:pw-3-hunter2@db-3.internal:5432/app3\nservice_4: api_key = AKIA0000000000000004\npostgresql://root:pw-4-hunter2@db-4.internal:5432/app4\nservice_5: api_key = AKIA0000000000000005\npostgresql://root:pw-5-hunter2@db-5.internal:5432/app5\nservice_6: api_key = AKIA0000000000000006\npostgresql://root:pw-6-hunter2@db-6.internal:5432/app6\nservice_7: api_key = AKIA0000000000000007\npostgresql://root:pw-7-hunter2@db-7.internal:5432/app7\nservice_8: api_key = AKIA0000000000000008\npostgresql://root:pw-8-hunter2@db-8.internal:5432/app8\nservice_9: api_key = AKIA0000000000000009\npostgresql://root:pw-9-hunter2@db-9.internal:5432/app9\nservice_10: api_key = AKIA000000000000000A\npostgresql://root:pw-10-hunter2@db-10.internal:5432/app10\nservice_11: api_key = AKIA000000000000000B\npostgresql://root:pw-11-hunter2@db-11.internal:5432/app11\nservice_12: api_key = AKIA000000000000000C\npostgresql://root:pw-12-hunter2@db-12.internal:5432/app12\nservice_13: api_key = AKIA000000000000000D\npostgresql://root:pw-13-hunter2@db-13.internal:5432/app13\nservice_14: api_key = AKIA000000000000000E\npostgresql://root:pw-14-hunter2@db-14.internal:5432/app14\nservice_15: api_key = AKIA000000000000000F\npostgresql://root:pw-15-hunter2@db-15.internal:5432/app15\nservice_16: api_key = AKIA0000000000000010\npostgresql://root:pw-16-hunter2@db-16.internal:5432/app16\nservice_17: api_key = AKIA0000000000000011\npostgresql://root:pw-17-hunter2@db-17.internal:5432/app17\nservice_18: api_key = AKIA0000000000000012\npostgresql://root:pw-18-hunter2@db-18.internal:5432/app18\nservice_19: api_key = AKIA0000000000000013\npostgresql://root:pw-19-hunter2@db-19.internal:5432/app19\nservice_20: api_key = AKIA0000000000000014\npostgresql://root:pw-20-hunter2@db-20.internal:5432/app20\nservice_21: api_key = AKIA0000000000000015\npostgresql://root:pw-21-hunter2@db-21.internal:5432/app21\nservice_22: api_key = AKIA0000000000000016\npostgresql://root:pw-22-hunter2@db-22.internal:5432/app22\nservice_23: api_key = AKIA0000000000000017\npostgresql://root:pw-23-hunter2@db-23.internal:5432/app23\nservice_24: api_key = AKIA0000000000000018\npostgresql://root:pw-24-hunter2@db-24.internal:5432/app24\nservice_25: api_key = AKIA0000000000000019\npostgresql://root:pw-25-hunter2@db-25.internal:5432/app25\nservice_26: api_key = AKIA000000000000001A\npostgresql://root:pw-26-hunter2@db-26.internal:5432/app26\nservice_27: api_key = AKIA000000000000001B\npostgresql://root:pw-27-hunter2@db-27.internal:5432/app27\nservice_28: api_key = AKIA000000000000001C\npostgresql://root:pw-28-hunter2@db-28.internal:5432/app28\nservice_29: api_key = AKIA000000000000001D\npostgresql://root:pw-29-hunter2@db-29.internal:5432/app29\nservice_30: api_key = AKIA000000000000001E\npostgresql://root:pw-30-hunter2@db-30.internal:5432/app30\nservice_31: api_key = AKIA000000000000001F\npostgresql://root:pw-31-hunter2@db-31.internal:5432/app31\nservice_32: api_key = AKIA0000000000000020\npostgresql://root:pw-32-hunter2@db-32.internal:5432/app32\nservice_33: api_key = AKIA0000000000000021\npostgresql://root:pw-33-hunter2@db-33.internal:5432/app33\nservice_34: api_key = AKIA0000000000000022\npostgresql://root:pw-34-hunter2@db-34.internal:5432/app34\nservice_35: api_key = AKIA0000000000000023\npostgresql://root:pw-35-hunter2@db-35.internal:5432/app35\nservice_36: api_key = AKIA0000000000000024\npostgresql://root:pw-36-hunter2@db-36.internal:5432/app36\nservice_37: api_key = AKIA0000000000000025\npostgresql://root:pw-37-hunter2@db-37.internal:5432/app37\nservice_38: api_key = AKIA0000000000000026\npostgresql://root:pw-38-hunter2@db-38.internal:5432/app38\nservice_39: api_key = AKIA0000000000000027\npostgresql://root:pw-39-hunter2@db-39.internal:5432/app39\nservice_40: api_key = AKIA0000000000000028\npostgresql://root:pw-40-hunter2@db-40.internal:5432/app40\nservice_41: api_key = AKIA0000000000000029\npostgresql://root:pw-41-hunter2@db-41.internal:5432/app41\nservice_42: api_key = AKIA000000000000002A\npostgresql://root:pw-42-hunter2@db-42.internal:5432/app42\nservice_43: api_key = AKIA000000000000002B\npostgresql://root:pw-43-hunter2@db-43.internal:5432/app43\nservice_44: api_key = AKIA000000000000002C\npostgresql://root:pw-44-hunter2@db-44.internal:5432/app44\nservice_45: api_key = AKIA000000000000002D\npostgresql://root:pw-45-hunter2@db-45.internal:5432/app45\nservice_46: api_key = AKIA000000000000002E\npostgresql://root:pw-46-hunter2@db-46.internal:5432/app46\nservice_47: api_key = AKIA000000000000002F\npostgresql://root:pw-47-hunter2@db-47.internal:5432/app47\nservice_48: api_key = AKIA0000000000000030\npostgresql://root:pw-48-hunter2@db-48.internal:5432/app48\nservice_49: api_key = AKIA0000000000000031\npostgresql://root:pw-49-hunter2@db-49.internal:5432/app49\nservice_50: api_key = AKIA0000000000000032\npostgresql://root:pw-50-hunter2@db-50.internal:5432/app50\nservice_51: api_key = AKIA0000000000000033\npostgresql://root:pw-51-hunter2@db-51.internal:5432/app51\nservice_52: api_key = AKIA0000000000000034\npostgresql://root:pw-52-hunter2@db-52.internal:5432/app52\nservice_53: api_key = AKIA0000000000000035\npostgresql://root:pw-53-hunter2@db-53.internal:5432/app53\nservice_54: api_key = AKIA0000000000000036\npostgresql://root:pw-54-hunter2@db-54.internal:5432/app54\nservice_55: api_key = AKIA0000000000000037\npostgresql://root:pw-55-hunter2@db-55.internal:5432/app55\nservice_56: api_key = AKIA0000000000000038\npostgresql://root:pw-56-hunter2@db-56.internal:5432/app56\nservice_57: api_key = AKIA0000000000000039\npostgresql://root:pw-57-hunter2@db-57.internal:5432/app57\nservice_58: api_key = AKIA000000000000003A\npostgresql://root:pw-58-hunter2@db-58.internal:5432/app58\nservice_59: api_key = AKIA000000000000003B\npostgresql://root:pw-59-hunter2@db-59.internal:5432/app59",
+   "spans": [
+    {
+     "start": 700,
+     "end": 708,
+     "line": 15,
+     "value": "AKIA0000",
+     "score": 0.898339
+    },
+    {
+     "start": 1497,
+     "end": 1501,
+     "line": 31,
+     "value": "AKIA",
+     "score": 0.809665
+    },
+    {
+     "start": 2305,
+     "end": 2309,
+     "line": 47,
+     "value": "AKIA",
+     "score": 0.640696
+    },
+    {
+     "start": 4123,
+     "end": 4125,
+     "line": 83,
+     "value": "AK",
+     "score": 0.636123
+    },
+    {
+     "start": 5539,
+     "end": 5541,
+     "line": 111,
+     "value": "IA",
+     "score": 0.682443
+    },
+    {
+     "start": 5941,
+     "end": 5943,
+     "line": 119,
+     "value": "AK",
+     "score": 0.662308
+    }
+   ],
+   "spans_tau": [],
+   "masked": "service_0: api_key = AKIA0000000000000000\npostgresql://root:pw-0-hunter2@db-0.internal:5432/app0\nservice_1: api_key = AKIA0000000000000001\npostgresql://root:pw-1-hunter2@db-1.internal:5432/app1\nservice_2: api_key = AKIA0000000000000002\npostgresql://root:pw-2-hunter2@db-2.internal:5432/app2\nservice_3: api_key = AKIA0000000000000003\npostgresql://root:pw-3-hunter2@db-3.internal:5432/app3\nservice_4: api_key = AKIA0000000000000004\npostgresql://root:pw-4-hunter2@db-4.internal:5432/app4\nservice_5: api_key = AKIA0000000000000005\npostgresql://root:pw-5-hunter2@db-5.internal:5432/app5\nservice_6: api_key = AKIA0000000000000006\npostgresql://root:pw-6-hunter2@db-6.internal:5432/app6\nservice_7: api_key = ***MASKED***000000000007\npostgresql://root:pw-7-hunter2@db-7.internal:5432/app7\nservice_8: api_key = AKIA0000000000000008\npostgresql://root:pw-8-hunter2@db-8.internal:5432/app8\nservice_9: api_key = AKIA0000000000000009\npostgresql://root:pw-9-hunter2@db-9.internal:5432/app9\nservice_10: api_key = AKIA000000000000000A\npostgresql://root:pw-10-hunter2@db-10.internal:5432/app10\nservice_11: api_key = AKIA000000000000000B\npostgresql://root:pw-11-hunter2@db-11.internal:5432/app11\nservice_12: api_key = AKIA000000000000000C\npostgresql://root:pw-12-hunter2@db-12.internal:5432/app12\nservice_13: api_key = AKIA000000000000000D\npostgresql://root:pw-13-hunter2@db-13.internal:5432/app13\nservice_14: api_key = AKIA000000000000000E\npostgresql://root:pw-14-hunter2@db-14.internal:5432/app14\nservice_15: api_key = ***MASKED***000000000000000F\npostgresql://root:pw-15-hunter2@db-15.internal:5432/app15\nservice_16: api_key = AKIA0000000000000010\npostgresql://root:pw-16-hunter2@db-16.internal:5432/app16\nservice_17: api_key = AKIA0000000000000011\npostgresql://root:pw-17-hunter2@db-17.internal:5432/app17\nservice_18: api_key = AKIA0000000000000012\npostgresql://root:pw-18-hunter2@db-18.internal:5432/app18\nservice_19: api_key = AKIA0000000000000013\npostgresql://root:pw-19-hunter2@db-19.internal:5432/app19\nservice_20: api_key = AKIA0000000000000014\npostgresql://root:pw-20-hunter2@db-20.internal:5432/app20\nservice_21: api_key = AKIA0000000000000015\npostgresql://root:pw-21-hunter2@db-21.internal:5432/app21\nservice_22: api_key = AKIA0000000000000016\npostgresql://root:pw-22-hunter2@db-22.internal:5432/app22\nservice_23: api_key = ***MASKED***0000000000000017\npostgresql://root:pw-23-hunter2@db-23.internal:5432/app23\nservice_24: api_key = AKIA0000000000000018\npostgresql://root:pw-24-hunter2@db-24.internal:5432/app24\nservice_25: api_key = AKIA0000000000000019\npostgresql://root:pw-25-hunter2@db-25.internal:5432/app25\nservice_26: api_key = AKIA000000000000001A\npostgresql://root:pw-26-hunter2@db-26.internal:5432/app26\nservice_27: api_key = AKIA000000000000001B\npostgresql://root:pw-27-hunter2@db-27.internal:5432/app27\nservice_28: api_key = AKIA000000000000001C\npostgresql://root:pw-28-hunter2@db-28.internal:5432/app28\nservice_29: api_key = AKIA000000000000001D\npostgresql://root:pw-29-hunter2@db-29.internal:5432/app29\nservice_30: api_key = AKIA000000000000001E\npostgresql://root:pw-30-hunter2@db-30.internal:5432/app30\nservice_31: api_key = AKIA000000000000001F\npostgresql://root:pw-31-hunter2@db-31.internal:5432/app31\nservice_32: api_key = AKIA0000000000000020\npostgresql://root:pw-32-hunter2@db-32.internal:5432/app32\nservice_33: api_key = AKIA0000000000000021\npostgresql://root:pw-33-hunter2@db-33.internal:5432/app33\nservice_34: api_key = AKIA0000000000000022\npostgresql://root:pw-34-hunter2@db-34.internal:5432/app34\nservice_35: api_key = AKIA0000000000000023\npostgresql://root:pw-35-hunter2@db-35.internal:5432/app35\nservice_36: api_key = AKIA0000000000000024\npostgresql://root:pw-36-hunter2@db-36.internal:5432/app36\nservice_37: api_key = AKIA0000000000000025\npostgresql://root:pw-37-hunter2@db-37.internal:5432/app37\nservice_38: api_key = AKIA0000000000000026\npostgresql://root:pw-38-hunter2@db-38.internal:5432/app38\nservice_39: api_key = AKIA0000000000000027\npostgresql://root:pw-39-hunter2@db-39.internal:5432/app39\nservice_40: api_key = AKIA0000000000000028\npostgresql://root:pw-40-hunter2@db-40.internal:5432/app40\nservice_41: api_key = ***MASKED***IA0000000000000029\npostgresql://root:pw-41-hunter2@db-41.internal:5432/app41\nservice_42: api_key = AKIA000000000000002A\npostgresql://root:pw-42-hunter2@db-42.internal:5432/app42\nservice_43: api_key = AKIA000000000000002B\npostgresql://root:pw-43-hunter2@db-43.internal:5432/app43\nservice_44: api_key = AKIA000000000000002C\npostgresql://root:pw-44-hunter2@db-44.internal:5432/app44\nservice_45: api_key = AKIA000000000000002D\npostgresql://root:pw-45-hunter2@db-45.internal:5432/app45\nservice_46: api_key = AKIA000000000000002E\npostgresql://root:pw-46-hunter2@db-46.internal:5432/app46\nservice_47: api_key = AKIA000000000000002F\npostgresql://root:pw-47-hunter2@db-47.internal:5432/app47\nservice_48: api_key = AKIA0000000000000030\npostgresql://root:pw-48-hunter2@db-48.internal:5432/app48\nservice_49: api_key = AKIA0000000000000031\npostgresql://root:pw-49-hunter2@db-49.internal:5432/app49\nservice_50: api_key = AKIA0000000000000032\npostgresql://root:pw-50-hunter2@db-50.internal:5432/app50\nservice_51: api_key = AKIA0000000000000033\npostgresql://root:pw-51-hunter2@db-51.internal:5432/app51\nservice_52: api_key = AKIA0000000000000034\npostgresql://root:pw-52-hunter2@db-52.internal:5432/app52\nservice_53: api_key = AKIA0000000000000035\npostgresql://root:pw-53-hunter2@db-53.internal:5432/app53\nservice_54: api_key = AKIA0000000000000036\npostgresql://root:pw-54-hunter2@db-54.internal:5432/app54\nservice_55: api_key = AK***MASKED***0000000000000037\npostgresql://root:pw-55-hunter2@db-55.internal:5432/app55\nservice_56: api_key = AKIA0000000000000038\npostgresql://root:pw-56-hunter2@db-56.internal:5432/app56\nservice_57: api_key = AKIA0000000000000039\npostgresql://root:pw-57-hunter2@db-57.internal:5432/app57\nservice_58: api_key = AKIA000000000000003A\npostgresql://root:pw-58-hunter2@db-58.internal:5432/app58\nservice_59: api_key = ***MASKED***IA000000000000003B\npostgresql://root:pw-59-hunter2@db-59.internal:5432/app59",
+   "invalid_bio_transitions": 1
+  }
+ ]
+}

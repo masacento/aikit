@@ -654,6 +654,17 @@ func (t Tensor) Int64s() ([]int64, error) {
 	return typedLE[int64](t, "I64")
 }
 
+// Int8s returns the tensor data as []int8. Requires DType "I8". Aliases the
+// mmap region (see Float32s on lifetime).
+func (t Tensor) Int8s() ([]int8, error) {
+	defer runtime.KeepAlive(t.owner) // §2.5
+	if t.DType != "I8" {
+		return nil, fmt.Errorf("tensor %q: expected I8, got %s", t.Name, t.DType)
+	}
+	// int8 is 1 byte, always aligned — reinterpretLE handles it.
+	return reinterpretLE[int8](t.Name, t.raw)
+}
+
 // Int32s returns the tensor data as []int32. Requires DType "I32" — used for
 // GPTQ's packed qweight/qzeros/g_idx. Aliases when aligned, else a copy (see
 // reinterpretLE).

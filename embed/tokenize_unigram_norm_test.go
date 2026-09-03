@@ -35,14 +35,14 @@ func loadCharsmap(t *testing.T, path string) *precompiled {
 // TestPrecompiledNormalizer_oracle is the byte-exact gate for the SentencePiece
 // Precompiled normalizer: for every case in the HF-generated oracle
 // (per-codepoint sweep over U+0000..U+2FFFF plus combining sequences and real
-// multilingual lines, scripts/oracle/pin_xlmr_tokenizer.py) aikit's normalize must equal
+// multilingual lines, scripts/pin_xlmr_tokenizer.py) aikit's normalize must equal
 // HF `tokenizers`' normalizer.normalize_str output character-for-character.
 func TestPrecompiledNormalizer_oracle(t *testing.T) {
 	p := loadCharsmap(t, "../testdata/xlm-roberta-base/tokenizer.json")
 
 	raw, err := os.ReadFile("../testdata/xlmr_norm_golden.json")
 	if err != nil {
-		t.Skip("no norm golden — run scripts/oracle/pin_xlmr_tokenizer.py")
+		t.Skip("no norm golden — run scripts/pin_xlmr_tokenizer.py")
 	}
 	var g struct {
 		Cases []struct {

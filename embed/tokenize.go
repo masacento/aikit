@@ -414,6 +414,32 @@ func (t *Tokenizer) SpecialID(literal string) (int32, bool) {
 	return id, ok
 }
 
+// TemplateSpecials reports the ids this tokenizer wraps a sequence with — what
+// EncodeWithSpecials prepends and appends, typically [CLS] … [SEP] or <s> … </s>.
+// Either may be empty (potion has no specials at all).
+//
+// It exists for heads that build their own sequence and so cannot call
+// EncodeWithSpecials: GLiNER interleaves label markers with the words, so it needs
+// the wrapping ids without the wrapping. SpecialID is not a substitute — these ids
+// come from the model's bos/eos or its post-processor template, and for a
+// SentencePiece model [CLS] is a CONTROL piece, deliberately absent from the
+// added-token table that SpecialID searches (the literal text "[CLS]" must not
+// tokenize to id 1).
+func (t *Tokenizer) TemplateSpecials() (prefix, suffix []int32) {
+	switch {
+	case t.uni != nil:
+		return t.uni.prefixIDs, t.uni.suffixIDs
+	case t.bpe != nil:
+		return t.bpe.prefixIDs, t.bpe.suffixIDs
+	}
+	if cls, ok := t.addedTokens["[CLS]"]; ok {
+		if sep, ok := t.addedTokens["[SEP]"]; ok {
+			return []int32{cls}, []int32{sep}
+		}
+	}
+	return nil, nil
+}
+
 // EncodeWithSpecials runs Encode and wraps the result as
 //
 //	[CLS] ++ Encode(text) ++ [SEP]

@@ -7,7 +7,7 @@ import (
 )
 
 // TestUnigram_bgeM3Encode certifies the bge-m3 tokenizer variant against the raw
-// HF `tokenizers` contract (scripts/oracle/pin_bge_m3.py). bge-m3 differs from XLM-R in
+// HF `tokenizers` contract (scripts/pin_bge_m3.py). bge-m3 differs from XLM-R in
 // two config-driven ways this exercises: a normalizer Sequence[Precompiled,
 // Replace(" {2,}"→" ")] that collapses space runs, and a BARE Metaspace
 // pre-tokenizer (no WhitespaceSplit) that keeps a lone ▁ for a trailing space.
@@ -26,8 +26,8 @@ func TestUnigram_bgeM3Encode(t *testing.T) {
 	if tok.uni == nil {
 		t.Fatal("expected Unigram backend for bge-m3")
 	}
-	if tok.uni.whitespaceSplit {
-		t.Fatal("bge-m3 pre_tokenizer is bare Metaspace, not WhitespaceSplit+Metaspace")
+	if tok.uni.metaspace != metaspaceKindPrepend {
+		t.Fatalf("bge-m3 pre_tokenizer is a bare prepend Metaspace, got kind %d", tok.uni.metaspace)
 	}
 	if len(tok.uni.replaces) != 1 {
 		t.Fatalf("bge-m3 normalizer should carry one Replace rule, got %d", len(tok.uni.replaces))
@@ -35,7 +35,7 @@ func TestUnigram_bgeM3Encode(t *testing.T) {
 
 	raw, err := os.ReadFile("../testdata/bge_m3_encode_golden.json")
 	if err != nil {
-		t.Skip("no encode golden — run scripts/oracle/pin_bge_m3.py")
+		t.Skip("no encode golden — run scripts/pin_bge_m3.py")
 	}
 	var g struct {
 		Cases []struct {
