@@ -31,23 +31,43 @@ func (w *WeightMat) RepackInt4Row4() bool {
 }
 
 // MatmulBTW4A8Into is MatmulBTW4A8Into's WeightMat-method form for an
-// int4-resident w, uniform for the caller: uses the row4-interleaved
-// kernel when RepackInt4Row4 has populated it and M=1 (the only shape it
-// applies to — batched/prefill gets nothing from this optimization and
-// keeps routing through the canonical path, matching
-// docs/prompts/w4a8-item3-harness.md's own "no M>1-specific work" scoping),
-// falls back to the canonical per-row kernel otherwise. This is where the
+// int4-resident w, uniform for the caller: uses the row4-interleaved layout
+// whenever RepackInt4Row4 (or WrapInt4Row4) has populated it, and the
+// canonical per-row kernel otherwise.
+//
+// TWO row4 kernels, split at M=1. M=1 takes dotW4A8SplitHalf4Row, the decode
+// kernel: one activation row against a quad's four weight rows. M>1 takes the
+// register-blocked tile (MatmulBTW4A8Row4TileInto, docs/task-simd-audit.md
+// S-01), which reduces FOUR activation rows against those same four weight rows
+// per call so the nibble unpack and scale broadcast are paid once per weight row
+// per group instead of once per activation row. Measured 2.88x over the
+// canonical path at M>=4, K=1536 N=8960, single core (TestW4A8TileVsCanonicalAB).
+//
+// The original scoping of the row4 work was M=1 only — "batched/prefill gets
+// nothing from this optimization" (docs/prompts/w4a8-item3-harness.md). That was
+// true of the M=1 KERNEL and is why prefill kept the canonical path; it stopped
+// being true of the LAYOUT once a tile existed to exploit it, which is S-01's
+// whole point. This is where the
 // paged-MoE carve-out becomes automatic rather than a call-site special
 // case: a WeightMat that was never repacked (paged tensors, by
 // construction, since a read-only mmap span has no load-time repack step)
 // simply always takes the fallback branch here.
 //
-// Bit-identical either way, for the same logical weights
-// (TestDotW4A8SplitHalf4Row_bitIdenticalToCanonical) — this method chooses
-// a kernel, never a numeric result.
+// Bit-identical down all three branches, for the same logical weights — this
+// method chooses a kernel, never a numeric result. Held by
+// TestDotW4A8SplitHalf4Row_bitIdenticalToCanonical (the M=1 kernel),
+// TestMatmulBTW4A8Row4TileInto_bitIdenticalToCanonical (the tile), and
+// TestWeightMatW4A8_MConsistentAcrossRow4Dispatch, which is the one that spans
+// the M=1/M>1 split HERE: it compares a row computed alone through the decode
+// kernel against the same row computed inside a batch through the tile, which is
+// exactly the pair speculative verify exercises.
 func (w *WeightMat) MatmulBTW4A8Into(ws *Workspace, a, dst []float32, M int) {
-	if M == 1 && w.q4Row4 != nil {
-		MatmulBTW4A8Row4Into(ws, a, w.q4Row4, w.q4Row4Scales, dst, M, w.cols, w.rows, w.group)
+	if w.q4Row4 != nil {
+		if M == 1 {
+			MatmulBTW4A8Row4Into(ws, a, w.q4Row4, w.q4Row4Scales, dst, M, w.cols, w.rows, w.group)
+			return
+		}
+		MatmulBTW4A8Row4TileInto(ws, a, w.q4Row4, w.q4Row4Scales, dst, M, w.cols, w.rows, w.group)
 		return
 	}
 	MatmulBTW4A8Into(ws, a, w.q4, w.q4s, dst, M, w.cols, w.rows, w.group)

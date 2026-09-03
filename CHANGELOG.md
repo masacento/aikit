@@ -9,6 +9,49 @@ excluded from that promise and may change in any release until it graduates.
 
 ## [Unreleased]
 
+### Added
+
+**A register-blocked W4A8 tile for arm64, and int4 prefill gets 2.88× on the kernel.**
+`MatmulBTW4A8Row4TileInto` reduces four activation rows against the four weight rows of one
+row4 quad in a single kernel call — 16 outputs, 16 live f32 accumulators, the register budget
+exactly filled. `WeightMat.MatmulBTW4A8Into` routes every M>1 to it automatically when the
+tensor is row4-resident (`RepackInt4Row4` / `WrapInt4Row4`); M=1 decode is untouched and still
+takes `dotW4A8SplitHalf4Row`. Non-arm64, non-DotProd cores, non-repacked tensors and paged-MoE
+spans all keep the canonical path, unchanged.
+
+What this removes is repetition, not arithmetic. The canonical M>1 path is a GEMV per
+(activation row, weight row) pair, so the 16-byte weight load, the four-op nibble unpack and
+the per-group scale broadcast are each paid M times over the same weight bytes. That is why
+`int8int8` prefill has been beating `int4` by 25–33% despite moving twice the bytes: at M>1 the
+byte saving is served from cache anyway while the unpack ALU cost stays. The tile pays the
+unpack once per weight row per group regardless of M — 0.19 SIMD µops per MAC against 0.34.
+
+Measured on an M1 Pro at K=1536 N=8960 (the Qwen2.5-Coder-1.5B gate/up projection), three
+interleaved paired passes, median: **2.88× single-core at M≥4** (24.1 → 69.5 GMAC/s) and
+**2.42–2.62× on the parallel dispatch** (96 → 251 GMAC/s aggregate). M=1 and M=2 read 1.74×
+because below M=4 the tile body never runs — those rows take the shipped four-weight-row kernel
+one at a time. The canonical arm sits flat at 24.1 GMAC/s at every M, reproducing its own
+previously recorded 24.5–25.0, so this is a same-box A/B rather than a comparison against
+another machine's numbers.
+
+**Bit-identical to the canonical path, by construction and by gate.** For each of the 16
+outputs the per-group instruction sequence is the one `dotW4A8SplitHalf4Row` already runs —
+zero, SDOT low, SDOT high, SCVTF, FMLA by the broadcast group scale into a persistent 4-lane
+accumulator, in ascending group — and the epilogue is the same FADDP tree. Nothing is
+reassociated; only sharing changes. `TestMatmulBTW4A8Row4TileInto_bitIdenticalToCanonical`
+holds it against `MatmulBTW4A8Into` over M ∈ {1..9, 12, 13} at both production projections,
+with companions for width-inertness and the zero-activation-row shortcut.
+
+**New M-invariance gates for the quantized kernels**, landed before the tile rather than with
+it: `TestMatmulBTW4A8_MConsistent`, `TestMatmulBTW8A8_MConsistent` and
+`TestWeightMatW4A8_MConsistentAcrossRow4Dispatch` pin that an output row computed inside an
+M-row batch is bit-identical to the same row computed alone at M=1. `TestMatmulBT_MConsistent`
+had been the only M-invariance gate in the package and it covers f32 `MatmulBT` only. The third
+is the one that matters most: `WeightMat.MatmulBTW4A8Into` sends M=1 to one kernel and M>1 to
+another, which is exactly the pair speculative verify exercises when a draft proposes at M=1 and
+a target verifies at M=K.
+
+
 ## [1.31.0] — 2026-08-31
 
 ### Added

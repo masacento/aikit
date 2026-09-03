@@ -72,6 +72,19 @@ func dotW4A8SplitHalf4Acc(act *int8, packed *byte, scales *float32, nGroups int)
 //go:noescape
 func dotW4A8SplitHalf4Row(act *int8, packed4 *byte, scales4 *float32, dst *float32, nGroups int)
 
+// dotW4A8Row4Tile4x4 is the register-blocked M>1 tile (docs/task-simd-audit.md
+// S-01): four ACTIVATION rows, actStride bytes apart, against the four weight
+// rows of one row4 quad, producing 16 float32 row-major in dst (dst[m*4+r] is
+// activation row m against weight row r). packed4/scales4 are the same
+// repackSplitHalf4RowBlock / interleaveScales4Row layout dotW4A8SplitHalf4Row
+// consumes; each weight row is loaded and unpacked ONCE per group instead of
+// once per activation row. Bit-identical to calling dotW4A8SplitHalf4Row per
+// activation row — same per-output instruction sequence, see
+// dot_w4a8_tile_arm64.s.
+//
+//go:noescape
+func dotW4A8Row4Tile4x4(act *int8, actStride int, packed4 *byte, scales4 *float32, dst *float32, nGroups int)
+
 // dotW4A8SplitHalf4RowPrefetch is dotW4A8SplitHalf4Row plus one PRFM
 // PLDL1KEEP per outer iteration, issued prefetchDistance BYTES ahead of the
 // current group's packed4 pointer (docs/task-w4a8-neon-bandwidth.md's

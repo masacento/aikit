@@ -16,9 +16,14 @@
 > `docs/internal/perf-dead-ends.md` and goinfer's campaign records was read first and is not
 > re-proposed.
 >
-> **Status: SCOPED 2026-09-03. The four no-hardware items are DONE (2026-09-03) — S-09.2,
-> S-09.3, S-10.1, S-10.2; see the annotations on each. Everything else is unstarted and needs
-> either a quiet box (step 0) or hardware neither box has (I8MM, VNNI).**
+> **Status: SCOPED 2026-09-03. Done so far (all 2026-09-03): the four no-hardware items —
+> S-09.2, S-09.3, S-10.1, S-10.2; S-08.1 (the 3700X's bandwidth, and a 30% correction to
+> `gpu-assessment.md` that has NOT yet been applied at the source); S-04 step 1 (the pure-Go AV
+> accumulator blocks, 2.35× arm64 / 1.36–1.46× amd64); and S-01's arm64 half — the M-invariance
+> gate and then the register-blocked 4×4 tile, `dotW4A8Row4Tile4x4`, measured 2.88× on the
+> prefill kernel. See the annotation on each. Still open: S-01's amd64 span and S-01b, the S-04
+> NEON ports, S-02/S-03/S-05/S-06/S-07, and the items needing hardware neither box has (I8MM,
+> VNNI). S-09.1 needs goinfer's decode bench in their repo.**
 >
 > **Original status: nothing started.** Static read of aikit `v1.31.0-5-gca817a4`
 > (`linalg/`, 16 assembly files, the Go dispatch, the docs and bench records) and goinfer
@@ -77,7 +82,7 @@ heads / 2 kv heads, hd 128, vocab 151936); ~1.05 GB of int4 weights + scales per
 |---|---|---|---|---|
 | **decode M=1, arm64** (Mac, 1.5B, depth ≤ 512) | ~85% weight stream | `dotW4A8SplitHalf4Row` (SDOT, 4 rows, f32 fold in register), W8A8 head via `dotI8SDOT` | **kernel at 91–97% of its issue ceiling per core; the 6-worker aggregate at 26–35% of six cores** | S-02 (fan-out), S-05 (9→7 µops), S-03 (batch entry) |
 | **decode M=1, amd64** (3700X) | same | `dotW4A8FoldAVX2` (25 instr/32 MACs, 1 acc), `dotI8AVX2` (4 acc) | kernel at ~53% of its port floor but **2–4 cores already exceed any plausible DRAM figure**; 16 SMT shards per call | S-02, S-08 (measure the box first) |
-| **prefill / verify M>1, both archs** | the whole prefill | `w4a8Span`: `for col { for row { dotW4A8(row, col) } }` — the M=1 GEMV per pair | **no reuse of unpacked weights across rows on either arch**; W4A8 spends 11 SIMD µops per 32 MACs per row where W8A8 spends 2 | **S-01** (4×4 tile on the row4 layout; 2.7× counted) |
+| **prefill / verify M>1, both archs** | the whole prefill | `w4a8Span`: `for col { for row { dotW4A8(row, col) } }` — the M=1 GEMV per pair | ✅ **arm64 FIXED 2026-09-03** — `dotW4A8Row4Tile4x4` reuses each unpacked weight row across four activation rows, measured **2.88×** (24.1 → 69.5 GMAC/s per core). amd64 still spends 9 unpack instructions per 32 MACs per row. | **S-01** (4×4 tile on the row4 layout; 2.7× counted, **2.88× measured**) |
 | **decode attention, depth ≥ 2k** | 75% of the token at 8k | `MatmulQKAcc64` / `MatmulAVAcc64` — pure Go f64, 8 scalar chains / memory accumulators | QK at 80% of its scalar issue bound; AV at ~40% (accumulators in memory) | **S-04** (NEON f64 lane-per-output, bit-identical) |
 | **Go-side serial work** | 8–10% at short context | `quantizeRowInt8Core` ×7 per layer (3 redundant), `silu` via f64 `math.Exp`, norms, fork/join | scalar, single goroutine, between parallel matmuls | S-03, S-06 |
 | **weight-only `int8` mode** | every projection | `q8Span` → `dequantRowInt8` + `dotNEON4` (**one** FMLA chain) | 3.2 GMAC/s per core — the mechanism behind the LM head's old 11–13 GB/s | S-07 (bit-identical 8-column form) |
@@ -178,8 +183,68 @@ prefill == speculative verify` guarantees rest on.
 > written while the implementation still satisfies it by construction, so the tile is measured
 > against a contract that predates it.
 >
-> **Still open in S-01:** the 4×4 tile kernel itself (arm64, on the existing row4 layout), the
-> amd64 unpack-once span, and the S-01b W8A8 M-tile.
+> **THE ARM64 TILE IS BUILT AND MEASURED, 2026-09-03 — 2.88×, bit-identical, and it beat the
+> count.** `dotW4A8Row4Tile4x4` (`linalg/dot_w4a8_tile_arm64.s`) reduces FOUR activation rows
+> against the four weight rows of one row4 quad per call — 16 outputs, 16 live f32 accumulators.
+> Entry point `MatmulBTW4A8Row4TileInto`; `WeightMat.MatmulBTW4A8Into` now routes every M>1 to it
+> when the tensor is row4-resident, and M=1 is untouched (decode keeps `dotW4A8SplitHalf4Row`).
+>
+> **Measured on `apple-m1pro`, K=1536 N=8960 (the gate/up projection), three interleaved paired
+> passes, median** (`TestW4A8TileVsCanonicalAB`; the box was NOT idle — load ~2.3, ~0.4 cores
+> busy — which matters little for the single-core arm and is why the parallel row is the softer
+> number):
+>
+> | M | serial canonical | serial tile | | parallel canonical | parallel tile | |
+> |--:|--:|--:|--:|--:|--:|--:|
+> | 1 | 24.0 GMAC/s | 41.7 | 1.74× | 23.6 | 41.6 | 1.77× |
+> | 2 | 24.1 | 42.3 | 1.75× | 79.8 | 131.9 | 1.65× |
+> | 4 | 24.1 | **69.5** | **2.88×** | 91.4 | 221.0 | 2.42× |
+> | 8 | 24.1 | 69.4 | 2.88× | 91.6 | 223.4 | 2.44× |
+> | 16 | 24.1 | 69.2 | 2.87× | 95.7 | 234.3 | 2.45× |
+> | 64 | 24.1 | 69.5 | 2.89× | 96.0 | 251.3 | **2.62×** |
+>
+> **Against the pre-registered gate — ship at ≥1.5× on the int4 prefill cell — this clears it by
+> nearly 2×, and it clears the counted estimate too:** this section counted 2.7× and 21 MACs/cycle.
+> Measured is 2.88× and 23.78 cycles per 32-k group against a modelled 24.0 (96 SIMD µops ÷ 4
+> pipes at 3.228 GHz = 68.9 GMAC/s modelled, 69.5 measured — inside 1%). That is the FIRST time in
+> this campaign an instruction-count argument has landed on the high side; the roofline record's
+> note that such arguments overpromised three times is why the confidence line said "medium on
+> 2.7×", and it is worth recording that the count was conservative here rather than optimistic.
+>
+> **It does NOT settle Appendix B's SDOT-pipe question, and the hedge attached to it was wrong.**
+> Appendix B lists "whether SDOT issues on four pipes or two" as unconfirmed, with the note that
+> two would halve S-01's gain. Two would not: the tile issues 32 SDOTs per group inside a 24-cycle
+> window, and two pipes supply 48 slots in that window. The tile is bound by TOTAL SIMD µops (96,
+> exactly filling 4 pipes × 24 cycles), not by SDOT issue, so the answer to the pipe question
+> changes nothing here. The question stays open; the risk it was attached to does not exist.
+>
+> **Why M=1 and M=2 read lower (1.74–1.75×) is structural, not a shortfall.** Below M=4 the tile
+> body never executes — those rows take the M%4 remainder path, which is the shipped
+> `dotW4A8SplitHalf4Row` one activation row at a time. So that column is really row4-vs-canonical,
+> and 41.7 GMAC/s reproduces the row4 kernel's own recorded 42.4–44. The canonical arm sits flat
+> at 24.1 GMAC/s across every M, reproducing §2's recorded 24.5–25.0 for `dotW4A8FoldSDOT` to
+> within 2% — so this is a same-box A/B against a baseline that re-derived its own published
+> figure, not a comparison against another machine's records.
+>
+> **The parallel ratio being LOWER than the serial one (2.42–2.62 vs 2.88) is S-02 showing
+> through**, and is the expected sign: making the kernel 2.9× faster does not make the fork/join
+> 2.9× faster, so the fan-out's share of the call grows and the end-to-end ratio compresses. The
+> tile therefore makes S-02 worth MORE than the audit costed it, not less.
+>
+> **Identity is checked at production shapes, not argued.**
+> `TestMatmulBTW4A8Row4TileInto_bitIdenticalToCanonical` holds the tile against the canonical M>1
+> path over M ∈ {1..9, 12, 13} (every residue mod 4, including the M<4 shapes where only the
+> remainder path runs) at both production projections plus a single-group/single-quad shape and an
+> odd quad count; `_parallelMatchesSerial` pins width-inertness at 1/2/3/4/8 workers;
+> `_zeroActivationRow` pins the `aScale==0` shortcut in both the tiled and the remainder position.
+> `TestWeightMatW4A8_MConsistentAcrossRow4Dispatch` — written before the kernel — now genuinely
+> spans the M=1-kernel/M>1-tile boundary and passes. `go vet`, the full `linalg` suite, the
+> `aikit_checks` contract build and the whole repo's tests are green.
+>
+> **Still open in S-01:** the amd64 unpack-once span, and the S-01b W8A8 M-tile (`dotI8SDOT` is
+> latency-bound at 1 SDOT/cycle; 16 int32 accumulators should be issue-bound at 2–4×). Not yet
+> measured: goinfer's end-to-end prefill cell, which is the number that decides whether the
+> int4/int8int8 inversion is actually gone — that needs their repo and `scripts/bench_peer_prefill.py`.
 
 - **Where:** `quant.go:585-597` (`w4a8Span`), `quant.go:280-330` (`w8a8Span`);
   `weightmat_splithalf_amd64.go:67-73` and `weightmat_row4_arm64.go:48-54` route every M≠1 call
@@ -555,7 +620,7 @@ items; G4/G5 (f32 silu/gelu) were parity-gated; G10 (RoPE table) bit-identical. 
 | step | item | prize (counted, not measured) | numerics | prerequisite |
 |---|---|---|---|---|
 | 0 | S-09.1 re-run the serial/parallel A/B correctly; S-08.1 STREAM the 3700X; the per-shard timestamp harness for S-02 | decides where the decode gap is | none | none |
-| 1 | S-01 W4A8 M-invariance gate ✅ **DONE 2026-09-03**, then the 4×4 tile on row4 (arm64) and the unpack-once span (amd64) | CPU prefill 2–2.7× at the kernel; the int4/int8int8 inversion; verify rounds cheaper on every spec path | bit-identical | the gate |
+| 1 | S-01 W4A8 M-invariance gate ✅ **DONE**, the 4×4 tile on row4 (arm64) ✅ **DONE 2026-09-03, 2.88×**; the unpack-once span (amd64) still open | CPU prefill 2–2.7× at the kernel; the int4/int8int8 inversion; verify rounds cheaper on every spec path | bit-identical | the gate |
 | 2 | S-02 remedy that step 0 selects (dynamic chunking and/or `MatmulBTW4A8Batch`) + S-03 NEON quantiser | decode 1.15–1.7× on the fan-out term; −3 barriers, −3 quantisations per layer | bit-identical | step 0 |
 | 3 | S-04 AV pure-Go accumulator blocks → NEON AV → NEON QK | ~1.9× token at depth 8k; ~1.1× at 128 | bit-identical (exact products) | none |
 | 4 | S-06 step 1 (parallelise the elementwise loops) | prefill 7–25% at the 3700X rate, less on M1 | bit-identical | the stub measurement |
