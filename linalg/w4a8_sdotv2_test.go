@@ -280,7 +280,24 @@ func TestDotW4A8SplitHalf4Row_bitIdenticalToCanonical(t *testing.T) {
 	}
 	rng := rand.New(rand.NewSource(97))
 	const group = 32
-	for nGroups := 1; nGroups <= 20; nGroups++ {
+	// 1..20 sweeps the small group counts densely — every residue mod 4 several
+	// times, which is what catches a tail or unroll-boundary bug. But it stops at
+	// K=640, and PRODUCTION K IS 1536 AND 8960 (task-simd-audit.md S-09.3): the
+	// reference model's hidden and intermediate dims, i.e. nGroups 48 and 280.
+	//
+	// The structural argument says a group-count-dependent residue cannot exist —
+	// the kernel's accumulator layout does not vary with nGroups — and the
+	// production-shaped sibling gate (TestMatmulBTW4A8Row4Into_bitIdenticalTo-
+	// MatmulBTW4A8Into, which already runs {1536, 8960} and {8960, 1536}) covers
+	// the same ground one level up. This adds the two production counts to the RAW
+	// KERNEL gate anyway, because "an argument plus a different test" is weaker
+	// than the same test executing the shape, and it costs two iterations.
+	counts := make([]int, 0, 22)
+	for n := 1; n <= 20; n++ {
+		counts = append(counts, n)
+	}
+	counts = append(counts, 48, 280) // K = 1536, 8960
+	for _, nGroups := range counts {
 		K := nGroups * group
 		for trial := 0; trial < 10; trial++ {
 			act := make([]int8, K)

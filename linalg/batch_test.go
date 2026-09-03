@@ -152,3 +152,57 @@ func TestW8A8Into_zeroAllocWhenReused(t *testing.T) {
 		t.Errorf("reused Into allocs = %v/op, want 0", avg)
 	}
 }
+
+// TestW8A8Into_boundedAllocOnParallelPath closes task-simd-audit.md S-09.2.
+//
+// TestW8A8Into_zeroAllocWhenReused above runs at M*N*K = 4.35M MACs, which is BELOW
+// the default parallel threshold — so it has only ever pinned the SERIAL path, and
+// the parallel one has gone ungated. That is the path decode actually takes at
+// production shapes, and it is where a per-call allocation would hurt most.
+//
+// Zero is the wrong bar here and asserting it would be a bug in the test: the
+// fan-out legitimately allocates fork/join bookkeeping per dispatch, roughly one
+// object per worker plus a couple of fixed ones. What must not happen is that
+// figure growing WITH THE WORK — an allocation moved inside the per-column span, of
+// the kind q8Span's widen-per-row would have been (S-07). So this asserts a bound
+// that scales with WORKERS and not with N, and pins it at two very different N to
+// make "does not scale with the work" an assertion rather than a hope.
+func TestW8A8Into_boundedAllocOnParallelPath(t *testing.T) {
+	const M, K = 1, 896
+	const workers = 4
+
+	allocsAt := func(N int) float64 {
+		a := randF(M * K)
+		bq := randI8(N * K)
+		bs := randF(N)
+		dst := make([]float32, M*N)
+		var ws Workspace
+		ws.SetWorkers(workers)
+		ws.SetThreshold(1) // force the parallel path regardless of shape
+		MatmulBTW8A8Into(&ws, a, bq, bs, dst, M, K, N)
+		return testing.AllocsPerRun(20, func() {
+			MatmulBTW8A8Into(&ws, a, bq, bs, dst, M, K, N)
+		})
+	}
+
+	const bound = workers + 2
+	small, large := allocsAt(512), allocsAt(4864)
+	t.Logf("parallel-path allocs/op at %d workers: N=512 -> %.0f, N=4864 -> %.0f (bound %d)",
+		workers, small, large, bound)
+
+	for _, c := range []struct {
+		n int
+		a float64
+	}{{512, small}, {4864, large}} {
+		if c.a > bound {
+			t.Errorf("N=%d: %.0f allocs/op exceeds the workers+2 bound of %d — a per-dispatch "+
+				"allocation has been added to the parallel path", c.n, c.a, bound)
+		}
+	}
+	// The load-bearing half: a 9.5x larger N must not cost more allocations. If it
+	// does, something allocates per column or per span rather than per dispatch.
+	if large > small {
+		t.Errorf("allocs grew with the work (N=512 -> %.0f, N=4864 -> %.0f): the parallel path "+
+			"is allocating per column or per span, not per dispatch", small, large)
+	}
+}

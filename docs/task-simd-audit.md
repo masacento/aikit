@@ -16,7 +16,11 @@
 > `docs/internal/perf-dead-ends.md` and goinfer's campaign records was read first and is not
 > re-proposed.
 >
-> **Status: SCOPED 2026-09-03, nothing started.** Static read of aikit `v1.31.0-5-gca817a4`
+> **Status: SCOPED 2026-09-03. The four no-hardware items are DONE (2026-09-03) — S-09.2,
+> S-09.3, S-10.1, S-10.2; see the annotations on each. Everything else is unstarted and needs
+> either a quiet box (step 0) or hardware neither box has (I8MM, VNNI).**
+>
+> **Original status: nothing started.** Static read of aikit `v1.31.0-5-gca817a4`
 > (`linalg/`, 16 assembly files, the Go dispatch, the docs and bench records) and goinfer
 > `30b168e` (the callers). Three independent reviewers (arm64 assembly, amd64 assembly, Go
 > side + coupling), instruction counts by hand, every raw `WORD` encoding recomputed. Nothing
@@ -367,23 +371,42 @@ prefill == speculative verify` guarantees rest on.
    trace-derived ~1%/token scheduler latency stands; "removing every fork/join changes nothing"
    does not. Re-run with `cache.scr.ws.SetThreshold(1<<62)` and confirm zero `parallelSpawnCols`
    in the trace — S-02's premise depends on it.
-2. **Zero-alloc is pinned only on the serial path.** `TestW8A8Into_zeroAllocWhenReused` runs at
-   4.35M MACs, below the default threshold; the parallel path allocates `workers+2` objects per
-   dispatch (~74–85 KB/token, all fork/join bookkeeping). An `AllocsPerRun` gate with a
-   `≤ workers+2` bound would catch a regression of the `q8Span` kind (S-07).
+2. **Zero-alloc is pinned only on the serial path.** ✅ **DONE 2026-09-03.**
+   `TestW8A8Into_zeroAllocWhenReused` runs at 4.35M MACs, below the default threshold, so it
+   only ever pinned the serial path. `TestW8A8Into_boundedAllocOnParallelPath` now forces the
+   parallel path (`SetThreshold(1)`, `SetWorkers(4)`) and bounds it. **Measured: 4 allocs/op,
+   flat across N=512 and N=4864** — comfortably under the `workers+2` = 6 bound. The gate
+   asserts the bound AND that the count does not grow with N, which is the half that actually
+   catches an S-07-class regression: zero would have been the wrong bar (the fan-out legitimately
+   allocates bookkeeping per dispatch), so what is pinned is "per dispatch, not per column".
 3. **The row4 bit-identity unit test covers K ≤ 640** (nGroups 1..20); production K is 1536 and
-   8960. The structural argument and goinfer's end-to-end M-independence tests cover it; the unit
-   gate would miss a group-count-dependent residue. Extend to the production shapes.
+   8960. ✅ **DONE 2026-09-03, with a correction to this finding.** There are TWO row4
+   bit-identity gates and this item conflates them. The production-level one,
+   `TestMatmulBTW4A8Row4Into_bitIdenticalToMatmulBTW4A8Into`, **already ran `{1536, 8960}` and
+   `{8960, 1536}`** — the exact production shapes — so the claim as written overstates the gap.
+   The narrow one is the RAW KERNEL gate,
+   `TestDotW4A8SplitHalf4Row_bitIdenticalToCanonical` (`w4a8_sdotv2_test.go`), which swept
+   `nGroups 1..20` only. That now also runs nGroups 48 and 280 (K = 1536, 8960) and **passes
+   bit-identical**, so the structural argument has a measurement under it at the shapes that
+   ship.
 
 ### S-10 · Eng — hygiene
 
 - `fma_issue_probe_test.go:146-149` says Go "deliberately does NOT auto-fuse `a*b+c`"; it does
-  on arm64 (`FMADDS/FMADDD` rules), which is exactly why goinfer keys goldens by GOARCH. The
-  comment will mislead the next bit-identity audit of the f32 Go tails. `go build -gcflags=-S
-  ./linalg | grep FMADD` on the Mac settles it.
-- `WrapInt4Row4` (`weightmat.go:177-191`) validates lengths but not `rows%4`/`cols%group`; a
-  hostile kind-4 blob loads and panics at the first M=1 matmul (`MatmulBTW4A8Row4Into:101`)
-  instead of returning an error — the M17 hardening class in goinfer.
+  on arm64. ✅ **DONE 2026-09-03 — the finding is correct and the comment is now corrected in
+  place.** Settled by counting, on the Mac: `go build -gcflags=-S ./linalg | grep -c 'FMADD[SD]'`
+  → **59** (46 FMADDS, 13 FMADDD), while `grep -rn 'math\.FMA' linalg/*.go | grep -v _test` →
+  **0**. Zero explicit calls, 59 fused instructions: every one is auto-fused from plain `a*b+c`.
+  Sites include `dot.go`'s scalar tail (`sum += a[k] * b[k]`) and — the one that matters —
+  `matmul_qk_acc64.go`, an f64 attention kernel whose bit-identity is load-bearing.
+- `WrapInt4Row4` (`weightmat.go:177-191`) validates lengths but not `rows%4`/`cols%group`.
+  ✅ **DONE 2026-09-03.** It now rejects the shape at wrap, matching the two `requireExactLen`
+  calls beside it — a caller cannot recover from a malformed weight blob, and failing at load
+  names the blob where failing at the first matmul named a kernel. `RepackInt4Row4` already
+  declined exactly this shape, so `WrapInt4Row4` was the other door into the same field.
+  `TestWrapInt4Row4_rejectsBadShapeAtWrap` asserts the message names `WrapInt4Row4` and the
+  offending dims, so it distinguishes WHERE the failure happens rather than merely that one does;
+  verified by removing the guard and watching it fail.
 - Non-DotProd arm64 gets a fully scalar W4A8 (`quant_w4a8_arm64.go:119`; W8A8 has a
   `SMULL/SADALP` fallback, W4A8 does not) — irrelevant on Apple silicon, relevant for
   Graviton1/A72-class targets and the `dotprod_arm64_other.go` BSD/Windows assumption.
