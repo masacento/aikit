@@ -19,11 +19,13 @@
 > **Status: SCOPED 2026-09-03. Done so far (all 2026-09-03): the four no-hardware items —
 > S-09.2, S-09.3, S-10.1, S-10.2; S-08.1 (the 3700X's bandwidth, and a 30% correction to
 > `gpu-assessment.md` that has NOT yet been applied at the source); S-04 step 1 (the pure-Go AV
-> accumulator blocks, 2.35× arm64 / 1.36–1.46× amd64); and S-01's arm64 half — the M-invariance
+> accumulator blocks, 2.35× arm64 / 1.36–1.46× amd64); **S-01's arm64 half** — the M-invariance
 > gate and then the register-blocked 4×4 tile, `dotW4A8Row4Tile4x4`, measured 2.88× on the
-> prefill kernel. See the annotation on each. Still open: S-01's amd64 span and S-01b, the S-04
-> NEON ports, S-02/S-03/S-05/S-06/S-07, and the items needing hardware neither box has (I8MM,
-> VNNI). S-09.1 needs goinfer's decode bench in their repo.**
+> prefill kernel; and **S-01b's arm64 half** — `dotI8Tile4x4`, 3.5–3.9× on W8A8 at M≥4 in every
+> cache regime. Appendix B's SDOT-pipe question is measured and closed (four pipes, 3.98/cycle).
+> See the annotation on each. Still open: S-01/S-01b's amd64 halves, the S-04 NEON ports,
+> S-02/S-03/S-05/S-06/S-07, and the items needing hardware neither box has (I8MM, VNNI). S-09.1
+> needs goinfer's decode bench in their repo.**
 >
 > **Original status: nothing started.** Static read of aikit `v1.31.0-5-gca817a4`
 > (`linalg/`, 16 assembly files, the Go dispatch, the docs and bench records) and goinfer
@@ -100,7 +102,8 @@ The instruction accounting behind each row is in §2; the sources of every measu
 | `dotW4A8SplitHalf4Row` (`dot_w4a8_arm64.s:444-532`) | M==1 and the tensor has a row4 layout (`weightmat_row4_arm64.go:48-54`; every 0.5B/1.5B projection qualifies; kind-4 `.giw` aliases it) | 12.75 (load 2.25, unpack 4, SDOT 2+MOVI, fold 2, loop 1.5) | 9 | 4 f32 chains, one per row | 9 µops / 4 pipes = 2.25 cy | 45.5 GMAC/s = 22.8 GB/s packed, 28.4 with scales | hot ≈44 GMAC/s; cold 42.4–42.7; 1 worker 25.9–26.2 GB/s | **91–97%** |
 | same, 6 workers | — | — | — | — | not the kernel | 6 × 28.4 = 170 issue; 121 STREAM | 59.6–60.6 isolated; **44.9 in decode** | 35% / 26% |
 | `dotW4A8FoldSDOT` (canonical, `:43-81`) | **every M>1 call**, non-row4 tensors, paged MoE | 17 (load 3, unpack 6 incl. ZIP1/ZIP2, SDOT 2+MOVI, fold 2, loop 3) | 11 | 1 f32 chain | FMLA latency ≈4 cy/group | 25.6 GMAC/s | 24.5–25.0 | 96–98% of the latency bound |
-| `dotI8SDOT` (`dot_i8dp_arm64.s:22-76`, W8A8) | every W8A8 call, any M | 3.5 per 16 int8 MACs | 1 | 4 int32 | 1 SDOT / cy (4 acc × 4 cy) | 51 GMAC/s = 51 GB/s | 49.2 | 96% (64% of the load bound) |
+| `dotI8SDOT` (`dot_i8dp_arm64.s:22-76`, W8A8) | every W8A8 call at M<4, and the M%4/N%4 strips above it | 3.5 per 16 int8 MACs | 1 | 4 int32 | 1 SDOT / cy (4 acc × 4 cy) | 51 GMAC/s = 51 GB/s | 49.2 | 96% (64% of the load bound) |
+| `dotI8Tile4x4` (`dot_i8_tile_arm64.s`, **added 2026-09-03**, S-01b) | every W8A8 call at M≥4, arm64 + DotProd | 1.5 per 16 int8 MACs (8 loads + 16 SDOT per 256) | 1 | **16 int32** | SDOT issue, **measured 3.98/cy** | 203.6 GMAC/s (`TestSDOTIssuePeak`) | 163.5 | **80%** |
 | `dotNEON4` (`dot_arm64.s:25-45`, `dotF32`) | weight-only int8/int4 (`q8Span`, `q4Span`) | 5 per 4 f32 MACs | 1 chain | 1 | FMLA latency | 3.2 GMAC/s | LM head 11–13 GB/s over 6–8 cores | consistent |
 | `dotNEON2x8` (`dot2x8_arm64.s`) | f32 GEMM row pairs (`blockedFill`) | 16 FMLA / 64 MACs | 16 | — | FMLA issue | 102 GFLOPS theo., 95.4 measured peak | ~42 GMAC/s | ~95% |
 | `MatmulQKAcc64` (Go, `matmul_qk_acc64.go:21-67`) | decode attention QKᵀ | 26 instr / 8 f64 MACs (9 loads, 9 FCVT, 8 FMADD) | 17 FP | 8 f64 chains | FP issue | 6.0 GMAC/s | 4.8 | 80% |
@@ -241,10 +244,58 @@ prefill == speculative verify` guarantees rest on.
 > spans the M=1-kernel/M>1-tile boundary and passes. `go vet`, the full `linalg` suite, the
 > `aikit_checks` contract build and the whole repo's tests are green.
 >
-> **Still open in S-01:** the amd64 unpack-once span, and the S-01b W8A8 M-tile (`dotI8SDOT` is
-> latency-bound at 1 SDOT/cycle; 16 int32 accumulators should be issue-bound at 2–4×). Not yet
-> measured: goinfer's end-to-end prefill cell, which is the number that decides whether the
-> int4/int8int8 inversion is actually gone — that needs their repo and `scripts/bench_peer_prefill.py`.
+> **S-01b IS ALSO DONE, 2026-09-03 — the W8A8 tile, 3.5–3.9×, and the `dotI8Cols8` failure mode
+> did not reproduce.** `dotI8Tile4x4` (`linalg/dot_i8_tile_arm64.s`) reduces four activation rows
+> against four weight rows into 16 int32 accumulators. It needs no layout change and no opt-in —
+> `w8a8Span` now hands the largest 4×4 rectangle of every span to it on arm64, so **every** W8A8
+> caller at M≥4 gets it. Bit-identity is free rather than argued: every partial is int32, integer
+> addition is exact and associative, and the overflow envelope (|Σ| ≤ n·127²) is `dotI8SDOT`'s
+> own, unchanged.
+>
+> **Measured, serial, one core, median of 3 interleaved passes** — the arms are the pre-tile span
+> (`w8a8SpanRows`, literally the code that shipped before) and `w8a8Span`:
+>
+> | K | N | B size | M=4 | M=8 | M=16 |
+> |--:|--:|--:|--:|--:|--:|
+> | 1536 | 8960 | 13 MB resident — the prefill cell | 3.67× | 3.68× | 3.79× |
+> | 768 | 8192 | 6 MB resident — *the shape `dotI8Cols8` was shipped on* | 3.62× | 3.76× | 3.87× |
+> | 1536 | 18944 | 29 MB streamed — *`dotI8Cols8`'s worst case* | 3.74× | 3.74× | 3.83× |
+> | 3584 | 18944 | 68 MB streamed — a 7B FFN | 2.08× | 3.47× | 3.66× |
+> | 768 | 100000 | 73 MB streamed — aikit's ANN scan | 3.58× | 3.73× | 3.85× |
+>
+> **The grid straddling the LLC was the point, not decoration.** `w8a8Span`'s own comment records
+> that `dotI8Cols8` was measured at ONE cache-resident shape, shipped on it, and lost badly
+> wherever B streamed — it was deleted for that. The tile also advances multiple B streams, so the
+> same trap was live. It did not spring: the streamed rows are as good as the resident ones. Two
+> things differ from `dotI8Cols8` — four streams inside ONE contiguous 4·K block rather than eight
+> scattered ones, and four times the arithmetic per weight byte because M≥4 rather than M=1.
+>
+> **One real cliff, characterised rather than left as an outlier.** At **M=4 only**, the ratio
+> falls as K grows: a paired sweep at constant B (68 MB) gives 3.05× at K=3072, 2.05× at 3584,
+> 2.01× at 4096, **1.69× at 5120** — while M=8 stays flat at 3.4–3.8× across the same K range.
+> The mechanism is that M=4 is the one batch size with NO reuse in the tile's inner loop: each
+> 4-weight-row block is read exactly once, so the tile needs ~32 GB/s of weight fetch to keep four
+> SDOT pipes fed, against ~19 GB/s at M=8. Past K≈3072 the four large-stride streams stop
+> delivering it. Worst cell measured is 1.69×, still above this section's ≥1.5× ship gate, and no
+> cell anywhere regresses.
+>
+> **Appendix B's SDOT-pipe question is now ANSWERED: four.** `TestSDOTIssuePeak`
+> (`sdot_peak_arm64.s`) runs 32 independent SDOTs per iteration over 16 accumulators with no
+> memory traffic: **3.98 SDOT/cycle, 12.73 G SDOT/s, 203.6 GMAC/s** on one P-core — 99.5% of the
+> 4-pipe ceiling at 3.2 GHz, and never below the 3-pipe ceiling even on a busy box. Two pipes was
+> the hedge; it is excluded by a factor of two. The probe asserts the CEILING and not a floor, per
+> the roofline record's rule, so a folded loop or a wrong clock constant fails it rather than
+> being believed. Against that ceiling the W8A8 tile's 163.5 GMAC/s is **80% of pure SDOT issue**,
+> which is a good fraction for a kernel that also runs 8 loads per 16 SDOTs.
+>
+> This supersedes the more cautious note above, which said the W4A8 tile did not settle the pipe
+> question. It did not — 32 SDOTs in a 24-cycle window fit in two pipes — but the direct probe
+> does.
+>
+> **Still open in S-01:** the amd64 unpack-once span and an amd64 W8A8 M-tile over `dotI8AVX2`'s
+> four accumulators (both need the 3700X). Not yet measured: goinfer's end-to-end prefill cell,
+> the number that decides whether the int4/int8int8 inversion is actually gone — that needs their
+> repo and `scripts/bench_peer_prefill.py`.
 
 - **Where:** `quant.go:585-597` (`w4a8Span`), `quant.go:280-330` (`w8a8Span`);
   `weightmat_splithalf_amd64.go:67-73` and `weightmat_row4_arm64.go:48-54` route every M≠1 call
@@ -693,6 +744,10 @@ for SDOT/SCVTF/FMLA alike, 3 loads/cycle) — the 91–97% fractions are the evi
 whether `MOVI #0` is a rename-time zero idiom; which of wake-chain stagger vs E-core/SMT
 stragglers dominates S-02; whether gc emitted `FCSEL` or branches in the quantiser; the cost of
 a line-straddling 16-byte load on Apple silicon (the `.giw` arbitrary-base question, expected ≤
-a few % single-core, nil at six workers); the 3700X's real bandwidth; the Go version that
-introduced `GOAMD64>=v3` FMA fusion; ggml/KleidiAI op counts beyond kernel shape; whether SDOT
-issues on four pipes or two (halves S-01's counted gain, still positive).
+a few % single-core, nil at six workers); ~~the 3700X's real bandwidth~~ (**measured, S-08.1**);
+the Go version that introduced `GOAMD64>=v3` FMA fusion; ggml/KleidiAI op counts beyond kernel
+shape; ~~whether SDOT issues on four pipes or two~~ — **MEASURED 2026-09-03: four.**
+`TestSDOTIssuePeak` reads 3.98 SDOT/cycle (12.73 G SDOT/s, 203.6 GMAC/s) on one M1 Pro P-core,
+99.5% of the 4-pipe ceiling and 1.99× the 2-pipe one. The "halves S-01's counted gain" note
+attached to it was wrong twice over: the count did not need halving, and neither tile is
+SDOT-issue-limited in the first place.

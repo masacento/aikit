@@ -31,11 +31,9 @@ import (
 // TestMatmulBTW4A8Row4TileInto_bitIdenticalToCanonical). Read the numbers, do
 // not let CI vote on them.
 func TestW4A8TileVsCanonicalAB(t *testing.T) {
+	harnessOnly(t)
 	if !hasDotProd {
 		t.Skip("no FEAT_DotProd on this core; the row4 kernels do not dispatch")
-	}
-	if testing.Short() {
-		t.Skip("A/B timing harness; -short")
 	}
 	const (
 		group = 32

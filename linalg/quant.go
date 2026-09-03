@@ -316,10 +316,30 @@ func w8a8Span(aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, M
 	// DELETED rather than left sitting unused: it is recoverable from v1.17.0, the
 	// redo wants a different shape of kernel anyway, and unused assembly with no
 	// caller is exactly the kind of machinery this repo does not keep.
+	// S-01b (docs/task-simd-audit.md): on arm64 at M>=4 a register-blocked tile
+	// takes the largest 4-row-by-4-column rectangle of this span, and the two
+	// leftover strips fall to the loop below unchanged. Off arm64, or at M<4, or
+	// without DotProd, w8a8TileRect claims nothing and the first call below is
+	// the whole span — byte-for-byte the code that shipped before the tile.
+	mTiled, jTiled := w8a8TileRect(aq, aScales, bQ, bScales, dst, M, K, N, j0, j1)
+	if mTiled < M {
+		w8a8SpanRows(aq, aScales, bQ, bScales, dst, K, N, mTiled, M, j0, j1)
+	}
+	if jTiled < j1 {
+		w8a8SpanRows(aq, aScales, bQ, bScales, dst, K, N, 0, mTiled, jTiled, j1)
+	}
+}
+
+// w8a8SpanRows is w8a8Span's kernel over an explicit row range as well as a
+// column range: dst[i,j] for i in [i0,i1), j in [j0,j1). The column-outer,
+// row-inner order and the linear walk of B are the shape the long comment above
+// argues for, and are unchanged — this is a factoring, not a rewrite, so that the
+// tile's leftover strips run exactly the code the whole span used to run.
+func w8a8SpanRows(aq []int8, aScales []float32, bQ []int8, bScales, dst []float32, K, N, i0, i1, j0, j1 int) {
 	for j := j0; j < j1; j++ {
 		bj := bQ[j*K : j*K+K]
 		bScale := bScales[j]
-		for i := range M {
+		for i := i0; i < i1; i++ {
 			if aScales[i] == 0 {
 				dst[i*N+j] = 0
 				continue

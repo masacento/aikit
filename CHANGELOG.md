@@ -42,6 +42,36 @@ reassociated; only sharing changes. `TestMatmulBTW4A8Row4TileInto_bitIdenticalTo
 holds it against `MatmulBTW4A8Into` over M ∈ {1..9, 12, 13} at both production projections,
 with companions for width-inertness and the zero-activation-row shortcut.
 
+**A register-blocked W8A8 tile too, and this one needs no opt-in.** `dotI8Tile4x4` reduces four
+activation rows against four weight rows into 16 int32 accumulators, and `w8a8Span` hands it the
+largest 4×4 rectangle of every span on arm64 — so every W8A8 caller at M≥4 gets it with no layout
+change, no repack and no API change. Below M=4 (decode, and the ANN scan's M=1 queries) nothing
+changes at all.
+
+`dotI8SDOT` sat on two near-coincident limits: four int32 accumulators at ~4-cycle SDOT latency
+cap it at 1 SDOT/cycle, and its 2 loads per SDOT need 2 of 3 load slots to sustain even that.
+Sixteen accumulators clear the first, and sharing each load across the other tile dimension takes
+the ratio to 8 loads per 16 SDOTs, clearing the second. Measured serial on one core, median of
+three interleaved passes: **3.5–3.9× at M≥8 across every shape tested**, from a 6 MB
+cache-resident B to a 73 MB streamed one. At M=4 — the one batch size with no reuse in the tile's
+inner loop — the ratio falls with K, from 3.05× at K=3072 to 1.69× at K=5120; that is the worst
+cell measured anywhere, and it is still a 1.69× win.
+
+The multi-stream regression this could have been was checked for explicitly rather than reasoned
+away. A deleted eight-column kernel (`dotI8Cols8`, v1.17.0) was measured at one cache-resident
+shape, shipped on it, and lost badly wherever B streamed. The tile advances four B streams, so
+the grid deliberately straddles the LLC — and the streamed rows came back as strong as the
+resident ones.
+
+Bit-identity here is free rather than argued: every partial is int32, integer addition is exact
+and associative, and the int32 overflow envelope is `dotI8SDOT`'s own, unchanged.
+
+**`TestSDOTIssuePeak` measures SDOT issue width directly: 3.98 per cycle on an M1 Pro P-core**
+(12.73 G SDOT/s, 203.6 GMAC/s of int8), settling a constant that had been carried as an
+assumption. It asserts the ceiling and never a floor — a reading above four pipes means the loop
+was folded or the clock constant is wrong, which is the failure that has produced bogus bandwidth
+numbers before, while a low reading on a busy box is not a defect and must not fail CI.
+
 **New M-invariance gates for the quantized kernels**, landed before the tile rather than with
 it: `TestMatmulBTW4A8_MConsistent`, `TestMatmulBTW8A8_MConsistent` and
 `TestWeightMatW4A8_MConsistentAcrossRow4Dispatch` pin that an output row computed inside an
