@@ -182,6 +182,23 @@ func WrapInt4Row4(q4 []byte, q4s []float32, rows, cols, group int, q4Row4 []byte
 	if !row4Usable() {
 		return w
 	}
+	// SHAPE, NOT JUST LENGTH (task-simd-audit.md S-10). The row4 kernel interleaves
+	// FOUR rows and reads whole groups; it cannot express rows%4 != 0 or
+	// cols%group != 0. Until this check existed, a blob with the right byte COUNT
+	// but the wrong shape passed both requireExactLen calls below, got stored, and
+	// panicked later inside MatmulBTW4A8Row4Into on the first M=1 matmul — far from
+	// the blob that caused it and with nothing naming it.
+	//
+	// RepackInt4Row4 (weightmat_row4_arm64.go) already declines exactly this shape,
+	// so the constraint was known; this is the OTHER door into the same field, the
+	// one a prebuilt kind-4 blob comes through. Panicking here is deliberate and
+	// matches the two length checks immediately below: a caller cannot recover from
+	// a malformed weight blob, and failing at load names it while failing at the
+	// first matmul does not.
+	if group <= 0 || rows%4 != 0 || cols%group != 0 {
+		panic(fmt.Sprintf("linalg: WrapInt4Row4: the row4 layout needs rows%%4==0 and cols%%group==0, "+
+			"got rows=%d cols=%d group=%d", rows, cols, group))
+	}
 	nGroups, bpr := groupsFor(cols, group)
 	requireExactLen("WrapInt4Row4", "q4Row4", len(q4Row4), mul(rows, bpr))
 	requireExactLen("WrapInt4Row4", "q4Row4Scales", len(q4Row4Scales), mul(rows, nGroups))

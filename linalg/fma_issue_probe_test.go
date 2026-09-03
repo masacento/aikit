@@ -142,11 +142,32 @@ func resetAcc(acc []float64) {
 // Separate slots, not one running sum, so the instructions have no data
 // dependency between them — occupying distinct issue slots, not serializing
 // through one, is the entire point of the injection. math.FMA (not a*b+c)
-// because it is one of the Go compiler's few float intrinsics: plain a*b+c
-// is deliberately NOT auto-fused into hardware FMA (that would change
-// rounding vs separate mul+add, breaking Go's IEEE-754 reproducibility
-// guarantee), so math.FMA is the explicit escape hatch to a true single FMA
-// instruction on arm64/amd64.
+// because it is one of the Go compiler's few float intrinsics and therefore
+// emits a true single FMA on every architecture, which is what this probe
+// needs to inject a known unit of work.
+//
+// CORRECTION 2026-09-03 (task-simd-audit.md S-10). This comment used to claim
+// that plain a*b+c is "deliberately NOT auto-fused into hardware FMA", on the
+// grounds that fusing would break Go's IEEE-754 reproducibility guarantee.
+// THAT IS WRONG ON arm64, and it is wrong in this very package. The Go spec
+// explicitly PERMITS fusing an explicit floating-point multiply-add, and the
+// arm64 backend takes it:
+//
+//	$ go build -gcflags=-S ./linalg | grep -c 'FMADD[SD]'
+//	59            # 46 FMADDS + 13 FMADDD
+//	$ grep -rn 'math\.FMA' linalg/*.go | grep -v _test | wc -l
+//	0             # not one explicit call — every FMADD above is auto-fused
+//
+// The sites include linalg/dot.go's scalar tail (`sum += a[k] * b[k]`) and,
+// more consequentially, matmul_qk_acc64.go — one of the f64 attention kernels
+// whose bit-identity is load-bearing.
+//
+// The consequence is the reason this correction matters rather than being
+// pedantry: a*b+c and fma(a,b,c) round DIFFERENTLY (one rounding, not two), so
+// the same Go source produces different f32/f64 results on arm64 than on an
+// amd64 target that did not fuse. That is precisely why goinfer keys its
+// goldens by GOARCH. Anyone auditing the bit-identity of the pure-Go tails who
+// believed the old comment would conclude the arch split was unnecessary.
 //
 // fmaX/fmaY sit a few ULPs from the identity (1, 0) — real, data-dependent
 // arithmetic the compiler cannot constant-fold, without letting the
