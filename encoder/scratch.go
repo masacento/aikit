@@ -80,6 +80,12 @@ type scratch struct {
 	ctxHead []float32
 	// Attention scores [L, L].
 	scores []float32
+	// band is the per-worker arena for the BANDED sliding-window attention path
+	// (modernbert.go, mbBandQTile). Each worker owns one contiguous slot holding a
+	// [qTile, bandWidth] score tile followed by a [headDim, bandWidth] packed V
+	// band; sized by ensureBand. Only the ModernBERT local-attention path requests
+	// it, so other models' pooled scratches never carry it.
+	band []float32
 	// MoE scratch (moeMLP only): moeScores holds the per-token router logits
 	// [numExperts]; moeOut is the per-token expert-combination accumulator [D].
 	// x1 (the W1 output) and contrib (the per-expert W2 output) reuse val/mid,
@@ -158,6 +164,12 @@ func (s *scratch) ensureLayer(L, D, intermediate, heads, headDim, perHeadLen int
 	s.vH = ensureF32(s.vH, perHeadLen*headDim)
 	s.ctxHead = ensureF32(s.ctxHead, perHeadLen*headDim)
 	s.scores = ensureF32(s.scores, perHeadLen*perHeadLen)
+}
+
+// ensureBand sizes the banded-attention arena: one slot per worker, each holding
+// a [qTile, bandWidth] score tile plus a [headDim, bandWidth] packed V band.
+func (s *scratch) ensureBand(workers, qTile, bandWidth, headDim int) {
+	s.band = ensureF32(s.band, workers*(qTile+headDim)*bandWidth)
 }
 
 // ensureFusedMLP sizes the fused up/gate buffer. Kept out of ensureLayer so the

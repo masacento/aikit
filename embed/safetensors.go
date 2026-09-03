@@ -516,8 +516,32 @@ func (f *SafetensorsFile) TensorF32(name string, want ...int) ([]float32, error)
 		return t.BFloat16sToF32()
 	case "F16":
 		return t.Float16sToF32()
+	case "I8":
+		// Symmetric quantization: the scale lives in a companion tensor
+		// "<name>.scale" (F32) — shape [1] for per-tensor, [rows] for per-row
+		// on a 2D tensor. Written by scripts/quantize_embeddings.py; read by
+		// encoder.LoadModernBERTQ8's prequantized-i8 path.
+		st, err := f.Tensor(name + ".scale")
+		if err != nil {
+			return nil, fmt.Errorf("safetensors: I8 tensor %q missing companion scale: %w", name, err)
+		}
+		scaleF32, err := st.Float32s()
+		if err != nil {
+			return nil, fmt.Errorf("safetensors: scale for %q: %w", name, err)
+		}
+		switch {
+		case len(scaleF32) == 1:
+			return t.Int8sToF32(scaleF32[0])
+		case len(t.Shape) == 2 && len(scaleF32) == t.Shape[0]:
+			return t.Int8sToF32PerRow(scaleF32)
+		default:
+			if len(t.Shape) == 2 {
+				return nil, fmt.Errorf("safetensors: scale for %q: expected 1 or %d (rows) elements, got %d", name, t.Shape[0], len(scaleF32))
+			}
+			return nil, fmt.Errorf("safetensors: scale for %q: expected 1 element for tensor shape %v, got %d", name, t.Shape, len(scaleF32))
+		}
 	default:
-		return nil, fmt.Errorf("safetensors: tensor %q dtype %q unsupported for an F32 read (want F32/BF16/F16)", name, t.DType)
+		return nil, fmt.Errorf("safetensors: tensor %q dtype %q unsupported for an F32 read (want F32/BF16/F16/I8)", name, t.DType)
 	}
 }
 
@@ -718,6 +742,46 @@ func (t Tensor) Float16sToF32() ([]float32, error) {
 	for i := range n {
 		h := uint16(t.raw[2*i]) | uint16(t.raw[2*i+1])<<8
 		out[i] = halfBitsToF32(h)
+	}
+	return out, nil
+}
+
+// Int8sToF32 dequantizes an I8 tensor to a freshly-allocated []float32 using
+// a per-tensor symmetric scale: f32[i] = int8[i] * scale. Requires DType "I8".
+// Allocates (see BFloat16sToF32 on aliasing).
+func (t Tensor) Int8sToF32(scale float32) ([]float32, error) {
+	defer runtime.KeepAlive(t.owner) // §2.5
+	if t.DType != "I8" {
+		return nil, fmt.Errorf("tensor %q: expected I8, got %s", t.Name, t.DType)
+	}
+	n := len(t.raw)
+	out := make([]float32, n)
+	for i := range n {
+		out[i] = float32(int8(t.raw[i])) * scale
+	}
+	return out, nil
+}
+
+// Int8sToF32PerRow dequantizes a 2D I8 tensor to a freshly-allocated
+// []float32 using one symmetric scale per row: f32[r,c] = int8[r,c] *
+// scales[r]. Requires DType "I8" and len(scales) == Shape[0]. Allocates (see
+// BFloat16sToF32 on aliasing).
+func (t Tensor) Int8sToF32PerRow(scales []float32) ([]float32, error) {
+	defer runtime.KeepAlive(t.owner) // §2.5
+	if t.DType != "I8" {
+		return nil, fmt.Errorf("tensor %q: expected I8, got %s", t.Name, t.DType)
+	}
+	if len(t.Shape) != 2 || len(scales) != t.Shape[0] {
+		return nil, fmt.Errorf("tensor %q: per-row scales need a 2D tensor and %d scales, got shape %v and %d scales", t.Name, t.Shape[0], t.Shape, len(scales))
+	}
+	rows, cols := t.Shape[0], t.Shape[1]
+	out := make([]float32, len(t.raw))
+	for r := range rows {
+		s := scales[r]
+		base := r * cols
+		for c := range cols {
+			out[base+c] = float32(int8(t.raw[base+c])) * s
+		}
 	}
 	return out, nil
 }

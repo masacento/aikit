@@ -192,6 +192,13 @@ testdata/siglip-bench-l/
 testdata/mdeberta-v3-base
 testdata/gliner-multi-v2.5
 testdata/distilbert-secret-masker-v3.3a-rs
+testdata/bekko-embedding-v1-a8m
+testdata/bekko-modernbert
+testdata/ettin-reranker-17m
+testdata/ettin-reranker-32m-v1
+testdata/ruri-v3-30m
+testdata/ruri-v3-30m-fp16
+testdata/ruri-v3-30m-int8
 
 # repowise index — generated codebase-intelligence artifacts, never committed
 .repowise/

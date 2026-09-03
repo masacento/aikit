@@ -47,7 +47,7 @@ import (
 // offsets; the Unigram/BPE backends return an error rather than a silent empty
 // span.
 func (t *Tokenizer) EncodeOffsets(text string) ([]int32, [][2]int, error) {
-	if t.uni != nil || t.bpe != nil {
+	if t.uni != nil || t.bpe != nil || t.spbpe != nil {
 		return nil, nil, fmt.Errorf("embed: EncodeOffsets supports WordPiece tokenizers only")
 	}
 	var (

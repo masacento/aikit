@@ -312,3 +312,45 @@ func matmulBTBlockedIntoParallel(a, b, dst []float32, M, K, N int) {
 	}
 	wg.Wait()
 }
+
+// parallelChunks runs fn over [0,n) in chunks of `chunk` items, claimed one at a
+// time by `workers` goroutines off a shared atomic counter, and returns once every
+// chunk is done. fn receives its worker index (0..workers-1) so it can index
+// per-worker scratch, plus the [start,end) it claimed.
+//
+// This is a WORK-STEALING split, not an equal 1/workers slice + barrier: on an
+// asymmetric CPU (P- + E-cores) an equal split ends every fan-out waiting on the
+// slowest E-core shard, while with chunks the fast cores simply claim more of them
+// and the join tightens to one chunk's slack.
+//
+// The caller's goroutine is worker 0 and does its share inline, so a fan-out of W
+// spawns W-1 goroutines, not W.
+func parallelChunks(n, chunk, workers int, fn func(w, start, end int)) {
+	chunks := (n + chunk - 1) / chunk
+	workers = min(workers, chunks)
+	if workers < 2 {
+		fn(0, 0, n)
+		return
+	}
+	var next atomic.Int64
+	claim := func(w int) {
+		for {
+			c := int(next.Add(1)) - 1
+			if c >= chunks {
+				return
+			}
+			start := c * chunk
+			fn(w, start, min(start+chunk, n))
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(workers - 1)
+	for w := 1; w < workers; w++ {
+		go func(w int) {
+			defer wg.Done()
+			claim(w)
+		}(w)
+	}
+	claim(0)
+	wg.Wait()
+}
