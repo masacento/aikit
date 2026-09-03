@@ -138,6 +138,49 @@ prefill == speculative verify` guarantees rest on.
 
 ### S-01 · Perf-major (prefill, both archs) — no register-blocked int4/int8 GEMM; M>1 is the M=1 GEMV per (row, column)
 
+> **THE GATE IS IN, 2026-09-03 — and the audit's claim about it was right.** §5 step 1 calls the
+> W4A8 M-invariance gate "the thing that makes the rest safe to ship"; it now exists, in
+> `linalg/matmul_quant_mconsistent_test.go` (portable, both arches). The claim it rests on was
+> verified rather than assumed: `TestMatmulBT_MConsistent` in `matmul_mconsistent_test.go` was
+> the ONLY M-invariance gate in the package, and it covers f32 `MatmulBT` only.
+>
+> Three gates, because there are three distinct contracts and the existing tests pin none of them:
+>
+> | gate | pins |
+> |---|---|
+> | `TestMatmulBTW4A8_MConsistent` | canonical W4A8: row *i* of an M-row batch `==` that row alone at M=1 |
+> | `TestMatmulBTW8A8_MConsistent` | the same for W8A8 — S-01b proposes an M-tile there too |
+> | `TestWeightMatW4A8_MConsistentAcrossRow4Dispatch` | `WeightMat.MatmulBTW4A8Into`, which routes M=1 to the **row4** kernel and M>1 to the **canonical** one |
+>
+> **The third is the one that was actually missing**, and it is worth naming why. Two row4 gates
+> already existed: `TestMatmulBTW4A8Row4Into_bitIdenticalToMatmulBTW4A8Into` pins row4 `==`
+> canonical **at M=1**, and `TestWeightMat_RepackInt4Row4_dispatchMatchesCanonical` pins dispatch
+> `==` canonical **at a fixed M**. Neither pins the *diagonal* — row4-at-M=1 against
+> canonical-at-M>1 — which is exactly the pair speculative verify exercises (draft proposes at
+> M=1 through row4, target verifies at M=K through canonical).
+>
+> **Sweep:** M ∈ {1,2,3,4,5,7,8,9} — chosen for the residues mod 4, since a 4×4 tile runs four
+> activation rows at a time and hands 1/2/3 to a narrower remainder path. Shapes: both production
+> projections (1536×8960 and 8960×1536, the row4-eligible ones), an N=6 case where row4 is
+> rejected, a K=100 ragged-group case the row4 layout cannot represent, and a small shape that
+> stays under the parallel threshold. The W4A8/W8A8 gates run each M twice — default threshold and
+> a forced `SetThreshold(1)`/`SetWorkers(4)` fan-out — because a future M-tile can differ across
+> that decision.
+>
+> **Verified failure-capable, not merely green** (the `analyzer-canaries.md` discipline). A canary
+> that perturbs the M>1 result by **one ULP** — `Float32bits(x)+1` in `w4a8Span` and `w8a8Span` —
+> makes all three gates fail at **every** shape, and the failure message reports `repacked=true`
+> for the production shapes and `false` for the N=6/ragged ones, which is independent confirmation
+> that both dispatch branches are genuinely being taken. Reverted; full `linalg` suite green.
+>
+> Today the property holds trivially — `w4a8Span` loops activation rows *inside* the column loop,
+> so every output is its own independent reduction. That triviality is the point: the gate is
+> written while the implementation still satisfies it by construction, so the tile is measured
+> against a contract that predates it.
+>
+> **Still open in S-01:** the 4×4 tile kernel itself (arm64, on the existing row4 layout), the
+> amd64 unpack-once span, and the S-01b W8A8 M-tile.
+
 - **Where:** `quant.go:585-597` (`w4a8Span`), `quant.go:280-330` (`w8a8Span`);
   `weightmat_splithalf_amd64.go:67-73` and `weightmat_row4_arm64.go:48-54` route every M≠1 call
   to the canonical span; goinfer `decoder/weightmat.go` ("int4 weights run the W4A8 kernel at
@@ -512,7 +555,7 @@ items; G4/G5 (f32 silu/gelu) were parity-gated; G10 (RoPE table) bit-identical. 
 | step | item | prize (counted, not measured) | numerics | prerequisite |
 |---|---|---|---|---|
 | 0 | S-09.1 re-run the serial/parallel A/B correctly; S-08.1 STREAM the 3700X; the per-shard timestamp harness for S-02 | decides where the decode gap is | none | none |
-| 1 | S-01 W4A8 M-invariance gate, then the 4×4 tile on row4 (arm64) and the unpack-once span (amd64) | CPU prefill 2–2.7× at the kernel; the int4/int8int8 inversion; verify rounds cheaper on every spec path | bit-identical | the gate |
+| 1 | S-01 W4A8 M-invariance gate ✅ **DONE 2026-09-03**, then the 4×4 tile on row4 (arm64) and the unpack-once span (amd64) | CPU prefill 2–2.7× at the kernel; the int4/int8int8 inversion; verify rounds cheaper on every spec path | bit-identical | the gate |
 | 2 | S-02 remedy that step 0 selects (dynamic chunking and/or `MatmulBTW4A8Batch`) + S-03 NEON quantiser | decode 1.15–1.7× on the fan-out term; −3 barriers, −3 quantisations per layer | bit-identical | step 0 |
 | 3 | S-04 AV pure-Go accumulator blocks → NEON AV → NEON QK | ~1.9× token at depth 8k; ~1.1× at 128 | bit-identical (exact products) | none |
 | 4 | S-06 step 1 (parallelise the elementwise loops) | prefill 7–25% at the 3700X rate, less on M1 | bit-identical | the stub measurement |
