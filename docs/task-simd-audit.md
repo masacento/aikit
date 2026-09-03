@@ -1,0 +1,502 @@
+# Task: SIMD audit — is the CPU substrate using the hardware well? (2026-09-03)
+
+> **BLUF.** At M=1 on the Mac, yes: the production W4A8 decode kernel
+> (`dotW4A8SplitHalf4Row`) runs at 91–97% of its per-core issue ceiling, and the W8A8 kernel at
+> 96% of its latency bound. What is *not* using the hardware well sits around the kernels, not
+> inside them: (1) **there is no register-blocked GEMM for M>1 on either arch** — prefill and
+> speculative verify call the single-row GEMV once per (activation row, weight row) and pay the
+> nibble unpack and the scale fold M times, which is the mechanism behind "int8int8 prefill
+> beats int4 by 25–33%" and most of the 2.98× CPU prefill gap to Ollama; (2) **decode at 6–8
+> workers is fan-out-limited, not kernel-limited** — each core delivers 26–35% of what it does
+> alone, on both boxes; (3) **the f64 attention kernels are pure Go** and a lane-per-output NEON
+> port is bit-identical by construction, worth ~2× on QK and ~3× on P·V at depth 8k where they are
+> ~75% of the token; (4) **the activation quantiser and the transcendentals are scalar and serial**
+> on the calling goroutine, 8–10% of a short-context token. Everything proposed below keeps the
+> bit-identity contract or says exactly where it does not; every measured negative in
+> `docs/internal/perf-dead-ends.md` and goinfer's campaign records was read first and is not
+> re-proposed.
+>
+> **Status: SCOPED 2026-09-03, nothing started.** Static read of aikit `v1.31.0-5-gca817a4`
+> (`linalg/`, 16 assembly files, the Go dispatch, the docs and bench records) and goinfer
+> `30b168e` (the callers). Three independent reviewers (arm64 assembly, amd64 assembly, Go
+> side + coupling), instruction counts by hand, every raw `WORD` encoding recomputed. Nothing
+> was built or run — the review sandbox has go1.24 against `go 1.27`, no arm64, no GPU — so
+> every throughput figure is either quoted from the two repos with its box label or derived
+> from an instruction count with the arithmetic shown, and labelled as such. Supersedes nothing;
+> extends `go127-simd-audit.md` (2026-08-20, in `~/tmcode/go127-simd-audit/`) — §4 reconciles.
+
+**Boxes.** `apple-m1pro`: 6 P + 2 E cores, FEAT_DotProd (SDOT), **no FEAT_I8MM** (SMMLA is
+M2+); STREAM triad 71.9 GB/s one thread, 121 at six. `nvidia-rtx2070s` host: Ryzen 7 3700X (Zen
+2: AVX2+FMA, no VNNI, no AVX-512; 4.2 GHz implied by the FMA probe); **no STREAM-class
+bandwidth number exists for it in either repo** — the only anchors are Ollama's 27.6 GB/s of
+weights (P14) and a "~40 GB/s" estimate in `gpu-assessment.md`.
+
+**Reference model** throughout: Qwen2.5-Coder-1.5B (hidden 1536, inter 8960, 28 layers, 12 q
+heads / 2 kv heads, hd 128, vocab 151936); ~1.05 GB of int4 weights + scales per decode token.
+
+---
+
+## 1. Verdict by regime
+
+| regime | share of a token | what runs | verdict | lever |
+|---|---|---|---|---|
+| **decode M=1, arm64** (Mac, 1.5B, depth ≤ 512) | ~85% weight stream | `dotW4A8SplitHalf4Row` (SDOT, 4 rows, f32 fold in register), W8A8 head via `dotI8SDOT` | **kernel at 91–97% of its issue ceiling per core; the 6-worker aggregate at 26–35% of six cores** | S-02 (fan-out), S-05 (9→7 µops), S-03 (batch entry) |
+| **decode M=1, amd64** (3700X) | same | `dotW4A8FoldAVX2` (25 instr/32 MACs, 1 acc), `dotI8AVX2` (4 acc) | kernel at ~53% of its port floor but **2–4 cores already exceed any plausible DRAM figure**; 16 SMT shards per call | S-02, S-08 (measure the box first) |
+| **prefill / verify M>1, both archs** | the whole prefill | `w4a8Span`: `for col { for row { dotW4A8(row, col) } }` — the M=1 GEMV per pair | **no reuse of unpacked weights across rows on either arch**; W4A8 spends 11 SIMD µops per 32 MACs per row where W8A8 spends 2 | **S-01** (4×4 tile on the row4 layout; 2.7× counted) |
+| **decode attention, depth ≥ 2k** | 75% of the token at 8k | `MatmulQKAcc64` / `MatmulAVAcc64` — pure Go f64, 8 scalar chains / memory accumulators | QK at 80% of its scalar issue bound; AV at ~40% (accumulators in memory) | **S-04** (NEON f64 lane-per-output, bit-identical) |
+| **Go-side serial work** | 8–10% at short context | `quantizeRowInt8Core` ×7 per layer (3 redundant), `silu` via f64 `math.Exp`, norms, fork/join | scalar, single goroutine, between parallel matmuls | S-03, S-06 |
+| **weight-only `int8` mode** | every projection | `q8Span` → `dequantRowInt8` + `dotNEON4` (**one** FMLA chain) | 3.2 GMAC/s per core — the mechanism behind the LM head's old 11–13 GB/s | S-07 (bit-identical 8-column form) |
+| **f32 GEMM** (prefill attention, f32 models) | attention share of prefill | `blockedFill` → `Dot2x8` / `dotFMA3x4` | ~95% of the measured FMLA peak on arm64; 55–64% on amd64 (no B-panel packing there) | S-08 (amd64 packing at power-of-two K) |
+
+The instruction accounting behind each row is in §2; the sources of every measured figure are in
+§6.
+
+## 2. Kernel inventory — what executes per 32 int4 MACs (16 packed bytes)
+
+**arm64** (per P-core, 4 SIMD pipes; counts per 16 weight bytes unless stated)
+
+| kernel | selected when | instr / 32 MACs | SIMD µops | accumulators | binding resource | ceiling per core | measured | fraction |
+|---|---|---:|---:|---|---|---|---|---|
+| `dotW4A8SplitHalf4Row` (`dot_w4a8_arm64.s:444-532`) | M==1 and the tensor has a row4 layout (`weightmat_row4_arm64.go:48-54`; every 0.5B/1.5B projection qualifies; kind-4 `.giw` aliases it) | 12.75 (load 2.25, unpack 4, SDOT 2+MOVI, fold 2, loop 1.5) | 9 | 4 f32 chains, one per row | 9 µops / 4 pipes = 2.25 cy | 45.5 GMAC/s = 22.8 GB/s packed, 28.4 with scales | hot ≈44 GMAC/s; cold 42.4–42.7; 1 worker 25.9–26.2 GB/s | **91–97%** |
+| same, 6 workers | — | — | — | — | not the kernel | 6 × 28.4 = 170 issue; 121 STREAM | 59.6–60.6 isolated; **44.9 in decode** | 35% / 26% |
+| `dotW4A8FoldSDOT` (canonical, `:43-81`) | **every M>1 call**, non-row4 tensors, paged MoE | 17 (load 3, unpack 6 incl. ZIP1/ZIP2, SDOT 2+MOVI, fold 2, loop 3) | 11 | 1 f32 chain | FMLA latency ≈4 cy/group | 25.6 GMAC/s | 24.5–25.0 | 96–98% of the latency bound |
+| `dotI8SDOT` (`dot_i8dp_arm64.s:22-76`, W8A8) | every W8A8 call, any M | 3.5 per 16 int8 MACs | 1 | 4 int32 | 1 SDOT / cy (4 acc × 4 cy) | 51 GMAC/s = 51 GB/s | 49.2 | 96% (64% of the load bound) |
+| `dotNEON4` (`dot_arm64.s:25-45`, `dotF32`) | weight-only int8/int4 (`q8Span`, `q4Span`) | 5 per 4 f32 MACs | 1 chain | 1 | FMLA latency | 3.2 GMAC/s | LM head 11–13 GB/s over 6–8 cores | consistent |
+| `dotNEON2x8` (`dot2x8_arm64.s`) | f32 GEMM row pairs (`blockedFill`) | 16 FMLA / 64 MACs | 16 | — | FMLA issue | 102 GFLOPS theo., 95.4 measured peak | ~42 GMAC/s | ~95% |
+| `MatmulQKAcc64` (Go, `matmul_qk_acc64.go:21-67`) | decode attention QKᵀ | 26 instr / 8 f64 MACs (9 loads, 9 FCVT, 8 FMADD) | 17 FP | 8 f64 chains | FP issue | 6.0 GMAC/s | 4.8 | 80% |
+| `MatmulAVAcc64` (Go, `matmul_av_acc64.go:33-52`) | decode attention P·V | ≈7 instr / MAC (`acc[d]` in memory: load, load, FCVT, FMADD, store, index) | — | hd in memory | memory round-trip per MAC | ~1.9 GMAC/s | 1.86 | at its own bound |
+| `quantizeRowInt8Core` (Go, `quant.go:43-71`) | before every W8A8/W4A8 matmul, on the caller | two scalar passes | — | — | scalar chain, 4–10 cy/elem | — | 509k elem/token on the 1.5B | est. 0.6–1.6 ms/token |
+
+Not wired (all harness-only, all measured): `FoldSDOTv2` (uncentered + f32 correction, 0.972×,
+not bit-identical), `SplitHalfSDOT` (1.000×), `2Acc/4Acc` (1.4–1.75×, not bit-identical — a
+row's fold split across chains), `SplitHalf4RowPrefetch` (1.000× at every distance),
+`Deshared` (0.993×). `kquant.go`'s native Q4_K/Q6_K matmul (measured negative, `:5-10`). No
+kernel detects or uses I8MM; UDOT is unused; no alignment is assumed anywhere (`LD1 .B16` cannot
+fault; `.giw` aliases nibbles at an arbitrary byte offset, scales are heap-copied to 4-B alignment).
+
+**amd64** (Zen 2, 4 × 256-bit FP pipes, `VPMADDWD` on one; per 32 MACs)
+
+| kernel | selected when | instr / 32 MACs | FP µops | accumulators | port floor | ceiling per core | measured | fraction |
+|---|---|---:|---:|---|---|---|---|---|
+| `dotW4A8FoldAVX2` (`dot_w4a8_amd64.s:33-88`) | every W4A8 call, canonical layout (Zen 2 has no VNNI) | 25 (4 load, 9 unpack, 2 act widen, 3 MAC, 2 fold, 5 loop) | 16 (6 shuffle-class) | **1** f32 (`Y10`) | 4.2 cy/group | 32 GMAC/s = 16 GB/s packed | 17.1 hot / 16.2 cold | 53% |
+| `dotW4A8SplitHalfAVX2` (`:243-292`) | M==1 with `GOINFER_W4A8_SPLITHALF=1` (default off) | 23 | 14 | 1 | 3.8 | 35 | 19.2 / 18.3 | 55% |
+| `dotI8AVX2` (`dot_amd64.s:323-387`) | every W8A8 call | 10.5 | — | 4 int32 | 4.0 cy / 64 MACs | 67 GMAC/s | 48.3–51.3 | 72–76% |
+| `dotW4A8FoldAVX512VNNI` / `dotI8AVX512VNNI` | AVX512F+BW+VNNI(+VL) hosts only — neither project box, not Intel client parts (VEX AVX-VNNI undetected) | 23 / 4 | — | 2 f32 / 4 | — | — | +1.23–1.28× on a cloud Xeon | — |
+| `dotFMA3x4` / `dotFMA8` (f32 GEMM) | `blockedFill` | 10 / 11 | — | 12 / 8 | FMA issue | 67 / 54 GMAC/s | 43.2 (M32 GEMM) / 42.8 | 64% / 79% |
+| `dotFMA` (single f32 dot) | `q8Span`, `q4Span`, `Dot` | 18 | — | 4 | 2 loads / FMA | 34 GMAC/s | — | — |
+
+The W4A8 AVX2 kernel does **not** use `VPMADDUBSW`: both operands are sign-extended to int16
+and multiplied with the signed×signed `VPMADDWD`, so no saturation question exists (|pair| ≤
+2048). The measured 2Acc/4Acc null result (~0.5%) is real; the recorded *explanation* — "Zen 2
+cracks every 256-bit op into two 128-bit µops, already at that floor" — is a Zen 1 property, and
+the repo's own `dotI8AVX2` rate (16 vector instructions per 5.6–5.9 cycles) is impossible under
+it. The set of observations (1Acc ≈ 2Acc ≈ 4Acc; −2 µops → +12%; −8 µops → +57%; idle FMA ports)
+fits a kernel limited by how many ~24-cycle per-group dependency chains the FP scheduler holds
+in flight, not by a port and not by the loop-carried chain (S-08 says what to measure).
+
+## 3. Findings, ordered by prize
+
+Each carries the mechanism, what to measure before believing it, and the bit-identity
+consequence. "Bit-identical by construction" means every output's reduction is the same
+sequence of floating-point operations as today — the property goinfer's `decode == batched
+prefill == speculative verify` guarantees rest on.
+
+### S-01 · Perf-major (prefill, both archs) — no register-blocked int4/int8 GEMM; M>1 is the M=1 GEMV per (row, column)
+
+- **Where:** `quant.go:585-597` (`w4a8Span`), `quant.go:280-330` (`w8a8Span`);
+  `weightmat_splithalf_amd64.go:67-73` and `weightmat_row4_arm64.go:48-54` route every M≠1 call
+  to the canonical span; goinfer `decoder/weightmat.go` ("int4 weights run the W4A8 kernel at
+  EVERY M").
+- **Code:** `for j := range N { prow := w4[j*bpr:…]; for i := range M { dst[i,j] = dotW4A8(aq_i, prow, srow)·aScale_i } }`
+  — the 16-byte weight load, the unpack (6 SIMD µops arm64 / 9 instructions amd64), the SDOT
+  zero + scale fold (3 µops) and the ~18 ns Go↔asm transition execute once per activation row.
+- **Mechanism, measured in-tree:** the unpack alone isolates at **1.57×** on amd64
+  (goinfer `docs/measurements/aikit-w4a8-opsperbyte.md`), and on the Mac **int8int8 prefill is
+  25–33% faster than int4** despite twice the bytes (goinfer
+  `docs/measurements/cpu-peer-prefill-2026-09-01.md`) — the byte saving is served from cache at
+  M>1 anyway while the ALU cost stays. At K=512 goinfer prefills at 68 tok/s ≈ 17 GMAC/s per
+  core, ~17% of SDOT peak; Ollama's 204 tok/s ≈ 50%.
+- **Proposal (new mechanism, not in any non-goals list):** a 4×4 tile kernel on the **existing
+  row4 layout** — `dotW4A8Row4Tile4x4(act0..3, packed4, scales4, dst[16], nGroups)`: per
+  32-k group unpack four weight rows once (4 LD1 + 16 SIMD µops), load four activation chunks,
+  then 16 × (MOVI, SDOT, SDOT, SCVTF, FMLA) into 16 persistent f32 accumulators (register
+  budget 31 of 32). SIMD µops per group: 96 for 512 MACs = **0.19/MAC vs 0.34 today**, and
+  issue-bound instead of latency-bound: **21 MACs/cycle vs 8, counted 2.7×** (≈2× if SDOT issues
+  on only two pipes). The row4 bytes already exist for every eligible tensor; M%4 remainder rows
+  take the 4-row kernel one row at a time. amd64 twin: (a) unpack each weight row once per span
+  into a K-byte int8 scratch (L1-resident) and run the unpack-free body per activation row, or
+  (b) a 1-weight-row × 4-activation-row block: (15+36)/4 = 12.75 instructions per 32 MACs vs
+  25. W8A8 (S-01b): `dotI8SDOT` is latency-bound at 1 SDOT/cycle (4 accumulators × 4-cycle
+  latency — the measured 49.2 GMAC/s matches to 4%); an M-tile with 16 int32 accumulators is
+  SDOT-issue-bound at 2–4× that, and even 8 accumulators in the single-row kernel is 1.5×.
+- **Bit-identity:** preserved by construction on both — each output's per-group int32 is the
+  same SDOT lane mapping, its f32 fold is one FMLA per group in ascending g into its own
+  accumulator, the FADDP tree and `×aScale` are unchanged; W8A8 is exact integer arithmetic in
+  any arrangement. Prove with `==` against `MatmulBTW4A8Into` across M ∈ {1..9}
+  (`TestMatmulBTW4A8Row4Into_bitIdenticalToMatmulBTW4A8Into` is the shape) plus goinfer's
+  `TestForwardN_matchesSequential` and `TestMoEExpertMajor_bitIdentical`. **There is no
+  M-invariance gate for W4A8 today** (`TestMatmulBT_MConsistent` covers f32 only) — write it
+  first; it is the thing that makes the rest safe to ship.
+- **Decision rule, pre-registered:** `BenchmarkQ4vsQ8 W4A8/K1536_N8960` at M ∈ {4, 16, 64, 512}
+  cold, both boxes, then `scripts/bench_peer_prefill.py --backend cpu` at K=512/3900 paired and
+  interleaved. Ship at ≥1.5× on the int4 prefill cell and int4 ≥ int8int8 at every M; park
+  below 1.2×; between → second mechanism. Do-nothing arm: `--quant int8int8`, which is the
+  configuration the measurement says to use today.
+- **Confidence:** high on the mechanism and the counts; medium on 2.7× (the roofline record
+  notes instruction-count arguments overpromised here three times).
+
+### S-02 · Perf-major (decode) — six workers deliver two cores' worth; the fan-out is the limiter on both boxes, not the kernel
+
+- **Where:** `linalg.go:208-234` (`parallelSpawnCols`: one goroutine per equal static shard per
+  call, shards rounded to 8 columns, `wg.Wait`); `workspace.go:62-64`; goinfer
+  `decoder/weightmat.go:115` (`int4ParThreshold = 1<<20`), `decoder/attention.go:79-81` and
+  `decoder/mlp.go:385-386` (q, k, v, gate, up issued as separate W4A8 calls).
+- **Numbers (arm64):** one worker 25.9–26.2 GB/s (92% of the per-core port ceiling); six
+  workers 59.6–60.6 isolated / **44.9 in real decode**; eight 58–62. Per-core throughput at six
+  is 26–35% of the same core alone and ~50% of the 121 GB/s STREAM ceiling — neither the
+  instruction count nor DRAM explains it. **amd64:** the cold kernel does 9.9–10.6 GB/s per
+  core; the whole 8-core box streams ~19–21 GB/s (1.5B at 18.3 tok/s × 1.05 GB), i.e. two
+  cores' worth, against Ollama's 27.6; `queue-performance.md:336-339` compared that
+  whole-machine 11.7 GB/s figure against a *single-core* 10.65 and concluded "almost no
+  composition overhead" — one core against eight. The +2.1% end-to-end from a +12% kernel
+  (split-half) is the direct evidence the kernel is ≤ ~20% of the amd64 token at 8 cores.
+- **Mechanism (two candidates, same remedies):** (a) the sequential goroutine wake chain —
+  `newproc → wakep` wakes one spinning M at a time; a ~20 µs stagger per successive worker puts
+  the 8th shard's start at ~140 µs and its finish at ~180 µs, which reproduces the ~190 µs a
+  gate/up call takes at 45 GB/s while one P-core finishes its 1/8 shard in ~41 µs; (b) static
+  equal shards across 6P+2E (Mac) or 16 SMT siblings sharing 8 FP units and two CCX L3s (Zen 2)
+  — the slowest shard sets the barrier. Both are consistent with the June profile ("71%
+  fork/join, 1.3× scaling on 8 cores", goinfer `docs/completed/perf-campaign.md:225-239`) and
+  with `GOINFER_PAR_WIDTH=4` measuring +4.4% on the 1.5B. The spin-then-park pool is a
+  **measured negative** (`perf-dead-ends.md` §8.1; goinfer Phase 3b: pool 64.1 vs spawn 67.6
+  tok/s) and is not re-proposed; that negative does not cover shard skew, which the same entry
+  leaves open ("dynamic work-stealing over column chunks").
+- **Measure first (cheap, decisive):** per-shard `(start, end)` timestamps in
+  `TestW4A8Item3ParallelAggregate` (`w4a8_item3_parallel_arm64_test.go:99-112`) — a stagger
+  pattern is (a), a bimodal duration is (b); then the same harness with 8 matrices per fork/join
+  (8× the work per barrier): if GB/s climbs toward 100+ the barrier is the limiter, if it stays
+  ~60 the memory system is. On amd64, a 1..16-thread read-bandwidth probe of the 3700X first —
+  nothing can be concluded there until a STREAM number exists.
+- **Remedies (both output-partition-only, width-inert by the existing
+  `TestParallelWidth_bitIdentical` contract):** (1) dynamic chunking — workers take quad blocks
+  from an atomic counter (32 quads ≈ 96 KB at K=1536); under (a) the arithmetic gives ~110 µs
+  instead of ~190 per gate/up call (1.7×); (2) `MatmulBTW4A8Batch` mirroring the existing
+  `MatmulBTW8A8Batch` (`quant.go:351`): q‖k‖v in one fork/join and one quantisation, gate‖up in
+  one → 5 → 3 barriers and 7 → 4 quantisations per layer; the W8A8 batch form measured 60 →
+  66–68 tok/s when it shipped (`perf-campaign.md:213-216`). goinfer's `GOMAXPROCS` default of
+  16 on the 3700X puts SMT siblings on one FP unit; `GOINFER_PAR_WIDTH=8` is a one-run check.
+- **Decision rule:** the 1.5B decode cell (`bench_peer`, paired) on each box; ship at ≥1.15×,
+  park below 1.05×.
+- **Confidence:** high that the kernel is not the limiter (three independent measurements);
+  medium on which candidate dominates — hence measure first.
+
+### S-03 · Perf-minor (2–6% of a token) — the activation quantiser is scalar, serial, and run seven times per layer where four would do
+
+- **Where:** `quant.go:43-71` (`quantizeRowInt8Core`: an abs/max pass, then
+  `int8(math.Round(float64(v*inv)))` with clamps), called on the calling goroutine before every
+  fan-out from `MatmulBTW4A8Into:568-570`, `MatmulBTW4A8Row4Into` (`matmul_w4a8_row4_arm64.go:109`),
+  `MatmulBTW8A8Batch:366-368`; no `.s`, no `simd` build on either arch.
+- **Cost:** 28 × 7 quantisations = **509k elements per 1.5B token** (three of the seven
+  re-quantise the same activation — q/k/v and gate/up have no W4A8 batch form); at an estimated
+  4–10 cycles per element on the M1 that is 0.6–1.6 ms of a ~25 ms token; the June W8A8 profile
+  put it at ~9% of CPU on the 0.5B (`perf-campaign.md:231`); on the 3700X `math.Round` alone
+  measured 1.56–3.07 ns per element.
+- **Fix, bit-identical:** NEON `FABS`+`FMAXNM` (4-wide, `FMAXV` at the end — max is exact),
+  then `FMUL.4S` (the same f32 product as today), `FCVTAS.4S` (round-to-nearest-away on the f32
+  value, which equals `math.Round` on its exact f64 widening), `SMIN/SMAX` clamp, `SQXTN`
+  narrow — ≈0.3 cycles per element, ~50 µs per token. amd64: `VMULPS` + the `x+copysign(0.5,x)`
+  truncate form that is exact here. Pin the edge cases the scalar defines (−0.0, NaN → 0 vs
+  `int8(NaN)`, ±Inf) with the scalar as oracle. Then the W4A8 batch entry (S-02) removes the
+  redundant three.
+- **Decision rule:** `BenchmarkQuantizeRowInt8` per element before/after, and the 1.5B decode
+  cell; the kernel is small enough that anything under 1.02× end-to-end is fine to keep for the
+  fork/join count it also removes.
+- **Confidence:** high on mechanism and identity; medium on the 2–6% (whether gc emitted
+  `FCSEL` or branches for the abs/max is unverified).
+
+### S-04 · Perf-major at long context — NEON f64 lane-per-output ports of the acc64 attention kernels, bit-identical
+
+- **Where:** `matmul_qk_acc64.go:21-67` (8 keys as 8 named f64 accumulators; per d-step the
+  arm64 compiler emits per key `LDR s` + `FCVTSD` + `FMADDD`), `matmul_av_acc64.go:33-52`
+  (`acc[d] += w * float64(vrow[d])` with `acc` in memory: two loads, a convert, an FMADD, a
+  store and index work per MAC). goinfer `decoder/forwardn.go:791`, `:893` — the only live
+  decode-attention path.
+- **Measured (aikit benches quoted in goinfer `task-attention-decode-cost.md` §A1):** QK 3,463
+  ns at depth 130 / 219,500 at 8192 (≈4.8 GMAC/s, depth-independent); AV 8,929 / 565,038
+  (≈1.86 GMAC/s). At depth 8192 attention is 85.2 ms of a ~110 ms token even with the 6-way
+  head fan-out.
+- **Why a port is bit-identical, and stronger than the code claims:** both operands are f32
+  widened to f64, so every product is *exact* in f64 (24+24 ≤ 53 bits). A lane running
+  `RN(acc + q_d·k_d)` in ascending d is therefore identical to the scalar `FMADDD` chain —
+  and identical to an unfused `FMUL.2D`+`FADD.2D`, and to amd64's `MULSD`+`ADDSD`: these two
+  kernels are the one place in the substrate that is already cross-arch identical. The existing
+  `==` gates (`matmul_qk_acc64_test.go` over every nKeys residue mod 8;
+  `TestMatmulAVAcc64_exactMatchesStrided`) are the acceptance test as they stand.
+- **QK port:** lane j = key j. Without a layout change: per 2 keys × 4 d, two `LDR Q`, `ZIP1/ZIP2`
+  (pair keys per d), `FCVTL/FCVTL2` ×4, `FMLA.2D` ×4 by element of a pre-widened q → 40 SIMD
+  µops per 32 MACs vs 68 today: **≈1.7×**; with keys stored contiguous per d (a K-layout the
+  cache could write at append time) it is `LDR D` + `FCVTL` + `FMLA.2D` per 2 MACs: **≈2.1×**.
+- **AV port:** register-resident accumulators — 24 registers hold 48 dims, three passes for
+  hd=128; per (key, 2 dims) `LDR D` + `FCVTL` + `FMLA.2D` by the widened score ≈1.05 µops/MAC
+  vs ~7 instructions/MAC today. Bound ~6× when L1-resident; at depth 8192 the 4 MB V slice is
+  re-read three times from L2/SLC (~120 µs) plus ~82 µs of compute → **≈3× (565 → ~180 µs per
+  head-call)**. A pure-Go intermediate (16 named f64 accumulators per dim block, keys inner)
+  gets ~2× with no assembly and the same identity argument — worth landing first because it
+  needs no `.s` and settles the mechanism. Sharing the V widen across the six query heads of a
+  GQA group (one worker owns a KV group) halves AV's convert+load cost again but re-shapes the
+  head fan-out; second step.
+- **Bound overall:** per head-call at depth 8192 ≈ 785 → ≈300 µs; attention 85 → ~33 ms; the
+  token ~110 → ~58 ms (**≈1.9× at 8k**, ~1.1× at depth 128). DRAM is not the limiter (K+V read
+  per token at 8k ≈ 470 MB ≈ 4–8 ms).
+- **Decision rule:** the isolated QK/AV benches at depth 130/2048/8192, order-alternated
+  best-of-3 as A1 did, then `bench_peer` at depth 2048 and 8192 paired (the harness re-prefills
+  the prompt per completion — use the fixed-prefix protocol the campaign switched to). Ship at
+  ≥1.5× on the depth-8192 attention component with every `==` gate green; the Go intermediate
+  ships on its own at ≥1.3×.
+- **Confidence:** high on identity; medium-high on the bounds (Firestorm port counts are from
+  the same external table as the rest of §2).
+
+### S-05 · Perf-minor (decode kernel, arm64) — fold the −8 centering into the SDOT accumulator's initial value: 9 → 7 SIMD µops per row-group, bit-identical
+
+- **Where:** `dot_w4a8_arm64.s:462-473` (per row per group: `VSUB`, `VSUB`, `VMOVI $0`).
+- **Mechanism:** per lane l the two SDOTs produce Σ over k ∈ {4l..4l+3} ∪ {16+4l..} of
+  `(nib−8)·act`. Exactly, in integers (|values| ≪ 2³¹): `Σ(nib−8)·act = Σ nib·act − 8·Σ_lane act`.
+  Precompute per token, per group, one 4-lane int32 vector `corr_g = −8·laneSum_g` (two SDOTs
+  against a vector of 8s over the activation, K/32 groups), and replace `VMOVI $0, V16` with a
+  load/`ORR` of `corr_g` (one µop either way). The two `VSUB.16B` per row vanish and the int32
+  that reaches `SCVTF` is bit-for-bit what it is today, so the f32 fold is unchanged. Cost: one
+  extra 16-byte load per group shared by four rows.
+- **This is not the rejected v2 shape:** v2 applied `−8·Σ scale·sumAct` as a separate *f32* sum
+  after the fold (not bit-identical, an extra pass, measured 0.972×); this applies the
+  correction inside the exact int32 domain at zero extra µops. It is the "fold the correction
+  into item 3's layout" retry the campaign doc leaves open. ggml's repack-time `nib ^ 0x88` +
+  `SHL/SSHR` sign-extension is the alternative (3 µops for both halves instead of 4) but changes
+  the row4 byte layout — a kind-4 version bump; the in-RAM GGUF repack could adopt it freely.
+- **Expected:** up to 1.29× on the single-core issue-bound kernel; ~0 at six workers until S-02
+  lands (the kernel is not the limiter there). A second, load-side saving in the same loop: the
+  four rows' scales are adjacent (`[s_r0 s_r1 s_r2 s_r3]` per group) and could be one `LD1 .4S`
+  with `FMLA` by element instead of four `LD1R` + four `ADD` — six fewer instructions per 51,
+  off the scalar/load side rather than the SIMD pipes.
+- **Decision rule:** the hot/cold single-call harness (`TestW4A8Row4ColdFix_warmIntact` shape)
+  first; `==` vs `MatmulBTW4A8Into` as the gate; ship on any single-core win once S-02 makes it
+  visible end-to-end, since it is free.
+- **Confidence:** high on identity and the µop count; medium on 1.29× (`MOVI` may already be a
+  zero idiom at rename — then the saving is still two µops).
+
+### S-06 · Perf-minor decode / Perf-major prefill — the transcendentals are scalar f64 `math.Exp` on one goroutine, while `linalg`'s f32 SIMD family sits unused
+
+- **Where:** goinfer `decoder/rmsnorm.go:79-118` (`silu`, `geluErf`, `geluTanh`, all f64
+  "for parity"), the loops at `decoder/mlp.go:400-402` and `decoder/forwardn.go:585-587` (K×inter
+  elements in one plain loop on the calling goroutine), every softmax (`decoder/attention.go:236/299`,
+  `decoder/forwardn.go:829/861`, `decoder/fusedattn.go:126`); aikit `exp.go` / `exp_simd.go` (v1.15.0 scalar
+  minimax family; v1.23.0/1.24.0 `simd` vectorisation behind `GOEXPERIMENT=simd`, ≤1 ULP vs
+  `math.Exp`, softmax 5.2 → 2.1 ns/elem and SiLU 3.86 → 1.34 on the M1) — **called from nowhere
+  in goinfer**.
+- **Cost:** 251k `math.Exp` per decode token (SiLU over 8960 × 28) — ≤1 ms on the M1 (bounded by
+  the 4.2 ms "everything else" bucket in the Gate-0 stub), ~3.8 ms of a 66 ms token on the
+  3700X (15 ns/elem measured there); **128M per 512-token prefill and 980M at K=3900**, serial:
+  ≤0.5 s of a 7.5 s prefill on the M1, ~1.9 s at the 3700X rate — 7–25% of a prefill that is
+  2.98× behind. Softmax is ~0.3% at depth 128 and ~4% at 8k (already inside the head-parallel
+  worker).
+- **Two steps, the first free:** (1) split the elementwise loops across the existing worker pool
+  — elementwise has no reduction, so it is bit-identical and costs nothing in goldens; the
+  prefill share alone justifies it. (2) f32 `SiLUInto`/`SoftmaxRowScaledInto` — shifts every
+  logit ≤4 ULP; `decode == prefill == verify` survives if the same function is used in both
+  `mlp.go` and `forwardn.go`; arch-keyed goldens regenerate and the HF cosine gate re-runs. Step
+  2 is the parity-class decision the August audit already named (its G4/G5); nothing about it
+  changed except that the kernel now exists and is measured.
+- **Decision rule:** stub the activation loop at K=512/3900 first (the share has never been
+  measured directly — the Gate-0 stub bucketed it under "everything else"); ship step 1 on any
+  win; step 2 needs the parity re-baseline and is a product decision (the same one as
+  `--cpu-fast-attention`).
+- **Confidence:** high on mechanism; medium on magnitude until the stub runs.
+
+### S-07 · Perf-major for weight-only `int8` mode — `dotNEON4` has one FMLA chain: 1 MAC per cycle
+
+- **Where:** `dot_arm64.s:36-41`, `quant.go:130-144` (`q8Span`: per weight row `dequantRowInt8`
+  then `dotF32` per activation row).
+- **Mechanism:** a single accumulator at ~4-cycle FMLA latency → 3.2 GMAC/s per core = 3.2 GB/s
+  of int8 weights; that is the arithmetic behind the LM head's 11–13 GB/s at 6–8 workers before
+  it moved to W8A8 (`MatmulBTQ8` vs `MatmulBTQ8Into` identical at 12.6 GB/s — allocation was
+  never the bottleneck, the chain was). `--quant int8` users still run every projection through
+  it.
+- **Fix, bit-identical to today's `MatmulBTQ8`:** dequantise eight weight rows into an 8×K
+  scratch and call `dot8ColsInto` (`Dot8x4`) — its per-row lane partials are the identical
+  lane-wise FMLA sequence to `dotNEON4`'s and the Go fold is the same left-to-right `s0+s1+s2+s3`
+  (`dot_arm64.go:44`, `dot8cols.go:11`); eight independent chains are load-bound at ≈10.7
+  MACs/cycle, ~4× per row including the dequant. Also fixes the per-worker `make([]float32, K)`
+  per parallel call (~16 MB/token in `int8`/`int4Mix` modes).
+- **Confidence:** high.
+
+### S-08 · amd64 — five items that are measurement or contract before they are kernels
+
+1. **Measure the box.** No STREAM-class number for the 3700X exists; every "DRAM-bound" claim
+   about it is an estimate. A 1..16-thread read-bandwidth probe is a prerequisite for S-02 there.
+2. **`GOAMD64` is unpinned, and v3 fuses the pure-Go accumulates.** `s += x*y` in
+   `dot_acc64.go`, `matmul_qk_acc64.go`, `matmul_av_acc64.go`, the strided span and every Go
+   scalar tail (`dot.go:24-26`, `matmul_blocked.go`, `rowblock_amd64.go`) compiles to
+   `MULSD+ADDSD` at v1 and `VFMADD231SD` at v3 — a different bit pattern for every f32-tail
+   partial sum on the same CPU from the same source. (The acc64 kernels are exempt — exact
+   products — but the f32 tails are not.) Nothing pins the level in either repo's CI, `go.mod`
+   or release docs. A 3-line startup self-test (`x := 1+2⁻²⁷; y := 1−2⁻²⁷; x*y−1` is 0 unfused,
+   −2⁻⁵⁴ fused) mixed into goinfer's parity `deps_hash`, or `GOAMD64=v1` pinned in the release
+   build and said so.
+3. **The VNNI W4A8 kernel keeps the AVX2 unpack and doubles the fold** (23 instructions vs 25);
+   a 2-group split layout with the −8Σact term as a per-group int32 accumulator init lands at
+   ≈10.5 instructions per 32 MACs at YMM width (bit-identical to AVX2 with a lane permutation)
+   or ≈6 at ZMM (not). Neither project box can measure it; file, do not build.
+4. **VEX `AVX-VNNI` hosts (Intel client 12th–14th gen) are not detected** — they take the AVX2
+   tier; the EVEX.256 kernel already has the right width and needs a `{vex}` twin. A detection
+   gap, not a wrong result.
+5. **The Zen 2 "double-pump" explanation of the 2Acc null result is wrong** (a Zen 1 property);
+   the real constraint is unmeasured. Two-arm synthetic: +4 independent 1-cycle dummy ops per
+   group vs +4 dependent ops on the chain — if the chain arm slows and the port arm does not,
+   the scheduler-window model holds and the levers are chain-shortening ones (which is what the
+   split-half and unpack-free results already suggest). Also: `blockedFill` has no B-panel packing
+   on amd64 (`matmul_blocked.go:60-62`, "waits on §2.4"), so prefill P·V with nKeys a multiple of
+   1024 aliases L1 sets — `MatmulBT` M=64, K=4096 vs 4000, N=128 on the 3700X is the one-run
+   check.
+
+### S-09 · Eng — three gates that vouch for less than they read as
+
+1. **The "serial ties parallel, fork/join is net-neutral" A/B compared two parallel arms.**
+   goinfer's `BenchmarkDecode` `GOINFER_PAR_THRESHOLD` sets only the process global
+   (goinfer `decoder/decode_bench_test.go:91-99`); since 2026-08-01 decode uses the per-Workspace 300K override
+   (`decoder/scratch.go:84-85`), so the 2026-08-11 "serial 54.77 vs parallel 54.34"
+   (`perf-campaign.md:386-401`, cited from `queue-release.md:758-766`) measured nothing. The
+   trace-derived ~1%/token scheduler latency stands; "removing every fork/join changes nothing"
+   does not. Re-run with `cache.scr.ws.SetThreshold(1<<62)` and confirm zero `parallelSpawnCols`
+   in the trace — S-02's premise depends on it.
+2. **Zero-alloc is pinned only on the serial path.** `TestW8A8Into_zeroAllocWhenReused` runs at
+   4.35M MACs, below the default threshold; the parallel path allocates `workers+2` objects per
+   dispatch (~74–85 KB/token, all fork/join bookkeeping). An `AllocsPerRun` gate with a
+   `≤ workers+2` bound would catch a regression of the `q8Span` kind (S-07).
+3. **The row4 bit-identity unit test covers K ≤ 640** (nGroups 1..20); production K is 1536 and
+   8960. The structural argument and goinfer's end-to-end M-independence tests cover it; the unit
+   gate would miss a group-count-dependent residue. Extend to the production shapes.
+
+### S-10 · Eng — hygiene
+
+- `fma_issue_probe_test.go:146-149` says Go "deliberately does NOT auto-fuse `a*b+c`"; it does
+  on arm64 (`FMADDS/FMADDD` rules), which is exactly why goinfer keys goldens by GOARCH. The
+  comment will mislead the next bit-identity audit of the f32 Go tails. `go build -gcflags=-S
+  ./linalg | grep FMADD` on the Mac settles it.
+- `WrapInt4Row4` (`weightmat.go:177-191`) validates lengths but not `rows%4`/`cols%group`; a
+  hostile kind-4 blob loads and panics at the first M=1 matmul (`MatmulBTW4A8Row4Into:101`)
+  instead of returning an error — the M17 hardening class in goinfer.
+- Non-DotProd arm64 gets a fully scalar W4A8 (`quant_w4a8_arm64.go:119`; W8A8 has a
+  `SMULL/SADALP` fallback, W4A8 does not) — irrelevant on Apple silicon, relevant for
+  Graviton1/A72-class targets and the `dotprod_arm64_other.go` BSD/Windows assumption.
+- `.giw` f32 scale arrays are heap-copied at load (goinfer `decoder/serialize.go:1150-1161`):
+  4 B per 32 weights = 12.5% of the int4 bytes ≈ 130 MB for the 1.5B — the kind-4 table's
+  "resident memory added ~0" line should say so.
+- K-quant dequant on load is scalar (`kquant.go` mirrors `embed/gguf.go`); it is load-time
+  only and parallel across layers, and does not matter.
+
+## 4. What changed since the August Go 1.27 audit
+
+`go127-simd-audit.md` (2026-08-20) concluded: the `.s` fleet is not replaceable in 1.27 (no
+SDOT/UDOT/I8MM, no `VPDPBUSD` intrinsic); the opening is the transcendental layer (item 13);
+goinfer's G1 (scores·V vectorised across d) and G2 (four-key scalar ILP) were the attention
+items; G4/G5 (f32 silu/gelu) were parity-gated; G10 (RoPE table) bit-identical. Since then:
+
+- **G2 landed as A1's 8-chain restructure** (4.4× measured) and is now at 80% of its scalar
+  issue bound — the remaining lever is the lane-per-output port (S-04), which the August doc
+  scoped as G1 for AV and which this audit extends to QK with the exact-product argument.
+- **Item 13 shipped in aikit** (`exp.go`; `exp_simd.go` behind `GOEXPERIMENT=simd`) and is used
+  by nothing in goinfer (S-06). The August doc's step-1 recommendation (adopt the scalar f32
+  family first, behind a per-family re-baseline) still stands unchanged; the new information is
+  the prefill share, which makes the free parallelisation step worth taking before the parity
+  decision.
+- **The M>1 GEMM gap (S-01) was not in the August scope** — it is an assembly-level item the
+  1.27 packages cannot express (no SDOT), which is why the field's answer is hand-written
+  interleaved kernels on both arches (ggml `q4_0_4x4`/`8x8` repack GEMM with `SDOT` by element,
+  KleidiAI's `dotprod` GEMV and `i8mm` GEMM). On the M1 the reachable shape is the `dotprod`
+  4×4 tile; the `SMMLA` GEMM (2× MACs per instruction) is where a further 2× sits behind hardware
+  aikit does not have (M2+/Graviton3+ — add detection when a box exists, `HWCAP2_I8MM`).
+- **The fan-out finding (S-02) supersedes the August doc's silence on composition**; the pool
+  negative is unchanged, the shard-skew question is new.
+- Verdicts unchanged: no porting of the `.s` fleet to `archsimd`; no waiting for VNNI
+  intrinsics; layerNorm, hamming and the f64 pool gather stay settled.
+
+## 5. Program — sequenced by prize, each independently droppable
+
+| step | item | prize (counted, not measured) | numerics | prerequisite |
+|---|---|---|---|---|
+| 0 | S-09.1 re-run the serial/parallel A/B correctly; S-08.1 STREAM the 3700X; the per-shard timestamp harness for S-02 | decides where the decode gap is | none | none |
+| 1 | S-01 W4A8 M-invariance gate, then the 4×4 tile on row4 (arm64) and the unpack-once span (amd64) | CPU prefill 2–2.7× at the kernel; the int4/int8int8 inversion; verify rounds cheaper on every spec path | bit-identical | the gate |
+| 2 | S-02 remedy that step 0 selects (dynamic chunking and/or `MatmulBTW4A8Batch`) + S-03 NEON quantiser | decode 1.15–1.7× on the fan-out term; −3 barriers, −3 quantisations per layer | bit-identical | step 0 |
+| 3 | S-04 AV pure-Go accumulator blocks → NEON AV → NEON QK | ~1.9× token at depth 8k; ~1.1× at 128 | bit-identical (exact products) | none |
+| 4 | S-06 step 1 (parallelise the elementwise loops) | prefill 7–25% at the 3700X rate, less on M1 | bit-identical | the stub measurement |
+| 5 | S-05 centering fold + the scale-vector load; S-07 `q8Span` 8-column form | single-core kernel up to 1.29×; weight-only int8 ~4× per row | bit-identical | S-02 (to be visible) |
+| 6 | S-06 step 2 (f32 transcendentals), S-08.3 VNNI redesign, S-08.2 GOAMD64 pin | parity-class / hardware-gated | not bit-identical / n/a | product decision / a VNNI host |
+| 7 | I8MM detection + `SMMLA` GEMM | 2× on step 1's prefill kernel | bit-identity needs its own argument (different lane grouping) | an M2+/Graviton3 box |
+
+Every step names its do-nothing arm as today's shipped configuration and is measured paired and
+interleaved on a quiet box per the campaign rules; a counted number in this doc is a hypothesis
+until the row exists.
+
+## 6. Sources for the measured figures
+
+aikit: `linalg/w4a8_item3_parallel_arm64_test.go` (1/6/8-worker GB/s), `w4a8_opsperbyte_bench_arm64_test.go`
+(hot/cold GMAC/s, unpack tax), `matmul_w4a8_row4_arm64_test.go` (row4 vs canonical, `==` gate),
+`fmapeak_*` (95.4 GFLOPS M1; 135.6 GFLOPS 3700X), `dot_w4a8_2acc_amd64_test.go`,
+`dot_w4a8_splithalf_amd64_test.go`, `dot_w4a8_avx512vnni_amd64_bench_test.go`, `acc64_test.go`,
+`matmul_qk_acc64_test.go`, `matmul_av_acc64_test.go`, `matmul_mconsistent_test.go`,
+`decode_perf_test.go`; `docs/internal/perf-dead-ends.md` (§2, §4.4, §8.1, §8.10, Group 2),
+`docs/internal/measuring-performance.md`, `docs/internal/roofline-2026-08.md`,
+`docs/internal/cpu-acceleration.md`, `docs/internal/perf-amdahl-apple-m1pro.md`, CHANGELOG
+1.15.0/1.23.0/1.24.0/1.25.0/1.29.0. goinfer: `docs/task-w4a8-neon-bandwidth.md` (Gate 0, Gate 1,
+probes 1+2, item-3 harness, end-to-end, non-goals), `docs/task-attention-decode-cost.md` (A0
+split, A1 moves, depth curve), `docs/measurements/cpu-peer-prefill-2026-09-01.md`,
+`docs/measurements/aikit-w4a8-opsperbyte.md`, `docs/completed/perf-campaign.md` (Phase 0/3b,
+trace coda, W8A8 batch), `docs/completed/queue-performance.md` (P14), `docs/parity-coverage-policy.md`
+(fused-site census), `docs/audit-2026-09-02.md` (P-04, P-07, P-08, L-09). Field shapes from
+memory of ggml `ggml-cpu/arch/arm/quants.c`, `repack.cpp`, `ggml-cpu/arch/x86/quants.c` and
+KleidiAI's `kai_matmul_clamp_f32_qai8dxp*_qsi4cxp*` families — structure certain, exact op
+counts not.
+
+---
+
+## Appendix A — goinfer-side scalar inventory (what is not in aikit's kernels)
+
+Per token, Qwen2.5-Coder-1.5B, Mac int4, ~25 ms at depth ~128 (39–41 tok/s). Measured figures
+from the Gate-0 stub (26.5% non-matmul floor), the probe-1 split (norm 0.40 ms, attention
+15.16 pre-A1), the A0 split (softmax 0.39 ms serial at depth 130, RoPE 0.05) and the A1 depth
+curve (2.81 ms @128, 85.2 ms @8192).
+
+| term | where | work per token | depth 128 | depth 8192 | SIMD today | vectorisable bit-identically? |
+|---|---|---|---|---|---|---|
+| dense W4A8 matmuls | aikit | ~1.05 GB | ~21 ms (85%) | ~21 ms (20%) | SDOT row4, 6w | n/a |
+| attention QK/PV acc64 | aikit (pure Go) | 2·12·28·nKeys·128 MACs | ~2.4 ms (10%) | ~81 ms (75%) | scalar f64 chains | **yes** — lane per output (S-04) |
+| softmax (max/exp/normalise, f64 `math.Exp`) | goinfer, inside the head worker | 336·nKeys exps | ~0.07 ms (0.3%) | ~4 ms (4%) | scalar | the sum is order-pinned; a lane-wise exp is not `math.Exp`-identical |
+| SiLU (f64 `x/(1+exp(−x))`) | goinfer, main goroutine | 250,880 | ≤1 ms (≤4%), unmeasured | same | scalar, serial | elementwise: parallelising is identical; a lane-wise exp must reproduce the algorithm |
+| activation int8 quantisation | aikit, calling goroutine | 509k elements | 0.6–1.6 ms (2.5–6%) | same | scalar | **yes** (S-03) |
+| RMSNorm (f64 square-sum) | goinfer | 57 × 1536 | 0.40 ms (1.6%) | same | scalar | reduction — leave |
+| RoPE | goinfer | 25k rotations + 1.8k cos/sin | 0.05 ms | same | scalar f64 | table is value-identical; leave |
+| fork/join | aikit | 169 dispatches | ~0.3 ms (1.2%) | same | — | S-02 |
+| sampler, residual adds, KV append | goinfer | — | <0.5 ms | same | partly | — |
+| DeltaNet recurrence (hybrid families) | goinfer `decoder/deltanet.go:226-243` | per layer state walk | ~19% of a 35B token | — | scalar, stride-`hv` | loop interchange keeps order (audit P-07) |
+| Mamba-2 projections (Granite/Nemotron) | goinfer `mamba2.go` | f32 `matvec` | unmeasured | — | f32 kernels at 4 B/weight | WeightMat → W8A8 is a precision decision (audit P-08) |
+
+Reading: at short context the Go-side serial remainder is ≈8–10% of the token and the whole of
+it is four small items (quantiser, SiLU, norms, fork/join); at long context the token is the
+acc64 kernels, which are aikit's and pure Go. The 73–86% that is weight streaming is the SDOT
+kernel at its per-core ceiling and the fan-out at a third of six cores.
+
+## Appendix B — what was read, and what is unconfirmed
+
+Read in full: every `.s` under `linalg/` (all 16; every raw `WORD` recomputed), every non-test
+`.go` in `linalg/`, the tests that record numbers (listed in §6), `docs/internal/*.md`,
+`docs/architecture.md`, CHANGELOG entries for W4A8/W8A8/acc64/exp/Workspace; goinfer's
+`decoder/{weightmat,scratch,tune,forwardn,mlp,rmsnorm,attention,rope,fusedattn,serialize}.go` and
+the campaign records above; `go127-simd-audit.md` and its `proto/`.
+
+Unconfirmed (would take a run on the box): the Firestorm port/latency constants (4 SIMD pipes
+for SDOT/SCVTF/FMLA alike, 3 loads/cycle) — the 91–97% fractions are the evidence they fit;
+whether `MOVI #0` is a rename-time zero idiom; which of wake-chain stagger vs E-core/SMT
+stragglers dominates S-02; whether gc emitted `FCSEL` or branches in the quantiser; the cost of
+a line-straddling 16-byte load on Apple silicon (the `.giw` arbitrary-base question, expected ≤
+a few % single-core, nil at six workers); the 3700X's real bandwidth; the Go version that
+introduced `GOAMD64>=v3` FMA fusion; ggml/KleidiAI op counts beyond kernel shape; whether SDOT
+issues on four pipes or two (halves S-01's counted gain, still positive).
