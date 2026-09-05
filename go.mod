@@ -3,6 +3,7 @@ module github.com/townsendmerino/aikit
 go 1.27.0
 
 require (
+	github.com/masacento/cjk v0.1.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.40.0
 )

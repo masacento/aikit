@@ -1,3 +1,5 @@
+github.com/masacento/cjk v0.1.0 h1:/u1x3RLga0tiLBPaqFU52oqfIEKOGTBbfnO6BKKGvMA=
+github.com/masacento/cjk v0.1.0/go.mod h1:Z2KDadXB3cwQaGgahJugRJzBJHxNFDp2WswP1hL+Fbw=
 golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
 golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
 golang.org/x/text v0.40.0 h1:Ub2Z6/xjgF1WrYQz2nuITOEegKFtiIy+rieRJ5lHZKs=

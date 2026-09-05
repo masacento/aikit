@@ -1,6 +1,6 @@
 package ner
 
-import cjkseg "github.com/townsendmerino/aikit/cjk"
+import cjkseg "github.com/masacento/cjk"
 
 // SplitWordsCJK segments text for word-level NER input, choosing the
 // splitter by content:

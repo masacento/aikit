@@ -1,7 +1,7 @@
 package ner
 
 import (
-	cjkseg "github.com/townsendmerino/aikit/cjk"
+	cjkseg "github.com/masacento/cjk"
 	"strings"
 	"unicode"
 )
